@@ -41,15 +41,17 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
 /// JNI 调用失败统一清理（apk-1 方案）：Android ART 的 CheckJNI 要求同一线程
 /// 的 JNIEnv 先清除挂起异常才能继续调用其他 JNI 函数。Rust 侧 Tokio 工作线程
 /// 池会复用线程——任一 JNI 调用返回 Err 后若不清除 Pending Exception，下一次
-/// 复用该线程的任意 JNI 调用都会触发 CheckJNI 致命断言（SIGABRT 闪退）
-fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
+/// 复用该线程的任意 JNI 调用都会触发 CheckJNI 致命断言（SIGABRT 闪退）。
+/// 返回 anyhow::Error（不能是 String：String 未实现 StdError，无法被
+/// anyhow 的 `?` 吸收——build #178 的编译错误根因）
+fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> anyhow::Error {
     if env.exception_check().unwrap_or(false) {
         // 将 Java 异常栈输出到 adb logcat 方便排查
         let _ = env.exception_describe();
         // 关键：清除当前线程挂起的 Java 异常
         let _ = env.exception_clear();
     }
-    format!("{step}: {err}")
+    anyhow!("{step}: {err}")
 }
 
 /// 平台初始化（Tauri setup 中调用）：注册原生方法 + libbox C 回调
@@ -85,7 +87,7 @@ pub fn ensure_permission() -> Result<bool> {
             .call_static_method(BRIDGE_CLASS, "ensurePermission", "()Z", &[])
             .map_err(|e| jni_err(env, "call ensurePermission", e))?
             .z()
-            .map_err(|e| format!("ensurePermission ret: {e}"))?;
+            .map_err(|e| anyhow!("ensurePermission ret: {e}"))?;
         Ok(granted)
     })
 }
@@ -97,7 +99,7 @@ pub fn start_service_and_wait() -> Result<()> {
             .call_static_method(BRIDGE_CLASS, "startServiceAndWait", "()Z", &[])
             .map_err(|e| jni_err(env, "call startServiceAndWait", e))?
             .z()
-            .map_err(|e| format!("startServiceAndWait ret: {e}"))?;
+            .map_err(|e| anyhow!("startServiceAndWait ret: {e}"))?;
         if ok {
             Ok(())
         } else {
@@ -157,7 +159,7 @@ fn open_tun(options_json: &str) -> Result<i32> {
             )
             .map_err(|e| jni_err(env, "call openTun", e))?
             .i()
-            .map_err(|e| format!("openTun ret: {e}"))?;
+            .map_err(|e| anyhow!("openTun ret: {e}"))?;
         if fd < 0 {
             return Err(anyhow!("VpnService.establish() failed (service not foreground?)"));
         }
@@ -176,7 +178,7 @@ fn protect_socket(fd: c_int) -> Result<()> {
             )
             .map_err(|e| jni_err(env, "call protectSocket", e))?
             .z()
-            .map_err(|e| format!("protectSocket ret: {e}"))?;
+            .map_err(|e| anyhow!("protectSocket ret: {e}"))?;
         if ok {
             Ok(())
         } else {
