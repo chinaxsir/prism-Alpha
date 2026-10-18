@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD}, Engine as _};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::core::kernel::{
     KernelApi, KernelConfig, KernelHandle, check_config, generate_secret, probe_version,
@@ -169,7 +169,14 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     let api_secret = generate_secret();
 
     // 配置构建：自定义规则 + Clash YAML（多订阅合并）→ sing-box runtime JSON
+    // Go Lan / Go Cus 仅在授权激活时生效（未激活传入默认配置 = 完全关闭）
     let custom_rules = crate::core::store::load_custom_rules(&state.data_dir);
+    let pro_unlocked = state.entitlement.read().is_unlocked();
+    let (go_lan_cfg, go_cus_cfg) = if pro_unlocked {
+        (state.go_lan.read().clone(), state.go_cus.read().clone())
+    } else {
+        (Default::default(), Default::default())
+    };
     let built = crate::core::config_builder::build(
         &profiles,
         &custom_rules,
@@ -179,6 +186,8 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         &work_dir,
         &api_addr,
         &api_secret,
+        &go_lan_cfg,
+        &go_cus_cfg,
     )
     .map_err(|e| e.to_string())?;
     for warning in &built.warnings {
@@ -271,6 +280,26 @@ async fn apply_prepared(
         }
         crate::platform::set_system_proxy("127.0.0.1", settings.mixed_port)
             .map_err(|e| e.to_string())?;
+    }
+
+    // Go Cus 边车：授权激活且启用覆写时拉起本地处理服务（进程内单例）
+    {
+        let pro_unlocked = state.entitlement.read().is_unlocked();
+        if pro_unlocked && state.go_cus.read().enabled {
+            crate::core::go_cus::ensure_sidecar(app.clone());
+        }
+    }
+
+    // Go AIM（Pro）：授权激活即后台探测评级；开关打开时自动锁定 + 故障转移监控
+    {
+        let pro_unlocked = state.entitlement.read().is_unlocked();
+        if pro_unlocked {
+            let enabled = state.settings.read().go_aim_enabled;
+            if enabled {
+                crate::core::go_aim::spawn_monitor(app.clone());
+            }
+            crate::core::go_aim::start_probe(app.clone());
+        }
     }
 
     Ok(())
@@ -1523,6 +1552,8 @@ pub async fn save_settings(
 
     // 运行模式以 set_mode 为唯一入口（设置表单可能携带旧值，直接覆盖防止回退）
     settings.mode = *state.mode.read();
+    // Go AIM 开关由 set_go_aim_enabled 命令管理（设置表单不携带该字段，防止覆盖回退）
+    settings.go_aim_enabled = prev.go_aim_enabled;
 
     // 自启动立即生效
     crate::platform::set_auto_start(settings.auto_start).map_err(|e| e.to_string())?;
@@ -1545,4 +1576,269 @@ pub async fn save_settings(
         restart_core(&app, &state).await?;
     }
     Ok(())
+}
+
+// ============================== Go AIM（Pro） ==============================
+
+/// Go AIM 状态：开关 / 锁定节点 / 探测进度 / 全量评级结果
+#[tauri::command]
+pub async fn get_go_aim_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::to_value(crate::core::go_aim::status_dto(&state))
+        .map_err(|e| e.to_string())?)
+}
+
+/// 开关 Go AIM 自动锁定；开启且内核运行中时立即探测并锁定
+#[tauri::command]
+pub async fn set_go_aim_enabled(
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let ent = state.entitlement.read();
+        if enabled && !ent.is_unlocked() {
+            return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let mut settings = state.settings.read().clone();
+    settings.go_aim_enabled = enabled;
+    state
+        .save_settings(settings)
+        .map_err(|e| format!("保存设置失败: {e}"))?;
+    if enabled && *state.status.read() == CoreStatus::Running {
+        crate::core::go_aim::spawn_monitor(app.clone());
+        crate::core::go_aim::start_probe(app.clone());
+    }
+    if !enabled {
+        *state.aim_locked_node.write() = None;
+        let _ = app.emit(crate::core::go_aim::AIM_EVENT, serde_json::json!({ "locked": null }));
+    }
+    Ok(())
+}
+
+/// 手动触发一轮全量探测（需内核运行中 + 授权激活）
+#[tauri::command]
+pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    if *state.status.read() != CoreStatus::Running {
+        return Err("内核未运行，无法探测".into());
+    }
+    let already = state.aim_probing.load(std::sync::atomic::Ordering::Acquire);
+    if !already {
+        crate::core::go_aim::start_probe(app);
+    }
+    Ok(already)
+}
+
+// ============================== Go Lan（Pro） ==============================
+
+/// 读取回家网络配置
+#[tauri::command]
+pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let lan = state.go_lan.read().clone();
+    serde_json::to_value(lan).map_err(|e| e.to_string())
+}
+
+/// 保存回家网络配置；内核运行中时重建配置生效
+#[tauri::command]
+pub async fn save_go_lan_settings(
+    settings: serde_json::Value,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let lan: crate::core::go_lan::GoLanSettings =
+        serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
+    crate::core::go_lan::save(&state.data_dir, &lan)?;
+    *state.go_lan.write() = lan.clone();
+    // 运行中 → 重建内核配置立即生效
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    // 返回构建警告（无效网段等）
+    let (_, warnings) = crate::core::go_lan::go_lan_route_rules(&lan);
+    Ok(warnings)
+}
+
+/// Managed 模式：向授权服务器拉取回家节点配置
+#[tauri::command]
+pub async fn sync_go_lan_managed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let lan = crate::core::go_lan::sync_managed(&app).await?;
+    // 拉取成功后若内核运行中，重建配置生效
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    serde_json::to_value(lan).map_err(|e| e.to_string())
+}
+
+// ============================== Go Cus（Pro） ==============================
+
+/// 读取覆写引擎配置
+#[tauri::command]
+pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let cus = state.go_cus.read().clone();
+    serde_json::to_value(cus).map_err(|e| e.to_string())
+}
+
+/// 保存覆写引擎基础设置（enabled / mitm / dns / hosts）；运行中重建生效
+#[tauri::command]
+pub async fn save_go_cus_settings(
+    settings: serde_json::Value,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let cus: crate::core::go_cus::GoCusSettings =
+        serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
+    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    *state.go_cus.write() = cus;
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    Ok(())
+}
+
+/// 导入模块：http(s) URL 自动下载，否则按本地内容解析
+#[tauri::command]
+pub async fn import_go_cus_module(
+    source: String,
+    name: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err("请输入模块链接或粘贴模块内容".into());
+    }
+    let raw = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        crate::core::go_cus::fetch_module_text(trimmed).await?
+    } else {
+        trimmed.to_string()
+    };
+    let mut cus = state.go_cus.read().clone();
+    let module = crate::core::go_cus::upsert_module(&mut cus, trimmed, &raw, name.as_deref())?;
+    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    *state.go_cus.write() = cus.clone();
+    // 首个模块导入即自动启用引擎并拉起边车
+    let mut cus = state.go_cus.read().clone();
+    let mut changed = false;
+    if !cus.enabled {
+        cus.enabled = true;
+        changed = true;
+    }
+    if changed {
+        crate::core::go_cus::save(&state.data_dir, &cus)?;
+        *state.go_cus.write() = cus;
+    }
+    crate::core::go_cus::ensure_sidecar(app.clone());
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    serde_json::to_value(module).map_err(|e| e.to_string())
+}
+
+/// 启停模块；启用状态变化时运行中内核重建生效
+#[tauri::command]
+pub async fn toggle_go_cus_module(
+    id: String,
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let mut cus = state.go_cus.read().clone();
+    let Some(module) = cus.modules.iter_mut().find(|m| m.id == id) else {
+        return Err("模块不存在".into());
+    };
+    module.enabled = enabled;
+    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    *state.go_cus.write() = cus;
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    Ok(())
+}
+
+/// 删除模块
+#[tauri::command]
+pub async fn delete_go_cus_module(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let mut cus = state.go_cus.read().clone();
+    let before = cus.modules.len();
+    cus.modules.retain(|m| m.id != id);
+    if cus.modules.len() == before {
+        return Err("模块不存在".into());
+    }
+    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    *state.go_cus.write() = cus;
+    if *state.status.read() == CoreStatus::Running {
+        restart_core(&app, &state).await?;
+    }
+    Ok(())
+}
+
+/// 生成/读取 Root CA 并确保分发服务运行（返回指纹 + 安装 URL）
+#[tauri::command]
+pub async fn generate_or_get_ca_url(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    {
+        let ent = state.entitlement.read();
+        if !ent.is_unlocked() {
+            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+        }
+    }
+    let info = crate::core::go_cus::generate_or_get_ca(&state, app)?;
+    serde_json::to_value(info).map_err(|e| e.to_string())
 }

@@ -18,6 +18,7 @@ import {
   Copy,
   Smartphone,
   AppWindow,
+  Home,
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 
@@ -29,16 +30,21 @@ import {
   getSettings,
   saveSettings,
   setMode,
+  getGoLanSettings,
+  saveGoLanSettings,
+  syncGoLanManaged,
   type KernelInfo,
   type EntitlementState,
+  type GoLanSettings,
+  type WgManualConfig,
 } from "@/api/ipc";
 import type { RunMode, UserSettings } from "@/stores/core";
 import { useCoreStore } from "@/stores/core";
 import { RUN_MODES } from "@/constants/modes";
-import { ActivateProModal } from "@/components/ProGate";
+import ProGate, { ActivateProModal } from "@/components/ProGate";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
-import { isMobile } from "@/pro/gating";
+import { Feature, isMobile } from "@/pro/gating";
 import Switch from "@/components/ui/Switch";
 import clsx from "clsx";
 
@@ -78,6 +84,78 @@ const RUN_MODE_ICON: Record<RunMode, typeof Wifi> = {
   tun: Network,
 };
 
+// ---- Go Lan · 回家网络 ----
+
+/// 手动配置方式：WireGuard 完整参数 / 回家节点分享链接
+type GoLanMethod = "wg" | "uri";
+
+/// Go Lan 卡片本地编辑表单（textarea 内容保持为多行字符串，保存时再拆分）
+interface GoLanForm {
+  enabled: boolean;
+  mode: "manual" | "managed";
+  method: GoLanMethod;
+  nodeUri: string;
+  wgServer: string;
+  wgServerPort: number;
+  wgPrivateKey: string;
+  wgPeerPublicKey: string;
+  wgPreSharedKey: string;
+  wgLocalIp: string;
+  wgMtu: number;
+  lanCidrs: string;
+  lanDns: string;
+  lanDomains: string;
+  managedServer: string;
+  deviceCode: string;
+}
+
+const WG_DEFAULTS = { localIp: "10.0.0.2/32", mtu: 1420 };
+const MANAGED_SERVER_DEFAULT = "https://askcn.de";
+
+const EMPTY_GO_LAN: GoLanForm = {
+  enabled: false,
+  mode: "manual",
+  method: "wg",
+  nodeUri: "",
+  wgServer: "",
+  wgServerPort: 0,
+  wgPrivateKey: "",
+  wgPeerPublicKey: "",
+  wgPreSharedKey: "",
+  wgLocalIp: WG_DEFAULTS.localIp,
+  wgMtu: WG_DEFAULTS.mtu,
+  lanCidrs: "",
+  lanDns: "",
+  lanDomains: "",
+  managedServer: MANAGED_SERVER_DEFAULT,
+  deviceCode: "",
+};
+
+/// 后端设置 → 本地编辑表单（数组字段反向 join 为多行文本）
+function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
+  const wg = s.wgConfig ?? null;
+  const method: GoLanMethod =
+    wg && wg.server ? "wg" : s.nodeUri ? "uri" : "wg";
+  return {
+    enabled: s.enabled,
+    mode: s.mode,
+    method,
+    nodeUri: s.nodeUri ?? "",
+    wgServer: wg?.server ?? "",
+    wgServerPort: wg?.serverPort ?? 0,
+    wgPrivateKey: wg?.privateKey ?? "",
+    wgPeerPublicKey: wg?.peerPublicKey ?? "",
+    wgPreSharedKey: wg?.preSharedKey ?? "",
+    wgLocalIp: wg?.localIp || WG_DEFAULTS.localIp,
+    wgMtu: wg?.mtu || WG_DEFAULTS.mtu,
+    lanCidrs: (s.lanCidrs ?? []).join("\n"),
+    lanDns: s.lanDns ?? "",
+    lanDomains: (s.lanDomains ?? []).join("\n"),
+    managedServer: s.managedServer || MANAGED_SERVER_DEFAULT,
+    deviceCode: s.deviceCode ?? "",
+  };
+}
+
 export default function Settings() {
   const [mode, setRunMode] = useState<RunMode>("systemProxy");
   const [modeBusy, setModeBusy] = useState(false);
@@ -108,6 +186,12 @@ export default function Settings() {
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
 
+  // Go Lan · 回家网络（Pro）：拷贝后端设置到本地表单编辑
+  const [goLan, setGoLan] = useState<GoLanForm>(EMPTY_GO_LAN);
+  const [goLanLoaded, setGoLanLoaded] = useState<GoLanSettings | null>(null);
+  const [goLanBusy, setGoLanBusy] = useState(false);
+  const [goLanSyncing, setGoLanSyncing] = useState(false);
+
   useEffect(() => {
     getDeviceId()
       .then(setDeviceId)
@@ -115,6 +199,12 @@ export default function Settings() {
     getVersion()
       .then(setAppVersion)
       .catch((e) => console.error("get app version failed:", e));
+    getGoLanSettings()
+      .then((s) => {
+        setGoLanLoaded(s);
+        setGoLan(applyGoLanLoaded(s));
+      })
+      .catch((e) => console.error("get go lan settings failed:", e));
   }, []);
 
   const copyDeviceId = async () => {
@@ -203,6 +293,96 @@ export default function Settings() {
       setSaved(true);
     } catch (e) {
       console.error("save settings failed:", e);
+    }
+  };
+
+  const patchGoLan = (p: Partial<GoLanForm>) => setGoLan((f) => ({ ...f, ...p }));
+
+  /// 本地表单 → 后端设置（多行文本按行拆分并过滤空行；保留 cachedManagedOutbound 等未编辑字段）
+  const buildGoLanPayload = (): GoLanSettings => {
+    const base: GoLanSettings = goLanLoaded ?? ({} as GoLanSettings);
+    const wgAnyFilled = [
+      goLan.wgServer,
+      goLan.wgPrivateKey,
+      goLan.wgPeerPublicKey,
+      goLan.wgPreSharedKey,
+    ].some((v) => v.trim() !== "");
+    const wgConfig: WgManualConfig | null =
+      goLan.mode === "manual" && goLan.method === "wg" && wgAnyFilled
+        ? {
+            server: goLan.wgServer.trim(),
+            serverPort: goLan.wgServerPort || 0,
+            privateKey: goLan.wgPrivateKey.trim(),
+            peerPublicKey: goLan.wgPeerPublicKey.trim(),
+            preSharedKey: goLan.wgPreSharedKey.trim() || null,
+            localIp: goLan.wgLocalIp.trim() || WG_DEFAULTS.localIp,
+            mtu: goLan.wgMtu || WG_DEFAULTS.mtu,
+          }
+        : null;
+    return {
+      ...base,
+      enabled: goLan.enabled,
+      mode: goLan.mode,
+      nodeUri: goLan.nodeUri.trim(),
+      wgConfig,
+      lanCidrs: goLan.lanCidrs
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+      lanDns: goLan.lanDns.trim() || null,
+      lanDomains: goLan.lanDomains
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+      managedServer: goLan.managedServer.trim() || MANAGED_SERVER_DEFAULT,
+      deviceCode: goLan.deviceCode.trim(),
+    };
+  };
+
+  const handleGoLanSave = async () => {
+    // WireGuard 手动配置：任一字段非空时，server / 私钥 / Peer 公钥必填
+    if (goLan.mode === "manual" && goLan.method === "wg") {
+      const anyFilled = [
+        goLan.wgServer,
+        goLan.wgPrivateKey,
+        goLan.wgPeerPublicKey,
+        goLan.wgPreSharedKey,
+      ].some((v) => v.trim() !== "");
+      if (
+        anyFilled &&
+        (!goLan.wgServer.trim() ||
+          !goLan.wgPrivateKey.trim() ||
+          !goLan.wgPeerPublicKey.trim())
+      ) {
+        toast.error("WireGuard 手动配置需填写 Server、私钥与 Peer 公钥");
+        return;
+      }
+    }
+    setGoLanBusy(true);
+    try {
+      const warnings = await saveGoLanSettings(buildGoLanPayload());
+      if (warnings && warnings.length > 0) {
+        warnings.forEach((w) => toast.info(w));
+      }
+      toast.success("Go Lan 配置已保存");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setGoLanBusy(false);
+    }
+  };
+
+  const handleGoLanSync = async () => {
+    setGoLanSyncing(true);
+    try {
+      const s = await syncGoLanManaged();
+      setGoLanLoaded(s);
+      setGoLan(applyGoLanLoaded(s));
+      toast.success("已拉取回家配置");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setGoLanSyncing(false);
     }
   };
 
@@ -329,6 +509,289 @@ export default function Settings() {
           />
         )}
       </SettingsGroup>
+
+      {/* Go Lan · 回家网络（Pro 门控） */}
+      <ProGate feature={Feature.GoLan}>
+        <SettingsGroup
+          title="Go Lan · 回家网络"
+          icon={<Home size={14} />}
+          desc="回家路由：指定网段/域名经家庭隧道直达局域网"
+          headerRight={
+            <Switch
+              checked={goLan.enabled}
+              onChange={(v) => patchGoLan({ enabled: v })}
+            />
+          }
+        >
+          <div className="space-y-4 px-3 py-3">
+            {/* 模式：手动配置 / 托管下发 */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => patchGoLan({ mode: "manual" })}
+                className={clsx(
+                  "rounded-full px-3 py-1 text-xs transition-colors",
+                  goLan.mode === "manual"
+                    ? "bg-accent text-white"
+                    : "bg-surface-hover text-gray-400 hover:text-gray-200"
+                )}
+              >
+                手动配置
+              </button>
+              <button
+                onClick={() => patchGoLan({ mode: "managed" })}
+                className={clsx(
+                  "rounded-full px-3 py-1 text-xs transition-colors",
+                  goLan.mode === "managed"
+                    ? "bg-accent text-white"
+                    : "bg-surface-hover text-gray-400 hover:text-gray-200"
+                )}
+              >
+                托管下发
+              </button>
+            </div>
+
+            {goLan.mode === "manual" && (
+              <>
+                {/* 手动方式：WireGuard 参数 / 节点分享链接 */}
+                <div className="flex w-fit items-center gap-1 rounded-lg bg-surface-hover p-0.5 text-xs">
+                  <button
+                    onClick={() => patchGoLan({ method: "wg" })}
+                    className={clsx(
+                      "rounded-md px-2.5 py-1 transition-colors",
+                      goLan.method === "wg"
+                        ? "bg-surface-card text-gray-100"
+                        : "text-gray-500 hover:text-gray-300"
+                    )}
+                  >
+                    WireGuard 参数
+                  </button>
+                  <button
+                    onClick={() => patchGoLan({ method: "uri" })}
+                    className={clsx(
+                      "rounded-md px-2.5 py-1 transition-colors",
+                      goLan.method === "uri"
+                        ? "bg-surface-card text-gray-100"
+                        : "text-gray-500 hover:text-gray-300"
+                    )}
+                  >
+                    节点分享链接
+                  </button>
+                </div>
+
+                {goLan.method === "wg" ? (
+                  <div className="space-y-3">
+                    <div className="flex gap-2">
+                      <GoLanField label="Server" className="flex-1">
+                        <input
+                          type="text"
+                          value={goLan.wgServer}
+                          onChange={(e) =>
+                            patchGoLan({ wgServer: e.target.value })
+                          }
+                          placeholder="vpn.home.example.com"
+                          spellCheck={false}
+                          autoComplete="off"
+                          className={GO_LAN_INPUT}
+                        />
+                      </GoLanField>
+                      <GoLanField label="端口" className="w-24 shrink-0">
+                        <input
+                          type="number"
+                          min={0}
+                          max={65535}
+                          value={goLan.wgServerPort}
+                          onChange={(e) =>
+                            patchGoLan({ wgServerPort: Number(e.target.value) })
+                          }
+                          placeholder="51820"
+                          className={clsx(GO_LAN_INPUT, "text-right")}
+                        />
+                      </GoLanField>
+                    </div>
+                    <GoLanField label="私钥（Private Key）">
+                      <input
+                        type="password"
+                        value={goLan.wgPrivateKey}
+                        onChange={(e) =>
+                          patchGoLan({ wgPrivateKey: e.target.value })
+                        }
+                        placeholder="客户端 WireGuard 私钥"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className={GO_LAN_INPUT}
+                      />
+                    </GoLanField>
+                    <GoLanField label="Peer 公钥">
+                      <input
+                        type="text"
+                        value={goLan.wgPeerPublicKey}
+                        onChange={(e) =>
+                          patchGoLan({ wgPeerPublicKey: e.target.value })
+                        }
+                        placeholder="家庭端 WireGuard 公钥"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className={GO_LAN_INPUT}
+                      />
+                    </GoLanField>
+                    <GoLanField label="Pre-Shared Key（可选）">
+                      <input
+                        type="password"
+                        value={goLan.wgPreSharedKey}
+                        onChange={(e) =>
+                          patchGoLan({ wgPreSharedKey: e.target.value })
+                        }
+                        placeholder="预共享密钥"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className={GO_LAN_INPUT}
+                      />
+                    </GoLanField>
+                    <div className="flex gap-2">
+                      <GoLanField
+                        label="本机地址（Local IP）"
+                        className="flex-1"
+                      >
+                        <input
+                          type="text"
+                          value={goLan.wgLocalIp}
+                          onChange={(e) =>
+                            patchGoLan({ wgLocalIp: e.target.value })
+                          }
+                          placeholder={WG_DEFAULTS.localIp}
+                          spellCheck={false}
+                          autoComplete="off"
+                          className={GO_LAN_INPUT}
+                        />
+                      </GoLanField>
+                      <GoLanField label="MTU" className="w-24 shrink-0">
+                        <input
+                          type="number"
+                          min={576}
+                          max={65535}
+                          value={goLan.wgMtu}
+                          onChange={(e) =>
+                            patchGoLan({ wgMtu: Number(e.target.value) })
+                          }
+                          placeholder={String(WG_DEFAULTS.mtu)}
+                          className={clsx(GO_LAN_INPUT, "text-right")}
+                        />
+                      </GoLanField>
+                    </div>
+                  </div>
+                ) : (
+                  <GoLanField
+                    label="回家节点分享链接"
+                    hint="单条 vless / vmess / ss / trojan / hy2 / tuic 链接"
+                  >
+                    <textarea
+                      rows={3}
+                      value={goLan.nodeUri}
+                      onChange={(e) => patchGoLan({ nodeUri: e.target.value })}
+                      placeholder="vless://…"
+                      spellCheck={false}
+                      className={clsx(
+                        GO_LAN_INPUT,
+                        "resize-none font-mono text-xs leading-relaxed"
+                      )}
+                    />
+                  </GoLanField>
+                )}
+              </>
+            )}
+
+            {goLan.mode === "managed" && (
+              <div className="space-y-3">
+                <GoLanField label="托管服务器" hint="从该服务器拉取家庭网络配置">
+                  <input
+                    type="text"
+                    value={goLan.managedServer}
+                    onChange={(e) =>
+                      patchGoLan({ managedServer: e.target.value })
+                    }
+                    placeholder={MANAGED_SERVER_DEFAULT}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className={GO_LAN_INPUT}
+                  />
+                </GoLanField>
+                <GoLanField label="设备码（Device Code）">
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={goLan.deviceCode}
+                      onChange={(e) =>
+                        patchGoLan({ deviceCode: e.target.value })
+                      }
+                      placeholder="托管端为本机生成的设备码"
+                      spellCheck={false}
+                      autoComplete="off"
+                      className={clsx(GO_LAN_INPUT, "flex-1")}
+                    />
+                    <button
+                      onClick={handleGoLanSync}
+                      disabled={goLanSyncing}
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-surface-hover px-3 py-2 text-xs transition-colors hover:bg-white/10 disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        size={12}
+                        className={goLanSyncing ? "animate-spin" : ""}
+                      />
+                      {goLanSyncing ? "同步中…" : "同步回家配置"}
+                    </button>
+                  </div>
+                </GoLanField>
+              </div>
+            )}
+
+            {/* 通用字段：回家目标（网段 / DNS / 域名后缀） */}
+            <div className="space-y-3 border-t border-white/5 pt-3">
+              <GoLanField label="局域网网段（CIDR）" hint="每行一个，如 192.168.1.0/24">
+                <textarea
+                  rows={2}
+                  value={goLan.lanCidrs}
+                  onChange={(e) => patchGoLan({ lanCidrs: e.target.value })}
+                  placeholder={"192.168.1.0/24\n10.8.0.0/24"}
+                  spellCheck={false}
+                  className={clsx(GO_LAN_INPUT, "resize-none font-mono text-xs leading-relaxed")}
+                />
+              </GoLanField>
+              <GoLanField label="局域网 DNS（可选）">
+                <input
+                  type="text"
+                  value={goLan.lanDns}
+                  onChange={(e) => patchGoLan({ lanDns: e.target.value })}
+                  placeholder="192.168.1.1"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className={GO_LAN_INPUT}
+                />
+              </GoLanField>
+              <GoLanField label="域名后缀" hint="每行一个，如 nas.home">
+                <textarea
+                  rows={2}
+                  value={goLan.lanDomains}
+                  onChange={(e) => patchGoLan({ lanDomains: e.target.value })}
+                  placeholder={"nas.home\nrouter.home"}
+                  spellCheck={false}
+                  className={clsx(GO_LAN_INPUT, "resize-none font-mono text-xs leading-relaxed")}
+                />
+              </GoLanField>
+            </div>
+          </div>
+
+          <div className="flex justify-end px-3 pb-3">
+            <button
+              onClick={handleGoLanSave}
+              disabled={goLanBusy}
+              className="flex items-center gap-1.5 rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={goLanBusy ? "animate-spin" : ""} />
+              保存
+            </button>
+          </div>
+        </SettingsGroup>
+      </ProGate>
 
       {/* 高级 */}
       <SettingsGroup title="高级" icon={<Sliders size={14} />} desc="IPv6、QUIC、连接切换等内核行为">
@@ -540,6 +1003,31 @@ export default function Settings() {
 const MODES = RUN_MODES;
 
 // ---- 复用组件 ----
+
+/// Go Lan 卡片输入框统一样式
+const GO_LAN_INPUT =
+  "w-full rounded-lg border border-white/5 bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent";
+
+/// Go Lan 字段容器：label + 输入控件 + 可选说明
+function GoLanField({
+  label,
+  hint,
+  className,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={clsx("min-w-0 space-y-1", className)}>
+      <label className="block text-xs text-gray-400">{label}</label>
+      {children}
+      {hint && <p className="text-[11px] text-gray-600">{hint}</p>}
+    </div>
+  );
+}
 
 function SettingsGroup({
   title,

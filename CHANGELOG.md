@@ -4,6 +4,52 @@
 每次发布前更新本文件，并在 Git 打对应 tag。
 移动端与桌面端共用同一版本 tag；更新内容按平台分节说明。
 
+## [Alpha 0.1.0] - 2026-10-18
+
+> 三大 Pro 引擎上线：Go AIM 解锁加速 / Go Lan 回家网络 / Go Cus 覆写引擎。
+
+### 共用更新（移动端 + 桌面端）
+
+#### Go AIM · AI/流媒体自动探测锁定（Pro）
+- 全量节点解锁评级：对每个存活节点经内核单节点延迟端点做 7 点
+  二值信号探测（GPT/Claude/Gemini/NF/YT/Disney+/TK），**绝不切换
+  全局选择器**，不污染当前连接；结果实时缓存并推送前端徽章。
+- 启用后自动锁定「AI 优先 → 流媒体 → 延迟最低」的最优解锁节点；
+  节点失联时每 20 秒自动故障转移至次优解锁节点。
+- 节点页新增 全部/Go AIM/AI/流媒体 筛选与 AI/NF 徽章及「AI检测」
+  一键探测；仪表盘新增 Pro 引擎矩阵卡。
+
+#### Go Lan · 家庭局域网隧穿（Pro）
+- 三种配置：手动 WireGuard 完整参数 / 手动回家分享链接 / Managed
+  授权服务器下发（POST /api/golan/fetch-config，携带设备识别码与
+  授权密钥）。
+- `go-lan-home` 出站注入 sing-box 配置，lan_domains / lan_cidrs
+  路由规则置于 `geosite: private` 与 `ip_is_private` 之前（否则被
+  私网直连抢先命中）；lan_domains 经隧道内家庭 DNS（dns-home）
+  解析。
+- iOS 扩展智能同网段防环回：本机 Wi-Fi IP 落在回家网段时自动改走
+  直连（蜂窝 CGNAT 10.x 豁免）；DNS 重构保留 dns-home 服务器与
+  规则；ip_is_private 直连规则强制排在回家规则之后。
+
+#### Go Cus · 全兼容覆写引擎（Pro）
+- 全兼容模块解析：Surge `.sgmodule` / QuantumultX `[rewrite_local]`
+  / Loon / Stash `.stoverride`，统一产出 规则/URL改写/脚本/MitM/
+  Host 五类条目。
+- 编译注入：REJECT*→block、DIRECT→direct、其余→主策略组；改写
+  阻断域名提取并入 block；重定向/脚本/MitM 域名路由到本地边车
+  （127.0.0.1:2081）；DNS 覆写与 [Host] 映射（静态映射降级为本地
+  直连解析，内核 1.12 起完整支持）。
+- 本地边车：极简异步 HTTP/1.1 处理服务，应用 reject / reject-200 /
+  302 / 307 / header 改写；HTTPS CONNECT 级阻断生效。
+- MitM CA：纯 Rust 自签名 Root CA（rcgen/ring）+ SHA-256 指纹展示
+  + .mobileconfig 描述文件本地分发服务（127.0.0.1:2082）。
+- 新增 Go Cus 管理页（模块/改写/MitM/脚本 四子标签）；脚本 Alpha
+  版完成解析与展示，JS 执行器后续接入（诚实标注）。
+
+#### 其他
+- 版本号统一切换为 Alpha 0.1.0 体系（package.json / tauri.conf.json /
+  Cargo.toml 同步）。
+
 ## [0.3.14] - 2026-10-17
 
 > 锁屏防误停、安全区适配与仪表盘节点卡片优化。

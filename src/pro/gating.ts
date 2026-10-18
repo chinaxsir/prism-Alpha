@@ -4,12 +4,18 @@ export enum Feature {
   MultiSubscription = "multiSubscription",
   Connections = "connections",
   Rules = "rules",
+  GoAim = "goAim",
+  GoLan = "goLan",
+  GoCus = "goCus",
 }
 
 export const FEATURE_LABEL: Record<Feature, string> = {
   [Feature.MultiSubscription]: "多订阅",
   [Feature.Connections]: "连接管理",
   [Feature.Rules]: "规则自定义",
+  [Feature.GoAim]: "Go AIM 解锁加速",
+  [Feature.GoLan]: "Go Lan 回家网络",
+  [Feature.GoCus]: "Go Cus 覆写引擎",
 };
 
 let cachedMobile: boolean | null = null;

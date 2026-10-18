@@ -95,6 +95,9 @@ pub struct UserSettings {
     /// 手动切换策略后关闭现有连接（让新策略立即生效）
     #[serde(default)]
     pub close_connections_on_switch: bool,
+    /// Go AIM（Pro）：AI/流媒体自动探测锁定开关
+    #[serde(default)]
+    pub go_aim_enabled: bool,
 }
 
 impl Default for UserSettings {
@@ -114,6 +117,7 @@ impl Default for UserSettings {
             ipv6: false,
             block_quic: false,
             close_connections_on_switch: false,
+            go_aim_enabled: false,
         }
     }
 }
@@ -146,6 +150,20 @@ pub struct AppState {
     pub entitlement: RwLock<super::license::EntitlementStatus>,
     /// 系统代理备份：启动时备份原设置，停止/切换时恢复，确保代理独占
     pub proxy_backup: RwLock<Option<crate::platform::ProxyBackup>>,
+
+    // ---- Go 三引擎（Pro）运行时状态 ----
+    /// Go AIM：各节点解锁评级缓存（node → result）
+    pub aim_results: RwLock<std::collections::HashMap<String, super::go_aim::AimNodeResult>>,
+    /// Go AIM：探测进行中标志
+    pub aim_probing: std::sync::atomic::AtomicBool,
+    /// Go AIM：当前锁定的解锁节点
+    pub aim_locked_node: RwLock<Option<String>>,
+    /// Go AIM：监控任务已启动标志（进程内单例）
+    pub aim_monitor_started: std::sync::atomic::AtomicBool,
+    /// Go Lan：回家网络配置（go_lan.json）
+    pub go_lan: RwLock<super::go_lan::GoLanSettings>,
+    /// Go Cus：覆写引擎配置（go_cus.json）
+    pub go_cus: RwLock<super::go_cus::GoCusSettings>,
 }
 
 impl AppState {
@@ -173,6 +191,12 @@ impl AppState {
             main_selector: RwLock::new(None),
             entitlement: RwLock::new(super::license::cached_entitlement(&data_dir)),
             proxy_backup: RwLock::new(None),
+            aim_results: RwLock::new(std::collections::HashMap::new()),
+            aim_probing: std::sync::atomic::AtomicBool::new(false),
+            aim_locked_node: RwLock::new(None),
+            aim_monitor_started: std::sync::atomic::AtomicBool::new(false),
+            go_lan: RwLock::new(super::go_lan::load(&data_dir)),
+            go_cus: RwLock::new(super::go_cus::load(&data_dir)),
         }
     }
 

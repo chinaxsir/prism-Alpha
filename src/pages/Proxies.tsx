@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Zap, Gauge, RefreshCw, ChevronRight, Search } from "lucide-react";
+import { Zap, Gauge, RefreshCw, ChevronRight, Search, Crosshair } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { Link } from "react-router-dom";
 
@@ -9,6 +9,9 @@ import {
   getCachedProxies,
   selectProxy,
   urlTest,
+  getGoAimStatus,
+  runGoAimProbe,
+  type GoAimStatus,
 } from "@/api/ipc";
 import { useCoreStore } from "@/stores/core";
 import { toast } from "@/components/ui/Toast";
@@ -51,6 +54,15 @@ const PROTOCOL_LABEL: Record<string, string> = {
 const protocolTag = (type: string): string =>
   PROTOCOL_LABEL[type] ?? type ?? "—";
 
+/// Go AIM 筛选 pills
+type AimFilter = "all" | "aim" | "ai" | "media";
+const AIM_FILTERS: Array<{ value: AimFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "aim", label: "Go AIM" },
+  { value: "ai", label: "AI" },
+  { value: "media", label: "流媒体" },
+];
+
 export default function Proxies() {
   const coreStatus = useCoreStore((s) => s.status);
   const [mainSelectorName, setMainSelectorName] = useState("");
@@ -64,6 +76,9 @@ export default function Proxies() {
   /// 用户手动选择标记：一旦用户点选过某节点，不再自动切换到最低延迟
   const [userTouched, setUserTouched] = useState(false);
   const [keyword, setKeyword] = useState("");
+  /// Go AIM 解锁评级结果与筛选 pill
+  const [aim, setAim] = useState<GoAimStatus | null>(null);
+  const [filter, setFilter] = useState<AimFilter>("all");
 
   // 用 ref 保存最新值，避免 useEffect([]) 闭包捕获到初始值（stale closure）。
   // loadProxies 由 core://status / proxies://changed 事件触发，必须读到最新状态。
@@ -83,10 +98,16 @@ export default function Proxies() {
       })
       .catch(() => loadProxies());
 
+    // Go AIM 评级结果：挂载时拉取，探测/评级更新经事件实时刷新
+    getGoAimStatus().then(setAim).catch(() => undefined);
+
     // 事件名与后端一致（commands.rs emit "proxies://changed"）：
     // 启动自动选点/手动切换后刷新当前选中项与延迟
     const unStatus = listen("core://status", () => loadProxies());
     const unProxies = listen("proxies://changed", () => loadProxies());
+    const unAim = listen("go-aim://updated", () => {
+      getGoAimStatus().then(setAim).catch(() => undefined);
+    });
     // 测速增量事件：后端逐节点推送 { group, name, delay }（delay=null 为超时）。
     // 仅应用与当前主选择组匹配的节点，测试中实时刷新延迟显示。
     const unUrlTest = listen<{ group: string; name: string; delay: number | null }>(
@@ -104,6 +125,7 @@ export default function Proxies() {
     return () => {
       unStatus.then((fn) => fn());
       unProxies.then((fn) => fn());
+      unAim.then((fn) => fn());
       unUrlTest.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -258,11 +280,37 @@ export default function Proxies() {
     }
   };
 
-  const filtered = keyword.trim()
-    ? nodes.filter((n) =>
-        n.name.toLowerCase().includes(keyword.trim().toLowerCase())
-      )
-    : nodes;
+  /// Go AIM 解锁探测：结果经 go-aim://updated 事件实时刷新到列表徽章
+  const handleAimProbe = async () => {
+    if (coreStatus !== "running") {
+      toast.error("内核未运行，无法探测");
+      return;
+    }
+    try {
+      await runGoAimProbe();
+      toast.info("Go AIM 探测已启动，结果将实时更新");
+    } catch (e) {
+      // 含 "Pro" 的错误为门控/授权类错误，直接原样提示
+      toast.error(String(e));
+    }
+  };
+
+  /// 关键字 + Go AIM 解锁状态联合过滤
+  const keywordLower = keyword.trim().toLowerCase();
+  const filtered = nodes.filter((n) => {
+    if (keywordLower && !n.name.toLowerCase().includes(keywordLower)) return false;
+    if (filter === "all") return true;
+    const r = aim?.results[n.name];
+    if (!r) return false;
+    if (filter === "aim") return r.aiUnlocked || r.mediaUnlocked;
+    if (filter === "ai") return r.aiUnlocked;
+    return r.mediaUnlocked;
+  });
+
+  const resetFilters = () => {
+    setFilter("all");
+    setKeyword("");
+  };
 
   /// 测速完成后按延迟从低到高排列：有延迟的升序在前，未测速保持原序居中，
   /// 超时的最后。测速进行中不排序（增量结果会导致列表跳动），
@@ -330,6 +378,38 @@ export default function Proxies() {
       {/* 出站模式快捷切换（位于页头之下、搜索/测速工具栏之上） */}
       <OutboundModeSwitch />
 
+      {/* Go AIM 筛选 pills + AI 检测入口 */}
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 overflow-x-auto">
+          {AIM_FILTERS.map((f) => (
+            <button
+              key={f.value}
+              onClick={() => setFilter(f.value)}
+              className={clsx(
+                "shrink-0 px-3 py-1 rounded-full text-xs transition-colors",
+                filter === f.value
+                  ? "bg-accent text-white font-medium"
+                  : "bg-white/5 text-gray-400 hover:text-gray-200"
+              )}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={handleAimProbe}
+          className="ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+          title={
+            coreStatus === "running"
+              ? "运行 Go AIM 解锁探测（AI / 流媒体）"
+              : "启动内核后可探测"
+          }
+        >
+          <Crosshair size={13} />
+          AI检测
+        </button>
+      </div>
+
       {/* 顶部工具栏：搜索 + 测速 */}
       <div className="flex items-center gap-2">
         <div className="flex-1 flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-card border border-white/5">
@@ -365,10 +445,23 @@ export default function Proxies() {
       </div>
 
       {/* 节点列表流（Shadowrocket 风格；测速完成后按延迟升序） */}
+      {sorted.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-white/5 py-12 px-6 text-center">
+          <Search size={22} className="text-gray-600" />
+          <p className="mt-3 text-sm text-gray-400">无符合筛选条件的节点</p>
+          <button
+            onClick={resetFilters}
+            className="mt-4 rounded-lg border border-white/10 px-4 py-1.5 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+          >
+            重置筛选
+          </button>
+        </div>
+      ) : (
       <div className="rounded-2xl bg-surface-card overflow-hidden border border-white/5">
         {sorted.map((node, idx) => {
           const delay = lastDelay(node);
           const selected = current === node.name;
+          const aimResult = aim?.results[node.name];
           return (
             <button
               key={node.name}
@@ -404,6 +497,18 @@ export default function Proxies() {
                 {protocolTag(node.type)}
               </span>
 
+              {/* Go AIM 解锁徽章（探测评级后显示） */}
+              {aimResult?.aiUnlocked && (
+                <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-accent/15 text-accent">
+                  AI
+                </span>
+              )}
+              {aimResult?.mediaUnlocked && (
+                <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-latency-good/15 text-latency-good">
+                  NF
+                </span>
+              )}
+
               {/* 延迟 */}
               <span
                 className={clsx(
@@ -419,6 +524,7 @@ export default function Proxies() {
           );
         })}
       </div>
+      )}
     </div>
   );
 }

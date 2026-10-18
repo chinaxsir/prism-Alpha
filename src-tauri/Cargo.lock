@@ -3520,7 +3520,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "prism-proxy"
-version = "0.3.14"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3535,6 +3535,8 @@ dependencies = [
  "libc",
  "once_cell",
  "parking_lot",
+ "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3551,6 +3553,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-shell",
  "thiserror 1.0.69",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -3851,6 +3854,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -7185,6 +7201,15 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

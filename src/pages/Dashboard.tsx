@@ -8,6 +8,9 @@ import {
   BarChart3,
   X,
   ChevronRight,
+  Crosshair,
+  Home,
+  Wand2,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import clsx from "clsx";
@@ -29,13 +32,24 @@ import {
   selectProxy,
   startCore,
   stopCore,
+  getGoAimStatus,
+  setGoAimEnabled,
+  getGoLanSettings,
+  saveGoLanSettings,
+  getGoCusSettings,
+  saveGoCusSettings,
+  type GoAimStatus,
+  type GoLanSettings,
+  type GoCusSettings,
 } from "@/api/ipc";
 import { useCoreStore, type RunMode } from "@/stores/core";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
-import { isMobile } from "@/pro/gating";
+import { Feature, isMobile } from "@/pro/gating";
 import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
+import ProGate from "@/components/ProGate";
+import Switch from "@/components/ui/Switch";
 
 const MODE_LABEL: Record<RunMode, string> = {
   systemProxy: "系统代理",
@@ -79,6 +93,11 @@ export default function Dashboard() {
   const [nodes, setNodes] = useState<ProxyEntry[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [selecting, setSelecting] = useState(false);
+
+  // Pro 引擎矩阵状态（Go AIM / Go Lan / Go Cus）
+  const [aim, setAim] = useState<GoAimStatus | null>(null);
+  const [lan, setLan] = useState<GoLanSettings | null>(null);
+  const [cus, setCus] = useState<GoCusSettings | null>(null);
 
   const running = status === "running";
 
@@ -181,6 +200,50 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Pro 引擎状态：挂载时拉取一次；Go AIM 评级结果经事件实时刷新
+  useEffect(() => {
+    getGoAimStatus().then(setAim).catch(() => undefined);
+    getGoLanSettings().then(setLan).catch(() => undefined);
+    getGoCusSettings().then(setCus).catch(() => undefined);
+    const unAim = listen("go-aim://updated", () => {
+      getGoAimStatus().then(setAim).catch(() => undefined);
+    });
+    return () => {
+      unAim.then((fn) => fn());
+    };
+  }, []);
+
+  const toggleAim = async (v: boolean) => {
+    try {
+      await setGoAimEnabled(v);
+      setAim((prev) => (prev ? { ...prev, enabled: v } : prev));
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const toggleLan = async (v: boolean) => {
+    try {
+      const s = await getGoLanSettings();
+      s.enabled = v;
+      await saveGoLanSettings(s);
+      setLan(s);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const toggleCus = async (v: boolean) => {
+    try {
+      const s = await getGoCusSettings();
+      s.enabled = v;
+      await saveGoCusSettings(s);
+      setCus(s);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   const toggle = async () => {
     setErrorMsg(null);
     try {
@@ -241,6 +304,30 @@ export default function Dashboard() {
       setSelecting(false);
     }
   };
+
+  // ---- Pro 引擎矩阵状态文案 ----
+  // 内核未运行或配置读取失败时统一显示「—」
+  const aimStatus = !running || !aim
+    ? "—"
+    : aim.probing
+      ? "探测中…"
+      : aim.lockedNode
+        ? `已锁定: ${aim.lockedNode}`
+        : "未锁定";
+  const aimUnlocked = aim
+    ? Object.values(aim.results).filter((r) => r.aiUnlocked || r.mediaUnlocked)
+        .length
+    : 0;
+  const lanStatus = !running || !lan
+    ? "—"
+    : lan.enabled && lan.homeName
+      ? lan.homeName
+      : "未配置回家节点";
+  const cusStatus = !running || !cus
+    ? "—"
+    : cus.modules.length === 0
+      ? "未配置模块"
+      : `${cus.modules.filter((m) => m.enabled).length}/${cus.modules.length} 个模块`;
 
   return (
     <div className="space-y-5">
@@ -346,6 +433,38 @@ export default function Dashboard() {
           label="运行模式"
           value={MODE_LABEL[mode]}
         />
+      </div>
+
+      {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus，Pro 门控） */}
+      <div className="grid grid-cols-3 gap-3">
+        <ProGate feature={Feature.GoAim}>
+          <EngineCard
+            icon={<Crosshair size={14} className="text-accent" />}
+            name="Go AIM"
+            status={aimStatus}
+            enabled={aim?.enabled ?? false}
+            onToggle={toggleAim}
+            footer={`已评级解锁 ${aimUnlocked} 个节点`}
+          />
+        </ProGate>
+        <ProGate feature={Feature.GoLan}>
+          <EngineCard
+            icon={<Home size={14} className="text-accent" />}
+            name="Go Lan"
+            status={lanStatus}
+            enabled={lan?.enabled ?? false}
+            onToggle={toggleLan}
+          />
+        </ProGate>
+        <ProGate feature={Feature.GoCus}>
+          <EngineCard
+            icon={<Wand2 size={14} className="text-accent" />}
+            name="Go Cus"
+            status={cusStatus}
+            enabled={cus?.enabled ?? false}
+            onToggle={toggleCus}
+          />
+        </ProGate>
       </div>
 
       {/* 实时速率（合并卡片，左右分布） */}
@@ -533,6 +652,41 @@ function StatChip({
         </span>
         {onClick && <ChevronRight size={12} className="shrink-0 text-gray-600" />}
       </div>
+    </div>
+  );
+}
+
+/// Pro 引擎卡：紧凑垂直布局（图标+名称一行、状态一行），Switch 位于行尾
+function EngineCard({
+  icon,
+  name,
+  status,
+  enabled,
+  onToggle,
+  footer,
+}: {
+  icon: ReactNode;
+  name: string;
+  status: string;
+  enabled: boolean;
+  onToggle: (v: boolean) => void;
+  footer?: string;
+}) {
+  return (
+    <div className="bg-surface-card rounded-xl p-3 border border-white/5 flex flex-col">
+      <div className="flex items-center justify-between gap-1.5">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-gray-200 min-w-0">
+          {icon}
+          <span className="truncate">{name}</span>
+        </div>
+        <Switch checked={enabled} onChange={onToggle} />
+      </div>
+      <div className="mt-1.5 text-xs text-gray-400 truncate" title={status}>
+        {status}
+      </div>
+      {footer && (
+        <div className="mt-0.5 text-[10px] text-gray-600 truncate">{footer}</div>
+      )}
     </div>
   );
 }

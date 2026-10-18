@@ -685,39 +685,65 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //      Worker 节点出站连接 1.1.1.1，代理 DNS 请求 100% 被边缘拒绝
         //    - rules 补齐直连/全局模式与国内域名分流：直连模式下 DNS
         //      也必须走 dns-direct（223.5.5.5），否则连百度都打不开
+        //
+        //    Go Lan（回家网络）：先从原配置中提取 dns-home 服务器与其解析规则，
+        //    重建时原样保留——回家域名必须经隧道内家庭 DNS 解析
+        var preservedDnsServers: [[String: Any]] = []
+        var preservedDnsRules: [[String: Any]] = []
+        if let oldDns = root["dns"] as? [String: Any] {
+            if let servers = oldDns["servers"] as? [[String: Any]] {
+                for s in servers {
+                    let tag = (s["tag"] as? String) ?? ""
+                    let detour = (s["detour"] as? String) ?? ""
+                    if tag == "dns-home" || detour == "go-lan-home" {
+                        preservedDnsServers.append(s)
+                    }
+                }
+            }
+            if let oldRules = oldDns["rules"] as? [[String: Any]] {
+                for r in oldRules where (r["server"] as? String) == "dns-home" {
+                    preservedDnsRules.append(r)
+                }
+            }
+        }
+        var dnsServers: [[String: Any]] = [
+            [
+                "tag": "dns-remote",
+                "address": "tcp://8.8.8.8",
+                "detour": mainProxyTag,
+                "strategy": "ipv4_only"
+            ],
+            [
+                "tag": "dns-direct",
+                "address": "223.5.5.5",
+                "detour": "direct",
+                "strategy": "prefer_ipv4"
+            ]
+        ]
+        dnsServers.append(contentsOf: preservedDnsServers)
+        // dns-home 规则必须排在最前（位于 outbound:any 兜底规则之前）
+        var dnsRules: [[String: Any]] = preservedDnsRules
+        dnsRules.append(contentsOf: [
+            [
+                "outbound": "any",
+                "server": "dns-direct"
+            ],
+            [
+                "clash_mode": "direct",
+                "server": "dns-direct"
+            ],
+            [
+                "clash_mode": "global",
+                "server": "dns-remote"
+            ],
+            [
+                "geosite": ["cn", "private"],
+                "server": "dns-direct"
+            ]
+        ])
         root["dns"] = [
-            "servers": [
-                [
-                    "tag": "dns-remote",
-                    "address": "tcp://8.8.8.8",
-                    "detour": mainProxyTag,
-                    "strategy": "ipv4_only"
-                ],
-                [
-                    "tag": "dns-direct",
-                    "address": "223.5.5.5",
-                    "detour": "direct",
-                    "strategy": "prefer_ipv4"
-                ]
-            ],
-            "rules": [
-                [
-                    "outbound": "any",
-                    "server": "dns-direct"
-                ],
-                [
-                    "clash_mode": "direct",
-                    "server": "dns-direct"
-                ],
-                [
-                    "clash_mode": "global",
-                    "server": "dns-remote"
-                ],
-                [
-                    "geosite": ["cn", "private"],
-                    "server": "dns-direct"
-                ]
-            ],
+            "servers": dnsServers,
+            "rules": dnsRules,
             "final": "dns-remote",
             "strategy": "ipv4_only"
         ]
@@ -739,14 +765,38 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let finalDnsTag = dnsOutboundTag ?? "dns-out"
         let finalBlockTag = blockOutboundTag ?? "block"
 
-        let headerRules: [[String: Any]] = [
+        // Go Lan（回家网络）智能同网段防环回：
+        // 本机 Wi-Fi IP（en*）落在回家网段内时，对应 ip_cidr 规则改走直连，
+        // 避免设备在家时把家庭局域网流量再绕回家庭隧道形成回环。
+        // 豁免：蜂窝（pdp_ip*）出口的 CGNAT 10.x 与常见局域网网段重叠，不参与判定。
+        if phyName.hasPrefix("en"), let localIP = localInterfaceIPv4(phyName) {
+            for i in rules.indices {
+                guard (rules[i]["outbound"] as? String) == "go-lan-home",
+                      let cidrs = rules[i]["ip_cidr"] as? [String]
+                else { continue }
+                if cidrs.contains(where: { ipv4InCidr(localIP, $0) }) {
+                    rules[i]["outbound"] = "direct"
+                }
+            }
+        }
+
+        let goLanIndices = rules.indices.filter { (rules[$0]["outbound"] as? String) == "go-lan-home" }
+        var headRules: [[String: Any]] = [
             ["protocol": ["dns"], "outbound": finalDnsTag],
             ["port": [53], "outbound": finalDnsTag],
             ["protocol": ["quic"], "outbound": finalBlockTag],
-            ["network": ["udp"], "port": [443], "outbound": finalBlockTag],
-            ["ip_is_private": true, "outbound": "direct"]
+            ["network": ["udp"], "port": [443], "outbound": finalBlockTag]
         ]
-        rules.insert(contentsOf: headerRules, at: 0)
+        if goLanIndices.isEmpty {
+            headRules.append(["ip_is_private": true, "outbound": "direct"])
+            rules.insert(contentsOf: headRules, at: 0)
+        } else {
+            // 回家规则存在：ip_is_private 直连规则必须排在全部 go-lan-home 规则之后，
+            // 否则私网流量会被"私网直连"抢先命中，回家路由彻底失效
+            rules.insert(contentsOf: headRules, at: 0)
+            let lastGoLanIdx = goLanIndices.max()! + headRules.count
+            rules.insert(["ip_is_private": true, "outbound": "direct"], at: lastGoLanIdx + 1)
+        }
         route["rules"] = rules
 
         if var geoip = route["geoip"] as? [String: Any], geoip["path"] != nil {
@@ -801,6 +851,54 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return rawJSON
         }
         return newText
+    }
+
+    // MARK: - Go Lan 辅助：本机地址与网段判定
+
+    /// 读取指定网卡（en0 / pdp_ip0）的 IPv4 地址
+    private func localInterfaceIPv4(_ name: String) -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let p = ptr {
+            let ifa = p.pointee
+            ptr = ifa.ifa_next
+            guard let addr = ifa.ifa_addr,
+                  String(cString: ifa.ifa_name) == name,
+                  addr.pointee.sa_family == UInt8(AF_INET)
+            else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host,
+                                     socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            if result == 0 {
+                let ip = String(cString: host)
+                // 去掉可能的 zone 后缀（fe80::1%en0 形式仅 IPv6，稳妥起见仍做切分）
+                return ip.split(separator: "%").first.map(String.init)
+            }
+        }
+        return nil
+    }
+
+    /// 判断 IPv4 是否位于 CIDR 网段内
+    private func ipv4InCidr(_ ip: String, _ cidr: String) -> Bool {
+        let parts = cidr.split(separator: "/")
+        guard parts.count == 2, let mask = Int(parts[1]) else { return false }
+        func toU32(_ s: String) -> UInt32? {
+            var result: UInt32 = 0
+            var count = 0
+            for octet in s.split(separator: ".") {
+                guard let v = UInt32(octet), v <= 255, count < 4 else { return nil }
+                result = (result << 8) | v
+                count += 1
+            }
+            return count == 4 ? result : nil
+        }
+        guard let ipU = toU32(ip), let cidrU = toU32(String(parts[0])) else { return false }
+        if mask <= 0 { return true }
+        if mask >= 32 { return ipU == cidrU }
+        let maskBits: UInt32 = ~UInt32(0) << (32 - UInt32(mask))
+        return (ipU & maskBits) == (cidrU & maskBits)
     }
 
     private func copyGeoDatabases(to workDir: URL) throws {

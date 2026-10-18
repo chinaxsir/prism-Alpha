@@ -9,6 +9,9 @@
 
 pub mod config_builder;
 pub mod events;
+pub mod go_aim;
+pub mod go_cus;
+pub mod go_lan;
 pub mod kernel;
 pub mod license;
 pub mod state;

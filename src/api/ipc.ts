@@ -127,3 +127,108 @@ export interface KernelInfo {
 
 export const getKernelInfo = () => invoke<KernelInfo>("get_kernel_info");
 export const ensureKernel = () => invoke<KernelInfo>("ensure_kernel");
+
+// ============================== Go 三引擎（Pro） ==============================
+
+// ---- Go AIM ----
+
+export interface AimNodeResult {
+  nodeName: string;
+  unlockedTags: string[];
+  aiUnlocked: boolean;
+  mediaUnlocked: boolean;
+  score: number;
+  delayMs: number;
+  updatedAt: number;
+}
+
+export interface GoAimStatus {
+  enabled: boolean;
+  lockedNode: string | null;
+  probing: boolean;
+  results: Record<string, AimNodeResult>;
+}
+
+export const getGoAimStatus = () => invoke<GoAimStatus>("get_go_aim_status");
+export const setGoAimEnabled = (enabled: boolean) =>
+  invoke<void>("set_go_aim_enabled", { enabled });
+export const runGoAimProbe = () => invoke<boolean>("run_go_aim_probe");
+
+// ---- Go Lan ----
+
+export interface WgManualConfig {
+  server: string;
+  serverPort: number;
+  privateKey: string;
+  peerPublicKey: string;
+  preSharedKey?: string | null;
+  localIp: string;
+  mtu: number;
+}
+
+export interface GoLanSettings {
+  enabled: boolean;
+  mode: "manual" | "managed";
+  nodeUri: string;
+  wgConfig?: WgManualConfig | null;
+  lanCidrs: string[];
+  lanDns?: string | null;
+  lanDomains: string[];
+  managedServer: string;
+  deviceCode: string;
+  cachedManagedOutbound?: unknown | null;
+  homeName?: string | null;
+}
+
+export const getGoLanSettings = () => invoke<GoLanSettings>("get_go_lan_settings");
+export const saveGoLanSettings = (settings: GoLanSettings) =>
+  invoke<string[]>("save_go_lan_settings", { settings });
+export const syncGoLanManaged = () => invoke<GoLanSettings>("sync_go_lan_managed");
+
+// ---- Go Cus ----
+
+export interface CusModuleStats {
+  rules: number;
+  rewrites: number;
+  scripts: number;
+  mitmHosts: number;
+  hosts: number;
+}
+
+export interface CusModule {
+  id: string;
+  name: string;
+  desc?: string | null;
+  source: string;
+  rawContent: string;
+  enabled: boolean;
+  stats: CusModuleStats;
+  updatedAt: number;
+}
+
+export interface GoCusSettings {
+  enabled: boolean;
+  mitmEnabled: boolean;
+  dnsOverride?: string | null;
+  hostOverrides: Array<[string, string]>;
+  modules: CusModule[];
+  caInstalled: boolean;
+}
+
+export const getGoCusSettings = () => invoke<GoCusSettings>("get_go_cus_settings");
+export const saveGoCusSettings = (settings: GoCusSettings) =>
+  invoke<void>("save_go_cus_settings", { settings });
+export const importGoCusModule = (source: string, name?: string) =>
+  invoke<CusModule>("import_go_cus_module", { source, name: name ?? null });
+export const toggleGoCusModule = (id: string, enabled: boolean) =>
+  invoke<void>("toggle_go_cus_module", { id, enabled });
+export const deleteGoCusModule = (id: string) =>
+  invoke<void>("delete_go_cus_module", { id });
+
+export interface CaInfo {
+  fingerprint: string;
+  installUrl: string;
+  created: boolean;
+}
+
+export const generateOrGetCaUrl = () => invoke<CaInfo>("generate_or_get_ca_url");

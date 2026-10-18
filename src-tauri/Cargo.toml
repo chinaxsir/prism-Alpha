@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.3.14"
+version = "0.1.0"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"
@@ -64,6 +64,10 @@ dashmap = "5.5"
 once_cell = "1.19"
 parking_lot = "0.12"
 bytes = "1.5"
+# Go Cus：URL 改写规则匹配 + 自签名 Root CA（纯 Rust，ring 后端）
+regex = "1"
+rcgen = "0.13"
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 # TUN / networking (platform-gated)
 tun = { version = "0.6", optional = true }

@@ -98,7 +98,7 @@ pub struct ProviderView {
 }
 
 #[derive(Deserialize)]
-struct ClashNode {
+pub(crate) struct ClashNode {
     name: String,
     #[serde(rename = "type")]
     kind: String,
@@ -275,6 +275,8 @@ pub fn build(
     work_dir: &Path,
     api_addr: &str,
     api_secret: &str,
+    go_lan_cfg: &crate::core::go_lan::GoLanSettings,
+    go_cus_cfg: &crate::core::go_cus::GoCusSettings,
 ) -> Result<BuiltConfig> {
     // 单条 sing-box JSON：原样透传，但自定义规则仍可前置合并（见 merge_json_custom）
     if profiles.len() == 1 && profiles[0].2.trim().starts_with('{') {
@@ -409,6 +411,33 @@ pub fn build(
             route_rules.push(rule);
         }
     }
+
+    // ---- Go Lan 回家路由（Pro）：必须先于内置 geosite: private /
+    // ip_is_private -> direct，否则会被"私网直连"抢先命中导致回家失效 ----
+    let (lan_outbound, lan_warnings) = crate::core::go_lan::build_outbound(go_lan_cfg);
+    let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
+    let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
+    if let Some(outbound) = lan_outbound {
+        outbounds.push(outbound);
+        route_rules.extend(lan_rules);
+    }
+    warnings.extend(lan_warnings);
+    warnings.extend(lan_rule_warnings);
+
+    // ---- Go Cus 覆写引擎（Pro）：模块规则 / 改写阻断 / MitM 边车路由 ----
+    let cus_compiled = crate::core::go_cus::compile(go_cus_cfg, "PROXY");
+    if cus_compiled.sidecar_needed {
+        outbounds.push(json!({
+            "type": "http",
+            "tag": crate::core::go_cus::SIDECAR_TAG,
+            "server": "127.0.0.1",
+            "server_port": crate::core::go_cus::SIDECAR_PORT,
+        }));
+    }
+    route_rules.extend(cus_compiled.rules);
+    warnings.extend(cus_compiled.warnings);
+    let cus_dns_override = cus_compiled.dns_override;
+    let cus_dns_local_domains = cus_compiled.dns_local_domains;
 
     // ---- 内置常见分流规则·域名类（全平台，位于订阅规则之前）----
     // 仅域名匹配（不触发 DNS 解析，无污染改道风险）：
@@ -546,6 +575,9 @@ pub fn build(
     // 未被订阅覆盖的流量按真实 IP 兜底：局域网/私有网段与国内网段直连
     // （IP 字面量目标无需解析即匹配；域名目标才会触发解析）
     route_rules.push(json!({ "geoip": "private", "outbound": "direct" }));
+    // ip_is_private：不依赖 geoip 数据库的内置私网判定（IPA-3 方案 6.3，
+    // iOS 端 sanitize 流程同样引用该规则，Go Lan 回家规则已排在其前）
+    route_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
     route_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
 
     // 未显式 MATCH：优先全部订阅中的首个策略组，否则 direct（上方已算）
@@ -653,6 +685,17 @@ pub fn build(
         }
     }
 
+    // Go Cus 模块规则中的 PROXY 占位 → 主选择组（无主组时回落 final）
+    // 置于主组定位之后、配置组装之前，保证占位符解析到真实组 tag
+    let proxy_target = main_group_tag.clone().unwrap_or_else(|| final_tag.clone());
+    if !proxy_target.is_empty() && proxy_target != "PROXY" {
+        for rule in route_rules.iter_mut() {
+            if rule.get("outbound").and_then(Value::as_str) == Some("PROXY") {
+                rule["outbound"] = json!(proxy_target);
+            }
+        }
+    }
+
     match main_group_tag {
         Some(main_tag) => {
             if let Some(group) =
@@ -742,8 +785,8 @@ pub fn build(
     // 服务器为域名的节点：节点入口域名（如 node-1.sub.ibuy.eu.cc）必须经国内
     // 解析器解析——它们是面向国内的入口域名，且整条解析链路不得依赖境外可达性。
     // DNS 规则的 outbound 匹配器专门用于匹配「正在拨号的出站 tag」。
-    const RESOLVABLE_NODE_TYPES: [&str; 7] = [
-        "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria", "hysteria2",
+    const RESOLVABLE_NODE_TYPES: [&str; 8] = [
+        "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria", "hysteria2", "wireguard",
     ];
     let is_ip_literal = |s: &str| {
         s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
@@ -768,13 +811,28 @@ pub fn build(
     dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-local" }));
     dns_rules.push(json!({ "domain_suffix": [".cn"], "server": "dns-local" }));
 
+    // Go Cus [Host] 非阻断映射：走本地直连 DNS（防远程 DoH 解析私网域名失败）
+    if !cus_dns_local_domains.is_empty() {
+        dns_rules.push(json!({ "domain_suffix": cus_dns_local_domains, "server": "dns-local" }));
+    }
+    // Go Lan 家庭 DNS：lan_domains 域名经隧道内家庭 DNS 解析（置顶最高优先级）
+    if let Some(rule) = lan_dns_rule {
+        dns_rules.insert(0, rule);
+    }
+
+    // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
+    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
+    let mut dns_servers = vec![
+        // DoH 地址是域名，需 address_resolver 经 dns-local（223.5.5.5）自举解析，
+        // 否则 sing-box 报 missing address_resolver
+        json!({ "tag": "dns-remote", "address": "https://dns.alidns.com/dns-query", "address_resolver": "dns-local", "detour": "direct" }),
+        json!({ "tag": "dns-local", "address": dns_local_addr, "detour": "direct" }),
+    ];
+    if let Some(server) = lan_dns_server {
+        dns_servers.push(server);
+    }
     let dns = json!({
-        "servers": [
-            // DoH 地址是域名，需 address_resolver 经 dns-local（223.5.5.5）自举解析，
-            // 否则 sing-box 报 missing address_resolver
-            { "tag": "dns-remote", "address": "https://dns.alidns.com/dns-query", "address_resolver": "dns-local", "detour": "direct" },
-            { "tag": "dns-local", "address": "223.5.5.5", "detour": "direct" }
-        ],
+        "servers": dns_servers,
         "rules": dns_rules,
         "final": "dns-remote",
         "strategy": if settings.ipv6 { "prefer_ipv4" } else { "ipv4_only" }
@@ -1036,7 +1094,7 @@ fn parse_bandwidth(raw: &Option<String>) -> Option<u32> {
 }
 
 /// 节点转换；返回 (出站, 可选警告)，未知类型返回 None
-fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String>)> {
+pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String>)> {
     let base = json!({
         "tag": node.name,
         "server": node.server,
@@ -1578,6 +1636,8 @@ rules:
                 &std::env::temp_dir().join("prism-cb-test-hy1/kernel"),
                 "127.0.0.1:9090",
                 "secret",
+                &crate::core::go_lan::GoLanSettings::default(),
+                &crate::core::go_cus::GoCusSettings::default(),
             )
             .unwrap_or_else(|e| panic!("{extra}: {e}"));
             let hy = built.config["outbounds"]
@@ -1599,6 +1659,8 @@ rules:
             &std::env::temp_dir().join("prism-cb-test-hy1/kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
         assert!(built.config["outbounds"]
@@ -1637,6 +1699,8 @@ rules:
             &std::env::temp_dir().join("prism-cb-test-builtin/kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
 
@@ -1716,6 +1780,8 @@ rules:
             &std::env::temp_dir().join("prism-cb-test-builtin/kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
         let rules = built.config["route"]["rules"].as_array().unwrap();
@@ -1781,6 +1847,8 @@ rules:
             &work_dir,
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed with real nodes");
         let tags: Vec<&str> = built.config["outbounds"]
@@ -1817,6 +1885,8 @@ rules:
             &std::env::temp_dir().join("prism-cb-test-uncovered/kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
 
@@ -1859,6 +1929,8 @@ rules:
             &std::env::temp_dir().join("prism-cb-test-dns/kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
 
@@ -1913,6 +1985,8 @@ rules:
             &dir.join("kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("real profile must build");
 
@@ -2024,6 +2098,8 @@ rules:
             &dir.join("kernel"),
             "127.0.0.1:9090",
             "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed with wg/socks/http nodes");
 
@@ -2063,5 +2139,160 @@ rules:
         let https = find("HTTPS-01");
         assert_eq!(https["type"].as_str(), Some("http"));
         assert!(https.get("tls").is_some(), "https node must carry tls block");
+    }
+
+    // ============================== Go 引擎集成 ==============================
+
+    #[test]
+    fn test_go_lan_rules_before_private_builtin() {
+        // 方案 6.3：go-lan-home 回家规则必须位于 geosite: private 与
+        // ip_is_private -> direct 之前，否则被"私网直连"抢先命中导致回家失效
+        let clash = r#"
+proxies:
+  - name: HK-01
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: [HK-01]
+rules:
+  - MATCH,节点选择
+"#;
+        let lan = crate::core::go_lan::GoLanSettings {
+            enabled: true,
+            node_uri: "ss://YWVzLTI1Ni1nY206cHc@5.6.7.8:8388#Home".into(),
+            lan_cidrs: vec!["192.168.1.0/24".into()],
+            lan_domains: vec!["nas.home".into()],
+            // 家庭 DNS 未配置时 dns-home 不注入（实现按需降级），测试显式配置
+            lan_dns: Some("192.168.1.1".into()),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join("prism-cb-test-golan");
+        std::fs::create_dir_all(dir.join("kernel")).unwrap();
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &dir,
+            &dir.join("kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &lan,
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+        assert!(
+            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-lan-home")),
+            "必须注入 go-lan-home 出站"
+        );
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        let pos = |pred: &dyn Fn(&Value) -> bool| -> Option<usize> {
+            rules.iter().position(|r| pred(r))
+        };
+        let lan_ip = pos(&|r| {
+            r.get("outbound").and_then(Value::as_str) == Some("go-lan-home")
+                && r.get("ip_cidr").is_some()
+        });
+        let private_geosite = pos(&|r| {
+            r.get("geosite").and_then(Value::as_str) == Some("private")
+                && r.get("outbound").and_then(Value::as_str) == Some("direct")
+        });
+        let private_ip = pos(&|r| {
+            r.get("ip_is_private").and_then(Value::as_bool) == Some(true)
+                && r.get("outbound").and_then(Value::as_str) == Some("direct")
+        });
+        assert!(lan_ip.is_some(), "缺少回家 ip_cidr 规则");
+        assert!(private_geosite.is_some(), "缺少内置 geosite: private 规则");
+        assert!(private_ip.is_some(), "缺少 ip_is_private 直连规则");
+        assert!(lan_ip.unwrap() < private_geosite.unwrap(), "回家规则必须先于 geosite: private");
+        assert!(lan_ip.unwrap() < private_ip.unwrap(), "回家规则必须先于 ip_is_private 直连");
+        // dns-home 已并入 DNS 配置
+        let dns_servers = built.config["dns"]["servers"].as_array().unwrap();
+        assert!(
+            dns_servers.iter().any(|s| s["tag"].as_str() == Some("dns-home")),
+            "lan_domains 需经家庭 DNS 解析，必须注入 dns-home"
+        );
+    }
+
+    #[test]
+    fn test_go_cus_sidecar_and_rules() {
+        // 方案 6.3：Go Cus 启用 → 边车出站挂载 + 模块规则注入 + PROXY 占位解析
+        let clash = r#"
+proxies:
+  - name: HK-01
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies: [HK-01]
+rules:
+  - MATCH,节点选择
+"#;
+        let cus = crate::core::go_cus::GoCusSettings {
+            enabled: true,
+            mitm_enabled: true,
+            modules: vec![crate::core::go_cus::CusModule {
+                id: "m1".into(),
+                name: "测试".into(),
+                desc: None,
+                source: "local".into(),
+                raw_content: "[Rule]\nDOMAIN-SUFFIX,ads.example.com,REJECT\n[MITM]\nhostname = *.api.example.com\n".into(),
+                enabled: true,
+                stats: Default::default(),
+                updated_at: 0,
+            }],
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join("prism-cb-test-gocus");
+        std::fs::create_dir_all(dir.join("kernel")).unwrap();
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &dir,
+            &dir.join("kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &cus,
+        )
+        .expect("build must succeed");
+
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+        assert!(
+            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-cus-sidecar")),
+            "MitM 域名需要边车出站"
+        );
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        // 阻断规则存在
+        assert!(
+            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("block")
+                && r["domain_suffix"]
+                    .as_array()
+                    .map(|a| a.iter().any(|v| v.as_str() == Some("ads.example.com")))
+                    .unwrap_or(false)),
+            "模块 REJECT 规则应编译为 block"
+        );
+        // MitM 域名路由到边车，且不残留 PROXY 占位
+        assert!(
+            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("go-cus-sidecar")),
+            "MitM 域名必须路由到边车"
+        );
+        assert!(
+            rules.iter().all(|r| r.get("outbound").and_then(Value::as_str) != Some("PROXY")),
+            "PROXY 占位符必须全部解析为真实组 tag"
+        );
     }
 }
