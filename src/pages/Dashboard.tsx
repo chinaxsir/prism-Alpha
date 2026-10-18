@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Activity,
   Cpu,
@@ -34,6 +35,7 @@ import {
   stopCore,
   getGoAimStatus,
   setGoAimEnabled,
+  runGoAimProbe,
   getGoLanSettings,
   saveGoLanSettings,
   getGoCusSettings,
@@ -86,6 +88,7 @@ export default function Dashboard() {
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const mobile = isMobile();
+  const navigate = useNavigate();
 
   // 当前节点状态：主选择组、当前选中节点名、可选节点列表、选择器弹窗
   const [mainSelector, setMainSelector] = useState("");
@@ -305,29 +308,32 @@ export default function Dashboard() {
     }
   };
 
-  // ---- Pro 引擎矩阵状态文案 ----
-  // 内核未运行或配置读取失败时统一显示「—」
-  const aimStatus = !running || !aim
-    ? "—"
-    : aim.probing
-      ? "探测中…"
-      : aim.lockedNode
-        ? `已锁定: ${aim.lockedNode}`
-        : "未锁定";
+  // ---- Pro 引擎矩阵状态文案（ipa-8：横向通栏卡片，一行完整状态信息） ----
   const aimUnlocked = aim
     ? Object.values(aim.results).filter((r) => r.aiUnlocked || r.mediaUnlocked)
         .length
     : 0;
-  const lanStatus = !running || !lan
-    ? "—"
-    : lan.enabled && lan.homeName
-      ? lan.homeName
-      : "未配置回家节点";
-  const cusStatus = !running || !cus
-    ? "—"
-    : cus.modules.length === 0
-      ? "未配置模块"
-      : `${cus.modules.filter((m) => m.enabled).length}/${cus.modules.length} 个模块`;
+  const aimStatus = aim?.enabled
+    ? `已锁定: ${aim.lockedNode || currentNode || "—"} · 已评级解锁 ${aimUnlocked} 个节点`
+    : "自动优选解锁 ChatGPT / Claude / Netflix 的最低延迟节点";
+  const lanStatus =
+    lan && lan.lanCidrs.length > 0
+      ? `${lan.mode === "managed" ? "组网模式" : "手动模式"} · 内网 ${lan.lanCidrs.join(", ")}`
+      : "未配置回家网络 · 点击右侧配置回家参数";
+  const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];
+  const cusStatus =
+    cus && cus.modules.length > 0
+      ? `已启用 ${cusEnabledModules.length} 个模块 · ${cusEnabledModules.reduce((acc, m) => acc + (m.stats?.rewrites ?? 0), 0)} 改写 / ${cusEnabledModules.reduce((acc, m) => acc + (m.stats?.scripts ?? 0), 0)} 脚本`
+      : "未配置模块 · 点击右侧导入小火箭模块与脚本";
+
+  // Go AIM 开启时的「重测」：立即触发一轮评级探测（结果经 go-aim://updated 事件刷新）
+  const runAimProbe = async () => {
+    try {
+      await runGoAimProbe();
+    } catch (e) {
+      toast.error(`重测失败：${String(e)}`);
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -435,34 +441,64 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus，Pro 门控） */}
-      <div className="grid grid-cols-3 gap-3">
+      {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus，Pro 门控）
+          ipa-8：移动端单列通栏横向卡片（340px+ 宽度零截断），桌面端三列网格 */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
         <ProGate feature={Feature.GoAim}>
           <EngineCard
             icon={<Crosshair size={14} className="text-accent" />}
             name="Go AIM"
+            tag="AI/流媒体智选"
             status={aimStatus}
             enabled={aim?.enabled ?? false}
             onToggle={toggleAim}
-            footer={`已评级解锁 ${aimUnlocked} 个节点`}
+            action={
+              aim?.enabled ? (
+                <button
+                  onClick={runAimProbe}
+                  disabled={aim.probing}
+                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
+                >
+                  {aim.probing ? "探测中" : "重测"}
+                </button>
+              ) : undefined
+            }
           />
         </ProGate>
         <ProGate feature={Feature.GoLan}>
           <EngineCard
             icon={<Home size={14} className="text-accent" />}
             name="Go Lan"
+            tag="回家内网直通"
             status={lanStatus}
             enabled={lan?.enabled ?? false}
             onToggle={toggleLan}
+            action={
+              <button
+                onClick={() => navigate("/settings?focus=goLan")}
+                className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
+              >
+                配置
+              </button>
+            }
           />
         </ProGate>
         <ProGate feature={Feature.GoCus}>
           <EngineCard
             icon={<Wand2 size={14} className="text-accent" />}
             name="Go Cus"
+            tag="覆写/改写/脚本"
             status={cusStatus}
             enabled={cus?.enabled ?? false}
             onToggle={toggleCus}
+            action={
+              <button
+                onClick={() => navigate("/proxies?tab=goCus")}
+                className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
+              >
+                配置
+              </button>
+            }
           />
         </ProGate>
       </div>
@@ -656,37 +692,45 @@ function StatChip({
   );
 }
 
-/// Pro 引擎卡：紧凑垂直布局（图标+名称一行、状态一行），Switch 位于行尾
+/// Pro 引擎卡（ipa-8）：横向通栏布局——左侧图标+完整标题+功能标签胶囊+一行状态
+/// 副标题，右侧「配置/重测」轻按钮 + Switch；移动端不再因 grid-cols-3 窄卡片截断文字
 function EngineCard({
   icon,
   name,
+  tag,
   status,
   enabled,
   onToggle,
-  footer,
+  action,
 }: {
   icon: ReactNode;
   name: string;
+  tag: string;
   status: string;
   enabled: boolean;
   onToggle: (v: boolean) => void;
-  footer?: string;
+  action?: ReactNode;
 }) {
   return (
-    <div className="bg-surface-card rounded-xl p-3 border border-white/5 flex flex-col">
-      <div className="flex items-center justify-between gap-1.5">
-        <div className="flex items-center gap-1.5 text-xs font-medium text-gray-200 min-w-0">
+    <div className="flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-white/5">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
           {icon}
-          <span className="truncate">{name}</span>
+          <span className="font-semibold text-sm text-gray-100 whitespace-nowrap">
+            {name}
+          </span>
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-white/5 text-gray-400 whitespace-nowrap">
+            {tag}
+          </span>
         </div>
+        <div className="mt-1 text-xs text-gray-400 truncate" title={status}>
+          {status}
+        </div>
+      </div>
+      <div className="flex items-center gap-2.5 shrink-0">
+        {action}
         <Switch checked={enabled} onChange={onToggle} />
       </div>
-      <div className="mt-1.5 text-xs text-gray-400 truncate" title={status}>
-        {status}
-      </div>
-      {footer && (
-        <div className="mt-0.5 text-[10px] text-gray-600 truncate">{footer}</div>
-      )}
     </div>
   );
 }

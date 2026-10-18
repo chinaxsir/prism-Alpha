@@ -38,6 +38,18 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
     f(&mut guard)
 }
 
+/// JNI 调用返回 Err 时清理当前线程挂起的 Java 异常：
+/// 防止下次复用同一线程调用 JNI 时触发 CheckJNI SIGABRT 闪退。
+fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
+    if env.exception_check().unwrap_or(false) {
+        // 将 Java 异常栈输出到 adb logcat 方便调试
+        let _ = env.exception_describe();
+        // 关键：清除当前线程挂起的 Java 异常
+        let _ = env.exception_clear();
+    }
+    format!("{step}: {err}")
+}
+
 /// 平台初始化（Tauri setup 中调用）：注册原生方法 + libbox C 回调
 pub fn init(app: AppHandle) -> Result<()> {
     let _ = APP.set(app);
@@ -69,7 +81,7 @@ pub fn ensure_permission() -> Result<bool> {
     with_env(|env| {
         let granted = env
             .call_static_method(BRIDGE_CLASS, "ensurePermission", "()Z", &[])
-            .context("call ensurePermission")?
+            .map_err(|e| anyhow!(jni_err(env, "call ensurePermission", e)))?
             .z()
             .context("ensurePermission return type")?;
         Ok(granted)
@@ -81,7 +93,7 @@ pub fn start_service_and_wait() -> Result<()> {
     with_env(|env| {
         let ok = env
             .call_static_method(BRIDGE_CLASS, "startServiceAndWait", "()Z", &[])
-            .context("call startServiceAndWait")?
+            .map_err(|e| anyhow!(jni_err(env, "call startServiceAndWait", e)))?
             .z()
             .context("startServiceAndWait return type")?;
         if ok {
@@ -96,7 +108,7 @@ pub fn start_service_and_wait() -> Result<()> {
 pub fn stop_service() {
     let _ = with_env(|env| {
         env.call_static_method(BRIDGE_CLASS, "stopService", "()V", &[])
-            .context("call stopService")?;
+            .map_err(|e| anyhow!(jni_err(env, "call stopService", e)))?;
         Ok(())
     });
 }
@@ -141,7 +153,7 @@ fn open_tun(options_json: &str) -> Result<i32> {
                 "(Ljava/lang/String;)I",
                 &[JValue::Object(arg.as_ref())],
             )
-            .context("call openTun")?
+            .map_err(|e| anyhow!(jni_err(env, "call openTun", e)))?
             .i()
             .context("openTun return type")?;
         if fd < 0 {
@@ -160,7 +172,7 @@ fn protect_socket(fd: c_int) -> Result<()> {
                 "(I)Z",
                 &[JValue::Int(fd)],
             )
-            .context("call protectSocket")?
+            .map_err(|e| anyhow!(jni_err(env, "call protectSocket", e)))?
             .z()
             .context("protectSocket return type")?;
         if ok {

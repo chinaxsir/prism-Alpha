@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   Check,
   Lock,
@@ -173,12 +174,28 @@ export default function Settings() {
   const [saved, setSaved] = useState(false);
   const mobile = isMobile();
   const [showActivate, setShowActivate] = useState(false);
+  // ipa-8：移除授权的组件内二次确认（iOS WKWebView 会静默拦截 window.confirm 返回 false）
+  const [confirmDeactivate, setConfirmDeactivate] = useState(false);
+  const [deactivating, setDeactivating] = useState(false);
   const proUnlocked = useProStore((s) => s.unlocked);
   const entitlement = useProStore((s) => s.entitlement);
   const proBusy = useProStore((s) => s.busy);
   const refreshPro = useProStore((s) => s.refresh);
   const deactivatePro = useProStore((s) => s.deactivate);
   const tunGated = !proUnlocked;
+
+  // ipa-8：仪表盘 Go Lan 卡片「配置」跳转锚点——进入设置页后滚动定位到回家网络卡片
+  const [searchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get("focus") === "goLan") {
+      const t = setTimeout(() => {
+        document
+          .getElementById("go-lan-card")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 150);
+      return () => clearTimeout(t);
+    }
+  }, [searchParams]);
 
   const [kernelInfo, setKernelInfo] = useState<KernelInfo | null>(null);
   const [kernelBusy, setKernelBusy] = useState(false);
@@ -214,6 +231,51 @@ export default function Settings() {
       toast.success("设备 ID 已复制");
     } catch {
       toast.error("复制失败，请长按手动选择");
+    }
+  };
+
+  // ipa-8：「立即校验」直连后端强制联网校验（verify_remote_forced），完成后给出明确 Toast
+  const handleVerifyEntitlement = async () => {
+    await refreshPro();
+    const s = useProStore.getState();
+    if (s.error) {
+      const m = s.error;
+      if (m.startsWith("rate_limited:")) {
+        toast.error(`校验过于频繁，请 ${m.split(":")[1] ?? "30"} 秒后再试`);
+      } else {
+        toast.error(m);
+      }
+      return;
+    }
+    const st = s.entitlement.status;
+    if (st === "active") {
+      toast.success("授权校验成功：当前方案与有效期已同步");
+    } else if (st === "expired" || st === "revoked") {
+      toast.error("授权已过期或失效");
+    } else if (st === "offline") {
+      toast.info("网络不可用，授权校验失败，联网恢复后自动重试");
+    } else {
+      toast.info("本机暂无授权记录");
+    }
+  };
+
+  // ipa-8：移除授权——组件内二次确认替代 window.confirm：
+  // 第一次点击进入红色确认态（3 秒未点击自动恢复），第二次点击才真正执行移除
+  const handleDeactivate = async () => {
+    if (!confirmDeactivate) {
+      setConfirmDeactivate(true);
+      setTimeout(() => setConfirmDeactivate(false), 3000);
+      return;
+    }
+    setDeactivating(true);
+    try {
+      await deactivatePro();
+      toast.success("已成功移除本机授权");
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setDeactivating(false);
+      setConfirmDeactivate(false);
     }
   };
 
@@ -510,9 +572,10 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Go Lan · 回家网络（Pro 门控） */}
+      {/* Go Lan · 回家网络（Pro 门控）；id 供仪表盘「配置」按钮跳转定位 */}
       <ProGate feature={Feature.GoLan}>
         <SettingsGroup
+          id="go-lan-card"
           title="Go Lan · 回家网络"
           icon={<Home size={14} />}
           desc="回家路由：指定网段/域名经家庭隧道直达局域网"
@@ -944,24 +1007,24 @@ export default function Settings() {
             />
             <div className="flex flex-wrap gap-2 px-3 py-3 border-t border-white/5">
               <button
-                onClick={refreshPro}
+                onClick={handleVerifyEntitlement}
                 disabled={proBusy}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-white/10 text-xs transition-colors disabled:opacity-50"
               >
                 <RefreshCw size={12} className={proBusy ? "animate-spin" : ""} />
-                立即校验
+                {proBusy ? "校验中..." : "立即校验"}
               </button>
               <button
-                onClick={() => {
-                  if (window.confirm("确定移除本机授权？移除后 Pro 功能将锁定。")) {
-                    deactivatePro()
-                      .then(() => toast.info("授权已移除"))
-                      .catch((e) => toast.error(String(e)));
-                  }
-                }}
-                className="px-3 py-2 rounded-lg bg-surface-hover hover:bg-latency-bad/20 text-xs text-gray-400 hover:text-latency-bad transition-colors"
+                onClick={handleDeactivate}
+                disabled={deactivating}
+                className={clsx(
+                  "px-3 py-2 rounded-lg text-xs transition-colors disabled:opacity-50",
+                  confirmDeactivate
+                    ? "bg-latency-bad/20 text-latency-bad hover:bg-latency-bad/30"
+                    : "bg-surface-hover hover:bg-latency-bad/20 text-gray-400 hover:text-latency-bad"
+                )}
               >
-                移除授权
+                {confirmDeactivate ? "确认移除授权？" : "移除授权"}
               </button>
             </div>
           </>
@@ -980,12 +1043,12 @@ export default function Settings() {
                 激活授权
               </button>
               <button
-                onClick={refreshPro}
+                onClick={handleVerifyEntitlement}
                 disabled={proBusy}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-white/10 text-xs transition-colors disabled:opacity-50"
               >
                 <RefreshCw size={12} className={proBusy ? "animate-spin" : ""} />
-                立即校验
+                {proBusy ? "校验中..." : "立即校验"}
               </button>
             </div>
           </>
@@ -1035,15 +1098,18 @@ function SettingsGroup({
   icon,
   headerRight,
   children,
+  id,
 }: {
   title: string;
   desc?: string;
   icon?: React.ReactNode;
   headerRight?: React.ReactNode;
   children: React.ReactNode;
+  /** DOM 锚点：供其他页面跳转定位（如仪表盘 Go Lan「配置」按钮） */
+  id?: string;
 }) {
   return (
-    <section>
+    <section id={id}>
       <div className="flex items-center justify-between px-3 mb-1.5">
         <div className="flex items-center gap-1.5 text-xs font-medium text-gray-400 uppercase tracking-wide">
           {icon}

@@ -1,13 +1,16 @@
 package com.prism.proxy
 
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Looper
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.Keep
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -15,6 +18,7 @@ import java.util.concurrent.TimeUnit
 //
 // 生命周期顺序（Rust 侧保证）：
 //   ensurePermission() → startServiceAndWait() → [libbox openTun/protect] → stopService()
+@Keep
 object PrismVpnBridge {
     private const val TAG = "PrismVpn"
 
@@ -23,114 +27,176 @@ object PrismVpnBridge {
     private var consentLauncher: ActivityResultLauncher<Intent>? = null
     @Volatile
     private var consentInFlight = false
+    @Volatile
+    private var consentLatch: CountDownLatch? = null
+    @Volatile
+    private var consentGranted = false
 
     @Volatile
     private var service: PrismVpnService? = null
     @Volatile
     private var ready = CountDownLatch(1)
 
+    @Keep
     @JvmStatic
     external fun nativeVpnRevoked()
 
     // 由 MainActivity 的 init 块调用（必须早于 Activity STARTED，
     // 因为 registerForActivityResult 要求注册在启动之前）
+    @Keep
+    @JvmStatic
     fun attach(activity: ComponentActivity) {
         this.activity = activity
-        this.consentLauncher = activity.registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-            consentInFlight = false
-            Log.i(TAG, "vpn consent result=${result.resultCode}")
+        try {
+            this.consentLauncher = activity.registerForActivityResult(
+                ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                consentGranted = (result.resultCode == Activity.RESULT_OK)
+                consentInFlight = false
+                consentLatch?.countDown()
+                Log.i(TAG, "vpn consent result=${result.resultCode}, granted=$consentGranted")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "registerForActivityResult failed", t)
         }
     }
 
     // 系统 VPN 授权检查：
-    //   true  —— 已授权（或此前已授权，VpnService.prepare 返回 null）
-    //   false —— 已发起系统授权弹窗，用户授权后需重新点击启动
+    //   true  —— 已授权（或弹窗后用户点击“确定”完成授权）
+    //   false —— 用户拒绝授权或当前无法拉起弹窗
+    @Keep
     @JvmStatic
     fun ensurePermission(): Boolean {
-        val activity = this.activity ?: return false
-        val intent = VpnService.prepare(activity) ?: return true
-        if (consentInFlight) return false
-        consentInFlight = true
         return try {
-            consentLauncher?.launch(intent)
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "launch consent failed", e)
+            val act = this.activity ?: return false
+            val intent = VpnService.prepare(act) ?: return true
+
+            // 若已在主线程，不能阻塞等待，直接拉起弹窗并返回 false
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                if (!consentInFlight) {
+                    consentInFlight = true
+                    try {
+                        consentLauncher?.launch(intent)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "launch consent on main thread failed", t)
+                        consentInFlight = false
+                    }
+                }
+                return false
+            }
+
+            // 在 Rust 工作线程中：切到主线程拉起系统 VPN 授权弹窗，并阻塞等待用户点击结果
+            val latch = if (consentInFlight && consentLatch != null) {
+                consentLatch!!
+            } else {
+                CountDownLatch(1).also {
+                    consentLatch = it
+                    consentGranted = false
+                    consentInFlight = true
+                    act.runOnUiThread {
+                        try {
+                            val launcher = consentLauncher
+                            if (launcher != null) {
+                                launcher.launch(intent)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                act.startActivityForResult(intent, 0x5052)
+                                consentInFlight = false
+                                it.countDown()
+                            }
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "launch consent failed", t)
+                            consentInFlight = false
+                            it.countDown()
+                        }
+                    }
+                }
+            }
+
+            latch.await(60, TimeUnit.SECONDS)
+            consentGranted || VpnService.prepare(act) == null
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensurePermission error", t)
             consentInFlight = false
             false
         }
     }
 
     // 启动前台 VPN 服务并阻塞等待其就绪（Go 索要 TUN fd 前服务必须已前台化）
+    @Keep
     @JvmStatic
     fun startServiceAndWait(): Boolean {
-        val activity = this.activity ?: return false
-        ready = CountDownLatch(1)
-        service = null
-        val intent = Intent().apply { component = ComponentName(activity, PrismVpnService::class.java) }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                activity.applicationContext.startForegroundService(intent)
-            } else {
-                activity.applicationContext.startService(intent)
+        return try {
+            val act = this.activity ?: return false
+            ready = CountDownLatch(1)
+            service = null
+            val intent = Intent().apply {
+                component = ComponentName(act, PrismVpnService::class.java)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "start vpn service failed", e)
-            return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                act.applicationContext.startForegroundService(intent)
+            } else {
+                act.applicationContext.startService(intent)
+            }
+            ready.await(8, TimeUnit.SECONDS)
+            service != null
+        } catch (t: Throwable) {
+            Log.e(TAG, "start vpn service failed", t)
+            false
         }
-        ready.await(8, TimeUnit.SECONDS)
-        return service != null
     }
 
+    @Keep
     fun onServiceReady(service: PrismVpnService) {
         this.service = service
         ready.countDown()
     }
 
     // 停止并销毁前台 VPN 服务
+    @Keep
     @JvmStatic
     fun stopService() {
-        val activity = this.activity
+        val act = this.activity
         try {
             service?.shutdown()
-        } catch (e: Exception) {
-            Log.w(TAG, "service shutdown error", e)
+        } catch (t: Throwable) {
+            Log.w(TAG, "service shutdown error", t)
         }
-        if (activity != null) {
+        if (act != null) {
             val intent = Intent().apply {
-                component = ComponentName(activity, PrismVpnService::class.java)
+                component = ComponentName(act, PrismVpnService::class.java)
             }
             try {
-                activity.applicationContext.stopService(intent)
-            } catch (_: Exception) {
+                act.applicationContext.stopService(intent)
+            } catch (_: Throwable) {
             }
         }
         service = null
     }
 
+    @Keep
     @JvmStatic
     fun openTun(optionsJson: String): Int {
-        val service = this.service ?: run {
+        val svc = this.service ?: run {
             Log.e(TAG, "openTun: service not ready")
             return -1
         }
         return try {
-            service.openTun(optionsJson)
-        } catch (e: Exception) {
-            Log.e(TAG, "openTun failed", e)
+            svc.openTun(optionsJson)
+        } catch (t: Throwable) {
+            Log.e(TAG, "openTun failed", t)
             -1
         }
     }
 
+    @Keep
     @JvmStatic
     fun protectSocket(fd: Int): Boolean {
-        val service = this.service ?: return false
+        val svc = this.service ?: return false
         return try {
-            service.protect(fd)
-        } catch (e: Exception) {
-            Log.e(TAG, "protect($fd) failed", e)
+            svc.protect(fd)
+        } catch (t: Throwable) {
+            Log.e(TAG, "protect($fd) failed", t)
             false
         }
     }

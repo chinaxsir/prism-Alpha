@@ -442,7 +442,9 @@ jobs:
           done
 
           # ==================== 2. 属性对齐（必须在签名前）====================
-          APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          # 版本号以 Cargo.toml 为唯一权威源（ipa-8：杜绝 Info.plist 初始版本
+          # 与 crate 版本漂移导致设置页 APP 版本显示错误）
+          APP_VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           # 纯数字构建流水号（Apple 规范禁止 CFBundleVersion 含字母）
           BUILD_NUM=${GITHUB_RUN_NUMBER:-$(date +%s)}
           MAIN_BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")

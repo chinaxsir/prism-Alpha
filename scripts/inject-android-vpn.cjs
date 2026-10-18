@@ -7,6 +7,7 @@
  *   1. 拷贝 mobile-src/android（PrismVpnBridge / PrismVpnService）
  *   2. MainActivity.kt 增加 PrismVpnBridge.attach(this)
  *   3. AndroidManifest.xml 增加 BIND_VPN_SERVICE/前台服务权限与 VPN Service
+ *   4. proguard-rules.pro 增加 JNI 防裁剪与防混淆规则
  */
 const fs = require('fs')
 const path = require('path')
@@ -96,5 +97,25 @@ function patchManifest() {
   console.log('[inject-android-vpn] AndroidManifest patched')
 }
 patchManifest()
+
+// 4. ProGuard 注入防混淆规则（防止 R8 裁剪 JNI 反射调用的 PrismVpnBridge 方法）
+function patchProguard() {
+  const file = path.join(GEN, 'app', 'proguard-rules.pro')
+  let text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
+  if (text.includes('com.prism.proxy.PrismVpnBridge')) {
+    console.log('[inject-android-vpn] proguard-rules.pro already patched')
+    return
+  }
+
+  const rules = `
+# --- Prism VPN JNI Keep Rules ---
+-keep class com.prism.proxy.** { *; }
+-keepclassmembers class com.prism.proxy.** { *; }
+-dontwarn com.prism.proxy.**
+`
+  fs.writeFileSync(file, text + '\n' + rules)
+  console.log('[inject-android-vpn] proguard-rules.pro patched')
+}
+patchProguard()
 
 console.log('[inject-android-vpn] done')

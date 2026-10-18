@@ -1362,27 +1362,62 @@ pub async fn get_device_id(state: State<'_, AppState>) -> Result<String, String>
     crate::core::license::device_id(&state.data_dir).map_err(|e| e.to_string())
 }
 
-/// 主动联网刷新授权（设置页「立即校验」按钮；断网时返回 offline 锁定态）
+/// 主动联网刷新授权（设置页「立即校验」按钮；ipa-8：强制实时请求服务端，
+/// 无视当日缓存短路；断网时返回 offline 锁定态。校验成功后异步触发一次
+/// 云端订阅对账，同步云端订阅链接）
 #[tauri::command]
 pub async fn refresh_entitlement(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
     let data_dir = state.data_dir.clone();
     let settings = state.settings.read().clone();
-    let next = crate::core::license::verify_remote(&data_dir, &settings)
+    let next = crate::core::license::verify_remote_forced(&data_dir, &settings)
         .await
         .map_err(|e| e.to_string())?;
     state.apply_entitlement(next.clone());
+    // 校验成功：对账云端订阅链接（reconcile 内部自校验同步资格并幂等去重）
+    tauri::async_runtime::spawn(async move {
+        super::super::core::sync_links::reconcile(&app).await;
+    });
     Ok(next)
 }
 
-/// 移除本机授权
+/// 移除本机授权：清理本地授权/同步缓存文件，并自动关闭依赖 Pro 授权的开关
+/// （Go AIM / Go Lan / Go Cus 落盘保存为关闭），防止移除授权后后台仍残留运行
+/// Pro 模块。所有清理均为 best-effort，绝不导致移除失败。
 #[tauri::command]
 pub async fn deactivate_pro(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
     let next = crate::core::license::deactivate(&state.data_dir);
     state.apply_entitlement(next.clone());
+
+    // Go AIM：落盘关闭 + 清理锁定节点并通知前端
+    let mut settings = state.settings.read().clone();
+    settings.go_aim_enabled = false;
+    let _ = state.save_settings(settings);
+    *state.aim_locked_node.write() = None;
+    let _ = app.emit(
+        crate::core::go_aim::AIM_EVENT,
+        serde_json::json!({ "locked": null }),
+    );
+
+    // Go Lan / Go Cus：落盘关闭并同步内存状态（内核下次启动/重建即不再启用）
+    let mut lan = state.go_lan.read().clone();
+    if lan.enabled {
+        lan.enabled = false;
+        let _ = crate::core::go_lan::save(&state.data_dir, &lan);
+        *state.go_lan.write() = lan;
+    }
+    let mut cus = state.go_cus.read().clone();
+    if cus.enabled {
+        cus.enabled = false;
+        let _ = crate::core::go_cus::save(&state.data_dir, &cus);
+        *state.go_cus.write() = cus;
+    }
+
     Ok(next)
 }
 

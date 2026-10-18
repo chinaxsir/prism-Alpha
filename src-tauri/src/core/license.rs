@@ -625,14 +625,27 @@ pub async fn activate(
     Ok(ent)
 }
 
-/// 联网校验授权并更新本地加密缓存（成功后记为当天已同步）
+/// 联网校验授权并更新本地加密缓存（成功后记为当天已同步）。
+///
+/// - `force == false`（App 启动/后台定时器的每日自动同步路径）：同一 UTC 日内
+///   已同步且状态非 offline 时短路——只读本地 `license.dat`，不发网络请求；
+/// - `force == true`（设置页「立即校验」）：无视当日缓存短路，强制实时请求
+///   `GET {server}/api/license/status`，成功后用服务端最新 plan/expires_at/
+///   seats/sync_available 与当前时间戳重新加密写入 `license.dat`。
 pub async fn verify_remote(
     data_dir: &Path,
     settings: &UserSettings,
+    force: bool,
 ) -> Result<EntitlementStatus> {
     let Some(cache) = load_cache(data_dir) else {
         return Ok(EntitlementStatus::inactive());
     };
+
+    // 每日自动同步路径：当天已同步则只读本地缓存（ipa-8：手动校验走 force=true 不短路）
+    if !force && cache.synced_on == today_utc() && cache.entitlement.status != "offline" {
+        return Ok(cache.entitlement);
+    }
+
     let base = server_base(settings);
 
     match fetch_status(&base, &cache.license).await {
@@ -681,6 +694,15 @@ pub async fn verify_remote(
     }
 }
 
+/// 手动强制立即校验（设置页「立即校验」按钮）：无视当日缓存短路，
+/// 实时向服务端发起状态查询并用结果重写本地加密缓存
+pub async fn verify_remote_forced(
+    data_dir: &Path,
+    settings: &UserSettings,
+) -> Result<EntitlementStatus> {
+    verify_remote(data_dir, settings, true).await
+}
+
 /// 每天首次启动时与服务器同步授权；当天内已同步则只读本地加密缓存，不再联网。
 /// 返回 Some(状态) 表示需要应用到内存并广播（None = 无需变更）。
 ///
@@ -701,7 +723,7 @@ pub async fn daily_sync(
         return None;
     }
 
-    match verify_remote(data_dir, settings).await {
+    match verify_remote(data_dir, settings, false).await {
         Ok(next) => Some(next),
         Err(e) => {
             // 429 限流等：保持缓存状态不变，等下一轮重试
@@ -741,9 +763,13 @@ pub async fn submit_store_receipt(
     bail!("商店内购激活暂未开放，请使用授权码 + 邮箱激活");
 }
 
-/// 移除本机授权（切换账号/退款后）
+/// 移除本机授权（切换账号/退款后）：删除本地所有授权与同步缓存文件——
+/// 加密缓存 license.dat、旧版 license_cache.json 与订阅同步基线 sync_links.json。
+/// 文件不存在均忽略；本函数纯本地操作，绝不因远端接口 404 或断网而失败，
+/// 确保本地移除授权 100% 成功（重新激活后由 reconcile 重建同步基线）。
 pub fn deactivate(data_dir: &Path) -> EntitlementStatus {
     clear_cache(data_dir);
+    let _ = std::fs::remove_file(data_dir.join("sync_links.json"));
     EntitlementStatus::inactive()
 }
 

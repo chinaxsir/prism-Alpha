@@ -397,5 +397,32 @@
 - 桌面 `build.yml` 打包前硬校验 sidecar + geoip.db + geosite.db 均已就位
 - Android `mobile.yml` 新增 Go 环境、geo 数据库抓取、四架构 c-archive 构建
 
+### 修复（IPA-8 / APK-1 移动端专项）
+
+#### iOS（IPA-8）
+- 仪表盘三张 Pro 引擎卡片改为移动端单列通栏横向布局
+  （`grid-cols-1 md:grid-cols-3`）：标题/功能标签胶囊/状态副标题零截断；
+  Go Lan / Go Cus 新增「配置」快捷按钮（跳转设置页锚点 / 代理页 Go Cus
+  标签），Go AIM 开启时新增「重测」按钮
+- 「移除授权」改组件内二次确认（3 秒红色确认态），修复 iOS WKWebView
+  静默拦截 `window.confirm` 导致按钮点击无反应
+- 「立即校验」改为强制实时联网校验（无视当日缓存短路），成功后异步对账
+  云端订阅链接；按结果弹出明确 Toast（成功/过期失效/网络错误/限流）
+- 「移除授权」后端彻底清理：`license.dat`、`license_cache.json`、
+  `sync_links.json` 一并删除（best-effort 绝不失败），并自动关闭
+  Go AIM / Go Lan / Go Cus 三个 Pro 开关落盘
+- IPA 版本号以 `Cargo.toml` 为唯一权威源写入 Info.plist（CI 属性对齐阶段）
+
+#### Android（APK-1）
+- 修复 Release APK 因 R8 裁剪 JNI 反射方法导致「启动 VPN 报
+  call ensurePermission，第 3 次点击闪退」：注入脚本新增
+  proguard-rules.pro 防裁剪规则（`-keep com.prism.proxy.**`），
+  PrismVpnBridge 及全部 JNI 方法加 `@Keep` 双保险
+- 修复 ensurePermission 后台线程拉起系统授权弹窗的线程隐患：切主线程
+  launch + `CountDownLatch` 等待授权结果，首次点击「确定」后直接继续启动
+- 所有 JNI 入口统一 `try/catch Throwable` 兜底；Rust 侧 JNI 调用失败统一
+  经 `jni_err` 清除挂起异常（exception_describe + exception_clear），
+  根治 CheckJNI SIGABRT 闪退
+
 ## [0.2.0] - 历史版本
 - 初始公开发布版本
