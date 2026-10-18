@@ -27,6 +27,17 @@ use tokio::task::JoinHandle;
 /// 首选 external-controller 地址；被占用时会退回到系统分配的随机端口
 pub const PREFERRED_API_ADDR: &str = "127.0.0.1:9090";
 
+/// 内核报错脱敏：任何返回前端 / 用户可见的错误文本，统一把底层
+/// 内核商标字样（sing-box / libbox 等大小写变体）替换为「内核」，
+/// 防止二进制或库自带报错直接露出内核名称。
+pub fn sanitize_kernel_error(msg: &str) -> String {
+    let mut out = msg.to_string();
+    for pat in ["sing-box", "Sing-Box", "SING-BOX", "singbox", "SingBox", "libbox"] {
+        out = out.replace(pat, "内核");
+    }
+    out
+}
+
 /// iOS/Android 内嵌内核版本（与 ios-kernel/go.mod 的 sing-box 依赖保持一致）
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub const EMBEDDED_VERSION: &str = "1.11.3";
@@ -210,11 +221,11 @@ impl KernelHandle {
             }
             let mut child = cmd
                 .spawn()
-                .context("failed to spawn sing-box process")?;
+                .context("内核进程启动失败")?;
 
             let pid = child
                 .id()
-                .context("sing-box process exited immediately (no pid)")?;
+                .context("内核进程启动后立即退出")?;
             tracing::info!("sing-box process started, PID: {}", pid);
             register_kernel_pid(pid);
 
@@ -264,9 +275,12 @@ impl KernelHandle {
             }
             let tail = read_log_tail(&log_path);
             anyhow::bail!(
-                "sing-box 在 15 秒内未就绪，请查看内核日志 {} ；末尾输出：{}",
-                log_path.display(),
-                tail
+                "{}",
+                sanitize_kernel_error(&format!(
+                    "内核在 15 秒内未就绪，请查看内核日志 {} ；末尾输出：{}",
+                    log_path.display(),
+                    tail
+                ))
             );
         }
 
@@ -403,7 +417,12 @@ pub async fn check_config(
     {
         let _ = binary;
         mobile_ffi::check(config_path, work_dir)
-            .map_err(|e| anyhow::anyhow!("新配置校验未通过，已保留当前内核：\n{}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    sanitize_kernel_error(&format!("新配置校验未通过，已保留当前内核：\n{e}"))
+                )
+            })?;
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
@@ -423,7 +442,7 @@ pub async fn check_config(
         let output = cmd
             .output()
             .await
-            .context("failed to run sing-box check")?;
+            .context("内核配置校验执行失败")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -431,7 +450,10 @@ pub async fn check_config(
             let chars: Vec<char> = stderr.chars().collect();
             let skip = chars.len().saturating_sub(800);
             let tail: String = chars[skip..].iter().collect();
-            anyhow::bail!("新配置校验未通过，已保留当前内核：\n{}", tail.trim());
+            anyhow::bail!(
+                "{}",
+                sanitize_kernel_error(&format!("新配置校验未通过，已保留当前内核：\n{}", tail.trim()))
+            );
         }
     }
     Ok(())

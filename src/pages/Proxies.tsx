@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Zap, Gauge, RefreshCw, ChevronRight, Search, Crosshair } from "lucide-react";
+import { Zap, Gauge, RefreshCw, ChevronRight, Search, Crosshair, Lock } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { Link } from "react-router-dom";
 
@@ -14,9 +14,10 @@ import {
   type GoAimStatus,
 } from "@/api/ipc";
 import { useCoreStore } from "@/stores/core";
+import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
-import OutboundModeSwitch from "@/components/OutboundModeSwitch";
+import { ActivateProModal } from "@/components/ProGate";
 import clsx from "clsx";
 
 interface DelaySample {
@@ -65,6 +66,10 @@ const AIM_FILTERS: Array<{ value: AimFilter; label: string }> = [
 
 export default function Proxies() {
   const coreStatus = useCoreStore((s) => s.status);
+  // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
+  const proReady = useProStore((s) => s.ready);
+  const proUnlocked = useProStore((s) => s.unlocked);
+  const [showActivate, setShowActivate] = useState(false);
   const [mainSelectorName, setMainSelectorName] = useState("");
   const [current, setCurrent] = useState<string>("");
   const [nodes, setNodes] = useState<ProxyEntry[]>([]);
@@ -79,6 +84,20 @@ export default function Proxies() {
   /// Go AIM 解锁评级结果与筛选 pill
   const [aim, setAim] = useState<GoAimStatus | null>(null);
   const [filter, setFilter] = useState<AimFilter>("all");
+
+  // 未激活授权时禁止停留在 Go AIM 筛选态：自动重置回「全部」
+  useEffect(() => {
+    if (proReady && !proUnlocked && filter !== "all") setFilter("all");
+  }, [proReady, proUnlocked, filter]);
+
+  // 授权是否可用（启动瞬间 ready=false 时保持可用，避免闪烁误锁）
+  const proActive = proUnlocked || !proReady;
+
+  /// 未激活授权时的统一拦截：提示 + 弹出激活弹窗，绝不执行筛选/探测
+  const guardPro = () => {
+    toast.error("请先激活 Pro 授权以使用 Go AIM 智能筛选与检测");
+    setShowActivate(true);
+  };
 
   // 用 ref 保存最新值，避免 useEffect([]) 闭包捕获到初始值（stale closure）。
   // loadProxies 由 core://status / proxies://changed 事件触发，必须读到最新状态。
@@ -282,6 +301,10 @@ export default function Proxies() {
 
   /// Go AIM 解锁探测：结果经 go-aim://updated 事件实时刷新到列表徽章
   const handleAimProbe = async () => {
+    if (!proActive) {
+      guardPro();
+      return;
+    }
     if (coreStatus !== "running") {
       toast.error("内核未运行，无法探测");
       return;
@@ -375,37 +398,45 @@ export default function Proxies() {
 
   return (
     <div className="space-y-4">
-      {/* 出站模式快捷切换（位于页头之下、搜索/测速工具栏之上） */}
-      <OutboundModeSwitch />
-
-      {/* Go AIM 筛选 pills + AI 检测入口 */}
+      {/* Go AIM 筛选 pills + AI 检测入口（Go AIM / AI / 流媒体与检测为 Pro 功能：
+          未激活时锁定并弹激活弹窗，ipa-9） */}
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1.5 overflow-x-auto">
-          {AIM_FILTERS.map((f) => (
-            <button
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              className={clsx(
-                "shrink-0 px-3 py-1 rounded-full text-xs transition-colors",
-                filter === f.value
-                  ? "bg-accent text-white font-medium"
-                  : "bg-white/5 text-gray-400 hover:text-gray-200"
-              )}
-            >
-              {f.label}
-            </button>
-          ))}
+          {AIM_FILTERS.map((f) => {
+            const locked = f.value !== "all" && !proActive;
+            return (
+              <button
+                key={f.value}
+                onClick={() => (locked ? guardPro() : setFilter(f.value))}
+                className={clsx(
+                  "shrink-0 flex items-center gap-1 px-3 py-1 rounded-full text-xs transition-colors",
+                  filter === f.value
+                    ? "bg-accent text-white font-medium"
+                    : "bg-white/5 text-gray-400 hover:text-gray-200"
+                )}
+              >
+                {locked && <Lock size={12} className="opacity-70" />}
+                {f.label}
+              </button>
+            );
+          })}
         </div>
         <button
-          onClick={handleAimProbe}
+          onClick={proActive ? handleAimProbe : guardPro}
           className="ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
           title={
-            coreStatus === "running"
-              ? "运行 Go AIM 解锁探测（AI / 流媒体）"
-              : "启动内核后可探测"
+            !proActive
+              ? "Pro 功能：激活授权后可用"
+              : coreStatus === "running"
+                ? "运行 Go AIM 解锁探测（AI / 流媒体）"
+                : "启动内核后可探测"
           }
         >
-          <Crosshair size={13} />
+          {!proActive ? (
+            <Lock size={12} className="opacity-70" />
+          ) : (
+            <Crosshair size={13} />
+          )}
           AI检测
         </button>
       </div>
@@ -497,13 +528,13 @@ export default function Proxies() {
                 {protocolTag(node.type)}
               </span>
 
-              {/* Go AIM 解锁徽章（探测评级后显示） */}
-              {aimResult?.aiUnlocked && (
+              {/* Go AIM 解锁徽章（探测评级后显示；未激活授权不渲染） */}
+              {proActive && aimResult?.aiUnlocked && (
                 <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-accent/15 text-accent">
                   AI
                 </span>
               )}
-              {aimResult?.mediaUnlocked && (
+              {proActive && aimResult?.mediaUnlocked && (
                 <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-latency-good/15 text-latency-good">
                   NF
                 </span>
@@ -525,6 +556,12 @@ export default function Proxies() {
         })}
       </div>
       )}
+
+      {/* Pro 激活弹窗（Go AIM 筛选/检测拦截入口共用） */}
+      <ActivateProModal
+        open={showActivate}
+        onClose={() => setShowActivate(false)}
+      />
     </div>
   );
 }

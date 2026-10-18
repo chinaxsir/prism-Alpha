@@ -172,10 +172,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func writeSharedError(_ message: String) {
-        NSLog("[PrismVPN] ERROR: \(message)")
+        // 内核报错脱敏：写入共享错误文件前抹除内核商标字样（不区分大小写）
+        let cleanMsg = message
+            .replacingOccurrences(of: "sing-box", with: "内核", options: .caseInsensitive)
+            .replacingOccurrences(of: "singbox", with: "内核", options: .caseInsensitive)
+            .replacingOccurrences(of: "libbox", with: "内核", options: .caseInsensitive)
+        NSLog("[PrismVPN] ERROR: \(cleanMsg)")
         for dir in sharedDirURLs() {
             let url = dir.appendingPathComponent("prism_error.txt")
-            try? message.write(to: url, atomically: true, encoding: .utf8)
+            try? cleanMsg.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 

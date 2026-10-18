@@ -202,7 +202,9 @@ export function ActivateProModal({
 }
 
 /**
- * Pro 门控：未授权时给 children 盖毛玻璃遮罩 + 激活入口；
+ * Pro 门控（ipa-9 重构）：未授权时只渲染一张紧凑居中的引导卡，
+ * 绝不渲染 children（严禁旧版「渲染完整子组件 + 高斯模糊 + 悬浮大锁遮罩」
+ * 的实现——那会在长表单页撑出满屏模糊黑框，在窄卡片上导致元素溢出重叠）；
  * 已授权（active，服务端联网校验有效）时完全透明穿透。
  */
 export default function ProGate({
@@ -222,28 +224,21 @@ export default function ProGate({
   if (!ready) return <>{children}</>;
 
   return (
-    <div className="relative">
-      <div className="pointer-events-none select-none" aria-hidden>
-        {children}
-      </div>
-      <div className="absolute inset-0 flex items-center justify-center bg-surface/60 backdrop-blur-sm">
-        <div className="space-y-3 p-6 text-center">
-          <Lock size={28} className="mx-auto text-accent" />
-          <p className="text-sm text-gray-300">
-            {FEATURE_LABEL[feature]}为 Pro 功能
-          </p>
-          <button
-            onClick={() => setShowActivate(true)}
-            className="rounded-lg bg-accent px-5 py-2 text-sm transition-colors hover:bg-accent-hover"
-          >
-            激活 Pro
-          </button>
-        </div>
+    <>
+      <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-white/5 bg-surface-card px-5 py-6 text-center">
+        <Lock size={18} className="text-accent" />
+        <p className="text-sm text-gray-300">{FEATURE_LABEL[feature]}为 Pro 功能</p>
+        <button
+          onClick={() => setShowActivate(true)}
+          className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+        >
+          激活 Pro
+        </button>
       </div>
       <ActivateProModal
         open={showActivate}
         onClose={() => setShowActivate(false)}
       />
-    </div>
+    </>
   );
 }

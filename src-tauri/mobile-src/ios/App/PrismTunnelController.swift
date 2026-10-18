@@ -202,13 +202,23 @@ final class PrismTunnelController {
     /// 断开原因同时写入 App Group prism_error.txt 供诊断与下次启动回显）
     var onVpnUnexpectedDisconnect: ((String) -> Void)?
 
+    /// 内核报错脱敏：用户可见错误文本统一抹除内核商标字样（不区分大小写）
+    static func sanitizeKernelError(_ message: String) -> String {
+        message
+            .replacingOccurrences(of: "sing-box", with: "内核", options: .caseInsensitive)
+            .replacingOccurrences(of: "singbox", with: "内核", options: .caseInsensitive)
+            .replacingOccurrences(of: "libbox", with: "内核", options: .caseInsensitive)
+    }
+
     /// 把 NSError 完整描述（domain/code/userInfo）输出，便于真机定位
     static func describe(error: Error) -> String {
         let ns = error as NSError
         let userInfo = ns.userInfo.map { (k, v) -> String in
             "\(k)=\(v)"
         }.joined(separator: "; ")
-        return "domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription) userInfo={\(userInfo)}"
+        return sanitizeKernelError(
+            "domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription) userInfo={\(userInfo)}"
+        )
     }
 
     // MARK: - 扩展心跳/错误/崩溃诊断（build 145 方案）
@@ -1810,7 +1820,7 @@ final class PrismTunnelController {
             contentsOf: groupURL.appendingPathComponent("prism_error.txt"),
             encoding: .utf8
         ), !text.isEmpty else { return nil }
-        return text
+        return sanitizeKernelError(text)
     }
 
     // MARK: - 巨魔看门狗：扩展被 Jetsam 静默强杀的兜底判死

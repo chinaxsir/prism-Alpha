@@ -8,9 +8,15 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::core::kernel::{
     KernelApi, KernelConfig, KernelHandle, check_config, generate_secret, probe_version,
+    sanitize_kernel_error,
 };
 use crate::core::license::EntitlementStatus;
 use crate::core::state::{AppState, CoreStatus, OutboundMode, RunMode, UserSettings, is_port_free, pick_api_addr};
+
+/// 返回前端前的错误文本统一脱敏（抹除内核商标字样）
+fn sanitize_err(msg: &str) -> String {
+    sanitize_kernel_error(msg)
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,7 +50,7 @@ pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<()
         if matches!(current, CoreStatus::Starting | CoreStatus::Running) {
             return Ok(());
         }
-        return Err(e.to_string());
+        return Err(sanitize_err(&e.to_string()));
     }
 
     // 启动失败时统一回滚，避免半成品状态
@@ -57,7 +63,7 @@ pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<()
     *state.started_at.write() = Some(std::time::Instant::now());
     state
         .transition(CoreStatus::Running)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 启动后自动测速并切换到延迟最低的可用节点（用户随后仍可手动改选）
     if let Some(group) = state.main_selector.read().clone() {
@@ -92,7 +98,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     // - 移动端：系统 VPN 授权（Android VpnService.prepare）。
     //   未授权时返回 false，前端提示用户在系统弹窗中允许后重试
     #[cfg(any(target_os = "ios", target_os = "android"))]
-    if !crate::platform::ensure_vpn_permission().map_err(|e| e.to_string())? {
+    if !crate::platform::ensure_vpn_permission().map_err(|e| sanitize_err(&e.to_string()))? {
         return Err("需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into());
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -189,7 +195,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         &go_lan_cfg,
         &go_cus_cfg,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| sanitize_err(&e.to_string()))?;
     for warning in &built.warnings {
         tracing::warn!("config builder: {}", warning);
     }
@@ -233,7 +239,7 @@ async fn apply_prepared(
 
     let handle = KernelHandle::spawn(kernel_config, app.clone())
         .await
-        .map_err(|e| format!("内核启动失败: {}", e))?;
+        .map_err(|e| format!("内核启动失败: {}", sanitize_err(&e.to_string())))?;
 
     // 探测并缓存版本号供设置页展示（失败不影响启动）
     if let Some(version) = probe_version(&binary_path).await {
@@ -279,7 +285,7 @@ async fn apply_prepared(
             *state.proxy_backup.write() = Some(backup);
         }
         crate::platform::set_system_proxy("127.0.0.1", settings.mixed_port)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| sanitize_err(&e.to_string()))?;
     }
 
     // Go Cus 边车：授权激活且启用覆写时拉起本地处理服务（进程内单例）
@@ -390,27 +396,27 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
     std::fs::write(&check_path, bytes).map_err(|e| format!("写入预检配置失败: {e}"))?;
     if let Err(e) = check_config(&prepared.binary_path, &state.work_dir(), &check_path).await {
         let _ = std::fs::remove_file(&check_path);
-        return Err(e.to_string());
+        return Err(sanitize_err(&e.to_string()));
     }
     let _ = std::fs::remove_file(&check_path);
 
     // 3. 停止旧内核
     state
         .transition(CoreStatus::Stopping)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     if let Err(e) = do_stop(state).await {
         let _ = state.transition(CoreStatus::Error);
-        return Err(e.to_string());
+        return Err(sanitize_err(&e.to_string()));
     }
     *state.started_at.write() = None;
     state
         .transition(CoreStatus::Stopped)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 4. 应用已校验的配置启动新内核；失败仍转 Error 允许重试
     state
         .transition(CoreStatus::Starting)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     if let Err(e) = apply_prepared(prepared, app, state).await {
         let _ = do_stop(state).await;
         let _ = state.transition(CoreStatus::Error);
@@ -419,7 +425,7 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
     *state.started_at.write() = Some(std::time::Instant::now());
     state
         .transition(CoreStatus::Running)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 与 start_core 一致：重启后自动测速选点
     if let Some(group) = state.main_selector.read().clone() {
@@ -541,7 +547,7 @@ pub(crate) fn resolve_kernel_path(work_dir: &std::path::Path) -> anyhow::Result<
         }
     }
 
-    anyhow::bail!("未找到 sing-box 内核二进制")
+    anyhow::bail!("未找到内核二进制")
 }
 
 #[tauri::command]
@@ -554,19 +560,19 @@ pub async fn stop_core(state: State<'_, AppState>) -> Result<(), String> {
         if matches!(current, CoreStatus::Stopped | CoreStatus::Stopping) {
             return Ok(());
         }
-        return Err(e.to_string());
+        return Err(sanitize_err(&e.to_string()));
     }
 
     if let Err(e) = do_stop(&state).await {
         // 停止失败不能留在 Stopping（没有出边，会永久卡死），转入 Error 允许重试
         let _ = state.transition(CoreStatus::Error);
-        return Err(e.to_string());
+        return Err(sanitize_err(&e.to_string()));
     }
     *state.started_at.write() = None;
 
     state
         .transition(CoreStatus::Stopped)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     Ok(())
 }
 
@@ -672,7 +678,7 @@ pub async fn url_test(
         .kernel_api()
         .group_url_test(&req.group, req.url.as_deref(), req.timeout_ms, Some(&app))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 出站模式热切换（build 157 用户方案）：立即保存设置；内核运行中经
@@ -699,7 +705,7 @@ pub async fn set_outbound_mode(
         let api = state.kernel_api();
         api.patch_mode(mode_str)
             .await
-            .map_err(|e| format!("热切换出站模式失败: {e}"))?;
+            .map_err(|e| format!("热切换出站模式失败: {}", sanitize_err(&e.to_string())))?;
         // 旧连接继续走旧出口直至自然结束，主动清理保证立即按新模式路由
         let _ = api.close_all_connections().await;
         use tauri::Emitter;
@@ -718,7 +724,7 @@ pub async fn select_proxy(
         .kernel_api()
         .select_proxy(&group, &name)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 全局模式同步（build 172 方案）：GLOBAL 选择组与主组保持同一节点。
     // clash_mode global 规则指向独立的 GLOBAL 组，若只切主组，切到
@@ -834,7 +840,7 @@ pub(crate) async fn refresh_subscription(
     }
 
     if !text.contains("proxies") && !text.contains("{") {
-        return Err("订阅内容无法识别：既不是 Clash YAML，也不是 sing-box JSON".into());
+        return Err("订阅内容无法识别：既不是 Clash YAML，也不是内核 JSON".into());
     }
 
     // 落盘前校验：防止机场返回 HTML 错误页/限流提示等空内容覆盖本地可用订阅
@@ -845,7 +851,7 @@ pub(crate) async fn refresh_subscription(
     // 每条订阅独立 profile 文件（多订阅模型），路径由 URL 哈希派生
     let profile_path = crate::core::store::profile_path(&state.data_dir, &url);
     if let Some(parent) = profile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| sanitize_err(&e.to_string()))?;
     }
     std::fs::write(&profile_path, &text)
         .map_err(|e| format!("写入订阅文件失败: {}", e))?;
@@ -1337,7 +1343,7 @@ pub async fn activate_pro(
     let settings = state.settings.read().clone();
     let next = crate::core::license::activate(&data_dir, &settings, &code, &email)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     state.apply_entitlement(next.clone());
     // Pro/买断：激活成功后立即做一次云端订阅对账（静默）
     if next.is_unlocked() && next.sync_available {
@@ -1359,7 +1365,7 @@ pub async fn get_entitlement(
 /// 读取本机设备 ID（激活绑定与设置页展示用；首次调用时生成并落盘）
 #[tauri::command]
 pub async fn get_device_id(state: State<'_, AppState>) -> Result<String, String> {
-    crate::core::license::device_id(&state.data_dir).map_err(|e| e.to_string())
+    crate::core::license::device_id(&state.data_dir).map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 主动联网刷新授权（设置页「立即校验」按钮；ipa-8：强制实时请求服务端，
@@ -1374,7 +1380,7 @@ pub async fn refresh_entitlement(
     let settings = state.settings.read().clone();
     let next = crate::core::license::verify_remote_forced(&data_dir, &settings)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     state.apply_entitlement(next.clone());
     // 校验成功：对账云端订阅链接（reconcile 内部自校验同步资格并幂等去重）
     tauri::async_runtime::spawn(async move {
@@ -1432,7 +1438,7 @@ pub async fn submit_receipt(
     let settings = state.settings.read().clone();
     let next = crate::core::license::submit_store_receipt(&data_dir, &settings, &store, receipt)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     state.apply_entitlement(next.clone());
     Ok(next)
 }
@@ -1507,7 +1513,7 @@ pub async fn get_connections(state: State<'_, AppState>) -> Result<serde_json::V
         .kernel_api()
         .get_connections()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 关闭单条连接（连接页行内按钮）
@@ -1520,7 +1526,7 @@ pub async fn close_connection(
         .kernel_api()
         .close_connection(&id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 关闭全部连接（连接页头部按钮）
@@ -1530,7 +1536,7 @@ pub async fn close_all_connections(state: State<'_, AppState>) -> Result<(), Str
         .kernel_api()
         .close_all_connections()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 #[tauri::command]
@@ -1553,12 +1559,12 @@ pub async fn add_traffic_tick(
     down: u64,
 ) -> Result<crate::core::store::TrafficStats, String> {
     crate::core::store::add_traffic(&state.data_dir, up, down)
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 #[tauri::command]
 pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    state.kernel_api().get_rules().await.map_err(|e| e.to_string())
+    state.kernel_api().get_rules().await.map_err(|e| sanitize_err(&e.to_string()))
 }
 
 #[tauri::command]
@@ -1569,7 +1575,7 @@ pub async fn get_proxy_groups(
         .kernel_api()
         .get_proxies()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| sanitize_err(&e.to_string()))
 }
 
 #[tauri::command]
@@ -1591,7 +1597,7 @@ pub async fn save_settings(
     settings.go_aim_enabled = prev.go_aim_enabled;
 
     // 自启动立即生效
-    crate::platform::set_auto_start(settings.auto_start).map_err(|e| e.to_string())?;
+    crate::platform::set_auto_start(settings.auto_start).map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 落盘 settings.json，重启后恢复
     let next = settings.clone();
@@ -1619,7 +1625,7 @@ pub async fn save_settings(
 #[tauri::command]
 pub async fn get_go_aim_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     Ok(serde_json::to_value(crate::core::go_aim::status_dto(&state))
-        .map_err(|e| e.to_string())?)
+        .map_err(|e| sanitize_err(&e.to_string()))?)
 }
 
 /// 开关 Go AIM 自动锁定；开启且内核运行中时立即探测并锁定
@@ -1682,7 +1688,7 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
         }
     }
     let lan = state.go_lan.read().clone();
-    serde_json::to_value(lan).map_err(|e| e.to_string())
+    serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 保存回家网络配置；内核运行中时重建配置生效
@@ -1722,7 +1728,7 @@ pub async fn sync_go_lan_managed(
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
     }
-    serde_json::to_value(lan).map_err(|e| e.to_string())
+    serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
 }
 
 // ============================== Go Cus（Pro） ==============================
@@ -1737,7 +1743,7 @@ pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_jso
         }
     }
     let cus = state.go_cus.read().clone();
-    serde_json::to_value(cus).map_err(|e| e.to_string())
+    serde_json::to_value(cus).map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 保存覆写引擎基础设置（enabled / mitm / dns / hosts）；运行中重建生效
@@ -1805,7 +1811,7 @@ pub async fn import_go_cus_module(
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
     }
-    serde_json::to_value(module).map_err(|e| e.to_string())
+    serde_json::to_value(module).map_err(|e| sanitize_err(&e.to_string()))
 }
 
 /// 启停模块；启用状态变化时运行中内核重建生效
@@ -1875,5 +1881,5 @@ pub async fn generate_or_get_ca_url(
         }
     }
     let info = crate::core::go_cus::generate_or_get_ca(&state, app)?;
-    serde_json::to_value(info).map_err(|e| e.to_string())
+    serde_json::to_value(info).map_err(|e| sanitize_err(&e.to_string()))
 }

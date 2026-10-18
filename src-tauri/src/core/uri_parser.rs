@@ -38,7 +38,7 @@ pub fn parse_line(line: &str) -> Result<Option<Value>> {
     let node = match scheme {
         "ss" => parse_ss(rest)?,
         // SSR 已被内核（sing-box 1.6.0+）移除：明确报错而非解析后静默丢弃
-        "ssr" => bail!("SSR 协议已被内核（sing-box 1.6.0+）移除，无法支持"),
+        "ssr" => bail!("SSR 协议已被内核移除（1.6.0+ 版本不再支持），无法使用"),
         "vmess" => parse_vmess(rest)?,
         "vless" => parse_vless(rest)?,
         "trojan" => parse_trojan(rest)?,

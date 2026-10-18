@@ -6,6 +6,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  ChevronDown,
   ChevronRight,
   Wifi,
   Network,
@@ -42,10 +43,10 @@ import {
 import type { RunMode, UserSettings } from "@/stores/core";
 import { useCoreStore } from "@/stores/core";
 import { RUN_MODES } from "@/constants/modes";
-import ProGate, { ActivateProModal } from "@/components/ProGate";
+import { ActivateProModal } from "@/components/ProGate";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
-import { Feature, isMobile } from "@/pro/gating";
+import { isMobile } from "@/pro/gating";
 import Switch from "@/components/ui/Switch";
 import clsx from "clsx";
 
@@ -178,11 +179,14 @@ export default function Settings() {
   const [confirmDeactivate, setConfirmDeactivate] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
   const proUnlocked = useProStore((s) => s.unlocked);
+  const proReady = useProStore((s) => s.ready);
   const entitlement = useProStore((s) => s.entitlement);
   const proBusy = useProStore((s) => s.busy);
   const refreshPro = useProStore((s) => s.refresh);
   const deactivatePro = useProStore((s) => s.deactivate);
   const tunGated = !proUnlocked;
+  // ipa-9：Go Lan 是否渲染完整配置区（启动瞬间 ready=false 先渲染完整表单，避免闪烁）
+  const goLanUnlocked = proUnlocked || !proReady;
 
   // ipa-8：仪表盘 Go Lan 卡片「配置」跳转锚点——进入设置页后滚动定位到回家网络卡片
   const [searchParams] = useSearchParams();
@@ -208,6 +212,8 @@ export default function Settings() {
   const [goLanLoaded, setGoLanLoaded] = useState<GoLanSettings | null>(null);
   const [goLanBusy, setGoLanBusy] = useState(false);
   const [goLanSyncing, setGoLanSyncing] = useState(false);
+  // ipa-9：Go Lan 开关关闭时表单默认收起，点击「展开配置」后再显示
+  const [goLanExpanded, setGoLanExpanded] = useState(false);
 
   useEffect(() => {
     getDeviceId()
@@ -572,8 +578,37 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Go Lan · 回家网络（Pro 门控）；id 供仪表盘「配置」按钮跳转定位 */}
-      <ProGate feature={Feature.GoLan}>
+      {/* Go Lan · 回家网络（Pro 门控，ipa-9：未激活时绝不渲染长表单，
+          只渲染一张与普通设置行高度一致的紧凑单行引导卡；
+          id 供仪表盘「配置」按钮跳转定位） */}
+      {!goLanUnlocked ? (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-surface-card px-4 py-3.5">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
+              <Home size={15} className="text-accent" />
+            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
+                  Go Lan · 回家内网
+                </span>
+                <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                  PRO
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-xs text-gray-500">
+                启动代理同时自动连通家中局域网（激活授权后显示配置）
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setShowActivate(true)}
+            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+          >
+            激活 Pro
+          </button>
+        </div>
+      ) : (
         <SettingsGroup
           id="go-lan-card"
           title="Go Lan · 回家网络"
@@ -586,6 +621,25 @@ export default function Settings() {
             />
           }
         >
+          {/* ipa-9：开关关闭时表单默认收起，点击「展开配置」后再显示，保持页面清爽 */}
+          {!goLan.enabled && (
+            <div className="px-3 pt-3">
+              <button
+                onClick={() => setGoLanExpanded((v) => !v)}
+                className="flex items-center gap-1 text-xs text-gray-400 transition-colors hover:text-accent"
+              >
+                <ChevronDown
+                  size={12}
+                  className={
+                    goLanExpanded ? "rotate-180 transition-transform" : "transition-transform"
+                  }
+                />
+                {goLanExpanded ? "收起配置" : "展开配置"}
+              </button>
+            </div>
+          )}
+          {(goLan.enabled || goLanExpanded) && (
+          <>
           <div className="space-y-4 px-3 py-3">
             {/* 模式：手动配置 / 托管下发 */}
             <div className="flex items-center gap-2">
@@ -853,8 +907,10 @@ export default function Settings() {
               保存
             </button>
           </div>
+          </>
+          )}
         </SettingsGroup>
-      </ProGate>
+      )}
 
       {/* 高级 */}
       <SettingsGroup title="高级" icon={<Sliders size={14} />} desc="IPv6、QUIC、连接切换等内核行为">

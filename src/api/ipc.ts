@@ -1,5 +1,18 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { CoreStatus, OutboundMode, RunMode, UserSettings } from "@/stores/core";
+
+/** 内核报错脱敏：界面任何路径都不得出现内核商标字样（统一显示为「内核」） */
+export const sanitizeKernelText = (msg: string): string =>
+  msg.replace(/sing-?box|libbox/gi, "内核");
+
+/**
+ * 统一 invoke 包装：后端返回的错误消息脱敏后再抛给调用方，
+ * 兜底防止底层内核自带的报错文本直接漏到界面。
+ */
+const invoke = <T,>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
+  tauriInvoke<T>(cmd, args).catch((e) => {
+    throw typeof e === "string" ? sanitizeKernelText(e) : e;
+  });
 
 export const startCore = () => invoke<void>("start_core");
 export const stopCore = () => invoke<void>("stop_core");

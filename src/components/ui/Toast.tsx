@@ -19,6 +19,9 @@ interface ToastState {
 
 let nextId = 1;
 
+/// 兜底脱敏：任何 toast 消息都不得出现内核商标字样
+const clean = (message: string) => message.replace(/sing-?box|libbox/gi, "内核");
+
 export const useToast = create<ToastState>((set) => ({
   toasts: [],
   push: (type, message) => {
@@ -31,9 +34,9 @@ export const useToast = create<ToastState>((set) => ({
 
 /// 全局 toast API：toast.success("...") / toast.error("...") / toast.info("...")
 export const toast = {
-  success: (message: string) => useToast.getState().push("success", message),
-  error: (message: string) => useToast.getState().push("error", message),
-  info: (message: string) => useToast.getState().push("info", message),
+  success: (message: string) => useToast.getState().push("success", clean(message)),
+  error: (message: string) => useToast.getState().push("error", clean(message)),
+  info: (message: string) => useToast.getState().push("info", clean(message)),
 };
 
 export default function ToastViewport() {

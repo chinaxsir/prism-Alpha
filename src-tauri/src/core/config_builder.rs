@@ -283,7 +283,7 @@ pub fn build(
         let trimmed = profiles[0].2.trim();
         let mut config: Value = serde_json::from_str(trimmed)
             .context("profile looks like JSON but failed to parse")?;
-        let mut warnings = vec!["sing-box JSON 配置原样透传，未做模式/端口合并".into()];
+        let mut warnings = vec!["内核 JSON 配置原样透传，未做模式/端口合并".into()];
         merge_json_custom(&mut config, custom_rules, &mut warnings);
         let final_group = config
             .get("route")
@@ -1062,7 +1062,7 @@ fn parse_rule_line(
         // RULE-SET 依赖 rule-providers 元信息，无法从纯 Clash 配置无损转换
         "RULE-SET" => {
             warnings.push(format!(
-                "RULE-SET ({}) 需要规则集元信息，已跳过；请改用 GEOSITE 或 sing-box rule_set",
+                "RULE-SET ({}) 需要规则集元信息，已跳过；请改用 GEOSITE 或内核 rule_set",
                 payload
             ));
             None
@@ -1447,7 +1447,7 @@ fn build_transport(node: &ClashNode) -> (Option<Value>, Option<String>) {
         Some("h2") => (
             None,
             Some(
-                "节点使用 HTTP/2 (h2) 传输，sing-box 无对应传输类型，已移除传输（节点可能不可达）"
+                "节点使用 HTTP/2 (h2) 传输，内核无对应传输类型，已移除传输（节点可能不可达）"
                     .into(),
             ),
         ),
@@ -1513,7 +1513,7 @@ fn group_to_outbound(
         "fallback" | "Fallback" => {
             // sing-box 无 fallback 类型，降级为 urltest（高容忍度近似故障转移）
             warnings.push(format!(
-                "策略组 '{}' 类型为 Fallback，sing-box 无对应类型，已降级为 urltest",
+                "策略组 '{}' 类型为 Fallback，内核无对应类型，已降级为 urltest",
                 group.name
             ));
             json!({
@@ -1529,7 +1529,7 @@ fn group_to_outbound(
         // 降级为 urltest（自动选延迟最低节点，行为最接近）
         "load-balance" | "LoadBalance" => {
             warnings.push(format!(
-                "策略组 '{}' 为 load-balance，sing-box 1.11 不支持，已降级为 url-test",
+                "策略组 '{}' 为 load-balance，内核 1.11 不支持，已降级为 url-test",
                 group.name
             ));
             json!({

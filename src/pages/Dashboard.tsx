@@ -45,12 +45,13 @@ import {
   type GoCusSettings,
 } from "@/api/ipc";
 import { useCoreStore, type RunMode } from "@/stores/core";
+import { useProStore } from "@/stores/pro";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
-import { Feature, isMobile } from "@/pro/gating";
+import { isMobile } from "@/pro/gating";
 import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
-import ProGate from "@/components/ProGate";
+import { ActivateProModal } from "@/components/ProGate";
 import Switch from "@/components/ui/Switch";
 
 const MODE_LABEL: Record<RunMode, string> = {
@@ -89,6 +90,11 @@ export default function Dashboard() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const mobile = isMobile();
   const navigate = useNavigate();
+
+  // Pro 授权状态（ipa-9：未激活时引擎矩阵折叠为单张横幅卡）
+  const proReady = useProStore((s) => s.ready);
+  const proUnlocked = useProStore((s) => s.unlocked);
+  const [showActivate, setShowActivate] = useState(false);
 
   // 当前节点状态：主选择组、当前选中节点名、可选节点列表、选择器弹窗
   const [mainSelector, setMainSelector] = useState("");
@@ -442,9 +448,10 @@ export default function Dashboard() {
       </div>
 
       {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus，Pro 门控）
-          ipa-8：移动端单列通栏横向卡片（340px+ 宽度零截断），桌面端三列网格 */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
-        <ProGate feature={Feature.GoAim}>
+          ipa-9：未激活时不渲染三张带遮罩的卡片，折叠为一张紧凑协调的横幅卡；
+          已激活时渲染三张功能卡（移动端单列通栏横向卡片，桌面端三列网格） */}
+      {proUnlocked ? (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
           <EngineCard
             icon={<Crosshair size={14} className="text-accent" />}
             name="Go AIM"
@@ -464,8 +471,6 @@ export default function Dashboard() {
               ) : undefined
             }
           />
-        </ProGate>
-        <ProGate feature={Feature.GoLan}>
           <EngineCard
             icon={<Home size={14} className="text-accent" />}
             name="Go Lan"
@@ -482,8 +487,6 @@ export default function Dashboard() {
               </button>
             }
           />
-        </ProGate>
-        <ProGate feature={Feature.GoCus}>
           <EngineCard
             icon={<Wand2 size={14} className="text-accent" />}
             name="Go Cus"
@@ -500,8 +503,36 @@ export default function Dashboard() {
               </button>
             }
           />
-        </ProGate>
-      </div>
+        </div>
+      ) : proReady ? (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-surface-card px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
+                ✨ Pro 智联引擎
+              </span>
+              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+                Go AIM
+              </span>
+              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+                Go Lan
+              </span>
+              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+                Go Cus
+              </span>
+            </div>
+            <p className="mt-1 truncate text-xs text-gray-400">
+              激活授权解锁 AI/流媒体智选、回家内网直通与脚本覆写引擎
+            </p>
+          </div>
+          <button
+            onClick={() => setShowActivate(true)}
+            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90"
+          >
+            激活 Pro
+          </button>
+        </div>
+      ) : null}
 
       {/* 实时速率（合并卡片，左右分布） */}
       <div className="bg-surface-card rounded-2xl p-5 border border-white/5">
@@ -652,6 +683,12 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* Pro 激活弹窗（未激活横幅卡「激活 Pro」入口共用） */}
+      <ActivateProModal
+        open={showActivate}
+        onClose={() => setShowActivate(false)}
+      />
     </div>
   );
 }
