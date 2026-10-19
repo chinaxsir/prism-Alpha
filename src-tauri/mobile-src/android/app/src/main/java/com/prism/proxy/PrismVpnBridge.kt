@@ -41,12 +41,29 @@ object PrismVpnBridge {
     @JvmStatic
     external fun nativeVpnRevoked()
 
+    // Rust 侧初始化入口：在「携带应用 ClassLoader 的主线程」里解析
+    // com/prism/proxy/PrismVpnBridge 并缓存为 JNI GlobalRef。
+    // 由 attach() 调用，彻底规避 Rust 后台线程 FindClass 走系统 ClassLoader
+    // 导致的 ClassNotFoundException。
+    @Keep
+    @JvmStatic
+    external fun initNative()
+
     // 由 MainActivity 的 init 块调用（必须早于 Activity STARTED，
     // 因为 registerForActivityResult 要求注册在启动之前）
     @Keep
     @JvmStatic
     fun attach(activity: ComponentActivity) {
         this.activity = activity
+
+        // 主线程主动触发 Rust 初始化：先确保 so 已加载，再回调 initNative()
+        try {
+            System.loadLibrary("prism_proxy_lib")
+            initNative()
+        } catch (t: Throwable) {
+            Log.e(TAG, "load native lib / initNative failed", t)
+        }
+
         try {
             this.consentLauncher = activity.registerForActivityResult(
                 ActivityResultContracts.StartActivityForResult()

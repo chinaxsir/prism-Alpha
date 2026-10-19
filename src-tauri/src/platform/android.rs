@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 use jni::JNIEnv;
-use jni::objects::{JClass, JValue};
+use jni::objects::{GlobalRef, JClass, JValue};
 use jni::sys::{JNI_VERSION_1_6, jint};
 use tauri::{AppHandle, Emitter};
 
@@ -20,6 +20,16 @@ const BRIDGE_CLASS: &str = "com/prism/proxy/PrismVpnBridge";
 
 static JVM: OnceLock<jni::JavaVM> = OnceLock::new();
 static APP: OnceLock<AppHandle> = OnceLock::new();
+
+/// PrismVpnBridge 的全局类引用。
+///
+/// 必须缓存的原因：本模块后续所有 JNI 调用都发生在 Go/libbox 回调线程或
+/// Rust 后台线程上，这些线程通过 `attach_current_thread_as_daemon()` 挂接，
+/// 其 `FindClass` 走的是系统（Boot）ClassLoader，无法解析应用自带类，
+/// 表现为 `ClassNotFoundException: com.prism.proxy.PrismVpnBridge`。
+/// 只有在具备应用 ClassLoader 的线程（Tauri setup / 主线程）用 `find_class`
+/// 拿到类并转成 `GlobalRef` 后，其它线程才能稳定转发调用。
+static BRIDGE: OnceLock<GlobalRef> = OnceLock::new();
 
 /// cdylib 被 System.loadLibrary 加载时触发：缓存 JavaVM
 #[unsafe(no_mangle)]
@@ -36,6 +46,13 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
         .attach_current_thread_as_daemon()
         .context("attach current thread")?;
     f(&mut guard)
+}
+
+/// 返回已缓存的 PrismVpnBridge 全局类引用（在 `init()` 中建立）。
+fn bridge_class() -> Result<&'static GlobalRef> {
+    BRIDGE.get().ok_or_else(|| {
+        anyhow!("PrismVpnBridge class ref missing: platform::android::init() 未成功执行")
+    })
 }
 
 /// JNI 调用返回 Err 时提取并清理当前线程挂起的 Java 异常：
@@ -74,20 +91,58 @@ fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
     }
 }
 
+/// 解析 PrismVpnBridge 类并缓存为全局引用，同时注册原生回调方法。
+/// 幂等：桥类引用已存在时直接返回。
+///
+/// 必须在「携带应用 ClassLoader 的线程」上调用（Kotlin 主线程或 Tauri setup 线程）。
+fn cache_bridge(env: &mut JNIEnv) -> Result<()> {
+    if BRIDGE.get().is_some() {
+        return Ok(());
+    }
+
+    let local = match env.find_class(BRIDGE_CLASS) {
+        Ok(c) => c,
+        Err(e) => return Err(anyhow!(jni_err(env, "find PrismVpnBridge class", e))),
+    };
+    let global = env
+        .new_global_ref(&local)
+        .context("cache global ref for PrismVpnBridge")?;
+    let _ = BRIDGE.set(global);
+
+    let methods = [jni::NativeMethod {
+        name: "nativeVpnRevoked".into(),
+        sig: "()V".into(),
+        fn_ptr: native_vpn_revoked as *mut std::ffi::c_void,
+    }];
+    env.register_native_methods(bridge_class()?, &methods)
+        .context("register nativeVpnRevoked")?;
+    Ok(())
+}
+
+/// 导出给 Kotlin 的初始化入口，由 `PrismVpnBridge.attach()` 在 MainActivity
+/// 构造期（主线程）调用。此时传入的 JNIEnv 一定携带应用 ClassLoader，
+/// 是缓存 GlobalRef 最可靠的时机。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_prism_proxy_PrismVpnBridge_initNative<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    if let Err(e) = cache_bridge(&mut env) {
+        // 不 fatal_error（避免直接 abort 掉 App），只记录到 logcat
+        tracing::error!("PrismVpnBridge.initNative failed: {e:#}");
+    }
+}
+
 /// 平台初始化（Tauri setup 中调用）：注册原生方法 + libbox C 回调
 pub fn init(app: AppHandle) -> Result<()> {
     let _ = APP.set(app);
 
-    with_env(|env| {
-        let methods = [jni::NativeMethod {
-            name: "nativeVpnRevoked".into(),
-            sig: "()V".into(),
-            fn_ptr: native_vpn_revoked as *mut std::ffi::c_void,
-        }];
-        env.register_native_methods(BRIDGE_CLASS, &methods)
-            .context("register nativeVpnRevoked")?;
-        Ok(())
-    })?;
+    // 正常情况下 GlobalRef 已由 Kotlin 侧 PrismVpnBridge.attach() → initNative()
+    // 在主线程建立；此处兜底一次（attach 未被执行时），同样是具备应用
+    // ClassLoader 的线程，避免后台线程 FindClass 失败。
+    if BRIDGE.get().is_none() {
+        with_env(|env| cache_bridge(env)).context("cache PrismVpnBridge class ref")?;
+    }
 
     // libbox PlatformInterface 回调：Go 线程 → C → JNI → Kotlin
     crate::core::kernel::mobile_register_vpn_callbacks(
@@ -104,7 +159,7 @@ pub fn init(app: AppHandle) -> Result<()> {
 pub fn ensure_permission() -> Result<bool> {
     with_env(|env| {
         let granted = env
-            .call_static_method(BRIDGE_CLASS, "ensurePermission", "()Z", &[])
+            .call_static_method(bridge_class()?, "ensurePermission", "()Z", &[])
             .map_err(|e| anyhow!(jni_err(env, "call ensurePermission", e)))?
             .z()
             .context("ensurePermission return type")?;
@@ -116,7 +171,7 @@ pub fn ensure_permission() -> Result<bool> {
 pub fn start_service_and_wait() -> Result<()> {
     with_env(|env| {
         let ok = env
-            .call_static_method(BRIDGE_CLASS, "startServiceAndWait", "()Z", &[])
+            .call_static_method(bridge_class()?, "startServiceAndWait", "()Z", &[])
             .map_err(|e| anyhow!(jni_err(env, "call startServiceAndWait", e)))?
             .z()
             .context("startServiceAndWait return type")?;
@@ -131,7 +186,7 @@ pub fn start_service_and_wait() -> Result<()> {
 /// 停止并销毁前台 VpnService（libbox 停止后调用）
 pub fn stop_service() {
     let _ = with_env(|env| {
-        env.call_static_method(BRIDGE_CLASS, "stopService", "()V", &[])
+        env.call_static_method(bridge_class()?, "stopService", "()V", &[])
             .map_err(|e| anyhow!(jni_err(env, "call stopService", e)))?;
         Ok(())
     });
@@ -172,7 +227,7 @@ fn open_tun(options_json: &str) -> Result<i32> {
         let arg = env.new_string(options_json).context("new jstring")?;
         let fd = env
             .call_static_method(
-                BRIDGE_CLASS,
+                bridge_class()?,
                 "openTun",
                 "(Ljava/lang/String;)I",
                 &[JValue::Object(arg.as_ref())],
@@ -191,7 +246,7 @@ fn protect_socket(fd: c_int) -> Result<()> {
     with_env(|env| {
         let ok = env
             .call_static_method(
-                BRIDGE_CLASS,
+                bridge_class()?,
                 "protectSocket",
                 "(I)Z",
                 &[JValue::Int(fd)],
