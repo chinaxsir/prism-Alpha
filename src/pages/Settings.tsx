@@ -136,7 +136,7 @@ interface GoLanForm {
 }
 
 const WG_DEFAULTS = { localIp: "10.0.0.2/32", mtu: 1420 };
-const MANAGED_SERVER_DEFAULT = "https://askcn.de";
+const MANAGED_SERVER_DEFAULT = "https://prism.sarl";
 
 const EMPTY_GO_LAN: GoLanForm = {
   enabled: false,

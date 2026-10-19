@@ -29,7 +29,7 @@ use crate::core::state::UserSettings;
 /// 编译期固定授权服务地址（构建时可用 PRISM_LICENSE_URL 覆盖；App 内置，用户无需输入）
 const DEFAULT_SERVER: &str = match option_env!("PRISM_LICENSE_URL") {
     Some(v) => v,
-    None => "https://askcn.de",
+    None => "https://prism.sarl",
 };
 
 /// 新协议要求的请求来源标识头
@@ -768,7 +768,7 @@ fn offline_status(prev: &EntitlementStatus) -> EntitlementStatus {
 }
 
 /// 移动端商店收据上报（购买/恢复购买后调用）。
-/// 新协议（askcn.de HTTP API）未提供商店收据端点，暂不支持；
+/// 新协议（prism.sarl HTTP API）未提供商店收据端点，暂不支持；
 /// 保留函数与签名以兼容 ipc/commands.rs 调用点，前端收到明确错误提示。
 pub async fn submit_store_receipt(
     data_dir: &Path,

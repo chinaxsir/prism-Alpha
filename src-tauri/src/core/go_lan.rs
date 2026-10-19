@@ -31,7 +31,7 @@ fn default_mode() -> String {
 }
 
 fn default_managed_server() -> String {
-    "https://askcn.de".into()
+    "https://prism.sarl".into()
 }
 
 fn default_mtu() -> u32 {

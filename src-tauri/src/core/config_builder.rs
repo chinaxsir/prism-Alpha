@@ -635,7 +635,7 @@ pub fn build(
     // 官网始终可访问；域名后缀匹配零解析开销，不影响其它流量分流。
     route_rules.insert(
         0,
-        json!({ "domain_suffix": ["askcn.de"], "outbound": "direct" }),
+        json!({ "domain_suffix": ["prism.sarl"], "outbound": "direct" }),
     );
 
     // 校验策略组引用，剔除悬空目标
