@@ -32,7 +32,7 @@ interface ProState {
 
   init: () => Promise<void>;
   setEntitlement: (e: Entitlement) => void;
-  /** email 可选：部分 License Key 激活时需邮箱校验 */
+  /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
   deactivate: () => Promise<void>;
@@ -61,8 +61,8 @@ export const useProStore = create<ProState>((set) => ({
   activate: async (licenseKey, email) => {
     set({ busy: true, error: null });
     try {
-      // ipc.ts 的 activatePro 正在并行改造为 (licenseKey, email?)；
-      // 此处 email 兜底为空串，与旧签名 (code, email) 及新签名均兼容。
+      // 服务端要求「License Key + 注册邮箱」联合校验（两者必填）；
+      // 缺项时后端会在本地拦截并返回明确错误，不会发起无效请求。
       const e = await activatePro(licenseKey, email ?? "");
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
       return unlockedOf(e);

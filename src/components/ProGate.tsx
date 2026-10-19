@@ -6,9 +6,12 @@ import type { Entitlement } from "@/api/ipc";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 
-/** 服务端 429 时从错误信息中解析 retry_after 秒数（容忍 JSON / 纯文本格式） */
+/** 服务端 429 时从错误信息中解析 retry_after 秒数（容忍 JSON / 纯文本格式）。
+ *  后端约定：错误字符串以 "rate_limited:{秒数}" 开头（见 license.rs activate）。 */
 function parseRetryAfter(message: string): number {
   if (!message) return 0;
+  const prefixed = message.match(/rate[_\s-]*limited[^0-9]{0,12}(\d{1,5})/i);
+  if (prefixed) return parseInt(prefixed[1], 10);
   const explicit = message.match(/retry[_\s-]*after[^0-9]{0,12}(\d{1,5})/i);
   if (explicit) return parseInt(explicit[1], 10);
   const plain = message.match(/(\d{1,5})\s*(?:秒|seconds?|s)\b/i);
@@ -16,10 +19,11 @@ function parseRetryAfter(message: string): number {
   return 0;
 }
 
+/** 服务端方案名展示（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
 const PLAN_LABEL: Record<string, string> = {
-  free: "Free",
-  pro: "Pro",
-  team: "Team",
+  free: "试用版 (Trial)",
+  pro: "Pro 订阅版",
+  team: "终身买断版 (永久)",
 };
 
 /** 展示当前方案：优先服务端 plan 字段（free/pro/team），回落到授权类型 */
@@ -30,10 +34,25 @@ function planLabel(e: Entitlement): string {
   return "—";
 }
 
+/** Unix 秒 → "YYYY-MM-DD HH:mm"（本地时区） */
+function formatExpiry(secs: number): string {
+  const d = new Date(secs * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 距到期不足 3 天（用于「即将到期」黄色提醒） */
+function expiringSoon(secs: number | null): boolean {
+  if (!secs) return false;
+  const diff = secs * 1000 - Date.now();
+  return diff > 0 && diff < 3 * 86_400_000;
+}
+
 function expiryText(e: Entitlement): string {
-  if (e.kind === "lifetime" && !e.expiresAt) return "永久有效";
+  // 买断版永久有效：expires_at 为 null
+  if (e.plan === "team" || (e.kind === "lifetime" && !e.expiresAt)) return "永久有效";
   if (!e.expiresAt) return "—";
-  return new Date(e.expiresAt * 1000).toLocaleDateString();
+  return formatExpiry(e.expiresAt);
 }
 
 /// 激活 Pro 弹窗：License Key + 邮箱（全平台统一；不提供商店内购）
@@ -64,12 +83,20 @@ export function ActivateProModal({
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
   const counting = retryAfter > 0;
 
-  // License Key 激活（邮箱可选，激活时提交）
+  // License Key 激活：服务端强制「Key + 注册邮箱」联合校验，两者均为必填
   const submitLicense = async () => {
-    if (busy || counting || !licenseKey.trim()) return;
-    if (email.trim() && !emailOk) return;
+    if (busy || counting) return;
+    // 本地必填/格式校验：缺项绝不打服务端，避免白白触发 3 次防爆破锁定
+    if (!licenseKey.trim() || !email.trim()) {
+      toast.error("请输入完整的 License Key 和注册账号邮箱（两者均为必填项）");
+      return;
+    }
+    if (!emailOk) {
+      toast.error("邮箱格式不正确，请检查后重试");
+      return;
+    }
     setBusy(true);
-    const ok = await activate(licenseKey.trim(), email.trim() || undefined);
+    const ok = await activate(licenseKey.trim(), email.trim());
     setBusy(false);
     if (ok) {
       toast.success("Pro 已激活，高级功能全部解锁");
@@ -82,7 +109,7 @@ export function ActivateProModal({
       toast.error(
         wait > 0
           ? `激活尝试过于频繁，请 ${wait} 秒后重试`
-          : (error ?? "激活失败，请检查 License Key 与邮箱")
+          : (error ?? "激活失败，请检查 License Key 与注册邮箱")
       );
     }
   };
@@ -119,8 +146,13 @@ export function ActivateProModal({
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-gray-400">到期时间</span>
-                <span className="font-medium tabular-nums text-gray-100">
+                <span className="flex items-center gap-1.5 font-medium tabular-nums text-gray-100">
                   {expiryText(activated)}
+                  {expiringSoon(activated.expiresAt) && (
+                    <span className="text-[11px] font-normal text-yellow-400">
+                      即将到期
+                    </span>
+                  )}
                 </span>
               </div>
             </div>
@@ -138,10 +170,10 @@ export function ActivateProModal({
               <h3 className="text-base font-semibold">激活授权</h3>
             </div>
 
-            {/* License Key + 邮箱（可选） */}
+            {/* License Key + 注册邮箱（联合校验，均为必填） */}
             <div className="space-y-3">
               <div className="space-y-1.5">
-                <label className="text-xs text-gray-400">License Key</label>
+                <label className="text-xs text-gray-400">License Key（必填）</label>
                 <input
                   type="text"
                   value={licenseKey}
@@ -153,12 +185,12 @@ export function ActivateProModal({
                 />
               </div>
               <div className="space-y-1.5">
-                <label className="text-xs text-gray-400">邮箱（可选）</label>
+                <label className="text-xs text-gray-400">注册邮箱（必填）</label>
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="you@example.com"
+                  placeholder="请输入获取授权时绑定的账号邮箱"
                   autoComplete="email"
                   className="w-full rounded-lg border border-white/5 bg-surface-hover px-4 py-2 text-sm outline-none focus:border-accent"
                 />
@@ -167,7 +199,8 @@ export function ActivateProModal({
                 )}
               </div>
               <p className="text-xs text-gray-500">
-                邮箱为可选，用于授权校验；若该 License Key 需邮箱验证，请填写购买时预留的邮箱。激活成功后本页将自动显示订阅信息。
+                请输入您的 License Key 与注册账号邮箱完成设备绑定（支持试用版 /
+                Pro 订阅 / 终身买断授权）。
               </p>
               <p className="text-[11px] text-gray-600">
                 激活失败时请记下提示中的错误码，可在官网帮助中心按错误码查询具体原因。
@@ -185,7 +218,8 @@ export function ActivateProModal({
                     busy ||
                     counting ||
                     !licenseKey.trim() ||
-                    (email.trim() !== "" && !emailOk)
+                    !email.trim() ||
+                    !emailOk
                   }
                   className="flex items-center gap-1 rounded-lg bg-accent px-5 py-2 text-sm transition-colors hover:bg-accent-hover disabled:opacity-50"
                 >

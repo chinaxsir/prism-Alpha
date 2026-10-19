@@ -629,6 +629,15 @@ pub fn build(
         );
     }
 
+    // 官网域名强制直连（最高优先级）：官方站点用于授权激活/续费与客户端下载，
+    // 经节点在部分机场会被 CDN 或上游策略拦截，表现为「开代理后官网打不开」。
+    // 置于 clash_mode（全局/直连）与内置 geosite 规则之前，确保任何出站模式下
+    // 官网始终可访问；域名后缀匹配零解析开销，不影响其它流量分流。
+    route_rules.insert(
+        0,
+        json!({ "domain_suffix": ["askcn.de"], "outbound": "direct" }),
+    );
+
     // 校验策略组引用，剔除悬空目标
     // 注意：必须用 get_mut 探测，直接 outbound["outbounds"] 可变索引会给
     // 普通节点出站插入 "outbounds": null，导致 sing-box 报 unknown field

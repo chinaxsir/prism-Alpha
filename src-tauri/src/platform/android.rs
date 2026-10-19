@@ -38,16 +38,40 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
     f(&mut guard)
 }
 
-/// JNI 调用返回 Err 时清理当前线程挂起的 Java 异常：
-/// 防止下次复用同一线程调用 JNI 时触发 CheckJNI SIGABRT 闪退。
+/// JNI 调用返回 Err 时提取并清理当前线程挂起的 Java 异常：
+/// 1) 先取出异常对象（Java `Throwable`），再 `exception_describe` 把完整异常栈
+///    打到 logcat，随后 `exception_clear` 清除挂起异常——避免下次复用同一线程
+///    调用 JNI 时触发 CheckJNI SIGABRT 闪退；
+/// 2) 清除后仍可安全地对异常对象调用 `getMessage()`，把真实 Java 报错文本带出，
+///    不再只返回模糊的 "Java exception was thrown"。
 fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
+    let mut detail: Option<String> = None;
     if env.exception_check().unwrap_or(false) {
-        // 将 Java 异常栈输出到 adb logcat 方便调试
+        // 先取异常对象（Java Throwable），再打印完整栈到 logcat，随后清除挂起异常
+        let throwable = env.exception_occurred().ok();
         let _ = env.exception_describe();
-        // 关键：清除当前线程挂起的 Java 异常
         let _ = env.exception_clear();
+        // 清除后仍可对该异常对象调用 getMessage()，取出真实 Java 报错文本
+        if let Some(t) = throwable {
+            if let Ok(v) = env.call_method(t, "getMessage", "()Ljava/lang/String;", &[]) {
+                if let Ok(obj) = v.l() {
+                    if !obj.is_null() {
+                        if let Ok(s) = env.get_string((&obj).into()) {
+                            let m: String = s.into();
+                            let m = m.trim().to_string();
+                            if !m.is_empty() {
+                                detail = Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    format!("{step}: {err}")
+    match detail {
+        Some(m) => format!("{step}: {m}"),
+        None => format!("{step}: {err}"),
+    }
 }
 
 /// 平台初始化（Tauri setup 中调用）：注册原生方法 + libbox C 回调

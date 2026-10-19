@@ -148,12 +148,25 @@ class PrismVpnService : VpnService() {
             manager.createNotificationChannel(channel)
         }
 
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Prism")
-            .setContentText("VPN 已连接")
-            .setSmallIcon(R.mipmap.ic_launcher_foreground)
-            .setOngoing(true)
-            .build()
+        // Notification.Builder(Context, String) 为 API 26(Android 8.0) 起新增构造器，
+        // minSdk=24，Android 7.x 直接调用会抛 NoSuchMethodError 导致前台服务崩溃，
+        // 故按系统版本选择构造器。
+        @Suppress("DEPRECATION")
+        val notification: Notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("Prism")
+                .setContentText("VPN 已连接")
+                .setSmallIcon(R.mipmap.ic_launcher_foreground)
+                .setOngoing(true)
+                .build()
+        } else {
+            Notification.Builder(this)
+                .setContentTitle("Prism")
+                .setContentText("VPN 已连接")
+                .setSmallIcon(R.mipmap.ic_launcher_foreground)
+                .setOngoing(true)
+                .build()
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(

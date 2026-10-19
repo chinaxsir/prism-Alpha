@@ -414,6 +414,18 @@ async fn error_message(resp: reqwest::Response) -> String {
     }
 }
 
+/// 激活失败时按 HTTP 状态码给出精准的用户提示（对齐 api-license-activate.md §1/§4.5）：
+/// - 400 invalid_input：本地参数问题，给出可比对的固定文案；
+/// - 409 seat_limit_reached：席位已满，提示解绑旧设备；
+/// - 其余（含 403 activation_failed）：透传服务端更具体的 message + 错误码。
+fn activation_error(http: u16, server_message: String) -> String {
+    match http {
+        400 => "请求参数格式错误：请检查 License Key（ASKC- 开头）与邮箱格式是否正确".into(),
+        409 => "当前授权绑定设备数已达上限（试用版 1 台 / Pro 3 台 / 买断版 5 台），请前往官网用户面板解绑旧设备后重试".into(),
+        _ => server_message,
+    }
+}
+
 /// 从 429 响应体提取 retry_after（秒）；缺失/非法时回退 30
 async fn retry_after_secs(resp: reqwest::Response) -> i64 {
     let body: Value = resp.json().await.unwrap_or(Value::Null);
@@ -445,11 +457,14 @@ async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<Stat
 
 // ---------------- 状态映射 ----------------
 
-/// 将新协议响应映射为本地授权状态（沿用现有枚举语义，不新增枚举值）：
-/// - plan 为 pro/team 且未过期 → active
-/// - plan 为其他值（free 等）→ inactive（无 Pro 权益，保留缓存供后续状态轮询）
-/// - 服务端 status=expired 或 expires_at 已过 → expired
-/// - expires_at 存在 → subscription，否则 lifetime
+/// 将新协议响应映射为本地授权状态（沿用现有枚举语义，不新增枚举值）。
+///
+/// 调用方均已在「服务端认定凭证有效」的前提下调用本函数
+/// （activate 已校验 `ok=true`；status 已校验 `valid=true`）：
+/// - `free` 为合法试用版方案（1 席位，带 expires_at），与 `pro`（订阅）/
+///   `team`（买断）同为「有效授权」，一律映射 active —— 严禁把 free 判为 inactive；
+/// - 服务端 status=expired 或 expires_at 已过 → expired；
+/// - plan 为 team → lifetime（永久），其余 → subscription。
 fn map_entitlement(
     plan: &str,
     server_status: &str,
@@ -458,27 +473,19 @@ fn map_entitlement(
     used_seats: Option<u32>,
     sync_available: bool,
 ) -> EntitlementStatus {
-    let unlocked = plan == "pro" || plan == "team";
-    let expired = expires_at.map(|exp| exp <= now_secs()).unwrap_or(false) || server_status == "expired";
-    let status = if !unlocked {
-        "inactive"
-    } else if expired {
-        "expired"
-    } else {
-        "active"
-    };
+    let expired =
+        server_status == "expired" || expires_at.map(|exp| exp <= now_secs()).unwrap_or(false);
+    let status = if expired { "expired" } else { "active" };
     EntitlementStatus {
         status: status.into(),
-        kind: unlocked
-            .then(|| if expires_at.is_some() { "subscription" } else { "lifetime" })
-            .map(Into::into),
+        kind: Some(if plan == "team" { "lifetime" } else { "subscription" }.into()),
         expires_at,
         source: Some("code".into()),
         last_verified_at: now_secs(),
         plan: (!plan.is_empty()).then(|| plan.to_string()),
         max_seats,
         used_seats,
-        sync_available: unlocked && sync_available,
+        sync_available,
     }
 }
 
@@ -549,18 +556,26 @@ pub async fn activate(
     code: &str,
     email: &str,
 ) -> Result<EntitlementStatus> {
+    // 输入预处理：Key 去首尾空格并统一大写，邮箱去首尾空格并统一小写
+    // （与服务端 Key+邮箱联合校验的口径一致，避免大小写/空格导致 403）。
     let email = email.trim().to_lowercase();
+    let license_key = code.trim().to_uppercase();
+
+    // 本地必填校验：License Key 与注册邮箱缺一不可。绝不在缺项时向服务端发请求——
+    // 服务端对「邮箱不匹配」的失败同样计数，连续 3 次将触发 60 秒指数级临时锁定。
+    if license_key.is_empty() || email.is_empty() || !email.contains('@') {
+        bail!("请输入完整的 License Key 和注册账号邮箱（两者均为必填项）");
+    }
     if !valid_email(&email) {
-        bail!("请输入有效的邮箱地址");
+        bail!("请输入有效的邮箱地址（格式如 you@example.com）");
     }
     let base = server_base(settings);
     let device_id_str = device_id(data_dir)?;
-    let license_key = code.trim();
 
     let resp = post_with_fallback(
         &format!("{base}/api/license/activate"),
         &serde_json::json!({
-            "license_key": license_key,
+            "license_key": license_key.clone(),
             "email": email,
             "device_id": device_id_str,
             "device_name": device_name(),
@@ -575,9 +590,11 @@ pub async fn activate(
         let secs = retry_after_secs(resp).await;
         bail!("rate_limited:{secs}");
     }
-    // 401 无效/停用、409 设备已绑定等冲突，以及其他非 2xx
+    // 400/403/409 等按状态码给出精准文案（403 透传服务端 message + 错误码）
     if !resp.status().is_success() {
-        bail!(error_message(resp).await);
+        let http = resp.status().as_u16();
+        let msg = error_message(resp).await;
+        bail!(activation_error(http, msg));
     }
     let data: ActivateResponse = resp.json().await?;
     if !data.ok {
@@ -594,7 +611,7 @@ pub async fn activate(
         None,
         data.sync_available,
     );
-    match fetch_status(&base, license_key).await {
+    match fetch_status(&base, &license_key).await {
         Ok(s) if s.valid => {
             ent = map_entitlement(
                 &s.plan,

@@ -58,14 +58,14 @@ const STATUS_META: Record<
   offline: { label: "离线待校验", dot: "bg-yellow-400" },
   expired: { label: "已过期", dot: "bg-latency-bad" },
   revoked: { label: "已吊销", dot: "bg-latency-bad" },
-  inactive: { label: "未授权", dot: "bg-gray-500" },
+  inactive: { label: "未激活", dot: "bg-gray-500" },
 };
 
-/** 服务端方案名展示（与 /api/license/status 的 plan 字段一致） */
+/** 服务端方案名展示（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
 const PLAN_LABEL: Record<string, string> = {
-  free: "Free",
-  pro: "Pro",
-  team: "Team",
+  free: "试用版 (Trial)",
+  pro: "Pro 订阅版",
+  team: "终身买断版 (永久)",
 };
 
 function planText(plan: string | null, kind: string | null): string {
@@ -78,6 +78,30 @@ function planText(plan: string | null, kind: string | null): string {
 function fmtDate(secs: number | null): string {
   if (!secs) return "—";
   return new Date(secs * 1000).toLocaleDateString();
+}
+
+/** Unix 秒 → "YYYY-MM-DD HH:mm"（本地时区），用于展示授权到期时间 */
+function fmtDateTime(secs: number | null): string {
+  if (!secs) return "—";
+  const d = new Date(secs * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 距到期不足 3 天（用于「即将到期」黄色提醒） */
+function expiringSoon(secs: number | null): boolean {
+  if (!secs) return false;
+  const diff = secs * 1000 - Date.now();
+  return diff > 0 && diff < 3 * 86_400_000;
+}
+
+/** 主标题右侧状态标签：激活后按档位显示，未激活沿用状态文案 */
+function statusText(plan: string | null, status: EntitlementState): string {
+  if (status !== "active") return STATUS_META[status].label;
+  if (plan === "team") return "买断版 · 永久有效";
+  if (plan === "pro") return "Pro 订阅 · 已激活";
+  if (plan === "free") return "试用版 · 已激活";
+  return "已激活";
 }
 
 /// 接入模式图标
@@ -986,7 +1010,7 @@ export default function Settings() {
             <span
               className={`inline-block w-1.5 h-1.5 rounded-full ${STATUS_META[entitlement.status].dot}`}
             />
-            {STATUS_META[entitlement.status].label}
+            {statusText(entitlement.plan, entitlement.status)}
           </span>
         }
       >
@@ -1042,9 +1066,17 @@ export default function Settings() {
               iconBg="bg-white/5"
               title="到期时间"
               value={
-                entitlement.kind === "lifetime" && !entitlement.expiresAt
-                  ? "永久有效"
-                  : fmtDate(entitlement.expiresAt)
+                <span className="flex items-center gap-1.5">
+                  {entitlement.plan === "team" ||
+                  (entitlement.kind === "lifetime" && !entitlement.expiresAt)
+                    ? "永久有效"
+                    : fmtDateTime(entitlement.expiresAt)}
+                  {expiringSoon(entitlement.expiresAt) && (
+                    <span className="text-[11px] text-yellow-400">
+                      即将到期
+                    </span>
+                  )}
+                </span>
               }
             />
             {entitlement.maxSeats != null && (
@@ -1086,9 +1118,42 @@ export default function Settings() {
           </>
         ) : (
           <>
-            <div className="px-3 py-3 text-xs leading-relaxed text-gray-500 border-b border-white/5">
-              输入 License Key 激活后，解锁多订阅、连接管理、规则自定义等 Pro
-              功能。授权联网校验，激活即绑定本机设备。
+            <div className="space-y-2 border-b border-white/5 px-3 py-3">
+              <div className="text-xs font-medium text-gray-200">
+                解锁 Prism Pro 全场景智联权益
+              </div>
+              <ul className="space-y-1 text-[11px] leading-relaxed text-gray-500">
+                <li>
+                  •{" "}
+                  <span className="font-medium text-gray-300">
+                    Go AIM 智选引擎
+                  </span>
+                  ：实时探测并自动锁定解锁 ChatGPT、Claude、Netflix 等平台的最低延迟节点
+                </li>
+                <li>
+                  •{" "}
+                  <span className="font-medium text-gray-300">
+                    Go Lan 回家内网
+                  </span>
+                  ：外网科学加速的同时，自动建立加密隧道直通家中 NAS 与局域网设备
+                </li>
+                <li>
+                  •{" "}
+                  <span className="font-medium text-gray-300">
+                    Go Cus 模块中心
+                  </span>
+                  ：全面兼容主流客户端的覆写、URL 重定向、MitM 解密与脚本引擎
+                </li>
+                <li>
+                  •{" "}
+                  <span className="font-medium text-gray-300">多端云同步</span>
+                  ：Pro 订阅与买断版支持跨设备实时静默同步订阅链接
+                </li>
+              </ul>
+              <div className="border-t border-white/5 pt-1 text-[11px] text-gray-500/80">
+                支持试用版（1 台）、Pro 订阅（3 台）与终身买断（5 台）。凭 License
+                Key 与注册邮箱联合验证，激活即自动绑定本机设备 ID。
+              </div>
             </div>
             <div className="flex flex-wrap gap-2 px-3 py-3">
               <button
