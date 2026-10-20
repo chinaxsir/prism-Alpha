@@ -24,6 +24,9 @@ pub struct CoreStatusDto {
     pub status: CoreStatus,
     pub mode: RunMode,
     pub uptime_secs: u64,
+    /// 连接起始 Unix 毫秒时间戳（IPA-12）：前端亮屏 0ms 差值渲染的时钟基准；
+    /// 未运行时为 null（前端回退由 uptimeSecs 推导）
+    pub started_at_ms: Option<u64>,
     /// 主选择组（route.final 链上最深的 selector；内核未运行时为 None）
     pub main_selector: Option<String>,
     /// 出站模式（规则/全局/直连；Dashboard/Proxies 快捷切换条数据源）
@@ -97,9 +100,18 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     // - 桌面 TUN 模式：非管理员/root 时 tun inbound 必然失败，提前报错
     // - 移动端：系统 VPN 授权（Android VpnService.prepare）。
     //   未授权时返回 false，前端提示用户在系统弹窗中允许后重试
+    //   （IPA-12 2.3：ensurePermission 内部经 runOnUiThread 弹窗 + latch
+    //   阻塞等待最长 60s，必须放 spawn_blocking，防止卡死 Tokio worker）
     #[cfg(any(target_os = "ios", target_os = "android"))]
-    if !crate::platform::ensure_vpn_permission().map_err(|e| sanitize_err(&e.to_string()))? {
-        return Err("需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into());
+    {
+        let granted =
+            tauri::async_runtime::spawn_blocking(crate::platform::ensure_vpn_permission)
+                .await
+                .map_err(|e| format!("VPN 授权检查任务异常退出: {e}"))?
+                .map_err(|e| sanitize_err(&e.to_string()))?;
+        if !granted {
+            return Err("需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into());
+        }
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     if mode == RunMode::Tun && !crate::platform::has_elevated_privilege() {
@@ -633,6 +645,7 @@ pub async fn get_core_status(state: State<'_, AppState>) -> Result<CoreStatusDto
         status: *state.status.read(),
         mode: *state.mode.read(),
         uptime_secs,
+        started_at_ms: *state.started_at_ms.read(),
         main_selector: state.main_selector.read().clone(),
         outbound_mode: state.settings.read().outbound_mode,
     })

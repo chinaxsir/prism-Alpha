@@ -207,6 +207,11 @@ pub struct AppState {
     pub settings: RwLock<UserSettings>,
     /// 本次启动时间（用于计算 uptime）
     pub started_at: RwLock<Option<Instant>>,
+    /// 连接起始 Unix 毫秒时间戳（IPA-12）：前端亮屏第一帧用
+    /// Date.now() - startedAtMs 差值渲染时长，实现 0ms 瞬时同步。
+    /// iOS 上优先采用系统 nesessionmanagerd 维护的 connectedDate
+    /// （不受 App 挂起/锁屏影响）；仅 Running 态存在，停止/出错清空
+    pub started_at_ms: RwLock<Option<u64>>,
     pub kernel_handle: RwLock<Option<Arc<super::kernel::KernelHandle>>>,
     /// TUN 生命周期守卫（仅 TUN 模式下存在）
     pub tun_guard: RwLock<Option<super::tun::TunGuard>>,
@@ -269,6 +274,7 @@ impl AppState {
             mode: RwLock::new(mode),
             settings: RwLock::new(settings),
             started_at: RwLock::new(None),
+            started_at_ms: RwLock::new(None),
             kernel_handle: RwLock::new(None),
             tun_guard: RwLock::new(None),
             api_addr: RwLock::new(super::kernel::PREFERRED_API_ADDR.to_string()),
@@ -430,6 +436,23 @@ impl AppState {
         *self.status.write() = next;
         tracing::info!("core state: {:?} -> {:?}", current, next);
 
+        // IPA-12：进入 Running 时记录连接起始 Unix 毫秒时间戳（前端基准时钟）。
+        // iOS 优先使用系统级 connectedDate（prism_ios_vpn_connected_timestamp，
+        // 由 nesessionmanagerd 维护，不受 App 挂起/锁屏影响）；扩展尚未完成
+        // 建隧时回退本地时钟。停止/出错清空，保证非 Running 态不残留旧值
+        if next == CoreStatus::Running {
+            #[cfg(target_os = "ios")]
+            let started = {
+                let sys = crate::platform::ios::vpn_connected_timestamp_ms();
+                if sys > 0 { sys } else { unix_now_ms() }
+            };
+            #[cfg(not(target_os = "ios"))]
+            let started = unix_now_ms();
+            *self.started_at_ms.write() = Some(started);
+        } else if matches!(next, CoreStatus::Stopped | CoreStatus::Error) {
+            *self.started_at_ms.write() = None;
+        }
+
         // 广播在锁外执行；失败（无监听者）忽略
         let _ = self.app_handle.emit("core://status", self.status_payload());
         Ok(())
@@ -445,13 +468,23 @@ impl AppState {
             .read()
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
+        let started_at_ms = *self.started_at_ms.read();
         serde_json::json!({
             "status": status,
             "mode": mode,
             "uptimeSecs": uptime_secs,
+            "startedAtMs": started_at_ms,
             "mainSelector": main_selector,
         })
     }
+}
+
+/// 当前 Unix 毫秒时间戳（IPA-12 连接起始基准时钟）
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 供 IPC 层使用：判断端口是否可绑定

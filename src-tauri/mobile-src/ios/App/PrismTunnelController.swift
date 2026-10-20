@@ -164,6 +164,21 @@ func prismIosVpnIsConnected() -> Int32 {
     }
 }
 
+/// Rust 启动内核时读取系统级真实连接起始时间戳（IPA-12）：
+/// connectedDate 由系统守护进程 nesessionmanagerd 维护，不受 App 挂起、
+/// 锁屏甚至主 App 重启影响。Rust 在内核进入 Running 时优先采用该值作为
+/// startedAtMs，前端亮屏第一帧即可用 Date.now() 差值 0ms 瞬时同步时长。
+/// 未连接/无法获取时返回 0（Rust 侧回退本地时钟）
+@_cdecl("prism_ios_vpn_connected_timestamp")
+func prismIosVpnConnectedTimestamp() -> Int64 {
+    let status = PrismTunnelController.shared.currentConnectionStatus
+    guard status == .connected || status == .reasserting,
+          let connectedDate = PrismTunnelController.shared.vpnConnectedDate else {
+        return 0
+    }
+    return Int64(connectedDate.timeIntervalSince1970 * 1000.0)
+}
+
 // MARK: - 控制器
 
 final class PrismTunnelController {
@@ -192,6 +207,12 @@ final class PrismTunnelController {
     /// build 157）：activeManager 未启动时视为 invalid
     var currentConnectionStatus: NEVPNStatus {
         activeManager?.connection.status ?? .invalid
+    }
+
+    /// 系统级连接起始时间（IPA-12）：NEVPNConnection.connectedDate 由
+    /// nesessionmanagerd 维护，供 prism_ios_vpn_connected_timestamp 导出
+    var vpnConnectedDate: Date? {
+        activeManager?.connection.connectedDate
     }
 
     /// 巨魔看门狗定时器：连接成功后每 4s 轮询扩展心跳，

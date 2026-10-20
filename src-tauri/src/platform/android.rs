@@ -55,12 +55,14 @@ fn bridge_class() -> Result<&'static GlobalRef> {
     })
 }
 
-/// JNI 调用返回 Err 时提取并清理当前线程挂起的 Java 异常：
+/// JNI 调用返回 Err 时提取并清理当前线程挂起的 Java 异常（IPA-12 2.1）：
 /// 1) 先取出异常对象（Java `Throwable`），再 `exception_describe` 把完整异常栈
 ///    打到 logcat，随后 `exception_clear` 清除挂起异常——避免下次复用同一线程
 ///    调用 JNI 时触发 CheckJNI SIGABRT 闪退；
-/// 2) 清除后仍可安全地对异常对象调用 `getMessage()`，把真实 Java 报错文本带出，
-///    不再只返回模糊的 "Java exception was thrown"。
+/// 2) 清除后仍可安全地对异常对象调用 `toString()`，把「异常类名 + 消息」
+///    完整带出（如 java.lang.NoSuchMethodError: ...ensurePermission），
+///    不再只返回模糊的 "Java exception was thrown"；
+/// 3) `toString()` 失败时回退 `getMessage()`，仍无内容则退回原始 jni 错误文本。
 fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
     let mut detail: Option<String> = None;
     if env.exception_check().unwrap_or(false) {
@@ -68,19 +70,25 @@ fn jni_err(env: &mut JNIEnv, step: &str, err: jni::errors::Error) -> String {
         let throwable = env.exception_occurred().ok();
         let _ = env.exception_describe();
         let _ = env.exception_clear();
-        // 清除后仍可对该异常对象调用 getMessage()，取出真实 Java 报错文本
+        // 清除后仍可对该异常对象取文本：优先 toString()（含异常类名与完整描述）
         if let Some(t) = throwable {
-            if let Ok(v) = env.call_method(t, "getMessage", "()Ljava/lang/String;", &[]) {
-                if let Ok(obj) = v.l() {
-                    if !obj.is_null() {
-                        if let Ok(s) = env.get_string((&obj).into()) {
-                            let m: String = s.into();
-                            let m = m.trim().to_string();
-                            if !m.is_empty() {
-                                detail = Some(m);
-                            }
-                        }
-                    }
+            for method in ["toString", "getMessage"] {
+                // 传 &t（借用）：循环内多次调用，禁止按值移动 JThrowable
+                let Ok(v) = env.call_method(&t, method, "()Ljava/lang/String;", &[]) else {
+                    continue;
+                };
+                let Ok(obj) = v.l() else { continue };
+                if obj.is_null() {
+                    continue;
+                }
+                let Ok(s) = env.get_string((&obj).into()) else {
+                    continue;
+                };
+                let m: String = s.into();
+                let m = m.trim().to_string();
+                if !m.is_empty() && m != "null" {
+                    detail = Some(m);
+                    break;
                 }
             }
         }
@@ -115,7 +123,7 @@ fn cache_bridge(env: &mut JNIEnv) -> Result<()> {
         fn_ptr: native_vpn_revoked as *mut std::ffi::c_void,
     }];
     env.register_native_methods(bridge_class()?, &methods)
-        .context("register nativeVpnRevoked")?;
+        .map_err(|e| anyhow!(jni_err(env, "register nativeVpnRevoked", e)))?;
     Ok(())
 }
 

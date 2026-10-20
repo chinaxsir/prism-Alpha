@@ -24,17 +24,19 @@ fn main() {
             for lib in ["resolv", "z"] {
                 println!("cargo:rustc-link-lib={lib}");
             }
-            // prism_ios_vpn_start/stop/is_connected 由主 App Swift（@_cdecl）
-            // 实现，在 Xcode 最终链接 staticlib 时才存在；crate-type 里的
-            // cdylib 会单独链接 libprism_proxy_lib.dylib（CI run 37707763501
-            // 实证 Undefined symbols → exit 65）。用 ld64 -U 只放行这三个
+            // prism_ios_vpn_start/stop/is_connected/connected_timestamp 由主 App
+            // Swift（@_cdecl）实现，在 Xcode 最终链接 staticlib 时才存在；crate-type
+            // 里的 cdylib 会单独链接 libprism_proxy_lib.dylib（CI run 37707763501
+            // 实证 Undefined symbols → exit 65）。用 ld64 -U 只放行这四个
             // 符号（dylib 在 iOS 真机构建中从不被加载，真实解析仍由 Xcode
             // 链接期强校验；is_connected 为 build 157 状态轮询新增，
-            // CI run 38753559779 实证缺它会 Undefined symbols）
+            // CI run 38753559779 实证缺它会 Undefined symbols；
+            // connected_timestamp 为 IPA-12 零延迟时长同步新增）
             for sym in [
                 "_prism_ios_vpn_start",
                 "_prism_ios_vpn_stop",
                 "_prism_ios_vpn_is_connected",
+                "_prism_ios_vpn_connected_timestamp",
             ] {
                 println!("cargo:rustc-link-arg=-Wl,-U,{sym}");
             }

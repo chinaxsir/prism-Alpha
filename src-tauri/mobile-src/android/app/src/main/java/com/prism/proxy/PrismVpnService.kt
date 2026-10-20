@@ -14,6 +14,9 @@ import org.json.JSONObject
 
 // Prism 系统 VPN 服务：建立 TUN 并把文件描述符交给 Go libbox。
 // 参考 sing-box 官方 Android 实现 VPNService.kt。
+// @Keep（IPA-12 2.2）：openTun/shutdown 由 Rust 经 JNI 反射调用，
+// R8 裁剪/改名将导致真机 NoSuchMethodError
+@androidx.annotation.Keep
 class PrismVpnService : VpnService() {
 
     companion object {
@@ -35,7 +38,8 @@ class PrismVpnService : VpnService() {
         return START_STICKY
     }
 
-    // 由 Go（经 JNI）在 libbox 启动时调用
+    // 由 Go（经 JNI）在 libbox 启动时调用（IPA-12 2.2：@Keep 防 R8 裁剪）
+    @androidx.annotation.Keep
     fun openTun(optionsJson: String): Int {
         val options = JSONObject(optionsJson)
         val builder = Builder()
@@ -168,14 +172,26 @@ class PrismVpnService : VpnService() {
                 .build()
         }
 
+        // Android 14+（API 34）必须显式声明前台服务类型；部分国产定制 ROM 对
+        // SYSTEM_EXEMPTED 校验过严可能抛异常，逐级 try-catch 兜底降级（IPA-12 2.4）：
+        // 先按 SYSTEM_EXEMPTED 前台化，失败则退回无类型 startForeground——
+        // 任何路径都不允许让服务启动直接闪退
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
-            )
-        } else {
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
+                )
+                return
+            } catch (_: Throwable) {
+                // fallthrough 到无类型前台化
+            }
+        }
+        try {
             startForeground(NOTIFICATION_ID, notification)
+        } catch (_: Throwable) {
+            Log.e(TAG, "startForeground failed on all paths")
         }
     }
 }

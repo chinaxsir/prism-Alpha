@@ -5,9 +5,9 @@
  * gen/android 由 CLI 在 CI/本地现生成（不入库），因此所有定制必须
  * 在 init 之后经本脚本幂等注入：
  *   1. 拷贝 mobile-src/android（PrismVpnBridge / PrismVpnService）
- *   2. MainActivity.kt 增加 PrismVpnBridge.attach(this)
+ *   2. MainActivity.kt 增加 PrismVpnBridge.attach(this) 与 @Keep
  *   3. AndroidManifest.xml 增加 BIND_VPN_SERVICE/前台服务权限与 VPN Service
- *   4. proguard-rules.pro 增加 JNI 防裁剪与防混淆规则
+ *   4. proguard-rules.pro 增加 JNI 防裁剪与防混淆规则（IPA-12 2.2）
  */
 const fs = require('fs')
 const path = require('path')
@@ -35,7 +35,7 @@ function copyDir(from, to) {
 copyDir(SRC, GEN)
 console.log('[inject-android-vpn] copied mobile-src/android -> gen/android')
 
-// 2. MainActivity 注入 attach
+// 2. MainActivity 注入 attach 与 @Keep
 function patchMainActivity() {
   const rel = path.join('app', 'src', 'main', 'java', 'com', 'prism', 'proxy', 'MainActivity.kt')
   const file = path.join(GEN, rel)
@@ -44,21 +44,33 @@ function patchMainActivity() {
     process.exit(1)
   }
   let text = fs.readFileSync(file, 'utf8')
-  if (text.includes('PrismVpnBridge.attach')) {
-    console.log('[inject-android-vpn] MainActivity already patched')
-    return
+  let touched = false
+  if (!text.includes('PrismVpnBridge.attach')) {
+    const initBlock = '    init { PrismVpnBridge.attach(this) }'
+    const brace = text.indexOf('{')
+    if (brace >= 0) {
+      text = text.slice(0, brace + 1) + '\n' + initBlock + text.slice(brace + 1)
+    } else {
+      // class MainActivity : TauriActivity() —— 无类体
+      text = text.replace(/(class\s+MainActivity[^\n]*)/, `$1 {\n${initBlock}\n}`)
+    }
+    touched = true
   }
-
-  const initBlock = '    init { PrismVpnBridge.attach(this) }'
-  const brace = text.indexOf('{')
-  if (brace >= 0) {
-    text = text.slice(0, brace + 1) + '\n' + initBlock + text.slice(brace + 1)
+  // @Keep（IPA-12 2.2）：MainActivity 被 Tauri 宿主/外部反射引用，
+  // Release 构建禁止 R8 裁剪与改名
+  if (!text.includes('@Keep')) {
+    if (!text.includes('import androidx.annotation.Keep')) {
+      text = text.replace(/(package [^\n]+\n)/, `$1\nimport androidx.annotation.Keep\n`)
+    }
+    text = text.replace(/(class\s+MainActivity[^\n{]*)/, '@Keep\n$1')
+    touched = true
+  }
+  if (touched) {
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] MainActivity patched')
   } else {
-    // class MainActivity : TauriActivity() —— 无类体
-    text = text.replace(/(class\s+MainActivity[^\n]*)/, `$1 {\n${initBlock}\n}`)
+    console.log('[inject-android-vpn] MainActivity already patched')
   }
-  fs.writeFileSync(file, text)
-  console.log('[inject-android-vpn] MainActivity patched')
 }
 patchMainActivity()
 
@@ -66,17 +78,13 @@ patchMainActivity()
 function patchManifest() {
   const file = path.join(GEN, 'app', 'src', 'main', 'AndroidManifest.xml')
   let text = fs.readFileSync(file, 'utf8')
-  if (text.includes('PrismVpnService')) {
-    console.log('[inject-android-vpn] AndroidManifest already patched')
-    return
-  }
+  if (!text.includes('PrismVpnService')) {
+    const permissions = [
+      '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
+      '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED"/>',
+    ].join('\n    ')
 
-  const permissions = [
-    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
-    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED"/>',
-  ].join('\n    ')
-
-  const service = `
+    const service = `
         <service
             android:name=".PrismVpnService"
             android:exported="false"
@@ -87,31 +95,68 @@ function patchManifest() {
             </intent-filter>
         </service>`
 
-  if (!text.includes('</application>') || !text.includes('</manifest>')) {
-    console.error('[inject-android-vpn] AndroidManifest 结构异常')
-    process.exit(1)
+    if (!text.includes('</application>') || !text.includes('</manifest>')) {
+      console.error('[inject-android-vpn] AndroidManifest 结构异常')
+      process.exit(1)
+    }
+    text = text.replace('</application>', `${service}\n        </application>`)
+    text = text.replace('</manifest>', `    ${permissions}\n</manifest>`)
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] AndroidManifest patched')
+  } else {
+    console.log('[inject-android-vpn] AndroidManifest already patched')
   }
-  text = text.replace('</application>', `${service}\n        </application>`)
-  text = text.replace('</manifest>', `    ${permissions}\n</manifest>`)
-  fs.writeFileSync(file, text)
-  console.log('[inject-android-vpn] AndroidManifest patched')
+  // IPA-12 2.4：Android 14+ 前台服务类型兼容声明。部分 ROM 校验
+  // SPECIAL_USE 类型时需此权限；systemExempted 主路径不变。
+  // 独立幂等判断，兼容旧版脚本已注入过 service 的工程
+  if (!text.includes('FOREGROUND_SERVICE_SPECIAL_USE')) {
+    text = text.replace(
+      '</manifest>',
+      `    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>\n</manifest>`,
+    )
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] FOREGROUND_SERVICE_SPECIAL_USE added')
+  }
 }
 patchManifest()
 
-// 4. ProGuard 注入防混淆规则（防止 R8 裁剪 JNI 反射调用的 PrismVpnBridge 方法）
+// 4. ProGuard 注入防混淆规则（IPA-12 2.2）
+//
+// 根因：Release 构建启用 R8 后，ensurePermission / startServiceAndWait /
+// openTun / protectSocket 等方法仅由 Rust 经 JNI 反射调用，Kotlin 侧无
+// 直接引用，R8 会将其裁剪或改名（a()/b()），真机首次启动即抛
+// NoSuchMethodError（表现为 "call ensurePermission: Java exception was thrown"）
 function patchProguard() {
   const file = path.join(GEN, 'app', 'proguard-rules.pro')
   let text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
-  if (text.includes('com.prism.proxy.PrismVpnBridge')) {
+  if (text.includes('IPA-12 2.2')) {
     console.log('[inject-android-vpn] proguard-rules.pro already patched')
     return
   }
 
   const rules = `
-# --- Prism VPN JNI Keep Rules ---
+# --- Prism VPN JNI Keep Rules（IPA-12 2.2）---
+# Prism 全部 Kotlin 类（PrismVpnBridge / PrismVpnService / MainActivity）
+# 的成员原样保留：JNI 按名反射调用，禁止裁剪与混淆改名
 -keep class com.prism.proxy.** { *; }
 -keepclassmembers class com.prism.proxy.** { *; }
+# Tauri 宿主层同样被反射与 JNI 引用
+-keep class app.tauri.** { *; }
+-keepclassmembers class app.tauri.** { *; }
+# native 方法名必须与 SO 导出符号严格对应
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+# 标注 @androidx.annotation.Keep 的类/字段/方法强制保留
+-keep class * {
+    @androidx.annotation.Keep *;
+}
+-keepclassmembers class * {
+    @androidx.annotation.Keep <fields>;
+    @androidx.annotation.Keep <methods>;
+}
 -dontwarn com.prism.proxy.**
+-dontwarn app.tauri.**
 `
   fs.writeFileSync(file, text + '\n' + rules)
   console.log('[inject-android-vpn] proguard-rules.pro patched')

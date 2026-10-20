@@ -29,6 +29,8 @@ export interface CoreStatusDto {
   status: CoreStatus;
   mode: RunMode;
   uptimeSecs: number;
+  /** 连接起始 Unix 毫秒时间戳（IPA-12）：亮屏 0ms 差值渲染的时钟基准；未运行时为 null */
+  startedAtMs?: number | null;
   /** 主选择组（route.final 链上最深的 selector；内核未运行时为 null） */
   mainSelector?: string | null;
   /** 出站模式（规则/全局/直连） */

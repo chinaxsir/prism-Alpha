@@ -74,6 +74,7 @@ export default function Dashboard() {
   const downSpeed = useCoreStore((s) => s.downSpeed);
   const memoryUsage = useCoreStore((s) => s.memoryUsage);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
+  const startedAtMs = useCoreStore((s) => s.startedAtMs);
   const traffic = useCoreStore((s) => s.traffic);
   // 今日流量：后端持久化基数 + 当前会话内核绝对累计（前后台不间断）
   const todayBytes = useCoreStore((s) => s.todayBytes);
@@ -159,14 +160,58 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 本地运行时长计时
+  // 本地运行时长时钟（IPA-12）：禁止每秒 +1 计数器（锁屏/切后台时
+  // 系统 WebView 冻结定时器，亮屏后要等下个 tick 才恢复）。改为维护
+  // nowMs 本地时钟，以 250ms 轻量间隔刷新，时长 = (nowMs - startedAtMs)
+  // 差值实时计算；亮屏/回前台第一帧由下方唤醒监听 0ms 校准
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
   useEffect(() => {
     if (!running) return;
-    const timer = setInterval(() => {
-      setUptime(useCoreStore.getState().uptimeSecs + 1);
-    }, 1000);
+    const timer = setInterval(() => setNowMs(Date.now()), 250);
     return () => clearInterval(timer);
-  }, [running, setUptime]);
+  }, [running]);
+
+  // 关键唤醒监听（IPA-12）：亮屏/回前台瞬间第 1 步 0ms 刷新本地时钟
+  // （时长立刻跳到准确值，不等任何异步请求），第 2 步后台静默拉取
+  // 最新状态对齐基准时间戳与流量快照
+  useEffect(() => {
+    const syncClockImmediately = () => {
+      if (document.visibilityState === "visible") {
+        setNowMs(Date.now());
+        getCoreStatus()
+          .then((data) => {
+            const store = useCoreStore.getState();
+            store.setStatus(data.status);
+            store.setMode(data.mode);
+            store.setUptime(data.uptimeSecs);
+            store.syncStartedAt({
+              status: data.status,
+              uptimeSecs: data.uptimeSecs,
+              startedAtMs: data.startedAtMs,
+            });
+            if (data.outboundMode) store.setOutboundMode(data.outboundMode);
+          })
+          .catch(() => undefined);
+      }
+    };
+    document.addEventListener("visibilitychange", syncClockImmediately);
+    window.addEventListener("focus", syncClockImmediately);
+    window.addEventListener("pageshow", syncClockImmediately);
+    return () => {
+      document.removeEventListener("visibilitychange", syncClockImmediately);
+      window.removeEventListener("focus", syncClockImmediately);
+      window.removeEventListener("pageshow", syncClockImmediately);
+    };
+  }, []);
+
+  // 实时展示的已连接秒数：固定公式 nowMs - startedAtMs 差值（IPA-12）；
+  // 基准尚未就绪时回退 store 内 uptimeSecs（启动事件与首次拉取的间隙）
+  const displayUptimeSecs = running
+    ? startedAtMs
+      ? Math.max(0, Math.floor((nowMs - startedAtMs) / 1000))
+      : uptimeSecs
+    : 0;
 
   // 启动时与后端对齐一次状态（含运行模式：权威来源是后端持久化的 settings.json）
   useEffect(() => {
@@ -175,6 +220,11 @@ export default function Dashboard() {
         setStatus(data.status);
         setMode(data.mode);
         setUptime(data.uptimeSecs);
+        useCoreStore.getState().syncStartedAt({
+          status: data.status,
+          uptimeSecs: data.uptimeSecs,
+          startedAtMs: data.startedAtMs,
+        });
         if (data.outboundMode) setOutboundMode(data.outboundMode);
       })
       .catch(() => undefined);
@@ -232,6 +282,7 @@ export default function Dashboard() {
         await stopCore();
         setStatus("stopped");
         setUptime(0);
+        useCoreStore.getState().setStartedAtMs(null);
       } else {
         setStatus("starting");
         await startCore();
@@ -364,7 +415,7 @@ export default function Dashboard() {
                     : t("status.disconnected")}
             </div>
             <div className="text-2xl font-bold tabular-nums text-gray-100">
-              {running ? formatUptime(uptimeSecs) : "Prism"}
+              {running ? formatUptime(displayUptimeSecs) : "Prism"}
             </div>
             {/* 未连接（stopped）时不再显示「点击右侧按钮启动代理」副标题，
                 让左侧仅保留状态圆点与 Prism 标题；启动中仍给出隧道提示 */}

@@ -85,6 +85,9 @@ interface CoreState {
   downSpeed: number;
   memoryUsage: number;
   uptimeSecs: number;
+  /** 连接起始 Unix 毫秒时间戳（IPA-12）：基准时钟，亮屏第一帧用
+      Date.now() 差值 0ms 瞬时同步时长；非运行态为 null */
+  startedAtMs: number | null;
   traffic: TrafficPoint[];
   /** 今日流量（字节）：后端持久化基数 + 当前会话绝对累计，前后台不间断 */
   todayBytes: number;
@@ -100,6 +103,16 @@ interface CoreState {
   setTrafficRate: (up: number, down: number) => void;
   setMemoryUsage: (bytes: number) => void;
   setUptime: (secs: number) => void;
+  setStartedAtMs: (ms: number | null) => void;
+  /** 从后端状态 DTO 对齐 startedAtMs（IPA-12）：running 态优先采用后端
+      startedAtMs，仅有 uptimeSecs 时推导 Date.now() - uptimeSecs*1000；
+      与本地已有基准误差 <2s 时不改写（事件/轮询双源防抖动）。
+      非 running 态直接置 null */
+  syncStartedAt: (dto: {
+    status: CoreStatus;
+    uptimeSecs: number;
+    startedAtMs?: number | null;
+  }) => void;
   setSettings: (s: UserSettings) => void;
   pushTraffic: (up: number, down: number) => void;
   /** 当前会话累计流量（字节），关闭 APP 后清零 */
@@ -124,6 +137,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   downSpeed: 0,
   memoryUsage: 0,
   uptimeSecs: 0,
+  startedAtMs: null,
   traffic: [],
   todayBytes: 0,
   connections: [],
@@ -143,6 +157,27 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   setTrafficRate: (upSpeed, downSpeed) => set({ upSpeed, downSpeed }),
   setMemoryUsage: (memoryUsage) => set({ memoryUsage }),
   setUptime: (uptimeSecs) => set({ uptimeSecs }),
+  setStartedAtMs: (startedAtMs) => set({ startedAtMs }),
+
+  syncStartedAt: (dto) => {
+    if (dto.status !== "running") {
+      if (get().startedAtMs !== null) set({ startedAtMs: null });
+      return;
+    }
+    // 优先后端毫秒时间戳（iOS 为系统级 connectedDate，最精确）；
+    // 旧后端仅有 uptimeSecs 时推导基准
+    let next: number | null = null;
+    if (dto.startedAtMs && dto.startedAtMs > 0) {
+      next = dto.startedAtMs;
+    } else if (dto.uptimeSecs > 0) {
+      next = Date.now() - dto.uptimeSecs * 1000;
+    }
+    if (next === null) return;
+    const cur = get().startedAtMs;
+    // 误差 <2s 保持原基准不抖动（core://status 事件与轮询可能双源到达）
+    if (cur === null || Math.abs(cur - next) > 2000) set({ startedAtMs: next });
+  },
+
   setSettings: (settings) => set({ settings }),
 
   pushTraffic: (up, down) => {
@@ -182,6 +217,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       upSpeed: 0,
       downSpeed: 0,
       memoryUsage: 0,
+      startedAtMs: null,
       connections: [],
       analytics: { hosts: [], outbounds: [], rules: [] },
       sessionTraffic: 0,

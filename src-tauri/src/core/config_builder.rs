@@ -769,16 +769,32 @@ pub fn build(
         if settings.ipv6 {
             tun_addresses.push("fdfe:dcba:9876::1/126");
         }
-        let tun = json!({
+        // Android（IPA-12 2.5）：内核运行于 App 进程内，SELinux 严禁内核
+        // 自行 netlink 改路由/枚举网卡——
+        // - auto_route 仍为 true：libbox 平台接口模式下它只是传给
+        //   OpenTun 回调的选项，由 Kotlin VpnService.Builder（系统合法通道）
+        //   建立 0.0.0.0/0 路由与 DNS；置 false 会导致 VPN 无路由、全断网
+        // - strict_route / interface_name 移除：二者是桌面内核路由语义，
+        //   Android 上要么无意义、要么触发 netlink 权限拒绝；TUN fd 由
+        //   OpenTun 回调返回，路由全部由 VpnService.Builder 配置
+        let mut tun = json!({
             "type": "tun",
             "tag": TUN_TAG,
-            "interface_name": "prism-tun",
             "address": tun_addresses,
             "mtu": 9000,
             "auto_route": true,
-            "strict_route": true,
             "stack": "gvisor",
         });
+        {
+            let obj = tun.as_object_mut().expect("tun inbound is an object");
+            if cfg!(target_os = "android") {
+                obj.remove("strict_route");
+                obj.remove("interface_name");
+            } else {
+                obj.insert("strict_route".into(), json!(true));
+                obj.insert("interface_name".into(), json!("prism-tun"));
+            }
+        }
         inbounds.push(tun);
     }
 
@@ -872,7 +888,12 @@ pub fn build(
         "route": {
             "rules": route_rules,
             "final": final_tag,
-            "auto_detect_interface": true
+            // Android（IPA-12 2.5）：必须关闭——auto_detect_interface 经
+            // netlink 枚举默认网卡并按名绑定，Android 11+ SELinux 拦截普通
+            // 应用的 netlink 操作（permission denied）。出站 socket 保护由
+            // protect 回调（cb_protect → VpnService.protect）完成；桌面/iOS
+            // 维持 true（iOS 无 netlink 实现不会实际触发，保持原状不变）
+            "auto_detect_interface": !cfg!(target_os = "android")
         },
         "experimental": experimental
     });

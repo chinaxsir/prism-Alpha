@@ -88,13 +88,16 @@ export default function App() {
       status: CoreStatus;
       mode: RunMode;
       uptimeSecs: number;
+      startedAtMs?: number | null;
       outboundMode?: OutboundMode;
     }>("core://status", (event) => {
-      const { status, mode, uptimeSecs, outboundMode } = event.payload;
+      const { status, mode, uptimeSecs, startedAtMs, outboundMode } = event.payload;
       const store = useCoreStore.getState();
       store.setStatus(status);
       store.setMode(mode);
       store.setUptime(uptimeSecs);
+      // IPA-12：对齐连接起始基准时钟（亮屏 0ms 差值渲染）
+      store.syncStartedAt({ status, uptimeSecs, startedAtMs });
       if (outboundMode) store.setOutboundMode(outboundMode);
       // 状态切换（启动/停止/重启）后立即对齐一次后端快照
       if (status === "stopped") store.clearRuntime();
@@ -132,10 +135,14 @@ export default function App() {
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
+    // pageshow：移动端系统回退缓存页（bfcache）恢复时 visibilitychange
+    // 可能不触发，pageshow 兜底拉取快照（IPA-12）
+    window.addEventListener("pageshow", onVisible);
     return () => {
       window.clearInterval(id);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
+      window.removeEventListener("pageshow", onVisible);
     };
   }, [refreshRuntime]);
 
@@ -148,6 +155,7 @@ export default function App() {
           const store = useCoreStore.getState();
           store.setStatus("stopped");
           store.setUptime(0);
+          store.setStartedAtMs(null);
           store.clearRuntime();
         })
         .catch(() => undefined);

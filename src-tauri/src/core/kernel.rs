@@ -174,12 +174,23 @@ impl KernelHandle {
         #[cfg(target_os = "android")]
         let (child, pid): (Option<Child>, u32) = {
             let content = std::str::from_utf8(&config_bytes)
-                .map_err(|e| anyhow::anyhow!("内核配置编码错误: {e}"))?;
-            // 先建立前台 VpnService，libbox 才能经回调拿到 TUN fd
-            crate::platform::android::start_service_and_wait()
-                .map_err(|e| anyhow::anyhow!("VPN 服务启动失败: {e}"))?;
-            mobile_ffi::vpn_start(content, &config.work_dir)
-                .map_err(|e| anyhow::anyhow!("VPN 启动失败: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("内核配置编码错误: {e}"))?
+                .to_owned();
+            let kernel_work_dir = config.work_dir.clone();
+            // IPA-12 2.3：startServiceAndWait 内部经 runOnUiThread 拉起前台
+            // 服务并 latch 等待最长 8s，libbox 启动期间还会同步等待回调，
+            // 与 iOS start_tunnel 同理必须放 spawn_blocking，否则 Tokio
+            // worker 被阻塞，前端所有 IPC（状态/切页/事件）全部无响应
+            let started = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::platform::android::start_service_and_wait()
+                    .map_err(|e| anyhow::anyhow!("VPN 服务启动失败: {e}"))?;
+                mobile_ffi::vpn_start(&content, &kernel_work_dir)
+                    .map_err(|e| anyhow::anyhow!("VPN 启动失败: {e}"))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("VPN 启动任务异常退出: {e}"))?;
+            started?;
             tracing::info!("sing-box libbox VPN started in-process");
             (None, std::process::id())
         };
@@ -346,6 +357,7 @@ impl KernelHandle {
                         let _ =
                             state.transition(crate::core::state::CoreStatus::Stopped);
                         *state.started_at.write() = None;
+                        *state.started_at_ms.write() = None;
                     }
                     break;
                 }
