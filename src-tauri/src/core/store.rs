@@ -80,6 +80,15 @@ pub struct TrafficStats {
     pub last_week: u32,
     /// 上次统计的月份（用于判断是否需要重置 month）
     pub last_month: u32,
+    /// 今日日期戳（与 last_date 同款算法，全天一致；用于跨天归零判断）
+    #[serde(default)]
+    pub today_date: String,
+    /// 今日已结束会话累计（字节）
+    #[serde(default)]
+    pub today_archived_bytes: u64,
+    /// 当前会话最新绝对累计值（内核 uploadTotal + downloadTotal）
+    #[serde(default)]
+    pub current_session_bytes: u64,
 }
 
 impl Default for TrafficStats {
@@ -96,8 +105,19 @@ impl Default for TrafficStats {
             last_date: format!("day-{}", days),
             last_week: (days / 7) as u32,
             last_month: ((days / 30) as u32) % 12,
+            today_date: format!("day-{}", days),
+            today_archived_bytes: 0,
+            current_session_bytes: 0,
         }
     }
+}
+
+/// 当前日期戳（与 TrafficStats 的 last_date / today_date 同款算法，保证全天一致）
+fn current_day_stamp() -> String {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("day-{}", (epoch.as_secs() / 86400) as i64)
 }
 
 fn traffic_stats_path(data_dir: &Path) -> PathBuf {
@@ -154,6 +174,57 @@ pub fn add_traffic(data_dir: &Path, up: u64, down: u64) -> anyhow::Result<Traffi
 
     save_traffic_stats(data_dir, &stats)?;
     Ok(stats)
+}
+
+/// 读取当前会话绝对累计值；跨天视为 0（上个会话不计入今日）
+pub fn session_bytes(data_dir: &Path) -> u64 {
+    let stats = load_traffic_stats(data_dir);
+    if stats.today_date != current_day_stamp() {
+        return 0;
+    }
+    stats.current_session_bytes
+}
+
+/// 写入当前会话绝对累计值（内核 /connections 流上报的 uploadTotal+downloadTotal）。
+/// 跨天则把 today_archived_bytes 清零、today_date 重新盖章（上一个会话归属昨日）
+pub fn set_current_session(data_dir: &Path, bytes: u64) -> anyhow::Result<()> {
+    let mut stats = load_traffic_stats(data_dir);
+    let today = current_day_stamp();
+    if stats.today_date != today {
+        stats.today_date = today;
+        stats.today_archived_bytes = 0;
+    }
+    stats.current_session_bytes = bytes;
+    save_traffic_stats(data_dir, &stats)
+}
+
+/// 归档当前会话：把 current_session_bytes 累加进 today_archived_bytes 并归零。
+/// 跨天则清空 archived 与 legacy today_bytes（新的一天从零重新累计）
+pub fn archive_session(data_dir: &Path) -> anyhow::Result<()> {
+    let mut stats = load_traffic_stats(data_dir);
+    let today = current_day_stamp();
+    if stats.today_date != today {
+        stats.today_date = today;
+        stats.today_archived_bytes = 0;
+        stats.today_bytes = 0;
+    } else {
+        stats.today_archived_bytes = stats
+            .today_archived_bytes
+            .saturating_add(stats.current_session_bytes);
+    }
+    stats.current_session_bytes = 0;
+    save_traffic_stats(data_dir, &stats)
+}
+
+/// 今日总流量：today_archived_bytes + current_session_bytes（跨天返回 current_session_bytes）
+pub fn today_total_bytes(data_dir: &Path) -> u64 {
+    let stats = load_traffic_stats(data_dir);
+    if stats.today_date != current_day_stamp() {
+        return stats.current_session_bytes;
+    }
+    stats
+        .today_archived_bytes
+        .saturating_add(stats.current_session_bytes)
 }
 
 fn settings_path(data_dir: &Path) -> PathBuf {

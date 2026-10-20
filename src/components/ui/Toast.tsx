@@ -77,7 +77,7 @@ function ToastCard({ item }: { item: ToastItem }) {
         success
           ? "border-accent/50"
           : info
-            ? "border-white/10"
+            ? "border-border-strong"
             : "border-latency-bad/50",
         visible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-2"
       )}

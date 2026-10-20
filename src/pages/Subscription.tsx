@@ -14,6 +14,7 @@ import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
 import Switch from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
+import { useTranslation } from "@/i18n";
 import { useProStore } from "@/stores/pro";
 import { formatRelativeTime } from "@/utils/time";
 
@@ -27,6 +28,7 @@ function displayName(record: SubscriptionRecord): string {
 }
 
 export default function Subscription() {
+  const { t } = useTranslation();
   const [subs, setSubs] = useState<SubscriptionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [url, setUrl] = useState("");
@@ -42,7 +44,7 @@ export default function Subscription() {
       setSubs(records ?? []);
     } catch (e) {
       console.error("load subscriptions failed:", e);
-      toast.error(`加载订阅列表失败：${String(e)}`);
+      toast.error(t("sub.loadFailed", { error: String(e) }));
     } finally {
       setLoading(false);
     }
@@ -61,7 +63,7 @@ export default function Subscription() {
   const handleAdd = async () => {
     const trimmed = url.trim();
     if (!/^https?:\/\/.+/.test(trimmed)) {
-      toast.error("请输入有效的 http/https 订阅链接");
+      toast.error(t("sub.invalidUrl"));
       return;
     }
     // 免费版仅支持单订阅：第二条起需要 Pro（全平台门控）
@@ -72,7 +74,7 @@ export default function Subscription() {
     setAdding(true);
     try {
       await updateSubscription(trimmed);
-      toast.success("订阅已添加并更新");
+      toast.success(t("sub.added"));
       setUrl("");
       await load();
     } catch (e) {
@@ -88,7 +90,7 @@ export default function Subscription() {
     setUpdatingUrl(record.url);
     try {
       await updateSubscription(record.url);
-      toast.success("订阅已更新");
+      toast.success(t("sub.updated"));
       await load();
     } catch (e) {
       console.error("update subscription failed:", e);
@@ -101,7 +103,7 @@ export default function Subscription() {
   const handleToggle = async (record: SubscriptionRecord) => {
     try {
       await toggleSubscription(record.url, !record.enabled);
-      toast.success(record.enabled ? "订阅已停用" : "订阅已启用");
+      toast.success(t(record.enabled ? "sub.disabled" : "sub.enabled"));
       await load();
     } catch (e) {
       console.error("toggle subscription failed:", e);
@@ -112,7 +114,7 @@ export default function Subscription() {
   const handleDelete = async (record: SubscriptionRecord) => {
     try {
       await deleteSubscription(record.url);
-      toast.success("订阅已删除");
+      toast.success(t("sub.deleted"));
       setConfirmUrl(null);
       await load();
     } catch (e) {
@@ -123,18 +125,18 @@ export default function Subscription() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">订阅</h1>
+      <h1 className="text-2xl font-bold">{t("sub.title")}</h1>
 
       {/* 添加订阅 */}
       <div className="bg-surface-card rounded-xl p-5">
-        <h2 className="text-base font-semibold mb-4">添加订阅</h2>
+        <h2 className="text-base font-semibold mb-4">{t("sub.addTitle")}</h2>
         <div className="flex flex-col gap-3 md:flex-row">
           <input
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="输入订阅 URL（http/https）"
-            className="flex-1 px-4 py-2 rounded-lg bg-surface-hover border border-white/5 focus:border-accent outline-none text-sm"
+            placeholder={t("sub.urlPlaceholder")}
+            className="flex-1 px-4 py-2 rounded-lg bg-surface-hover border border-border focus:border-accent outline-none text-sm"
           />
           <button
             onClick={handleAdd}
@@ -142,7 +144,7 @@ export default function Subscription() {
             className="flex items-center justify-center gap-2 px-6 py-2 rounded-lg bg-accent hover:bg-accent-hover transition-colors text-sm disabled:opacity-50"
           >
             {adding && <Spinner size={14} className="text-white" />}
-            {adding ? "添加中…" : "添加并更新"}
+            {adding ? t("sub.adding") : t("sub.addAndUpdate")}
           </button>
         </div>
       </div>
@@ -150,7 +152,7 @@ export default function Subscription() {
       {/* 订阅列表 */}
       <div className="bg-surface-card rounded-xl p-5">
         <h2 className="text-base font-semibold mb-4">
-          我的订阅（{subs.length}）
+          {t("sub.myList", { count: subs.length })}
         </h2>
 
         {loading ? (
@@ -160,8 +162,8 @@ export default function Subscription() {
         ) : subs.length === 0 ? (
           <EmptyState
             icon={<Rss size={32} />}
-            title="暂无订阅"
-            description="添加订阅链接后即可拉取节点，免费版支持单订阅，Pro 支持多订阅"
+            title={t("sub.emptyTitle")}
+            description={t("sub.emptyDesc")}
           />
         ) : (
           <div className="space-y-3">
@@ -177,7 +179,7 @@ export default function Subscription() {
                     </span>
                     {record.enabled && (
                       <span className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
-                        已启用
+                        {t("sub.badgeEnabled")}
                       </span>
                     )}
                   </div>
@@ -185,9 +187,11 @@ export default function Subscription() {
                     {record.url}
                   </div>
                   <div className="mt-1 text-[11px] text-gray-500">
-                    更新于 {formatRelativeTime(record.updatedAt)}
+                    {t("sub.updatedAt", { time: formatRelativeTime(record.updatedAt) })}
                     {record.nodeCount != null && (
-                      <span className="ml-2">{record.nodeCount} 个节点</span>
+                      <span className="ml-2">
+                        {t("sub.nodes", { count: record.nodeCount })}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -197,7 +201,7 @@ export default function Subscription() {
                   <Switch
                     checked={record.enabled}
                     onChange={() => handleToggle(record)}
-                    title={record.enabled ? "点击停用" : "点击启用"}
+                    title={t(record.enabled ? "sub.toggleDisable" : "sub.toggleEnable")}
                   />
                   <button
                     onClick={() => handleUpdate(record)}
@@ -209,7 +213,7 @@ export default function Subscription() {
                     ) : (
                       <RefreshCw size={12} />
                     )}
-                    更新
+                    {t("sub.update")}
                   </button>
 
                   {confirmUrl === record.url ? (
@@ -218,13 +222,13 @@ export default function Subscription() {
                         onClick={() => handleDelete(record)}
                         className="rounded-lg bg-latency-bad/20 px-3 py-1.5 text-xs text-latency-bad hover:bg-latency-bad/30"
                       >
-                        确认删除
+                        {t("sub.confirmDelete")}
                       </button>
                       <button
                         onClick={() => setConfirmUrl(null)}
                         className="rounded-lg bg-surface-card px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200"
                       >
-                        取消
+                        {t("common.cancel")}
                       </button>
                     </>
                   ) : (
@@ -233,7 +237,7 @@ export default function Subscription() {
                       className="flex items-center gap-1.5 rounded-lg bg-surface-card px-3 py-1.5 text-xs text-gray-400 hover:text-latency-bad"
                     >
                       <Trash2 size={12} />
-                      删除
+                      {t("common.delete")}
                     </button>
                   )}
                 </div>

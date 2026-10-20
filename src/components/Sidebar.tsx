@@ -8,19 +8,22 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 
+import { useTranslation } from "@/i18n";
+
 export const navItems = [
-  { to: "/dashboard", icon: LayoutDashboard, label: "仪表盘" },
-  { to: "/proxies", icon: Globe, label: "代理" },
-  { to: "/subscription", icon: Rss, label: "订阅" },
-  { to: "/analytics", icon: BarChart3, label: "分析" },
-  { to: "/settings", icon: SettingsIcon, label: "设置" },
+  { to: "/dashboard", icon: LayoutDashboard, labelKey: "nav.dashboard" },
+  { to: "/proxies", icon: Globe, labelKey: "nav.proxies" },
+  { to: "/subscription", icon: Rss, labelKey: "nav.subscription" },
+  { to: "/analytics", icon: BarChart3, labelKey: "nav.analytics" },
+  { to: "/settings", icon: SettingsIcon, labelKey: "nav.settings" },
 ];
 
 export default function Sidebar() {
+  const { t } = useTranslation();
   return (
-    <aside className="hidden md:flex w-56 bg-surface-card border-r border-white/5 flex-col p-4 gap-1">
+    <aside className="hidden md:flex w-56 bg-surface-card border-r border-border flex-col p-4 gap-1">
       <div className="text-lg font-bold text-accent mb-6 px-2">Prism</div>
-      {navItems.map(({ to, icon: Icon, label }) => (
+      {navItems.map(({ to, icon: Icon, labelKey }) => (
         <NavLink
           key={to}
           to={to}
@@ -34,7 +37,7 @@ export default function Sidebar() {
           }
         >
           <Icon size={18} />
-          <span>{label}</span>
+          <span>{t(labelKey)}</span>
         </NavLink>
       ))}
     </aside>

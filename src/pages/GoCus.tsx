@@ -27,6 +27,7 @@ import Spinner from "@/components/ui/Spinner";
 import EmptyState from "@/components/ui/EmptyState";
 import { toast } from "@/components/ui/Toast";
 import { Feature } from "@/pro/gating";
+import { useTranslation } from "@/i18n";
 
 // ============================== 本地解析（仅展示用） ==============================
 
@@ -183,29 +184,30 @@ function rewriteBadgeClass(action: string): string {
   if (action === "302" || action === "307") return "bg-blue-500/15 text-blue-400";
   if (action.includes("header")) return "bg-purple-500/15 text-purple-400";
   if (action.startsWith("script-")) return "bg-accent/15 text-accent";
-  return "bg-white/5 text-gray-400";
+  return "bg-glass text-gray-400";
 }
 
 function scriptBadgeClass(type: string): string {
   if (type.includes("request")) return "bg-blue-500/15 text-blue-400";
   if (type.includes("response")) return "bg-purple-500/15 text-purple-400";
   if (type === "cron") return "bg-latency-medium/15 text-latency-medium";
-  return "bg-white/5 text-gray-400";
+  return "bg-glass text-gray-400";
 }
 
 // ============================== 页面 ==============================
 
 const SUB_TABS = [
-  { key: "modules", label: "模块" },
-  { key: "rewrites", label: "改写" },
-  { key: "mitm", label: "MitM" },
-  { key: "scripts", label: "脚本" },
+  { key: "modules", labelKey: "proxies.goCus.tab.modules" },
+  { key: "rewrites", labelKey: "proxies.goCus.tab.rewrites" },
+  { key: "mitm", labelKey: "proxies.goCus.tab.mitm" },
+  { key: "scripts", labelKey: "proxies.goCus.tab.scripts" },
 ] as const;
 
 type SubTabKey = (typeof SUB_TABS)[number]["key"];
 
 /** Go Cus 引擎：覆写 / 改写 / MitM / 脚本（Pro 功能） */
 export default function GoCus() {
+  const { t } = useTranslation();
   const [settings, setSettings] = useState<GoCusSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [subTab, setSubTab] = useState<SubTabKey>("modules");
@@ -257,13 +259,13 @@ export default function GoCus() {
   const handleImport = async () => {
     const src = source.trim();
     if (!src) {
-      toast.error("请输入模块链接或直接粘贴模块内容");
+      toast.error(t("proxies.goCus.err.emptySource"));
       return;
     }
     setImporting(true);
     try {
       const m = await importGoCusModule(src);
-      toast.success(`模块「${m.name}」导入成功`);
+      toast.success(t("proxies.goCus.importSuccess", { name: m.name }));
       setSource("");
       await reload();
     } catch (e) {
@@ -291,10 +293,10 @@ export default function GoCus() {
   };
 
   const removeModule = async (m: CusModule) => {
-    if (!window.confirm(`确定删除模块「${m.name}」？该操作不可撤销。`)) return;
+    if (!window.confirm(t("proxies.goCus.deleteConfirm", { name: m.name }))) return;
     try {
       await deleteGoCusModule(m.id);
-      toast.success("模块已删除");
+      toast.success(t("proxies.goCus.moduleDeleted"));
       await reload();
     } catch (e) {
       toast.error(String(e));
@@ -306,7 +308,7 @@ export default function GoCus() {
     try {
       const info = await generateOrGetCaUrl();
       setCa(info);
-      if (info.created) toast.success("CA 证书已生成");
+      if (info.created) toast.success(t("proxies.goCus.caGenerated"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -372,9 +374,9 @@ export default function GoCus() {
 
   if (!settings) {
     return (
-      <div className="rounded-2xl border border-white/5 bg-surface-card p-5">
+      <div className="rounded-2xl border border-border bg-surface-card p-5">
         <p className="py-6 text-center text-sm text-gray-500">
-          Go Cus 设置读取失败，请重启应用后重试
+          {t("proxies.goCus.loadFailed")}
         </p>
       </div>
     );
@@ -384,40 +386,40 @@ export default function GoCus() {
     <ProGate feature={Feature.GoCus}>
       <div className="space-y-4">
         {/* 引擎总开关 */}
-        <div className="flex items-center justify-between rounded-2xl border border-white/5 bg-surface-card p-5">
+        <div className="flex items-center justify-between rounded-2xl border border-border bg-surface-card p-5">
           <div className="flex items-center gap-3">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
               <Wand2 size={17} className="text-accent" />
             </span>
             <div>
               <h3 className="text-sm font-semibold text-gray-100">
-                Go Cus 引擎
+                {t("proxies.goCus.engineTitle")}
               </h3>
               <p className="mt-0.5 text-xs text-gray-500">
-                覆写 / 改写 / MitM / 脚本 —— 兼容 Loon · Surge · QuantumultX 模块
+                {t("proxies.goCus.engineDesc")}
               </p>
             </div>
           </div>
           <Switch
             checked={settings.enabled}
             onChange={(v) => persist({ ...settings, enabled: v })}
-            title="Go Cus 引擎总开关"
+            title={t("proxies.goCus.engineSwitch")}
           />
         </div>
 
         {/* 子标签 */}
-        <div className="flex rounded-lg border border-white/5 bg-surface-hover p-1">
-          {SUB_TABS.map((t) => (
+        <div className="flex rounded-lg border border-border bg-surface-hover p-1">
+          {SUB_TABS.map((tabItem) => (
             <button
-              key={t.key}
-              onClick={() => setSubTab(t.key)}
+              key={tabItem.key}
+              onClick={() => setSubTab(tabItem.key)}
               className={`flex-1 rounded-md px-3 py-1.5 text-sm transition-colors ${
-                subTab === t.key
+                subTab === tabItem.key
                   ? "bg-accent text-white"
                   : "text-gray-400 hover:text-gray-200"
               }`}
             >
-              {t.label}
+              {t(tabItem.labelKey)}
             </button>
           ))}
         </div>
@@ -425,21 +427,21 @@ export default function GoCus() {
         {/* ---------- 模块 ---------- */}
         {subTab === "modules" && (
           <div className="space-y-4">
-            <div className="rounded-2xl border border-white/5 bg-surface-card p-5">
+            <div className="rounded-2xl border border-border bg-surface-card p-5">
               <h3 className="mb-1 text-sm font-semibold text-gray-100">
-                导入模块
+                {t("proxies.goCus.importTitle")}
               </h3>
               <p className="mb-3 text-xs text-gray-500">
-                支持 http(s) 模块链接，或直接粘贴模块内容（Loon / Surge / QX 格式）
+                {t("proxies.goCus.importDesc")}
               </p>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   value={source}
                   onChange={(e) => setSource(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleImport()}
-                  placeholder="https://example.com/module.snippet 或粘贴模块内容"
+                  placeholder={t("proxies.goCus.importPlaceholder")}
                   spellCheck={false}
-                  className="flex-1 rounded-lg border border-white/5 bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent"
+                  className="flex-1 rounded-lg border border-border bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent"
                 />
                 <button
                   onClick={handleImport}
@@ -451,17 +453,17 @@ export default function GoCus() {
                   ) : (
                     <Download size={14} />
                   )}
-                  导入
+                  {t("common.import")}
                 </button>
               </div>
             </div>
 
             {settings.modules.length === 0 ? (
-              <div className="rounded-2xl border border-white/5 bg-surface-card">
+              <div className="rounded-2xl border border-border bg-surface-card">
                 <EmptyState
                   icon={<Package size={28} />}
-                  title="暂无模块"
-                  description="粘贴模块链接或内容后点击导入，模块中的规则 / 改写 / 脚本 / MitM 声明将分别在此展示"
+                  title={t("proxies.goCus.noModules")}
+                  description={t("proxies.goCus.noModulesDesc")}
                 />
               </div>
             ) : (
@@ -469,7 +471,7 @@ export default function GoCus() {
                 {settings.modules.map((m) => (
                   <div
                     key={m.id}
-                    className="rounded-2xl border border-white/5 bg-surface-card p-5"
+                    className="rounded-2xl border border-border bg-surface-card p-5"
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
@@ -481,10 +483,12 @@ export default function GoCus() {
                             className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
                               m.source.startsWith("http")
                                 ? "bg-accent/15 text-accent"
-                                : "bg-white/5 text-gray-400"
+                                : "bg-glass text-gray-400"
                             }`}
                           >
-                            {m.source.startsWith("http") ? "远程" : "本地"}
+                            {m.source.startsWith("http")
+                              ? t("proxies.goCus.remote")
+                              : t("proxies.goCus.local")}
                           </span>
                         </div>
                         {m.desc && (
@@ -503,11 +507,15 @@ export default function GoCus() {
                         <Switch
                           checked={m.enabled}
                           onChange={(v) => toggleModule(m, v)}
-                          title={m.enabled ? "停用模块" : "启用模块"}
+                          title={
+                            m.enabled
+                              ? t("proxies.goCus.disableModule")
+                              : t("proxies.goCus.enableModule")
+                          }
                         />
                         <button
                           onClick={() => removeModule(m)}
-                          title="删除模块"
+                          title={t("proxies.goCus.deleteModule")}
                           className="p-1.5 text-gray-500 transition-colors hover:text-latency-bad"
                         >
                           <Trash2 size={15} />
@@ -516,10 +524,19 @@ export default function GoCus() {
                     </div>
                     <div className="mt-3 grid grid-cols-4 gap-2">
                       {[
-                        { label: "规则", value: m.stats.rules },
-                        { label: "改写", value: m.stats.rewrites },
-                        { label: "脚本", value: m.stats.scripts },
-                        { label: "MitM", value: m.stats.mitmHosts },
+                        { label: t("metric.rules"), value: m.stats.rules },
+                        {
+                          label: t("proxies.goCus.tab.rewrites"),
+                          value: m.stats.rewrites,
+                        },
+                        {
+                          label: t("proxies.goCus.tab.scripts"),
+                          value: m.stats.scripts,
+                        },
+                        {
+                          label: t("proxies.goCus.tab.mitm"),
+                          value: m.stats.mitmHosts,
+                        },
                       ].map((s) => (
                         <div
                           key={s.label}
@@ -541,20 +558,20 @@ export default function GoCus() {
 
         {/* ---------- 改写 ---------- */}
         {subTab === "rewrites" && (
-          <div className="rounded-2xl border border-white/5 bg-surface-card p-5">
+          <div className="rounded-2xl border border-border bg-surface-card p-5">
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-gray-100">
-                改写规则（{rewrites.length} 条）
+                {t("proxies.goCus.rewritesTitle", { count: rewrites.length })}
               </h3>
               <p className="text-[11px] text-gray-500">
-                来自已启用模块，仅展示
+                {t("proxies.goCus.fromModulesOnly")}
               </p>
             </div>
             {rewrites.length === 0 ? (
               <EmptyState
                 icon={<Wand2 size={28} />}
-                title="暂无改写规则"
-                description="启用包含 [URL Rewrite] 区段的模块后在此展示"
+                title={t("proxies.goCus.noRewrites")}
+                description={t("proxies.goCus.noRewritesDesc")}
               />
             ) : (
               <div className="max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
@@ -595,27 +612,29 @@ export default function GoCus() {
         {/* ---------- MitM ---------- */}
         {subTab === "mitm" && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between rounded-2xl border border-white/5 bg-surface-card p-5">
+            <div className="flex items-center justify-between rounded-2xl border border-border bg-surface-card p-5">
               <div>
-                <h3 className="text-sm font-semibold text-gray-100">MitM</h3>
+                <h3 className="text-sm font-semibold text-gray-100">
+                  {t("proxies.goCus.tab.mitm")}
+                </h3>
                 <p className="mt-0.5 text-xs text-gray-500">
-                  开启后对下方主机名的 HTTPS 流量进行解密，供改写与脚本使用
+                  {t("proxies.goCus.mitmDesc")}
                 </p>
               </div>
               <Switch
                 checked={settings.mitmEnabled}
                 onChange={(v) => persist({ ...settings, mitmEnabled: v })}
-                title="MitM 总开关"
+                title={t("proxies.goCus.mitmSwitch")}
               />
             </div>
 
-            <div className="rounded-2xl border border-white/5 bg-surface-card p-5">
+            <div className="rounded-2xl border border-border bg-surface-card p-5">
               <h3 className="mb-3 text-sm font-semibold text-gray-100">
-                MitM 主机名（{mitmHosts.length} 个）
+                {t("proxies.goCus.mitmHostsTitle", { count: mitmHosts.length })}
               </h3>
               {mitmHosts.length === 0 ? (
                 <p className="py-4 text-center text-sm text-gray-500">
-                  暂无 MitM 主机名（启用包含 [mitm] 区段的模块后在此展示）
+                  {t("proxies.goCus.noMitmHosts")}
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5">
@@ -631,12 +650,12 @@ export default function GoCus() {
               )}
             </div>
 
-            <div className="space-y-4 rounded-2xl border border-white/5 bg-surface-card p-5">
+            <div className="space-y-4 rounded-2xl border border-border bg-surface-card p-5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <ShieldCheck size={16} className="text-accent" />
                   <h3 className="text-sm font-semibold text-gray-100">
-                    CA 证书
+                    {t("proxies.goCus.caTitle")}
                   </h3>
                 </div>
                 <button
@@ -649,20 +668,24 @@ export default function GoCus() {
                   ) : (
                     <ShieldCheck size={13} />
                   )}
-                  生成 / 读取 CA
+                  {t("proxies.goCus.caGenerate")}
                 </button>
               </div>
 
               {ca && (
                 <div className="space-y-3">
                   <div>
-                    <p className="mb-1 text-xs text-gray-500">SHA-256 指纹</p>
+                    <p className="mb-1 text-xs text-gray-500">
+                      {t("proxies.goCus.caFingerprint")}
+                    </p>
                     <p className="break-all rounded-lg bg-surface-hover px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-300">
                       {ca.fingerprint}
                     </p>
                   </div>
                   <div>
-                    <p className="mb-1 text-xs text-gray-500">安装链接</p>
+                    <p className="mb-1 text-xs text-gray-500">
+                      {t("proxies.goCus.caInstallUrl")}
+                    </p>
                     <div className="flex items-center gap-2">
                       <a
                         href={ca.installUrl}
@@ -674,11 +697,13 @@ export default function GoCus() {
                         {ca.installUrl}
                       </a>
                       <button
-                        onClick={() => copyText(ca.installUrl, "安装链接已复制")}
+                        onClick={() =>
+                          copyText(ca.installUrl, t("proxies.goCus.installCopied"))
+                        }
                         className="flex shrink-0 items-center gap-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 transition-colors hover:text-gray-100"
                       >
                         <Copy size={13} />
-                        复制安装链接
+                        {t("proxies.goCus.copyInstall")}
                       </button>
                     </div>
                   </div>
@@ -691,15 +716,13 @@ export default function GoCus() {
                       }
                       className="h-4 w-4 accent-indigo-500"
                     />
-                    我已在系统安装并信任该证书
+                    {t("proxies.goCus.caTrusted")}
                   </label>
                 </div>
               )}
 
               <p className="text-[11px] leading-relaxed text-gray-500">
-                HTTPS 改写与脚本需安装 CA 并信任（iOS 需在
-                设置→通用→关于本机→证书信任设置
-                中开启完全信任）。
+                {t("proxies.goCus.caHint")}
               </p>
             </div>
           </div>
@@ -707,18 +730,20 @@ export default function GoCus() {
 
         {/* ---------- 脚本 ---------- */}
         {subTab === "scripts" && (
-          <div className="rounded-2xl border border-white/5 bg-surface-card p-5">
+          <div className="rounded-2xl border border-border bg-surface-card p-5">
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-gray-100">
-                脚本（{scripts.length} 个）
+                {t("proxies.goCus.scriptsTitle", { count: scripts.length })}
               </h3>
-              <p className="text-[11px] text-gray-500">来自已启用模块，仅展示</p>
+              <p className="text-[11px] text-gray-500">
+                {t("proxies.goCus.fromModulesOnly")}
+              </p>
             </div>
             {scripts.length === 0 ? (
               <EmptyState
                 icon={<FileCode2 size={28} />}
-                title="暂无脚本"
-                description="启用包含 [Script] 区段或 script-* 改写的模块后在此展示"
+                title={t("proxies.goCus.noScripts")}
+                description={t("proxies.goCus.noScriptsDesc")}
               />
             ) : (
               <div className="max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
@@ -745,9 +770,9 @@ export default function GoCus() {
                     </div>
                     <button
                       onClick={() =>
-                        copyText(s.scriptPath, "脚本路径已复制")
+                        copyText(s.scriptPath, t("proxies.goCus.scriptPathCopied"))
                       }
-                      title={`点击复制：${s.scriptPath}`}
+                      title={t("proxies.goCus.clickToCopy", { path: s.scriptPath })}
                       className="flex max-w-[40%] shrink-0 items-center gap-1 text-[11px] text-gray-400 transition-colors hover:text-accent"
                     >
                       <Copy size={11} className="shrink-0" />
@@ -761,7 +786,7 @@ export default function GoCus() {
               </div>
             )}
             <p className="mt-4 text-[11px] leading-relaxed text-gray-500">
-              Alpha 版脚本已完成解析与展示，JS 执行器将在后续版本接入。
+              {t("proxies.goCus.scriptAlphaNote")}
             </p>
           </div>
         )}

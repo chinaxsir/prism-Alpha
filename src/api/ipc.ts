@@ -1,5 +1,11 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import type { CoreStatus, OutboundMode, RunMode, UserSettings } from "@/stores/core";
+import type {
+  CoreStatus,
+  OutboundMode,
+  RunMode,
+  RuntimeSnapshot,
+  UserSettings,
+} from "@/stores/core";
 
 /** 内核报错脱敏：界面任何路径都不得出现内核商标字样（统一显示为「内核」） */
 export const sanitizeKernelText = (msg: string): string =>
@@ -113,6 +119,10 @@ export const PRO_STATUS_EVENT = "pro://status";
 
 export const getConnections = () => invoke("get_connections");
 export const getTrafficStats = () => invoke("get_traffic_stats");
+
+/** 运行时快照：今日流量 / 速率 / 60 秒曲线 / 连接 / 分析聚合（前后台不间断） */
+export const getRuntimeSnapshot = () =>
+  invoke<RuntimeSnapshot>("get_runtime_snapshot");
 
 export const closeConnection = (id: string) =>
   invoke<void>("close_connection", { id });

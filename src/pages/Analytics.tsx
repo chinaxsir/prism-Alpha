@@ -1,24 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Globe2, ListFilter, PieChart } from "lucide-react";
-import { listen } from "@tauri-apps/api/event";
 
 import { getRules } from "@/api/ipc";
+import { useTranslation } from "@/i18n";
 import { useCoreStore } from "@/stores/core";
 import { formatBytes } from "@/utils/format";
-
-interface ConnItem {
-  id: string;
-  metadata: { host?: string; destinationIP?: string };
-  upload: number;
-  download: number;
-  chains?: string[];
-  rule?: string;
-  rulePayload?: string;
-}
-
-interface Snapshot {
-  connections: ConnItem[];
-}
 
 interface Agg {
   count: number;
@@ -32,77 +18,24 @@ interface RuleItem {
   proxy: string;
 }
 
-const TOP_N = 8;
-
-/// 分析页：主机名/策略/规则聚合统计。
-/// 聚合数据在本页挂载期间累积（connections://tick 为增量快照）。
+/// 分析页：主机名 / 策略 / 规则聚合统计。
+/// 聚合数据由后端在 kernel.rs + events.rs 中持续累积（store.analytics），
+/// 切页与后台不丢；本页仅保留规则类型的本地查询。
 export default function Analytics() {
+  const { t } = useTranslation();
   const status = useCoreStore((s) => s.status);
+  const analytics = useCoreStore((s) => s.analytics);
   const running = status === "running";
 
-  // 连接聚合：主机名 / 出站策略 / 命中规则（上次快照差量累加流量）
-  const aggRef = useRef({
-    hosts: new Map<string, Agg>(),
-    outbounds: new Map<string, Agg>(),
-    rules: new Map<string, Agg>(),
-    lastSeen: new Map<string, { up: number; down: number }>(),
-  });
-  const [hostTop, setHostTop] = useState<[string, Agg][]>([]);
-  const [outboundTop, setOutboundTop] = useState<[string, Agg][]>([]);
-  const [ruleTop, setRuleTop] = useState<[string, Agg][]>([]);
+  // 内核聚合按 key 归类，部分 key 为后端占位（未知/其他）——按语言归一显示
+  const mapKey = (k: string) =>
+    k === "未知" ? t("common.unknown") : k === "其他" ? t("analytics.other") : k;
 
-  useEffect(() => {
-    const un = listen<Snapshot>("connections://tick", (e) => {
-      const agg = aggRef.current;
-      const add = (map: Map<string, Agg>, key: string, dDown: number, dUp: number) => {
-        const cur = map.get(key) ?? { count: 0, down: 0, up: 0 };
-        cur.count += 0; // count 只在新连接时 +1，见下
-        cur.down += dDown;
-        cur.up += dUp;
-        map.set(key, cur);
-      };
+  const hostTop: [string, Agg][] = analytics.hosts as [string, Agg][];
+  const outboundTop: [string, Agg][] = analytics.outbounds as [string, Agg][];
+  const ruleTop: [string, Agg][] = analytics.rules as [string, Agg][];
 
-      for (const c of e.payload.connections) {
-        const host = c.metadata.host || c.metadata.destinationIP || "未知";
-        const outbound = c.chains?.[0] ?? "DIRECT";
-        const rule = c.rule
-          ? `${c.rule}${c.rulePayload ? ` ${c.rulePayload}` : ""}`
-          : "其他";
-
-        const prev = agg.lastSeen.get(c.id) ?? { up: 0, down: 0 };
-        const dDown = Math.max(c.download - prev.down, 0);
-        const dUp = Math.max(c.upload - prev.up, 0);
-        const isNew = !agg.lastSeen.has(c.id);
-        agg.lastSeen.set(c.id, { up: c.upload, down: c.download });
-
-        for (const [map, key] of [
-          [agg.hosts, host],
-          [agg.outbounds, outbound],
-          [agg.rules, rule],
-        ] as const) {
-          add(map, key, dDown, dUp);
-          if (isNew) map.get(key)!.count += 1;
-        }
-      }
-
-      // 快照中消失的连接从 lastSeen 移除（流量已计入聚合）
-      const live = new Set(e.payload.connections.map((c) => c.id));
-      for (const id of [...agg.lastSeen.keys()]) {
-        if (!live.has(id)) agg.lastSeen.delete(id);
-      }
-
-      const top = (m: Map<string, Agg>) =>
-        [...m.entries()].sort((a, b) => b[1].down + b[1].up - (a[1].down + a[1].up)).slice(0, TOP_N);
-      setHostTop(top(agg.hosts));
-      setOutboundTop(top(agg.outbounds));
-      setRuleTop(top(agg.rules));
-    });
-    return () => {
-      un.then((fn) => fn());
-    };
-  }, []);
-
-  // 规则统计：内核规则全集按类型计数
+  // 规则统计：内核规则全集按类型计数（非实时统计，独立查询）
   const [ruleTypes, setRuleTypes] = useState<[string, number][]>([]);
   useEffect(() => {
     if (!running) {
@@ -122,9 +55,9 @@ export default function Analytics() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">分析</h1>
+        <h1 className="text-2xl font-bold">{t("analytics.title")}</h1>
         {!running && (
-          <span className="text-xs text-gray-500">内核未运行，仅展示已采集数据</span>
+          <span className="text-xs text-gray-500">{t("analytics.coreNotRunningHint")}</span>
         )}
       </div>
 
@@ -133,16 +66,16 @@ export default function Analytics() {
         {/* Top 主机名 */}
         <AggCard
           icon={<Globe2 size={16} className="text-accent" />}
-          title="Top 主机名（按流量）"
-          rows={hostTop}
-          empty="暂无连接数据"
+          title={t("analytics.hostsTitle")}
+          rows={hostTop.map(([k, a]) => [mapKey(k), a] as [string, Agg])}
+          empty={t("analytics.emptyConnections")}
         />
         {/* 策略分布 */}
         <AggCard
           icon={<PieChart size={16} className="text-accent" />}
-          title="策略分布（按出站）"
+          title={t("analytics.outboundTitle")}
           rows={outboundTop}
-          empty="暂无连接数据"
+          empty={t("analytics.emptyConnections")}
         />
       </div>
 
@@ -151,11 +84,11 @@ export default function Analytics() {
         <div className="bg-surface-card rounded-xl p-5 shadow-md">
           <h2 className="text-base font-semibold mb-4 flex items-center gap-2">
             <ListFilter size={16} className="text-accent" />
-            规则统计（按类型）
+            {t("analytics.ruleTypesTitle")}
           </h2>
           {ruleTypes.length === 0 ? (
             <div className="py-6 text-center text-sm text-gray-500">
-              {running ? "暂无规则" : "内核未运行"}
+              {running ? t("analytics.emptyRules") : t("analytics.coreNotRunning")}
             </div>
           ) : (
             <div className="flex flex-wrap gap-2">
@@ -172,9 +105,9 @@ export default function Analytics() {
         </div>
         <AggCard
           icon={<ListFilter size={16} className="text-accent" />}
-          title="规则命中（按流量）"
-          rows={ruleTop}
-          empty="暂无命中记录"
+          title={t("analytics.ruleHitsTitle")}
+          rows={ruleTop.map(([k, a]) => [mapKey(k), a] as [string, Agg])}
+          empty={t("analytics.emptyHits")}
         />
       </div>
     </div>
@@ -192,6 +125,7 @@ function AggCard({
   rows: [string, Agg][];
   empty: string;
 }) {
+  const { t } = useTranslation();
   const max = rows.reduce((m, [, a]) => Math.max(m, a.down + a.up), 1);
   return (
     <div className="bg-surface-card rounded-xl p-5 shadow-md">
@@ -212,10 +146,10 @@ function AggCard({
                     {key}
                   </span>
                   <span className="shrink-0 pl-3 text-gray-500 font-mono">
-                    {a.count} 次 · {formatBytes(total)}
+                    {t("analytics.hitsCount", { count: a.count })} · {formatBytes(total)}
                   </span>
                 </div>
-                <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
+                <div className="h-1.5 rounded-full bg-glass overflow-hidden">
                   <div
                     className="h-full bg-accent/70 rounded-full"
                     style={{ width: `${Math.max((total / max) * 100, 2)}%` }}

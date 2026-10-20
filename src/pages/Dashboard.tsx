@@ -46,6 +46,7 @@ import {
 } from "@/api/ipc";
 import { useCoreStore, type RunMode } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
+import { useTranslation } from "@/i18n";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
 import { isMobile } from "@/pro/gating";
@@ -53,11 +54,6 @@ import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
 import { ActivateProModal } from "@/components/ProGate";
 import Switch from "@/components/ui/Switch";
-
-const MODE_LABEL: Record<RunMode, string> = {
-  systemProxy: "系统代理",
-  tun: "TUN 全局",
-};
 
 /// 与节点页一致的组类型过滤：只保留真实节点
 const GROUP_TYPES = ["Selector", "URLTest", "Fallback", "LoadBalance"];
@@ -71,6 +67,7 @@ interface ProxyEntry {
 }
 
 export default function Dashboard() {
+  const { t } = useTranslation();
   const status = useCoreStore((s) => s.status);
   const mode = useCoreStore((s) => s.mode);
   const upSpeed = useCoreStore((s) => s.upSpeed);
@@ -78,14 +75,12 @@ export default function Dashboard() {
   const memoryUsage = useCoreStore((s) => s.memoryUsage);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
   const traffic = useCoreStore((s) => s.traffic);
-  const sessionTraffic = useCoreStore((s) => s.sessionTraffic);
+  // 今日流量：后端持久化基数 + 当前会话内核绝对累计（前后台不间断）
+  const todayBytes = useCoreStore((s) => s.todayBytes);
   const setStatus = useCoreStore((s) => s.setStatus);
   const setMode = useCoreStore((s) => s.setMode);
   const setOutboundMode = useCoreStore((s) => s.setOutboundMode);
-  const setTrafficRate = useCoreStore((s) => s.setTrafficRate);
-  const setMemoryUsage = useCoreStore((s) => s.setMemoryUsage);
   const setUptime = useCoreStore((s) => s.setUptime);
-  const pushTraffic = useCoreStore((s) => s.pushTraffic);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const mobile = isMobile();
@@ -109,30 +104,7 @@ export default function Dashboard() {
   const [cus, setCus] = useState<GoCusSettings | null>(null);
 
   const running = status === "running";
-
-  // 订阅内核实时事件
-  useEffect(() => {
-    const unlistenTraffic = listen<{ up: number; down: number }>(
-      "traffic://tick",
-      (event) => {
-        const { up, down } = event.payload;
-        setTrafficRate(up, down);
-        pushTraffic(up, down);
-      }
-    );
-
-    const unlistenMemory = listen<{ inuse: number }>(
-      "memory://tick",
-      (event) => {
-        setMemoryUsage(event.payload.inuse ?? 0);
-      }
-    );
-
-    return () => {
-      unlistenTraffic.then((fn) => fn());
-      unlistenMemory.then((fn) => fn());
-    };
-  }, [setTrafficRate, setMemoryUsage, pushTraffic]);
+  const modeLabel = (m: RunMode) => t(m === "tun" ? "runMode.tun" : "runMode.systemProxy");
 
   // 拉取主选择组与当前节点（内核运行时才有实时数据）
   const loadCurrentNode = async () => {
@@ -297,7 +269,7 @@ export default function Dashboard() {
     if (!mainSelector) {
       setCurrentNode(name);
       setPickerOpen(false);
-      toast.success(`已预选节点：${name}（内核启动后生效）`);
+      toast.success(t("dashboard.pickerPreselected", { name }));
       return;
     }
     setSelecting(true);
@@ -305,10 +277,10 @@ export default function Dashboard() {
       await selectProxy(mainSelector, name);
       setCurrentNode(name);
       setPickerOpen(false);
-      toast.success(`已切换节点：${name}`);
+      toast.success(t("dashboard.pickerSwitched", { name }));
     } catch (e) {
       console.error("pick node failed:", e);
-      toast.error(`切换节点失败：${String(e)}`);
+      toast.error(t("dashboard.pickerFailed", { error: String(e) }));
     } finally {
       setSelecting(false);
     }
@@ -320,30 +292,40 @@ export default function Dashboard() {
         .length
     : 0;
   const aimStatus = aim?.enabled
-    ? `已锁定: ${aim.lockedNode || currentNode || "—"} · 已评级解锁 ${aimUnlocked} 个节点`
-    : "自动优选解锁 ChatGPT / Claude / Netflix 的最低延迟节点";
+    ? t("dashboard.aim.locked", {
+        node: aim.lockedNode || currentNode || "—",
+        count: aimUnlocked,
+      })
+    : t("dashboard.aim.idle");
   const lanStatus =
     lan && lan.lanCidrs.length > 0
-      ? `${lan.mode === "managed" ? "组网模式" : "手动模式"} · 内网 ${lan.lanCidrs.join(", ")}`
-      : "未配置回家网络 · 点击右侧配置回家参数";
+      ? t("dashboard.lan.configured", {
+          mode: t(lan.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
+          cidrs: lan.lanCidrs.join(", "),
+        })
+      : t("dashboard.lan.unset");
   const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];
   const cusStatus =
     cus && cus.modules.length > 0
-      ? `已启用 ${cusEnabledModules.length} 个模块 · ${cusEnabledModules.reduce((acc, m) => acc + (m.stats?.rewrites ?? 0), 0)} 改写 / ${cusEnabledModules.reduce((acc, m) => acc + (m.stats?.scripts ?? 0), 0)} 脚本`
-      : "未配置模块 · 点击右侧导入小火箭模块与脚本";
+      ? t("dashboard.cus.enabled", {
+          modules: cusEnabledModules.length,
+          rewrites: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.rewrites ?? 0), 0),
+          scripts: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.scripts ?? 0), 0),
+        })
+      : t("dashboard.cus.unset");
 
   // Go AIM 开启时的「重测」：立即触发一轮评级探测（结果经 go-aim://updated 事件刷新）
   const runAimProbe = async () => {
     try {
       await runGoAimProbe();
     } catch (e) {
-      toast.error(`重测失败：${String(e)}`);
+      toast.error(t("dashboard.aim.retestFailed", { error: String(e) }));
     }
   };
 
   return (
     <div className="space-y-5">
-      <h1 className="text-2xl font-bold">仪表盘</h1>
+      <h1 className="text-2xl font-bold">{t("dashboard.title")}</h1>
 
       {/* 出站模式快捷切换（规则/全局/直连） */}
       <OutboundModeSwitch />
@@ -353,7 +335,7 @@ export default function Dashboard() {
         className={`rounded-2xl p-5 border transition-colors ${
           running
             ? "bg-latency-good/10 border-latency-good/30"
-            : "bg-surface-card border-white/5"
+            : "bg-surface-card border-border"
         }`}
       >
         <div className="flex items-center justify-between">
@@ -374,23 +356,27 @@ export default function Dashboard() {
                   数秒（VPN 授权/扩展拉起），若显示"未连接"用户会以为
                   没反应而重复点击（后端幂等保护已兜底，但体验要明确） */}
               {running
-                ? "已连接"
+                ? t("status.connected")
                 : status === "starting"
-                  ? "连接中…"
+                  ? t("status.connecting")
                   : status === "error"
-                    ? "启动失败"
-                    : "未连接"}
+                    ? t("status.startFailed")
+                    : t("status.disconnected")}
             </div>
             <div className="text-2xl font-bold tabular-nums text-gray-100">
               {running ? formatUptime(uptimeSecs) : "Prism"}
             </div>
-            <div className="text-xs text-gray-500 mt-1">
-              {running
-                ? `运行模式 · ${MODE_LABEL[mode]}`
-                : status === "starting"
-                  ? "正在建立 VPN 隧道，请稍候"
-                  : "点击右侧按钮启动代理"}
-            </div>
+            {/* 未连接（stopped）时不再显示「点击右侧按钮启动代理」副标题，
+                让左侧仅保留状态圆点与 Prism 标题；启动中仍给出隧道提示 */}
+            {running ? (
+              <div className="text-xs text-gray-500 mt-1">
+                {t("dashboard.runModeLabel", { mode: modeLabel(mode) })}
+              </div>
+            ) : status === "starting" ? (
+              <div className="text-xs text-gray-500 mt-1">
+                {t("status.startingTunnel")}
+              </div>
+            ) : null}
           </div>
           <button
             onClick={toggle}
@@ -402,7 +388,11 @@ export default function Dashboard() {
             }`}
           >
             <Power size={16} className={status === "starting" ? "animate-pulse" : ""} />
-            {running ? "停止" : status === "starting" ? "启动中" : "启动"}
+            {running
+              ? t("action.stop")
+              : status === "starting"
+                ? t("action.starting")
+                : t("action.start")}
           </button>
         </div>
       </div>
@@ -410,7 +400,7 @@ export default function Dashboard() {
       {/* 启动/停止错误提示 */}
       {errorMsg && (
         <div className="rounded-xl p-4 text-sm bg-latency-bad/10 text-red-300 border border-red-500/20">
-          <div className="font-semibold mb-1">操作失败</div>
+          <div className="font-semibold mb-1">{t("dashboard.errorTitle")}</div>
           <div className="text-xs break-all text-red-200">{errorMsg}</div>
         </div>
       )}
@@ -419,10 +409,10 @@ export default function Dashboard() {
       <div className="grid grid-cols-3 gap-3">
         <StatChip
           icon={<Globe size={14} className="text-gray-400" />}
-          label="当前节点"
+          label={t("metric.currentNode")}
           value={
             running
-              ? currentNode || "未选择"
+              ? currentNode || t("dashboard.noSelection")
               : currentNode || nodes[0]?.name || "—"
           }
           onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
@@ -430,20 +420,20 @@ export default function Dashboard() {
         {mobile ? (
           <StatChip
             icon={<BarChart3 size={14} className="text-gray-400" />}
-            label="今日流量"
-            value={running ? formatBytes(sessionTraffic) : "—"}
+            label={t("metric.todayTraffic")}
+            value={running ? formatBytes(todayBytes) : "—"}
           />
         ) : (
           <StatChip
             icon={<Cpu size={14} className="text-gray-400" />}
-            label="内存占用"
+            label={t("metric.memoryUsage")}
             value={running && memoryUsage > 0 ? formatBytes(memoryUsage) : "—"}
           />
         )}
         <StatChip
           icon={<Gauge size={14} className="text-gray-400" />}
-          label="运行模式"
-          value={MODE_LABEL[mode]}
+          label={t("metric.mode")}
+          value={modeLabel(mode)}
         />
       </div>
 
@@ -454,8 +444,8 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
           <EngineCard
             icon={<Crosshair size={14} className="text-accent" />}
-            name="Go AIM"
-            tag="AI/流媒体智选"
+            name={t("engine.goAim")}
+            tag={t("engine.goAimTag")}
             status={aimStatus}
             enabled={aim?.enabled ?? false}
             onToggle={toggleAim}
@@ -466,15 +456,15 @@ export default function Dashboard() {
                   disabled={aim.probing}
                   className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
                 >
-                  {aim.probing ? "探测中" : "重测"}
+                  {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
                 </button>
               ) : undefined
             }
           />
           <EngineCard
             icon={<Home size={14} className="text-accent" />}
-            name="Go Lan"
-            tag="回家内网直通"
+            name={t("engine.goLan")}
+            tag={t("engine.goLanTag")}
             status={lanStatus}
             enabled={lan?.enabled ?? false}
             onToggle={toggleLan}
@@ -483,14 +473,14 @@ export default function Dashboard() {
                 onClick={() => navigate("/settings?focus=goLan")}
                 className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
               >
-                配置
+                {t("common.configure")}
               </button>
             }
           />
           <EngineCard
             icon={<Wand2 size={14} className="text-accent" />}
-            name="Go Cus"
-            tag="覆写/改写/脚本"
+            name={t("engine.goCus")}
+            tag={t("engine.goCusTag")}
             status={cusStatus}
             enabled={cus?.enabled ?? false}
             onToggle={toggleCus}
@@ -499,57 +489,57 @@ export default function Dashboard() {
                 onClick={() => navigate("/proxies?tab=goCus")}
                 className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
               >
-                配置
+                {t("common.configure")}
               </button>
             }
           />
         </div>
       ) : proReady ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-surface-card px-4 py-3">
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                ✨ Pro 智联引擎
+                ✨ {t("dashboard.proEngines")}
               </span>
-              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
                 Go AIM
               </span>
-              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
                 Go Lan
               </span>
-              <span className="whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
                 Go Cus
               </span>
             </div>
             <p className="mt-1 truncate text-xs text-gray-400">
-              激活授权解锁 AI/流媒体智选、回家内网直通与脚本覆写引擎
+              {t("dashboard.proBannerDesc")}
             </p>
           </div>
           <button
             onClick={() => setShowActivate(true)}
             className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90"
           >
-            激活 Pro
+            {t("pro.activatePro")}
           </button>
         </div>
       ) : null}
 
       {/* 实时速率（合并卡片，左右分布） */}
-      <div className="bg-surface-card rounded-2xl p-5 border border-white/5">
+      <div className="bg-surface-card rounded-2xl p-5 border border-border">
         <div className="grid grid-cols-2 gap-4">
           <div>
             <div className="flex items-center gap-1.5 text-xs text-gray-400">
               <Activity size={13} className="text-latency-good" />
-              下载
+              {t("metric.download")}
             </div>
             <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono">
               {running ? formatSpeed(downSpeed) : "—"}
             </div>
           </div>
-          <div className="border-l border-white/5 pl-4">
+          <div className="border-l border-border pl-4">
             <div className="flex items-center gap-1.5 text-xs text-gray-400">
               <Activity size={13} className="text-accent" />
-              上传
+              {t("metric.upload")}
             </div>
             <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono">
               {running ? formatSpeed(upSpeed) : "—"}
@@ -559,20 +549,25 @@ export default function Dashboard() {
       </div>
 
       {/* 流量曲线图 */}
-      <div className="bg-surface-card rounded-2xl p-5 border border-white/5">
-        <h2 className="text-sm font-semibold mb-4 text-gray-200">实时流量（最近 60 秒）</h2>
+      <div className="bg-surface-card rounded-2xl p-5 border border-border">
+        <h2 className="text-sm font-semibold mb-4 text-gray-200">
+          {t("metric.realtimeTraffic")}
+        </h2>
         <ResponsiveContainer width="100%" height={240}>
           <LineChart data={traffic} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
+            <CartesianGrid
+              strokeDasharray="3 3"
+              stroke="rgb(var(--border) / 0.15)"
+            />
             <XAxis
               dataKey="time"
-              stroke="#9ca3af"
+              stroke="rgb(var(--gray-500))"
               fontSize={10}
               tickLine={false}
               minTickGap={48}
             />
             <YAxis
-              stroke="#9ca3af"
+              stroke="rgb(var(--gray-500))"
               fontSize={10}
               tickLine={false}
               width={60}
@@ -580,21 +575,24 @@ export default function Dashboard() {
             />
             <Tooltip
               contentStyle={{
-                backgroundColor: "#1E222D",
-                border: "1px solid rgba(255,255,255,0.15)",
+                backgroundColor: "rgb(var(--surface-card))",
+                border: "1px solid rgb(var(--border) / 0.15)",
                 borderRadius: 8,
                 fontSize: 12,
                 padding: '8px 12px',
+                color: "rgb(var(--gray-100))",
               }}
-              labelStyle={{ color: '#E5E7EB' }}
-              itemStyle={{ color: '#E5E7EB' }}
+              labelStyle={{ color: 'rgb(var(--gray-100))' }}
+              itemStyle={{ color: 'rgb(var(--gray-100))' }}
               formatter={(value, name) => [
                 formatSpeed(Number(value)),
-                name === "down" ? "下载" : "上传",
+                name === "down" ? t("metric.download") : t("metric.upload"),
               ]}
             />
             <Legend
-              formatter={(v) => (v === "down" ? "下载" : "上传")}
+              formatter={(v) =>
+                v === "down" ? t("metric.download") : t("metric.upload")
+              }
               wrapperStyle={{ paddingTop: '12px', fontSize: 11 }}
             />
             <Line
@@ -608,7 +606,7 @@ export default function Dashboard() {
             <Line
               type="monotone"
               dataKey="up"
-              stroke="#6366f1"
+              stroke="rgb(var(--accent))"
               strokeWidth={2}
               dot={false}
               isAnimationActive={false}
@@ -625,13 +623,13 @@ export default function Dashboard() {
         >
           <div className="absolute inset-0 bg-black/60" />
           <div
-            className="relative w-full max-w-md flex flex-col max-h-[70vh] rounded-2xl bg-surface-card border border-white/10 shadow-xl"
+            className="relative w-full max-w-md flex flex-col max-h-[70vh] rounded-2xl bg-surface-card border border-border-strong shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border">
               <div className="flex items-center gap-2 text-sm font-semibold text-gray-100">
                 <Globe size={15} className="text-accent" />
-                选择节点
+                {t("dashboard.pickerTitle")}
               </div>
               <button
                 onClick={() => setPickerOpen(false)}
@@ -651,7 +649,7 @@ export default function Dashboard() {
                     disabled={selecting}
                     className={clsx(
                       "w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-left transition-colors",
-                      selected ? "bg-accent/10" : "hover:bg-white/[0.04]"
+                      selected ? "bg-accent/10" : "hover:bg-glass"
                     )}
                   >
                     <span
@@ -709,7 +707,7 @@ function StatChip({
       onClick={onClick}
       role={onClick ? "button" : undefined}
       className={clsx(
-        "bg-surface-card rounded-xl p-3 border border-white/5",
+        "bg-surface-card rounded-xl p-3 border border-border",
         onClick && "cursor-pointer hover:border-accent/40 transition-colors"
       )}
     >
@@ -749,14 +747,14 @@ function EngineCard({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-white/5">
+    <div className="flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border">
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           {icon}
           <span className="font-semibold text-sm text-gray-100 whitespace-nowrap">
             {name}
           </span>
-          <span className="text-[11px] px-1.5 py-0.5 rounded bg-white/5 text-gray-400 whitespace-nowrap">
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-glass text-gray-400 whitespace-nowrap">
             {tag}
           </span>
         </div>

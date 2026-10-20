@@ -21,11 +21,12 @@ import {
   Smartphone,
   AppWindow,
   Home,
+  Languages,
+  Palette,
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 
 import {
-  ensureKernel,
   getCoreStatus,
   getDeviceId,
   getKernelInfo,
@@ -48,32 +49,25 @@ import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { isMobile } from "@/pro/gating";
 import Switch from "@/components/ui/Switch";
+import { usePrefsStore, type Language, type ThemePref } from "@/stores/prefs";
+import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
-const STATUS_META: Record<
-  EntitlementState,
-  { label: string; dot: string }
-> = {
-  active: { label: "已激活", dot: "bg-latency-good" },
-  offline: { label: "离线待校验", dot: "bg-yellow-400" },
-  expired: { label: "已过期", dot: "bg-latency-bad" },
-  revoked: { label: "已吊销", dot: "bg-latency-bad" },
-  inactive: { label: "未激活", dot: "bg-gray-500" },
+/** 授权状态 → 文案 key 与状态点颜色 */
+const STATUS_META: Record<EntitlementState, { key: string; dot: string }> = {
+  active: { key: "pro.status.active", dot: "bg-latency-good" },
+  offline: { key: "pro.status.offline", dot: "bg-yellow-400" },
+  expired: { key: "pro.status.expired", dot: "bg-latency-bad" },
+  revoked: { key: "pro.status.revoked", dot: "bg-latency-bad" },
+  inactive: { key: "pro.status.inactive", dot: "bg-gray-500" },
 };
 
-/** 服务端方案名展示（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
+/** 服务端方案名 → 文案 key（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
 const PLAN_LABEL: Record<string, string> = {
-  free: "试用版 (Trial)",
-  pro: "Pro 订阅版",
-  team: "终身买断版 (永久)",
+  free: "pro.plan.free",
+  pro: "pro.plan.pro",
+  team: "pro.plan.team",
 };
-
-function planText(plan: string | null, kind: string | null): string {
-  if (plan && PLAN_LABEL[plan]) return PLAN_LABEL[plan];
-  if (kind === "lifetime") return "终身买断";
-  if (kind === "subscription") return "订阅";
-  return "—";
-}
 
 function fmtDate(secs: number | null): string {
   if (!secs) return "—";
@@ -93,15 +87,6 @@ function expiringSoon(secs: number | null): boolean {
   if (!secs) return false;
   const diff = secs * 1000 - Date.now();
   return diff > 0 && diff < 3 * 86_400_000;
-}
-
-/** 主标题右侧状态标签：激活后按档位显示，未激活沿用状态文案 */
-function statusText(plan: string | null, status: EntitlementState): string {
-  if (status !== "active") return STATUS_META[status].label;
-  if (plan === "team") return "买断版 · 永久有效";
-  if (plan === "pro") return "Pro 订阅 · 已激活";
-  if (plan === "free") return "试用版 · 已激活";
-  return "已激活";
 }
 
 /// 接入模式图标
@@ -183,6 +168,7 @@ function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
 }
 
 export default function Settings() {
+  const { t } = useTranslation();
   const [mode, setRunMode] = useState<RunMode>("systemProxy");
   const [modeBusy, setModeBusy] = useState(false);
   const [form, setForm] = useState<UserSettings>({
@@ -195,6 +181,8 @@ export default function Settings() {
     ipv6: false,
     blockQuic: false,
     closeConnectionsOnSwitch: false,
+    language: "system",
+    theme: "system",
   });
   const [saved, setSaved] = useState(false);
   const mobile = isMobile();
@@ -212,22 +200,26 @@ export default function Settings() {
   // ipa-9：Go Lan 是否渲染完整配置区（启动瞬间 ready=false 先渲染完整表单，避免闪烁）
   const goLanUnlocked = proUnlocked || !proReady;
 
+  // 语言与外观偏好（全局 store，改动即时生效；同时持久化到后端 settings.json）
+  const language = usePrefsStore((s) => s.language);
+  const themePref = usePrefsStore((s) => s.theme);
+  const setLanguage = usePrefsStore((s) => s.setLanguage);
+  const setThemePref = usePrefsStore((s) => s.setTheme);
+
   // ipa-8：仪表盘 Go Lan 卡片「配置」跳转锚点——进入设置页后滚动定位到回家网络卡片
   const [searchParams] = useSearchParams();
   useEffect(() => {
     if (searchParams.get("focus") === "goLan") {
-      const t = setTimeout(() => {
+      const timer = setTimeout(() => {
         document
           .getElementById("go-lan-card")
           ?.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 150);
-      return () => clearTimeout(t);
+      return () => clearTimeout(timer);
     }
   }, [searchParams]);
 
   const [kernelInfo, setKernelInfo] = useState<KernelInfo | null>(null);
-  const [kernelBusy, setKernelBusy] = useState(false);
-  const [kernelMsg, setKernelMsg] = useState<string | null>(null);
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
 
@@ -258,9 +250,9 @@ export default function Settings() {
     if (!deviceId) return;
     try {
       await navigator.clipboard.writeText(deviceId);
-      toast.success("设备 ID 已复制");
+      toast.success(t("pro.deviceIdCopy"));
     } catch {
-      toast.error("复制失败，请长按手动选择");
+      toast.error(t("common.copyFailed"));
     }
   };
 
@@ -271,7 +263,9 @@ export default function Settings() {
     if (s.error) {
       const m = s.error;
       if (m.startsWith("rate_limited:")) {
-        toast.error(`校验过于频繁，请 ${m.split(":")[1] ?? "30"} 秒后再试`);
+        toast.error(
+          t("pro.verifyTooFrequent", { secs: m.split(":")[1] ?? "30" }),
+        );
       } else {
         toast.error(m);
       }
@@ -279,13 +273,13 @@ export default function Settings() {
     }
     const st = s.entitlement.status;
     if (st === "active") {
-      toast.success("授权校验成功：当前方案与有效期已同步");
+      toast.success(t("pro.verifySuccess"));
     } else if (st === "expired" || st === "revoked") {
-      toast.error("授权已过期或失效");
+      toast.error(t("pro.verifyExpired"));
     } else if (st === "offline") {
-      toast.info("网络不可用，授权校验失败，联网恢复后自动重试");
+      toast.info(t("pro.verifyOffline"));
     } else {
-      toast.info("本机暂无授权记录");
+      toast.info(t("pro.verifyNone"));
     }
   };
 
@@ -300,7 +294,7 @@ export default function Settings() {
     setDeactivating(true);
     try {
       await deactivatePro();
-      toast.success("已成功移除本机授权");
+      toast.success(t("pro.removedToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -331,23 +325,26 @@ export default function Settings() {
       .catch((e) => console.error(e));
   }, []);
 
-  const handleEnsureKernel = async () => {
-    setKernelBusy(true);
-    setKernelMsg("正在校验内核…");
-    try {
-      const info = await ensureKernel();
-      setKernelInfo(info);
-      setKernelMsg(info.exists ? "内核已就绪" : "内核未就位");
-    } catch (e) {
-      setKernelMsg(String(e));
-    } finally {
-      setKernelBusy(false);
-    }
-  };
-
   const patch = (p: Partial<UserSettings>) => {
     setForm((f) => ({ ...f, ...p }));
     setSaved(false);
+  };
+
+  /// 语言 / 外观：立即生效 + 立即持久化（无需再点「保存」）
+  const patchPrefs = (p: Partial<UserSettings>) => {
+    const next = { ...form, ...p };
+    setForm(next);
+    saveSettings(next).catch(() => undefined);
+  };
+
+  const chooseLanguage = (l: Language) => {
+    setLanguage(l);
+    patchPrefs({ language: l });
+  };
+
+  const chooseTheme = (th: ThemePref) => {
+    setThemePref(th);
+    patchPrefs({ theme: th });
   };
 
   const chooseMode = async (m: RunMode) => {
@@ -368,8 +365,8 @@ export default function Settings() {
       useCoreStore.getState().setMode(data.mode);
       toast.success(
         data.status === "running"
-          ? "模式已切换，内核已重启生效"
-          : "模式已切换，下次启动内核时生效"
+          ? t("settings.modeSwitchedRunning")
+          : t("settings.modeSwitchedNext")
       );
     } catch (e) {
       console.error(e);
@@ -446,7 +443,7 @@ export default function Settings() {
           !goLan.wgPrivateKey.trim() ||
           !goLan.wgPeerPublicKey.trim())
       ) {
-        toast.error("WireGuard 手动配置需填写 Server、私钥与 Peer 公钥");
+        toast.error(t("settings.goLan.invalidWg"));
         return;
       }
     }
@@ -456,7 +453,7 @@ export default function Settings() {
       if (warnings && warnings.length > 0) {
         warnings.forEach((w) => toast.info(w));
       }
-      toast.success("Go Lan 配置已保存");
+      toast.success(t("settings.goLan.saveToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -470,7 +467,7 @@ export default function Settings() {
       const s = await syncGoLanManaged();
       setGoLanLoaded(s);
       setGoLan(applyGoLanLoaded(s));
-      toast.success("已拉取回家配置");
+      toast.success(t("settings.goLan.syncToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -483,7 +480,7 @@ export default function Settings() {
   return (
     <div className="space-y-5 max-w-3xl">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">设置</h1>
+        <h1 className="text-2xl font-bold">{t("settings.title")}</h1>
         <button
           onClick={handleSave}
           className={clsx(
@@ -496,20 +493,62 @@ export default function Settings() {
           {saved ? (
             <span className="flex items-center gap-1">
               <Check size={14} />
-              已保存
+              {t("common.saved")}
             </span>
           ) : (
-            "保存"
+            t("common.save")
           )}
         </button>
       </div>
 
+      {/* 外观与语言：语言 / 深浅色外观，均可跟随系统 */}
+      <SettingsGroup
+        title={t("settings.appearance")}
+        icon={<Palette size={14} />}
+        desc={t("settings.appearanceDesc")}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3 border-b border-border">
+          <div className="flex items-center gap-3">
+            <RowIcon>
+              <Languages size={16} className="text-gray-400" />
+            </RowIcon>
+            <div className="text-sm">{t("settings.language")}</div>
+          </div>
+          <Segmented
+            value={language}
+            onChange={(v) => chooseLanguage(v as Language)}
+            options={[
+              { value: "system", label: t("settings.language.system") },
+              { value: "zh", label: t("settings.language.zh") },
+              { value: "en", label: t("settings.language.en") },
+            ]}
+          />
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3">
+          <div className="flex items-center gap-3">
+            <RowIcon>
+              <Palette size={16} className="text-gray-400" />
+            </RowIcon>
+            <div className="text-sm">{t("settings.theme")}</div>
+          </div>
+          <Segmented
+            value={themePref}
+            onChange={(v) => chooseTheme(v as ThemePref)}
+            options={[
+              { value: "system", label: t("settings.theme.system") },
+              { value: "dark", label: t("settings.theme.dark") },
+              { value: "light", label: t("settings.theme.light") },
+            ]}
+          />
+        </div>
+      </SettingsGroup>
+
       {/* 接入模式：iOS/Android 系统强制 TUN 接管，无切换意义，移动端不渲染 */}
       {!mobile && (
         <SettingsGroup
-          title="接入模式"
+          title={t("settings.mode")}
           icon={<Wifi size={14} />}
-          desc="决定流量如何进入 Prism（与下方出站模式互不影响）"
+          desc={t("settings.modeDesc")}
         >
           {runModes.map((m) => {
             const Icon = RUN_MODE_ICON[m.key] ?? Wifi;
@@ -525,7 +564,7 @@ export default function Settings() {
                   icon={
                     <Icon size={16} className={active ? "text-accent" : "text-gray-400"} />
                   }
-                  iconBg={active ? "bg-accent/10" : "bg-white/5"}
+                  iconBg={active ? "bg-accent/10" : "bg-glass"}
                   title={
                     <span className="flex items-center gap-1.5">
                       {m.title}
@@ -534,7 +573,7 @@ export default function Settings() {
                       )}
                     </span>
                   }
-                  value={active ? "已选" : ""}
+                  value={active ? t("settings.modeSelected") : ""}
                   chevron={!active}
                   valueClass={active ? "text-accent" : ""}
                 />
@@ -542,28 +581,27 @@ export default function Settings() {
             );
           })}
           {modeBusy && (
-            <div className="px-3 py-2 text-xs text-gray-400 border-t border-white/5">
-              正在切换模式（内核运行中将自动重启生效）…
+            <div className="px-3 py-2 text-xs text-gray-400 border-t border-border">
+              {t("settings.modeSwitching")}
             </div>
           )}
           {mode === "tun" && (
-            <div className="px-3 py-2.5 flex items-start gap-2 bg-yellow-500/5 text-yellow-400 text-xs border-t border-white/5">
+            <div className="px-3 py-2.5 flex items-start gap-2 bg-yellow-500/5 text-yellow-400 text-xs border-t border-border">
               <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-              TUN 模式启动时若提示权限不足，请完全退出 Prism 后，右键选择
-              “以管理员身份运行”（macOS/Linux 使用 sudo 启动）。
+              {t("settings.tunHint")}
             </div>
           )}
         </SettingsGroup>
       )}
 
       {/* 本地入站 */}
-      <SettingsGroup title="本地入站" icon={<Network size={14} />}>
-        <div className="flex items-center justify-between overflow-hidden px-3 py-3 border-b border-white/5">
+      <SettingsGroup title={t("settings.inbound")} icon={<Network size={14} />}>
+        <div className="flex items-center justify-between overflow-hidden px-3 py-3 border-b border-border">
           <div className="flex items-center gap-3">
             <RowIcon><Network size={16} className="text-gray-400" /></RowIcon>
             <div>
-              <div className="text-sm">混合代理端口</div>
-              <div className="text-[11px] text-gray-500">同端口提供 HTTP 与 SOCKS5</div>
+              <div className="text-sm">{t("settings.mixedPort")}</div>
+              <div className="text-[11px] text-gray-500">{t("settings.mixedPortDesc")}</div>
             </div>
           </div>
           <input
@@ -572,21 +610,21 @@ export default function Settings() {
             max={65535}
             value={form.mixedPort}
             onChange={(e) => patch({ mixedPort: Number(e.target.value) })}
-            className="w-24 px-3 py-1.5 rounded-lg bg-surface-hover border border-white/5 focus:border-accent outline-none text-sm text-right"
+            className="w-24 px-3 py-1.5 rounded-lg bg-surface-hover border border-border focus:border-accent outline-none text-sm text-right"
           />
         </div>
         <ToggleRow
           icon={<Globe size={16} className="text-gray-400" />}
-          title="允许局域网连接"
-          desc="同局域网其他设备可使用本机代理"
+          title={t("settings.allowLan")}
+          desc={t("settings.allowLanDesc")}
           checked={form.allowLan}
           onChange={(v) => patch({ allowLan: v })}
         />
         {!mobile && (
           <ToggleRow
             icon={<Wifi size={16} className="text-gray-400" />}
-            title="设置系统代理"
-            desc="系统代理模式启动时自动修改系统代理设置"
+            title={t("settings.systemProxy")}
+            desc={t("settings.systemProxyDesc")}
             checked={form.systemProxy}
             onChange={(v) => patch({ systemProxy: v })}
           />
@@ -594,8 +632,8 @@ export default function Settings() {
         {!mobile && (
           <ToggleRow
             icon={<Power size={16} className="text-gray-400" />}
-            title="开机自启动"
-            desc="登录系统后自动启动 Prism"
+            title={t("settings.autoStart")}
+            desc={t("settings.autoStartDesc")}
             checked={form.autoStart}
             onChange={(v) => patch({ autoStart: v })}
           />
@@ -606,7 +644,7 @@ export default function Settings() {
           只渲染一张与普通设置行高度一致的紧凑单行引导卡；
           id 供仪表盘「配置」按钮跳转定位） */}
       {!goLanUnlocked ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-surface-card px-4 py-3.5">
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5">
           <div className="flex min-w-0 items-center gap-3">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
               <Home size={15} className="text-accent" />
@@ -614,14 +652,14 @@ export default function Settings() {
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                  Go Lan · 回家内网
+                  {t("settings.goLan.lockedTitle")}
                 </span>
                 <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
                   PRO
                 </span>
               </div>
               <p className="mt-0.5 truncate text-xs text-gray-500">
-                启动代理同时自动连通家中局域网（激活授权后显示配置）
+                {t("settings.goLan.lockedDesc")}
               </p>
             </div>
           </div>
@@ -629,15 +667,15 @@ export default function Settings() {
             onClick={() => setShowActivate(true)}
             className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
           >
-            激活 Pro
+            {t("pro.activatePro")}
           </button>
         </div>
       ) : (
         <SettingsGroup
           id="go-lan-card"
-          title="Go Lan · 回家网络"
+          title={t("settings.goLan.title")}
           icon={<Home size={14} />}
-          desc="回家路由：指定网段/域名经家庭隧道直达局域网"
+          desc={t("settings.goLan.desc")}
           headerRight={
             <Switch
               checked={goLan.enabled}
@@ -658,7 +696,7 @@ export default function Settings() {
                     goLanExpanded ? "rotate-180 transition-transform" : "transition-transform"
                   }
                 />
-                {goLanExpanded ? "收起配置" : "展开配置"}
+                {goLanExpanded ? t("common.collapse") : t("common.expand")}
               </button>
             </div>
           )}
@@ -676,7 +714,7 @@ export default function Settings() {
                     : "bg-surface-hover text-gray-400 hover:text-gray-200"
                 )}
               >
-                手动配置
+                {t("settings.goLan.manual")}
               </button>
               <button
                 onClick={() => patchGoLan({ mode: "managed" })}
@@ -687,7 +725,7 @@ export default function Settings() {
                     : "bg-surface-hover text-gray-400 hover:text-gray-200"
                 )}
               >
-                托管下发
+                {t("settings.goLan.managed")}
               </button>
             </div>
 
@@ -704,7 +742,7 @@ export default function Settings() {
                         : "text-gray-500 hover:text-gray-300"
                     )}
                   >
-                    WireGuard 参数
+                    {t("settings.goLan.wg")}
                   </button>
                   <button
                     onClick={() => patchGoLan({ method: "uri" })}
@@ -715,14 +753,14 @@ export default function Settings() {
                         : "text-gray-500 hover:text-gray-300"
                     )}
                   >
-                    节点分享链接
+                    {t("settings.goLan.uri")}
                   </button>
                 </div>
 
                 {goLan.method === "wg" ? (
                   <div className="space-y-3">
                     <div className="flex gap-2">
-                      <GoLanField label="Server" className="flex-1">
+                      <GoLanField label={t("settings.goLan.server")} className="flex-1">
                         <input
                           type="text"
                           value={goLan.wgServer}
@@ -735,7 +773,7 @@ export default function Settings() {
                           className={GO_LAN_INPUT}
                         />
                       </GoLanField>
-                      <GoLanField label="端口" className="w-24 shrink-0">
+                      <GoLanField label={t("settings.goLan.port")} className="w-24 shrink-0">
                         <input
                           type="number"
                           min={0}
@@ -749,40 +787,40 @@ export default function Settings() {
                         />
                       </GoLanField>
                     </div>
-                    <GoLanField label="私钥（Private Key）">
+                    <GoLanField label={t("settings.goLan.privateKey")}>
                       <input
                         type="password"
                         value={goLan.wgPrivateKey}
                         onChange={(e) =>
                           patchGoLan({ wgPrivateKey: e.target.value })
                         }
-                        placeholder="客户端 WireGuard 私钥"
+                        placeholder={t("settings.goLan.privateKeyPlaceholder")}
                         autoComplete="off"
                         spellCheck={false}
                         className={GO_LAN_INPUT}
                       />
                     </GoLanField>
-                    <GoLanField label="Peer 公钥">
+                    <GoLanField label={t("settings.goLan.peerPublicKey")}>
                       <input
                         type="text"
                         value={goLan.wgPeerPublicKey}
                         onChange={(e) =>
                           patchGoLan({ wgPeerPublicKey: e.target.value })
                         }
-                        placeholder="家庭端 WireGuard 公钥"
+                        placeholder={t("settings.goLan.peerPublicKeyPlaceholder")}
                         autoComplete="off"
                         spellCheck={false}
                         className={GO_LAN_INPUT}
                       />
                     </GoLanField>
-                    <GoLanField label="Pre-Shared Key（可选）">
+                    <GoLanField label={t("settings.goLan.psk")}>
                       <input
                         type="password"
                         value={goLan.wgPreSharedKey}
                         onChange={(e) =>
                           patchGoLan({ wgPreSharedKey: e.target.value })
                         }
-                        placeholder="预共享密钥"
+                        placeholder={t("settings.goLan.pskPlaceholder")}
                         autoComplete="off"
                         spellCheck={false}
                         className={GO_LAN_INPUT}
@@ -790,7 +828,7 @@ export default function Settings() {
                     </GoLanField>
                     <div className="flex gap-2">
                       <GoLanField
-                        label="本机地址（Local IP）"
+                        label={t("settings.goLan.localIp")}
                         className="flex-1"
                       >
                         <input
@@ -805,7 +843,7 @@ export default function Settings() {
                           className={GO_LAN_INPUT}
                         />
                       </GoLanField>
-                      <GoLanField label="MTU" className="w-24 shrink-0">
+                      <GoLanField label={t("settings.goLan.mtu")} className="w-24 shrink-0">
                         <input
                           type="number"
                           min={576}
@@ -822,8 +860,8 @@ export default function Settings() {
                   </div>
                 ) : (
                   <GoLanField
-                    label="回家节点分享链接"
-                    hint="单条 vless / vmess / ss / trojan / hy2 / tuic 链接"
+                    label={t("settings.goLan.nodeLink")}
+                    hint={t("settings.goLan.nodeLinkHint")}
                   >
                     <textarea
                       rows={3}
@@ -843,7 +881,10 @@ export default function Settings() {
 
             {goLan.mode === "managed" && (
               <div className="space-y-3">
-                <GoLanField label="托管服务器" hint="从该服务器拉取家庭网络配置">
+                <GoLanField
+                  label={t("settings.goLan.managedServer")}
+                  hint={t("settings.goLan.managedServerHint")}
+                >
                   <input
                     type="text"
                     value={goLan.managedServer}
@@ -856,7 +897,7 @@ export default function Settings() {
                     className={GO_LAN_INPUT}
                   />
                 </GoLanField>
-                <GoLanField label="设备码（Device Code）">
+                <GoLanField label={t("settings.goLan.deviceCode")}>
                   <div className="flex gap-2">
                     <input
                       type="text"
@@ -864,7 +905,7 @@ export default function Settings() {
                       onChange={(e) =>
                         patchGoLan({ deviceCode: e.target.value })
                       }
-                      placeholder="托管端为本机生成的设备码"
+                      placeholder={t("settings.goLan.deviceCodePlaceholder")}
                       spellCheck={false}
                       autoComplete="off"
                       className={clsx(GO_LAN_INPUT, "flex-1")}
@@ -872,13 +913,13 @@ export default function Settings() {
                     <button
                       onClick={handleGoLanSync}
                       disabled={goLanSyncing}
-                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-surface-hover px-3 py-2 text-xs transition-colors hover:bg-white/10 disabled:opacity-50"
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-surface-hover px-3 py-2 text-xs transition-colors hover:bg-glass-strong disabled:opacity-50"
                     >
                       <RefreshCw
                         size={12}
                         className={goLanSyncing ? "animate-spin" : ""}
                       />
-                      {goLanSyncing ? "同步中…" : "同步回家配置"}
+                      {goLanSyncing ? t("common.syncing") : t("common.sync")}
                     </button>
                   </div>
                 </GoLanField>
@@ -886,8 +927,11 @@ export default function Settings() {
             )}
 
             {/* 通用字段：回家目标（网段 / DNS / 域名后缀） */}
-            <div className="space-y-3 border-t border-white/5 pt-3">
-              <GoLanField label="局域网网段（CIDR）" hint="每行一个，如 192.168.1.0/24">
+            <div className="space-y-3 border-t border-border pt-3">
+              <GoLanField
+                label={t("settings.goLan.lanCidrs")}
+                hint={t("settings.goLan.lanCidrsHint")}
+              >
                 <textarea
                   rows={2}
                   value={goLan.lanCidrs}
@@ -897,7 +941,7 @@ export default function Settings() {
                   className={clsx(GO_LAN_INPUT, "resize-none font-mono text-xs leading-relaxed")}
                 />
               </GoLanField>
-              <GoLanField label="局域网 DNS（可选）">
+              <GoLanField label={t("settings.goLan.lanDns")}>
                 <input
                   type="text"
                   value={goLan.lanDns}
@@ -908,7 +952,10 @@ export default function Settings() {
                   className={GO_LAN_INPUT}
                 />
               </GoLanField>
-              <GoLanField label="域名后缀" hint="每行一个，如 nas.home">
+              <GoLanField
+                label={t("settings.goLan.lanDomains")}
+                hint={t("settings.goLan.lanDomainsHint")}
+              >
                 <textarea
                   rows={2}
                   value={goLan.lanDomains}
@@ -928,7 +975,7 @@ export default function Settings() {
               className="flex items-center gap-1.5 rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
             >
               <RefreshCw size={12} className={goLanBusy ? "animate-spin" : ""} />
-              保存
+              {t("common.save")}
             </button>
           </div>
           </>
@@ -937,32 +984,36 @@ export default function Settings() {
       )}
 
       {/* 高级 */}
-      <SettingsGroup title="高级" icon={<Sliders size={14} />} desc="IPv6、QUIC、连接切换等内核行为">
+      <SettingsGroup
+        title={t("settings.advanced")}
+        icon={<Sliders size={14} />}
+        desc={t("settings.advancedDesc")}
+      >
         <ToggleRow
           icon={<Globe size={16} className="text-gray-400" />}
-          title="IPv6"
-          desc="开启后 DNS 返回 AAAA 并 TUN 接管 v6 流量"
+          title={t("settings.ipv6")}
+          desc={t("settings.ipv6Desc")}
           checked={form.ipv6 ?? false}
           onChange={(v) => patch({ ipv6: v })}
         />
         <ToggleRow
           icon={<Blocks size={16} className="text-gray-400" />}
-          title="阻止 QUIC"
-          desc="拦截 UDP/443 强制 TCP 回退"
+          title={t("settings.blockQuic")}
+          desc={t("settings.blockQuicDesc")}
           checked={form.blockQuic ?? false}
           onChange={(v) => patch({ blockQuic: v })}
         />
         <ToggleRow
           icon={<RefreshCw size={16} className="text-gray-400" />}
-          title="切换策略时关闭连接"
-          desc="切换节点后断开现有连接，新策略立即生效"
+          title={t("settings.closeConns")}
+          desc={t("settings.closeConnsDesc")}
           checked={form.closeConnectionsOnSwitch ?? false}
           onChange={(v) => patch({ closeConnectionsOnSwitch: v })}
         />
       </SettingsGroup>
 
-      {/* 代理内核 */}
-      <SettingsGroup title="代理内核" icon={<Cpu size={14} />}>
+      {/* 代理内核：仅保留版本状态展示行；启动时后台自动校验，无需手动按钮 */}
+      <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={14} />}>
         <Row
           icon={
             <ShieldCheck
@@ -973,74 +1024,57 @@ export default function Settings() {
           iconBg={kernelInfo?.exists ? "bg-latency-good/10" : "bg-latency-bad/10"}
           title={
             kernelInfo?.exists
-              ? `已安装${kernelInfo.version ? ` · v${kernelInfo.version}` : ""}`
-              : "内核文件缺失"
+              ? `${t("settings.kernelInstalled")}${kernelInfo.version ? ` · v${kernelInfo.version}` : ""}`
+              : t("settings.kernelMissing")
           }
-          value={kernelInfo?.exists ? "" : "请重新安装"}
+          value={kernelInfo?.exists ? "" : t("settings.kernelReinstall")}
           valueClass="text-latency-bad"
         />
         {kernelInfo?.path && (
-          <div className="px-3 py-2 text-[11px] font-mono break-all text-gray-500 border-b border-white/5">
+          <div className="px-3 py-2 text-[11px] font-mono break-all text-gray-500 border-t border-border">
             {kernelInfo.path}
           </div>
         )}
-        {kernelMsg && (
-          <div className="px-3 py-2 text-xs text-gray-300 border-b border-white/5">
-            {kernelMsg}
-          </div>
-        )}
-        <div className="px-3 py-3">
-          <button
-            onClick={handleEnsureKernel}
-            disabled={kernelBusy}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-hover hover:bg-white/10 text-xs transition-colors disabled:opacity-50"
-          >
-            <ShieldCheck size={13} className={kernelBusy ? "animate-pulse" : ""} />
-            {kernelBusy ? "处理中…" : "校验内核状态"}
-          </button>
-        </div>
       </SettingsGroup>
 
       {/* Prism Pro 授权卡片：未授权展示设备 ID + 激活入口；已授权展示协议授权信息 */}
       <SettingsGroup
-        title="Prism Pro"
+        title={t("pro.title")}
         icon={<Sparkles size={14} className="text-accent" />}
         headerRight={
           <span className="flex items-center gap-1.5 text-xs text-gray-400">
             <span
               className={`inline-block w-1.5 h-1.5 rounded-full ${STATUS_META[entitlement.status].dot}`}
             />
-            {statusText(entitlement.plan, entitlement.status)}
+            {statusTextT(entitlement.plan, entitlement.status, t)}
           </span>
         }
       >
         {entitlement.status === "offline" && (
-          <div className="flex items-start gap-2 px-3 py-2.5 bg-yellow-500/5 text-yellow-400 text-xs border-b border-white/5">
+          <div className="flex items-start gap-2 px-3 py-2.5 bg-yellow-500/5 text-yellow-400 text-xs border-b border-border">
             <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-            <span>
-              网络不可用，授权校验失败，Pro 功能已暂停；联网恢复后自动重新校验。
-            </span>
+            <span>{t("pro.offlineBanner")}</span>
           </div>
         )}
 
         {/* 设备 ID：激活时与服务端绑定，点击复制 */}
         <button
           onClick={copyDeviceId}
-          className="w-full flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-white/5 text-left transition-colors hover:bg-surface-hover/40"
+          className="w-full flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-border text-left transition-colors hover:bg-surface-hover/40"
         >
           <span className="flex items-center gap-3 min-w-0">
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-white/5">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-glass">
               <Fingerprint size={16} className="text-gray-400" />
             </span>
             <span className="min-w-0">
-              <span className="block text-sm">设备 ID</span>
+              <span className="block text-sm">{t("pro.deviceId")}</span>
               <span className="block text-[11px] text-gray-500">
-                点击复制 · 激活时绑定本机
+                {t("pro.deviceIdHint")}
               </span>
             </span>
           </span>
           <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-mono text-gray-400">
-            <span className="max-w-[150px] truncate">{deviceId ?? "生成中…"}</span>
+            <span className="max-w-[150px] truncate">{deviceId ?? t("common.loading")}</span>
             <Copy size={12} className="shrink-0 text-gray-500" />
           </span>
         </button>
@@ -1048,8 +1082,8 @@ export default function Settings() {
         {/* APP 版本：当前安装的 Prism 版本号 */}
         <Row
           icon={<AppWindow size={16} className="text-gray-400" />}
-          iconBg="bg-white/5"
-          title="APP 版本"
+          iconBg="bg-glass"
+          title={t("pro.appVersion")}
           value={appVersion ? `v${appVersion}` : "—"}
         />
 
@@ -1058,22 +1092,22 @@ export default function Settings() {
             <Row
               icon={<Sparkles size={16} className="text-accent" />}
               iconBg="bg-accent/10"
-              title="当前方案"
-              value={planText(entitlement.plan, entitlement.kind)}
+              title={t("pro.currentPlan")}
+              value={planTextT(entitlement.plan, entitlement.kind, t)}
             />
             <Row
               icon={<Check size={16} className="text-gray-400" />}
-              iconBg="bg-white/5"
-              title="到期时间"
+              iconBg="bg-glass"
+              title={t("pro.expiry")}
               value={
                 <span className="flex items-center gap-1.5">
                   {entitlement.plan === "team" ||
                   (entitlement.kind === "lifetime" && !entitlement.expiresAt)
-                    ? "永久有效"
+                    ? t("pro.permanent")
                     : fmtDateTime(entitlement.expiresAt)}
                   {expiringSoon(entitlement.expiresAt) && (
                     <span className="text-[11px] text-yellow-400">
-                      即将到期
+                      {t("pro.expiringSoon")}
                     </span>
                   )}
                 </span>
@@ -1082,25 +1116,25 @@ export default function Settings() {
             {entitlement.maxSeats != null && (
               <Row
                 icon={<Smartphone size={16} className="text-gray-400" />}
-                iconBg="bg-white/5"
-                title="设备名额"
+                iconBg="bg-glass"
+                title={t("pro.seats")}
                 value={`${entitlement.usedSeats ?? "?"} / ${entitlement.maxSeats}`}
               />
             )}
             <Row
               icon={<RefreshCw size={16} className="text-gray-400" />}
-              iconBg="bg-white/5"
-              title="上次校验"
+              iconBg="bg-glass"
+              title={t("pro.lastVerify")}
               value={fmtDate(entitlement.lastVerifiedAt)}
             />
-            <div className="flex flex-wrap gap-2 px-3 py-3 border-t border-white/5">
+            <div className="flex flex-wrap gap-2 px-3 py-3 border-t border-border">
               <button
                 onClick={handleVerifyEntitlement}
                 disabled={proBusy}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-white/10 text-xs transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-glass-strong text-xs transition-colors disabled:opacity-50"
               >
                 <RefreshCw size={12} className={proBusy ? "animate-spin" : ""} />
-                {proBusy ? "校验中..." : "立即校验"}
+                {proBusy ? t("pro.licensingBusy") : t("pro.verifyNow")}
               </button>
               <button
                 onClick={handleDeactivate}
@@ -1112,47 +1146,46 @@ export default function Settings() {
                     : "bg-surface-hover hover:bg-latency-bad/20 text-gray-400 hover:text-latency-bad"
                 )}
               >
-                {confirmDeactivate ? "确认移除授权？" : "移除授权"}
+                {confirmDeactivate ? t("pro.removeConfirm") : t("pro.remove")}
               </button>
             </div>
           </>
         ) : (
           <>
-            <div className="space-y-2 border-b border-white/5 px-3 py-3">
+            <div className="space-y-2 border-b border-border px-3 py-3">
               <div className="text-xs font-medium text-gray-200">
-                解锁 Prism Pro 全场景智联权益
+                {t("pro.benefitsTitle")}
               </div>
               <ul className="space-y-1 text-[11px] leading-relaxed text-gray-500">
                 <li>
                   •{" "}
                   <span className="font-medium text-gray-300">
-                    Go AIM 智选引擎
+                    {t("pro.name.goAim")}
                   </span>
-                  ：实时探测并自动锁定解锁 ChatGPT、Claude、Netflix 等平台的最低延迟节点
+                  {t("pro.benefit1")}
                 </li>
                 <li>
                   •{" "}
                   <span className="font-medium text-gray-300">
-                    Go Lan 回家内网
+                    {t("pro.name.goLan")}
                   </span>
-                  ：外网科学加速的同时，自动建立加密隧道直通家中 NAS 与局域网设备
+                  {t("pro.benefit2")}
                 </li>
                 <li>
                   •{" "}
                   <span className="font-medium text-gray-300">
-                    Go Cus 模块中心
+                    {t("pro.name.goCus")}
                   </span>
-                  ：全面兼容主流客户端的覆写、URL 重定向、MitM 解密与脚本引擎
+                  {t("pro.benefit3")}
                 </li>
                 <li>
                   •{" "}
-                  <span className="font-medium text-gray-300">多端云同步</span>
-                  ：Pro 订阅与买断版支持跨设备实时静默同步订阅链接
+                  <span className="font-medium text-gray-300">{t("pro.name.sync")}</span>
+                  {t("pro.benefit4")}
                 </li>
               </ul>
-              <div className="border-t border-white/5 pt-1 text-[11px] text-gray-500/80">
-                支持试用版（1 台）、Pro 订阅（3 台）与终身买断（5 台）。凭 License
-                Key 与注册邮箱联合验证，激活即自动绑定本机设备 ID。
+              <div className="border-t border-border pt-1 text-[11px] text-gray-500/80">
+                {t("pro.seatsHint")}
               </div>
             </div>
             <div className="flex flex-wrap gap-2 px-3 py-3">
@@ -1161,15 +1194,15 @@ export default function Settings() {
                 className="flex-1 min-w-[120px] flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-accent hover:bg-accent-hover text-white text-xs font-medium transition-colors"
               >
                 <Sparkles size={12} />
-                激活授权
+                {t("pro.activateNow")}
               </button>
               <button
                 onClick={handleVerifyEntitlement}
                 disabled={proBusy}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-white/10 text-xs transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-surface-hover hover:bg-glass-strong text-xs transition-colors disabled:opacity-50"
               >
                 <RefreshCw size={12} className={proBusy ? "animate-spin" : ""} />
-                {proBusy ? "校验中..." : "立即校验"}
+                {proBusy ? t("pro.licensingBusy") : t("pro.verifyNow")}
               </button>
             </div>
           </>
@@ -1186,11 +1219,66 @@ export default function Settings() {
 
 const MODES = RUN_MODES;
 
+/** 主标题右侧状态标签：激活后按档位显示，未激活沿用状态文案 */
+function statusTextT(
+  plan: string | null,
+  status: EntitlementState,
+  t: (k: string) => string,
+): string {
+  if (status !== "active") return t(STATUS_META[status].key);
+  if (plan === "team") return t("pro.status.teamPermanent");
+  if (plan === "pro") return t("pro.status.proActive");
+  if (plan === "free") return t("pro.status.freeActive");
+  return t("pro.status.active");
+}
+
+/** 方案名展示 */
+function planTextT(
+  plan: string | null,
+  kind: string | null,
+  t: (k: string) => string,
+): string {
+  if (plan && PLAN_LABEL[plan]) return t(PLAN_LABEL[plan]);
+  if (kind === "lifetime") return t("pro.plan.lifetime");
+  if (kind === "subscription") return t("pro.plan.subscription");
+  return "—";
+}
+
 // ---- 复用组件 ----
 
 /// Go Lan 卡片输入框统一样式
 const GO_LAN_INPUT =
-  "w-full rounded-lg border border-white/5 bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent";
+  "w-full rounded-lg border border-border bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent";
+
+/// 分段切换器（语言 / 外观等三态选择）
+function Segmented({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: Array<{ value: string; label: string }>;
+}) {
+  return (
+    <div className="flex items-center gap-1 rounded-lg bg-surface-hover p-0.5 text-xs">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          onClick={() => onChange(o.value)}
+          className={clsx(
+            "rounded-md px-2.5 py-1 whitespace-nowrap transition-colors",
+            value === o.value
+              ? "bg-accent text-white"
+              : "text-gray-400 hover:text-gray-200"
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /// Go Lan 字段容器：label + 输入控件 + 可选说明
 function GoLanField({
@@ -1243,7 +1331,7 @@ function SettingsGroup({
           {desc}
         </p>
       )}
-      <div className="rounded-xl bg-surface-card border border-white/5 overflow-hidden">
+      <div className="rounded-xl bg-surface-card border border-border overflow-hidden">
         {children}
       </div>
     </section>
@@ -1252,7 +1340,7 @@ function SettingsGroup({
 
 function RowIcon({ children }: { children: React.ReactNode }) {
   return (
-    <span className="flex h-7 w-7 items-center justify-center rounded-md bg-white/5">
+    <span className="flex h-7 w-7 items-center justify-center rounded-md bg-glass">
       {children}
     </span>
   );
@@ -1274,12 +1362,12 @@ function Row({
   chevron?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-white/5 last:border-0">
+    <div className="flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-border last:border-0">
       <div className="flex items-center gap-3 flex-1 min-w-0">
         <span
           className={clsx(
             "flex h-7 w-7 shrink-0 items-center justify-center rounded-md",
-            iconBg ?? "bg-white/5"
+            iconBg ?? "bg-glass"
           )}
         >
           {icon}
@@ -1308,10 +1396,10 @@ function ToggleRow({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-white/5 last:border-0">
+    <div className="flex items-center justify-between gap-3 overflow-hidden px-3 py-3 border-b border-border last:border-0">
       <div className="flex items-center gap-3 flex-1 min-w-0">
         {icon && (
-          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-white/5">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-glass">
             {icon}
           </span>
         )}

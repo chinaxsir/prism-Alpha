@@ -6,40 +6,44 @@ import Proxies from "./Proxies";
 import Connections from "./Connections";
 import Rules from "./Rules";
 import GoCus from "./GoCus";
+import { useTranslation } from "@/i18n";
 
 type TabKey = "nodes" | "connections" | "rules" | "goCus";
 
-const TABS: Array<{ key: TabKey; label: string; icon?: LucideIcon }> = [
-  { key: "nodes", label: "节点" },
-  { key: "connections", label: "连接" },
-  { key: "rules", label: "规则" },
-  { key: "goCus", label: "Go Cus", icon: Wand2 },
+const TABS: Array<{ key: TabKey; labelKey: string; icon?: LucideIcon }> = [
+  { key: "nodes", labelKey: "metric.nodes" },
+  { key: "connections", labelKey: "metric.connections" },
+  { key: "rules", labelKey: "metric.rules" },
+  { key: "goCus", labelKey: "engine.goCus", icon: Wand2 },
 ];
 
 /** 代理中心：节点 / 连接 / 规则 / Go Cus 四合一（原三个独立导航项合并） */
 export default function ProxiesHub() {
+  const { t } = useTranslation();
   const [params, setParams] = useSearchParams();
   const raw = params.get("tab");
-  const tab: TabKey = TABS.some((t) => t.key === raw) ? (raw as TabKey) : "nodes";
+  const tab: TabKey = TABS.some((it) => it.key === raw) ? (raw as TabKey) : "nodes";
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-2xl font-bold">代理</h1>
-        <div className="flex rounded-lg border border-white/5 bg-surface-hover p-1">
-          {TABS.map((t) => (
+        <h1 className="text-2xl font-bold">{t("nav.proxies")}</h1>
+        <div className="flex rounded-lg border border-border bg-surface-hover p-1">
+          {TABS.map((tabItem) => (
             <button
-              key={t.key}
-              onClick={() => setParams(t.key === "nodes" ? {} : { tab: t.key })}
+              key={tabItem.key}
+              onClick={() =>
+                setParams(tabItem.key === "nodes" ? {} : { tab: tabItem.key })
+              }
               className={clsx(
                 "flex items-center gap-1.5 rounded-md px-4 py-1.5 text-sm transition-colors",
-                tab === t.key
+                tab === tabItem.key
                   ? "bg-accent text-white"
                   : "text-gray-400 hover:text-gray-200"
               )}
             >
-              {t.icon && <t.icon size={14} />}
-              {t.label}
+              {tabItem.icon && <tabItem.icon size={14} />}
+              {t(tabItem.labelKey)}
             </button>
           ))}
         </div>

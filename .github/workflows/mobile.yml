@@ -480,7 +480,9 @@ jobs:
           # 与 crate 版本漂移导致设置页 APP 版本显示错误）
           APP_VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           # 纯数字构建流水号（Apple 规范禁止 CFBundleVersion 含字母）
-          BUILD_NUM=${GITHUB_RUN_NUMBER:-$(date +%s)}
+          # 以 200 为基数叠加 CI 流水号，保证单调递增且不低于历史版本
+          RUN_NUM=${GITHUB_RUN_NUMBER:-$(date +%s)}
+          BUILD_NUM=$((200 + RUN_NUM))
           MAIN_BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")
 
           # 主程序

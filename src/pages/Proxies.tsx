@@ -18,6 +18,7 @@ import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
 import { ActivateProModal } from "@/components/ProGate";
+import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
 interface DelaySample {
@@ -48,23 +49,26 @@ const PROTOCOL_LABEL: Record<string, string> = {
   WireGuard: "WG",
   Socks: "SOCKS",
   HTTP: "HTTP",
-  Direct: "直连",
-  Block: "阻断",
 };
-
-const protocolTag = (type: string): string =>
-  PROTOCOL_LABEL[type] ?? type ?? "—";
 
 /// Go AIM 筛选 pills
 type AimFilter = "all" | "aim" | "ai" | "media";
-const AIM_FILTERS: Array<{ value: AimFilter; label: string }> = [
-  { value: "all", label: "全部" },
-  { value: "aim", label: "Go AIM" },
-  { value: "ai", label: "AI" },
-  { value: "media", label: "流媒体" },
+const AIM_FILTERS: Array<{ value: AimFilter; labelKey: string }> = [
+  { value: "all", labelKey: "common.all" },
+  { value: "aim", labelKey: "engine.goAim" },
+  { value: "ai", labelKey: "proxies.aim.ai" },
+  { value: "media", labelKey: "proxies.aim.media" },
 ];
 
 export default function Proxies() {
+  const { t } = useTranslation();
+
+  const protocolTag = (type: string): string => {
+    if (type === "Direct") return t("proxies.proto.direct");
+    if (type === "Block") return t("proxies.proto.block");
+    return PROTOCOL_LABEL[type] ?? type ?? "—";
+  };
+
   const coreStatus = useCoreStore((s) => s.status);
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
   const proReady = useProStore((s) => s.ready);
@@ -95,7 +99,7 @@ export default function Proxies() {
 
   /// 未激活授权时的统一拦截：提示 + 弹出激活弹窗，绝不执行筛选/探测
   const guardPro = () => {
-    toast.error("请先激活 Pro 授权以使用 Go AIM 智能筛选与检测");
+    toast.error(t("proxies.goAim.guard"));
     setShowActivate(true);
   };
 
@@ -225,7 +229,7 @@ export default function Proxies() {
       if (fastest) {
         await selectProxy(groupName, fastest);
         setCurrent(fastest);
-        toast.info(`已自动选择延迟最低节点：${fastest}`);
+        toast.info(t("proxies.autoSelected", { name: fastest }));
         await loadProxies();
       }
     } catch (e) {
@@ -258,12 +262,12 @@ export default function Proxies() {
         /* ignore */
       }
       if (!mainSelectorRef.current) {
-        toast.error("未找到主选择组，请先启动内核");
+        toast.error(t("proxies.err.noMainGroup"));
         return;
       }
     }
     if (nodes.length === 0) {
-      toast.error("当前没有可测速的节点");
+      toast.error(t("proxies.err.noNodesToTest"));
       return;
     }
     setTesting(true);
@@ -281,7 +285,7 @@ export default function Proxies() {
       setDelays(result ?? {});
     } catch (e) {
       console.error("url test failed:", e);
-      toast.error(`测速失败：${String(e)}`);
+      toast.error(t("proxies.err.testFailed", { error: String(e) }));
     } finally {
       setTesting(false);
     }
@@ -306,12 +310,12 @@ export default function Proxies() {
       return;
     }
     if (coreStatus !== "running") {
-      toast.error("内核未运行，无法探测");
+      toast.error(t("proxies.err.coreNotRunningProbe"));
       return;
     }
     try {
       await runGoAimProbe();
-      toast.info("Go AIM 探测已启动，结果将实时更新");
+      toast.info(t("proxies.goAim.probeStarted"));
     } catch (e) {
       // 含 "Pro" 的错误为门控/授权类错误，直接原样提示
       toast.error(String(e));
@@ -364,15 +368,15 @@ export default function Proxies() {
 
   if (nodes.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 bg-surface-card/50 py-16 px-6 text-center">
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border-strong bg-surface-card/50 py-16 px-6 text-center">
         <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/10 text-accent">
           <Gauge size={26} />
         </div>
         <h3 className="text-base font-semibold text-gray-200">
-          暂无节点
+          {t("proxies.empty.noNodes")}
         </h3>
         <p className="mt-2 max-w-sm text-sm leading-relaxed text-gray-500">
-          请导入订阅或更新已导入的订阅；启动内核后可在此测速、切换节点。
+          {t("proxies.empty.noNodesDesc")}
         </p>
         <div className="mt-6 flex items-center gap-3">
           <Link
@@ -380,15 +384,15 @@ export default function Proxies() {
             className="flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-hover"
           >
             <RefreshCw size={14} />
-            管理订阅
+            {t("proxies.manageSub")}
           </Link>
           {coreStatus !== "running" && (
             <Link
               to="/dashboard"
-              className="flex items-center gap-2 rounded-lg border border-white/10 px-5 py-2.5 text-sm text-gray-300 transition-colors hover:border-white/20"
+              className="flex items-center gap-2 rounded-lg border border-border px-5 py-2.5 text-sm text-gray-300 transition-colors hover:border-border-strong"
             >
               <Gauge size={15} />
-              前往仪表盘启动
+              {t("proxies.goDashboard")}
             </Link>
           )}
         </div>
@@ -412,24 +416,24 @@ export default function Proxies() {
                   "shrink-0 flex items-center gap-1 px-3 py-1 rounded-full text-xs transition-colors",
                   filter === f.value
                     ? "bg-accent text-white font-medium"
-                    : "bg-white/5 text-gray-400 hover:text-gray-200"
+                    : "bg-glass text-gray-400 hover:text-gray-200"
                 )}
               >
                 {locked && <Lock size={12} className="opacity-70" />}
-                {f.label}
+                {t(f.labelKey)}
               </button>
             );
           })}
         </div>
         <button
           onClick={proActive ? handleAimProbe : guardPro}
-          className="ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+          className="ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border-strong text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
           title={
             !proActive
-              ? "Pro 功能：激活授权后可用"
+              ? t("proxies.goAim.lockedTip")
               : coreStatus === "running"
-                ? "运行 Go AIM 解锁探测（AI / 流媒体）"
-                : "启动内核后可探测"
+                ? t("proxies.goAim.probeTip")
+                : t("proxies.goAim.probeNeedCore")
           }
         >
           {!proActive ? (
@@ -437,18 +441,18 @@ export default function Proxies() {
           ) : (
             <Crosshair size={13} />
           )}
-          AI检测
+          {t("proxies.goAim.detect")}
         </button>
       </div>
 
       {/* 顶部工具栏：搜索 + 测速 */}
       <div className="flex items-center gap-2">
-        <div className="flex-1 flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-card border border-white/5">
+        <div className="flex-1 flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-card border border-border">
           <Search size={14} className="text-gray-500" />
           <input
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
-            placeholder="搜索节点…"
+            placeholder={t("proxies.searchNodes")}
             className="flex-1 bg-transparent text-sm outline-none placeholder:text-gray-600"
           />
         </div>
@@ -456,39 +460,45 @@ export default function Proxies() {
           onClick={handleTest}
           disabled={testing || coreStatus !== "running"}
           className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-accent text-white text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          title={coreStatus !== "running" ? "启动内核后可测速" : "测速"}
+          title={
+            coreStatus !== "running"
+              ? t("proxies.speedTestNeedCore")
+              : t("proxies.speedTest")
+          }
         >
           <Zap size={13} className={testing ? "animate-pulse" : ""} />
-          {testing ? "测速中" : "测速"}
+          {testing ? t("proxies.speedTesting") : t("proxies.speedTest")}
         </button>
       </div>
 
       {/* 当前选中节点信息 */}
       <div className="flex items-center justify-between px-1 text-xs text-gray-400">
         <span>
-          当前：
-          <span className="text-accent">{current || "未选择"}</span>
+          {t("proxies.current")}
+          <span className="text-accent">{current || t("proxies.notSelected")}</span>
           {coreStatus !== "running" && (
-            <span className="text-gray-600 ml-2">· 内核未运行（预览模式）</span>
+            <span className="text-gray-600 ml-2">
+              {t("proxies.coreNotRunningPreview")}
+            </span>
           )}
         </span>
-        <span>{filtered.length} 节点</span>
+        <span>{t("proxies.nodeCount", { count: filtered.length })}</span>
       </div>
 
       {/* 节点列表流（Shadowrocket 风格；测速完成后按延迟升序） */}
       {sorted.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-white/5 py-12 px-6 text-center">
+        <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-border py-12 px-6 text-center">
           <Search size={22} className="text-gray-600" />
-          <p className="mt-3 text-sm text-gray-400">无符合筛选条件的节点</p>
+          <p className="mt-3 text-sm text-gray-400">{t("proxies.empty.noMatch")}</p>
           <button
             onClick={resetFilters}
-            className="mt-4 rounded-lg border border-white/10 px-4 py-1.5 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+            className="mt-4 rounded-lg border border-border-strong px-4 py-1.5 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
           >
-            重置筛选
+            {t("proxies.resetFilter")}
           </button>
         </div>
       ) : (
-      <div className="rounded-2xl bg-surface-card overflow-hidden border border-white/5">
+      <div className="rounded-2xl bg-surface-card overflow-hidden border border-border">
         {sorted.map((node, idx) => {
           const delay = lastDelay(node);
           const selected = current === node.name;
@@ -500,9 +510,9 @@ export default function Proxies() {
               disabled={coreStatus !== "running"}
               className={clsx(
                 "w-full flex items-center gap-3 px-4 py-3 text-left transition-colors",
-                selected ? "bg-accent/10" : "hover:bg-white/[0.03]",
+                selected ? "bg-accent/10" : "hover:bg-glass",
                 coreStatus !== "running" && "cursor-default opacity-80",
-                idx !== sorted.length - 1 && "border-b border-white/5"
+                idx !== sorted.length - 1 && "border-b border-border"
               )}
             >
               {/* 选中指示器 */}
@@ -524,18 +534,24 @@ export default function Proxies() {
               </span>
 
               {/* 协议标签 */}
-              <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide bg-white/5 text-gray-400">
+              <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide bg-glass text-gray-400">
                 {protocolTag(node.type)}
               </span>
 
               {/* Go AIM 解锁徽章（探测评级后显示；未激活授权不渲染） */}
               {proActive && aimResult?.aiUnlocked && (
-                <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-accent/15 text-accent">
+                <span
+                  title={t("proxies.badge.ai")}
+                  className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-accent/15 text-accent"
+                >
                   AI
                 </span>
               )}
               {proActive && aimResult?.mediaUnlocked && (
-                <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-latency-good/15 text-latency-good">
+                <span
+                  title={t("proxies.badge.netflix")}
+                  className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-latency-good/15 text-latency-good"
+                >
                   NF
                 </span>
               )}

@@ -2,6 +2,51 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============================ 语义化主题变量 ============================
+   浅色为默认（:root / [data-theme="light"]），深色覆盖
+   （[data-theme="dark"] 或 .dark）。App.tsx 依据「跟随系统 / 深色 / 浅色」
+   写入 html 的 data-theme 与 dark 类，实现无感切换。 */
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  --surface: 244 245 249; /* #F4F5F9 柔和浅灰底 */
+  --surface-card: 255 255 255; /* #FFFFFF 纯白卡片 */
+  --surface-hover: 238 240 246; /* #EEF0F6 */
+  --border: 15 23 42; /* rgba(15,23,42,.07) */
+  --glass: 15 23 42;
+  --accent: 91 106 240; /* #5B6AF0 */
+  --accent-hover: 79 94 226;
+
+  --gray-100: 15 23 42; /* #0F172A */
+  --gray-200: 30 41 59;
+  --gray-300: 51 65 85;
+  --gray-400: 100 116 139; /* #64748B */
+  --gray-500: 100 116 139;
+  --gray-600: 148 163 184;
+}
+
+[data-theme="dark"],
+.dark {
+  color-scheme: dark;
+
+  --surface: 18 20 26; /* #12141A */
+  --surface-card: 30 34 45; /* #1E222D */
+  --surface-hover: 37 41 54; /* #252936 */
+  --border: 255 255 255;
+  --glass: 255 255 255;
+  --accent: 99 102 241; /* #6366f1 */
+  --accent-hover: 129 140 248; /* #818cf8 */
+
+  --gray-100: 248 250 252;
+  --gray-200: 226 232 240;
+  --gray-300: 203 213 225;
+  --gray-400: 148 163 184;
+  --gray-500: 107 114 128;
+  --gray-600: 75 85 99;
+}
+
 body {
   @apply bg-surface text-gray-200 antialiased;
   font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
@@ -10,6 +55,11 @@ body {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   overscroll-behavior: none;
+}
+
+/* 主题切换过渡（仅背景/文字/边框，避免布局抖动） */
+html {
+  background-color: rgb(var(--surface));
 }
 
 /* 杜绝任何子元素把页面撑宽导致内容横向溢出屏幕（iOS WKWebView 上
@@ -26,15 +76,15 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #1e222d;
+  background: rgb(var(--surface-hover));
   border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #4a505f;
+  background: rgb(var(--gray-600) / 0.5);
   border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #5a6070;
+  background: rgb(var(--gray-500) / 0.7);
 }

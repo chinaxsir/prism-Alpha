@@ -46,8 +46,8 @@ export default function Switch({
           width="43"
           height="23"
           rx="7.5"
-          fill={checked ? "#6366F1" : "rgba(255, 255, 255, 0.12)"}
-          stroke={checked ? "#818CF8" : "rgba(255, 255, 255, 0.2)"}
+          fill={checked ? "#6366F1" : "rgb(var(--glass) / 0.12)"}
+          stroke={checked ? "#818CF8" : "rgb(var(--glass) / 0.2)"}
           strokeWidth="1"
           style={{ transition: "fill 180ms ease, stroke 180ms ease" }}
         />

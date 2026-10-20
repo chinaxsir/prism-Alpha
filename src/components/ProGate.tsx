@@ -1,10 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Check, Loader2, Lock, Sparkles } from "lucide-react";
 
-import { FEATURE_LABEL, type Feature } from "@/pro/gating";
+import { Feature } from "@/pro/gating";
 import type { Entitlement } from "@/api/ipc";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
+import { useTranslation } from "@/i18n";
 
 /** 服务端 429 时从错误信息中解析 retry_after 秒数（容忍 JSON / 纯文本格式）。
  *  后端约定：错误字符串以 "rate_limited:{秒数}" 开头（见 license.rs activate）。 */
@@ -19,20 +20,22 @@ function parseRetryAfter(message: string): number {
   return 0;
 }
 
-/** 服务端方案名展示（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
+/** 服务端方案名 → 文案 key（API: free=试用版 / pro=Pro 订阅版 / team=终身买断版） */
 const PLAN_LABEL: Record<string, string> = {
-  free: "试用版 (Trial)",
-  pro: "Pro 订阅版",
-  team: "终身买断版 (永久)",
+  free: "pro.plan.free",
+  pro: "pro.plan.pro",
+  team: "pro.plan.team",
 };
 
-/** 展示当前方案：优先服务端 plan 字段（free/pro/team），回落到授权类型 */
-function planLabel(e: Entitlement): string {
-  if (e.plan && PLAN_LABEL[e.plan]) return PLAN_LABEL[e.plan];
-  if (e.kind === "lifetime") return "终身买断";
-  if (e.kind === "subscription") return "订阅";
-  return "—";
-}
+/** 门控功能名 → 文案 key */
+const FEATURE_KEY: Record<Feature, string> = {
+  [Feature.MultiSubscription]: "feature.multiSubscription",
+  [Feature.Connections]: "feature.connections",
+  [Feature.Rules]: "feature.rules",
+  [Feature.GoAim]: "feature.goAim",
+  [Feature.GoLan]: "feature.goLan",
+  [Feature.GoCus]: "feature.goCus",
+};
 
 /** Unix 秒 → "YYYY-MM-DD HH:mm"（本地时区） */
 function formatExpiry(secs: number): string {
@@ -48,13 +51,6 @@ function expiringSoon(secs: number | null): boolean {
   return diff > 0 && diff < 3 * 86_400_000;
 }
 
-function expiryText(e: Entitlement): string {
-  // 买断版永久有效：expires_at 为 null
-  if (e.plan === "team" || (e.kind === "lifetime" && !e.expiresAt)) return "永久有效";
-  if (!e.expiresAt) return "—";
-  return formatExpiry(e.expiresAt);
-}
-
 /// 激活 Pro 弹窗：License Key + 邮箱（全平台统一；不提供商店内购）
 export function ActivateProModal({
   open,
@@ -63,6 +59,7 @@ export function ActivateProModal({
   open: boolean;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const activate = useProStore((s) => s.activate);
   const error = useProStore((s) => s.error);
   const [licenseKey, setLicenseKey] = useState("");
@@ -83,23 +80,39 @@ export function ActivateProModal({
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
   const counting = retryAfter > 0;
 
+  /** 展示当前方案：优先服务端 plan 字段（free/pro/team），回落到授权类型 */
+  const planText = (e: Entitlement): string => {
+    if (e.plan && PLAN_LABEL[e.plan]) return t(PLAN_LABEL[e.plan]);
+    if (e.kind === "lifetime") return t("pro.plan.lifetime");
+    if (e.kind === "subscription") return t("pro.plan.subscription");
+    return "—";
+  };
+
+  /** 到期时间文案：买断版永久有效（expires_at 为 null） */
+  const expiryText = (e: Entitlement): string => {
+    if (e.plan === "team" || (e.kind === "lifetime" && !e.expiresAt))
+      return t("pro.permanent");
+    if (!e.expiresAt) return "—";
+    return formatExpiry(e.expiresAt);
+  };
+
   // License Key 激活：服务端强制「Key + 注册邮箱」联合校验，两者均为必填
   const submitLicense = async () => {
     if (busy || counting) return;
     // 本地必填/格式校验：缺项绝不打服务端，避免白白触发 3 次防爆破锁定
     if (!licenseKey.trim() || !email.trim()) {
-      toast.error("请输入完整的 License Key 和注册账号邮箱（两者均为必填项）");
+      toast.error(t("pro.requiredMissing"));
       return;
     }
     if (!emailOk) {
-      toast.error("邮箱格式不正确，请检查后重试");
+      toast.error(t("pro.emailInvalid"));
       return;
     }
     setBusy(true);
     const ok = await activate(licenseKey.trim(), email.trim());
     setBusy(false);
     if (ok) {
-      toast.success("Pro 已激活，高级功能全部解锁");
+      toast.success(t("pro.activatedToast"));
       setActivated(useProStore.getState().entitlement);
       setLicenseKey("");
       setEmail("");
@@ -108,8 +121,8 @@ export function ActivateProModal({
       if (wait > 0) setRetryAfter(wait);
       toast.error(
         wait > 0
-          ? `激活尝试过于频繁，请 ${wait} 秒后重试`
-          : (error ?? "激活失败，请检查 License Key 与注册邮箱")
+          ? t("pro.rateLimited", { secs: wait })
+          : (error ?? t("pro.activateFailed"))
       );
     }
   };
@@ -135,22 +148,22 @@ export function ActivateProModal({
               <span className="flex h-8 w-8 items-center justify-center rounded-full bg-latency-good/15">
                 <Check size={16} className="text-latency-good" />
               </span>
-              <h3 className="text-base font-semibold">激活成功</h3>
+              <h3 className="text-base font-semibold">{t("pro.activateSuccess")}</h3>
             </div>
-            <div className="space-y-2.5 rounded-lg border border-white/5 bg-surface-hover px-4 py-3.5 text-sm">
+            <div className="space-y-2.5 rounded-lg border border-border bg-surface-hover px-4 py-3.5 text-sm">
               <div className="flex items-center justify-between">
-                <span className="text-gray-400">当前方案</span>
+                <span className="text-gray-400">{t("pro.currentPlan")}</span>
                 <span className="font-medium text-gray-100">
-                  {planLabel(activated)}
+                  {planText(activated)}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-400">到期时间</span>
+                <span className="text-gray-400">{t("pro.expiry")}</span>
                 <span className="flex items-center gap-1.5 font-medium tabular-nums text-gray-100">
                   {expiryText(activated)}
                   {expiringSoon(activated.expiresAt) && (
                     <span className="text-[11px] font-normal text-yellow-400">
-                      即将到期
+                      {t("pro.expiringSoon")}
                     </span>
                   )}
                 </span>
@@ -160,57 +173,52 @@ export function ActivateProModal({
               onClick={dismiss}
               className="w-full rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-hover"
             >
-              完成
+              {t("common.done")}
             </button>
           </>
         ) : (
           <>
             <div className="flex items-center gap-2">
               <Sparkles size={18} className="text-accent" />
-              <h3 className="text-base font-semibold">激活授权</h3>
+              <h3 className="text-base font-semibold">{t("pro.activateTitle")}</h3>
             </div>
 
             {/* License Key + 注册邮箱（联合校验，均为必填） */}
             <div className="space-y-3">
               <div className="space-y-1.5">
-                <label className="text-xs text-gray-400">License Key（必填）</label>
+                <label className="text-xs text-gray-400">{t("pro.licenseLabel")}</label>
                 <input
                   type="text"
                   value={licenseKey}
                   onChange={(e) => setLicenseKey(e.target.value)}
-                  placeholder="ASKC-XXXX-XXXX-XXXX-XXXX"
+                  placeholder={t("pro.licensePlaceholder")}
                   autoComplete="off"
                   spellCheck={false}
-                  className="w-full rounded-lg border border-white/5 bg-surface-hover px-4 py-2 font-mono text-sm outline-none focus:border-accent"
+                  className="w-full rounded-lg border border-border bg-surface-hover px-4 py-2 font-mono text-sm outline-none focus:border-accent"
                 />
               </div>
               <div className="space-y-1.5">
-                <label className="text-xs text-gray-400">注册邮箱（必填）</label>
+                <label className="text-xs text-gray-400">{t("pro.emailLabel")}</label>
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="请输入获取授权时绑定的账号邮箱"
+                  placeholder={t("pro.emailPlaceholder")}
                   autoComplete="email"
-                  className="w-full rounded-lg border border-white/5 bg-surface-hover px-4 py-2 text-sm outline-none focus:border-accent"
+                  className="w-full rounded-lg border border-border bg-surface-hover px-4 py-2 text-sm outline-none focus:border-accent"
                 />
                 {email.trim() && !emailOk && (
-                  <p className="text-xs text-red-400">邮箱格式不正确</p>
+                  <p className="text-xs text-red-400">{t("pro.emailInvalid")}</p>
                 )}
               </div>
-              <p className="text-xs text-gray-500">
-                请输入您的 License Key 与注册账号邮箱完成设备绑定（支持试用版 /
-                Pro 订阅 / 终身买断授权）。
-              </p>
-              <p className="text-[11px] text-gray-600">
-                激活失败时请记下提示中的错误码，可在官网帮助中心按错误码查询具体原因。
-              </p>
+              <p className="text-xs text-gray-500">{t("pro.modalHint")}</p>
+              <p className="text-[11px] text-gray-600">{t("pro.modalHint2")}</p>
               <div className="flex justify-end gap-2">
                 <button
                   onClick={dismiss}
                   className="rounded-lg px-4 py-2 text-sm text-gray-400 hover:text-gray-200"
                 >
-                  取消
+                  {t("common.cancel")}
                 </button>
                 <button
                   onClick={submitLicense}
@@ -224,7 +232,7 @@ export function ActivateProModal({
                   className="flex items-center gap-1 rounded-lg bg-accent px-5 py-2 text-sm transition-colors hover:bg-accent-hover disabled:opacity-50"
                 >
                   {busy && <Loader2 size={14} className="animate-spin" />}
-                  {counting ? `请 ${retryAfter} 秒后重试` : "激活"}
+                  {counting ? t("pro.retryIn", { secs: retryAfter }) : t("common.activate")}
                 </button>
               </div>
             </div>
@@ -248,6 +256,7 @@ export default function ProGate({
   feature: Feature;
   children: ReactNode;
 }) {
+  const { t } = useTranslation();
   const unlocked = useProStore((s) => s.unlocked);
   const ready = useProStore((s) => s.ready);
   const [showActivate, setShowActivate] = useState(false);
@@ -259,14 +268,16 @@ export default function ProGate({
 
   return (
     <>
-      <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-white/5 bg-surface-card px-5 py-6 text-center">
+      <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-border bg-surface-card px-5 py-6 text-center">
         <Lock size={18} className="text-accent" />
-        <p className="text-sm text-gray-300">{FEATURE_LABEL[feature]}为 Pro 功能</p>
+        <p className="text-sm text-gray-300">
+          {t("pro.featureLocked", { feature: t(FEATURE_KEY[feature]) })}
+        </p>
         <button
           onClick={() => setShowActivate(true)}
           className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
         >
-          激活 Pro
+          {t("pro.activatePro")}
         </button>
       </div>
       <ActivateProModal

@@ -249,6 +249,10 @@ async fn apply_prepared(
 
     *state.kernel_handle.write() = Some(Arc::new(handle));
 
+    // 内核启动成功：清空运行时统计（60s 队列 / 活跃连接 / 分析聚合），
+    // 今日流量基数不动（事件流随后会重新填充）
+    state.reset_runtime_stats();
+
     // 解析主选择组：route.final 沿 selector 链走到最深的选择组。
     // 节点页默认落在该组——GLOBAL 等虚拟组不在路由链路中，在其中选节点不会生效。
     let api = state.kernel_api();
@@ -605,6 +609,14 @@ pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
             crate::platform::clear_system_proxy()?;
         }
     }
+
+    // 4. 会话归档：把本次会话累计写入今日基数并归零内存运行时统计
+    // （内核停止 → 今日流量基数保持，重启后今日流量不丢）
+    if let Err(e) = crate::core::store::archive_session(&state.data_dir) {
+        tracing::warn!("归档会话流量失败: {e}");
+    }
+    state.reset_runtime_stats();
+    *state.today_bytes_cache.write() = crate::core::store::today_total_bytes(&state.data_dir);
 
     Ok(())
 }
@@ -1550,6 +1562,15 @@ pub async fn get_traffic_stats(
         "stats": stats,
         "connections": conns,
     }))
+}
+
+/// 运行时统计快照：今日流量 / 实时速率 / 60s 曲线 / 活跃连接 / 分析聚合。
+/// 数据由 events.rs 的内核数据流实时维护在 AppState，前端无需轮询内核。
+#[tauri::command]
+pub async fn get_runtime_snapshot(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    Ok(state.runtime_snapshot())
 }
 
 #[tauri::command]

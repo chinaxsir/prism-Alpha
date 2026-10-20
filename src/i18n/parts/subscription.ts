@@ -1,0 +1,56 @@
+/**
+ * 订阅页词条。
+ * 由「订阅」页面维护（Subscription.tsx）。
+ */
+const zh: Record<string, string> = {
+  "sub.title": "订阅",
+  "sub.addTitle": "添加订阅",
+  "sub.urlPlaceholder": "输入订阅 URL（http/https）",
+  "sub.adding": "添加中…",
+  "sub.addAndUpdate": "添加并更新",
+  "sub.myList": "我的订阅（{count}）",
+  "sub.emptyTitle": "暂无订阅",
+  "sub.emptyDesc": "添加订阅链接后即可拉取节点，免费版支持单订阅，Pro 支持多订阅",
+  "sub.badgeEnabled": "已启用",
+  "sub.updatedAt": "更新于 {time}",
+  "sub.nodes": "{count} 个节点",
+  "sub.toggleDisable": "点击停用",
+  "sub.toggleEnable": "点击启用",
+  "sub.update": "更新",
+  "sub.confirmDelete": "确认删除",
+  "sub.loadFailed": "加载订阅列表失败：{error}",
+  "sub.invalidUrl": "请输入有效的 http/https 订阅链接",
+  "sub.added": "订阅已添加并更新",
+  "sub.updated": "订阅已更新",
+  "sub.disabled": "订阅已停用",
+  "sub.enabled": "订阅已启用",
+  "sub.deleted": "订阅已删除",
+};
+
+const en: Record<string, string> = {
+  "sub.title": "Subscriptions",
+  "sub.addTitle": "Add Subscription",
+  "sub.urlPlaceholder": "Enter subscription URL (http/https)",
+  "sub.adding": "Adding…",
+  "sub.addAndUpdate": "Add & Update",
+  "sub.myList": "My Subscriptions ({count})",
+  "sub.emptyTitle": "No Subscriptions",
+  "sub.emptyDesc":
+    "Add a subscription link to fetch nodes; Trial supports one subscription, Pro supports multiple",
+  "sub.badgeEnabled": "Enabled",
+  "sub.updatedAt": "Updated {time}",
+  "sub.nodes": "{count} nodes",
+  "sub.toggleDisable": "Click to disable",
+  "sub.toggleEnable": "Click to enable",
+  "sub.update": "Update",
+  "sub.confirmDelete": "Confirm Delete",
+  "sub.loadFailed": "Failed to load subscriptions: {error}",
+  "sub.invalidUrl": "Enter a valid http/https subscription link",
+  "sub.added": "Subscription added and updated",
+  "sub.updated": "Subscription updated",
+  "sub.disabled": "Subscription disabled",
+  "sub.enabled": "Subscription enabled",
+  "sub.deleted": "Subscription deleted",
+};
+
+export default { zh, en };

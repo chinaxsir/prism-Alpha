@@ -16,7 +16,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
@@ -284,8 +284,9 @@ impl KernelHandle {
             );
         }
 
-        // 4.5 iOS：内核就绪后自动测速选最低延迟节点（用户可随后在 UI 手动指定）
-        #[cfg(target_os = "ios")]
+        // 4.5 移动端（iOS/Android）：内核就绪后按三级规则自动选点
+        // （用户可随后在 UI 手动指定）；桌面平台不自动选点
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         {
             let auto_api = api.clone();
             // 主选择组 = route.final 直指 selector（与 resolve_main_selector
@@ -298,8 +299,9 @@ impl KernelHandle {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let auto_app = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = auto_select_best_proxy(&auto_api, &final_group).await {
+                if let Err(e) = auto_select_best_proxy(&auto_api, &final_group, auto_app).await {
                     tracing::warn!("自动选择节点失败: {e:#}");
                 }
             });
@@ -804,7 +806,6 @@ impl KernelApi {
                         }
                     };
                     if let Some(app) = app {
-                        use tauri::Emitter;
                         let _ = app.emit(
                             "url-test-update",
                             serde_json::json!({
@@ -897,14 +898,28 @@ impl KernelApi {
     }
 }
 
-/// 自动测速并选择延迟最低的节点（build 150 新需求：APP 运行后自动选优，
+/// 移动端自动测速并按三级规则选择节点（build 150 新需求：APP 运行后自动选优，
 /// 用户可随后在 UI 手动指定节点覆盖）。
-/// 流程：取 /proxies → 定位主选择组（final 直指 selector，build 159；
-/// 找不到时回退第一个 Selector）→ 并发对其真实节点测延迟
-/// （排除内置出站与嵌套策略组，3 秒超时）→ 选最低者 select_proxy。
+///
+/// 三级规则（读取 AppState）：
+///   A. 非 Pro：在全部真实节点里选 test_delay 最低的存活节点；
+///   B. Pro 且 go_aim_enabled == false：同样选全量最低延迟节点，并后台静默跑一次
+///      Go AIM 解锁探测（不切换节点）；
+///   C. Pro 且 go_aim_enabled == true：优先在「ai_unlocked || media_unlocked」的
+///      解锁池内选最低延迟；优先池为空或全部测速失败时回退全量最低延迟。
+///      探测结果异步写入，启动瞬间可能为空——此时按全量最低延迟选择并同时
+///      触发探测，等 go_aim 自身 monitor 后续锁定时再切换（此处不阻塞等待）。
+///
+/// 流程：取 /proxies → 定位主选择组（final 直指 selector，build 159；找不到时
+/// 回退第一个 Selector）→ 并发测延迟（排除内置出站与嵌套策略组，3 秒超时）→
+/// 选最低者 select_proxy（同步 GLOBAL）→ 清理旧连接 → 发射 proxies://changed。
 /// 全部超时则放弃并保持默认选择，不影响启动流程。
-#[cfg(target_os = "ios")]
-async fn auto_select_best_proxy(api: &KernelApi, final_group: &str) -> Result<()> {
+#[cfg(any(target_os = "ios", target_os = "android"))]
+async fn auto_select_best_proxy(
+    api: &KernelApi,
+    final_group: &str,
+    app_handle: AppHandle,
+) -> Result<()> {
     const TEST_URL: &str = "http://www.gstatic.com/generate_204";
     const TEST_TIMEOUT_MS: u32 = 3000;
     /// 内置出站与不可选择项（不做真实测速）
@@ -967,24 +982,47 @@ async fn auto_select_best_proxy(api: &KernelApi, final_group: &str) -> Result<()
         .collect();
     anyhow::ensure!(!nodes.is_empty(), "策略组 '{group}' 无可用节点");
 
-    // 并发测速（节点可达 50+，串行太慢）
-    let mut tasks: Vec<tokio::task::JoinHandle<Option<(String, u64)>>> =
-        Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let api = api.clone();
-        tasks.push(tokio::spawn(async move {
-            let delay = api.test_delay(&node, TEST_URL, TEST_TIMEOUT_MS).await?;
-            Some((node, delay))
-        }));
-    }
+    // ---- 三级规则：确定候选优先级池 + 是否需要触发 Go AIM 探测 ----
+    let state = app_handle.state::<crate::core::state::AppState>();
+    let pro_unlocked = state.entitlement.read().is_unlocked();
+    let go_aim_enabled = pro_unlocked && state.settings.read().go_aim_enabled;
 
-    let mut best: Option<(String, u64)> = None;
-    for task in tasks {
-        if let Ok(Some((node, delay))) = task.await {
-            if best.as_ref().is_none_or(|(_, d)| delay < *d) {
-                best = Some((node, delay));
+    // C：Go AIM 已解锁节点优先池（探测结果异步写入，启动瞬间可能为空）
+    let mut priority: Vec<String> = Vec::new();
+    if go_aim_enabled {
+        let results = state.aim_results.read();
+        for node in &nodes {
+            if results
+                .get(node)
+                .is_some_and(|r| r.ai_unlocked || r.media_unlocked)
+            {
+                priority.push(node.clone());
             }
         }
+    }
+
+    // 优先在解锁池内选最低延迟；池为空或全部失败则回退全量最低延迟
+    let mut best: Option<(String, u64)> = if priority.is_empty() {
+        None
+    } else {
+        test_fastest(api, &priority, TEST_URL, TEST_TIMEOUT_MS).await
+    };
+    if best.is_none() {
+        if !priority.is_empty() {
+            tracing::info!("Go AIM 优先池测速全部失败，回退全量节点");
+        }
+        best = test_fastest(api, &nodes, TEST_URL, TEST_TIMEOUT_MS).await;
+    }
+
+    // 后台静默跑一次 Go AIM 解锁探测（B，或 C 启动瞬间结果为空时）；
+    // 延迟数秒触发以等待内核状态迁移到 Running（start_probe 要求内核运行中）
+    let trigger_probe = pro_unlocked && (!go_aim_enabled || priority.is_empty());
+    if trigger_probe {
+        let probe_app = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            crate::core::go_aim::start_probe(probe_app);
+        });
     }
 
     let (node, delay) = best.context("所有节点测速均超时，保持默认选择")?;
@@ -1000,6 +1038,39 @@ async fn auto_select_best_proxy(api: &KernelApi, final_group: &str) -> Result<()
     if let Err(e) = api.close_all_connections().await {
         tracing::warn!("自动选节点后清理旧连接失败: {e}");
     }
+    // 通知节点页刷新当前选中项（前端依赖该事件对齐当前节点）
+    let _ = app_handle.emit("proxies://changed", serde_json::json!({}));
     tracing::info!("自动选择节点: {node}（{delay}ms，组: {group}）");
     Ok(())
+}
+
+/// 并发测速给定节点列表，返回延迟最低者（全部失败返回 None）
+#[cfg(any(target_os = "ios", target_os = "android"))]
+async fn test_fastest(
+    api: &KernelApi,
+    nodes: &[String],
+    url: &str,
+    timeout_ms: u32,
+) -> Option<(String, u64)> {
+    let mut tasks: Vec<tokio::task::JoinHandle<Option<(String, u64)>>> =
+        Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let api = api.clone();
+        let node = node.clone();
+        let url = url.to_string();
+        tasks.push(tokio::spawn(async move {
+            let delay = api.test_delay(&node, &url, timeout_ms).await?;
+            Some((node, delay))
+        }));
+    }
+
+    let mut best: Option<(String, u64)> = None;
+    for task in tasks {
+        if let Ok(Some((node, delay))) = task.await {
+            if best.as_ref().is_none_or(|(_, d)| delay < *d) {
+                best = Some((node, delay));
+            }
+        }
+    }
+    best
 }

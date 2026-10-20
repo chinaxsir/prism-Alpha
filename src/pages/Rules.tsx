@@ -10,6 +10,7 @@ import {
 import ProGate from "@/components/ProGate";
 import Spinner from "@/components/ui/Spinner";
 import { toast } from "@/components/ui/Toast";
+import { useTranslation } from "@/i18n";
 import { Feature } from "@/pro/gating";
 import { ruleTypeClass } from "@/utils/ruleType";
 
@@ -30,6 +31,7 @@ const RULE_TYPES = [
 ];
 
 export default function Rules() {
+  const { t } = useTranslation();
   const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -82,7 +84,7 @@ export default function Rules() {
     try {
       await saveCustomRules(next);
       setCustom(next);
-      toast.success("自定义规则已保存");
+      toast.success(t("proxies.rules.saved"));
       loadRules();
     } catch (e) {
       console.error("save custom rules failed:", e);
@@ -95,12 +97,12 @@ export default function Rules() {
   const handleAdd = () => {
     const p = payload.trim();
     if (!p) {
-      toast.error("请输入规则内容（域名 / IP / 关键词）");
+      toast.error(t("proxies.rules.err.emptyPayload"));
       return;
     }
     const line = `${kind},${p},${policy.trim() || "direct"}`;
     if (custom.includes(line)) {
-      toast.error("规则已存在");
+      toast.error(t("proxies.rules.err.exists"));
       return;
     }
     setPayload("");
@@ -124,21 +126,21 @@ export default function Rules() {
         {/* 自定义规则编辑器 */}
         <div className="bg-surface-card rounded-xl p-5 mb-6">
           <h2 className="text-base font-semibold mb-1">
-            自定义规则（{custom.length} 条）
+            {t("proxies.rules.customTitle", { count: custom.length })}
           </h2>
           <p className="text-xs text-gray-500 mb-4">
-            自上而下优先匹配，全部排在订阅规则之前
+            {t("proxies.rules.customDesc")}
           </p>
 
           <div className="flex flex-col gap-2 md:flex-row">
             <select
               value={kind}
               onChange={(e) => setKind(e.target.value)}
-              className="rounded-lg bg-surface-hover border border-white/5 px-3 py-2 text-sm outline-none focus:border-accent"
+              className="rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
             >
-              {RULE_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
+              {RULE_TYPES.map((rt) => (
+                <option key={rt} value={rt}>
+                  {rt}
                 </option>
               ))}
             </select>
@@ -146,16 +148,16 @@ export default function Rules() {
               value={payload}
               onChange={(e) => setPayload(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-              placeholder="规则内容，如 google.com 或 1.2.3.0/24"
-              className="flex-1 rounded-lg bg-surface-hover border border-white/5 px-3 py-2 text-sm outline-none focus:border-accent"
+              placeholder={t("proxies.rules.payloadPlaceholder")}
+              className="flex-1 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
             />
             <input
               value={policy}
               onChange={(e) => setPolicy(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               list="rule-policy-options"
-              placeholder="策略：direct / block / 策略组名"
-              className="md:w-56 rounded-lg bg-surface-hover border border-white/5 px-3 py-2 text-sm outline-none focus:border-accent"
+              placeholder={t("proxies.rules.policyPlaceholder")}
+              className="md:w-56 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
             />
             <datalist id="rule-policy-options">
               {policyOptions.map((n) => (
@@ -168,11 +170,11 @@ export default function Rules() {
               className="flex items-center justify-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm hover:bg-accent-hover disabled:opacity-50"
             >
               <Plus size={15} />
-              添加
+              {t("proxies.rules.add")}
             </button>
           </div>
           <p className="text-[11px] text-gray-500 -mt-1">
-            策略可选：direct（直连）、block（拦截），或订阅中的策略组名（内核运行时自动列出）。留空默认 direct。
+            {t("proxies.rules.policyHint")}
           </p>
 
           {custom.length > 0 && (
@@ -232,14 +234,14 @@ export default function Rules() {
         <div className="bg-surface-card rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-base font-semibold">
-              生效规则（{rules.length} 条，含内置 / 自定义与订阅）
+              {t("proxies.rules.effectiveTitle", { count: rules.length })}
             </h2>
             <button
               onClick={loadRules}
               className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-hover text-xs text-gray-400 hover:text-gray-200"
             >
               <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-              刷新
+              {t("common.refresh")}
             </button>
           </div>
 
@@ -249,7 +251,7 @@ export default function Rules() {
             </div>
           ) : rules.length === 0 ? (
             <p className="text-gray-500 text-sm py-8 text-center">
-              暂无规则（内核未启动）
+              {t("proxies.rules.empty")}
             </p>
           ) : (
             <div className="space-y-1.5 max-h-[28rem] overflow-y-auto pr-1">
