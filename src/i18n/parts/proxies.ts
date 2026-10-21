@@ -58,6 +58,13 @@ const zh: Record<string, string> = {
   "proxies.conn.empty": "暂无连接记录（内核未启动或无流量）",
   "proxies.conn.allClosed": "已关闭全部连接",
   "proxies.conn.closeThis": "关闭此连接",
+  "proxies.conn.quickRule": "快捷分流",
+  "proxies.conn.quickRuleTitle": "为 {host} 添加规则",
+  "proxies.conn.quickRuleDirect": "直连 DIRECT",
+  "proxies.conn.quickRuleProxy": "走节点 PROXY",
+  "proxies.conn.quickRuleReject": "拦截 REJECT",
+  "proxies.conn.ruleAdded": "已添加规则：{rule}",
+  "proxies.failover": "节点 {from} 不可用，已自动切换",
 
   // ---- 规则 ----
   "proxies.rules.customTitle": "自定义规则（{count} 条）",
@@ -192,6 +199,13 @@ const en: Record<string, string> = {
     "No connection records (core not started or no traffic)",
   "proxies.conn.allClosed": "All connections closed",
   "proxies.conn.closeThis": "Close this connection",
+  "proxies.conn.quickRule": "Quick rule",
+  "proxies.conn.quickRuleTitle": "Add a rule for {host}",
+  "proxies.conn.quickRuleDirect": "Direct",
+  "proxies.conn.quickRuleProxy": "Via proxy",
+  "proxies.conn.quickRuleReject": "Reject",
+  "proxies.conn.ruleAdded": "Rule added: {rule}",
+  "proxies.failover": "Node {from} is unavailable, switched automatically",
 
   // ---- Rules ----
   "proxies.rules.customTitle": "Custom Rules ({count})",

@@ -295,11 +295,17 @@ impl KernelHandle {
             );
         }
 
-        // 4.5 移动端（iOS/Android）：内核就绪后按三级规则自动选点
+        // 5. 订阅内核 WebSocket 数据流（traffic / connections / memory）
+        let mut stream_tasks = super::events::spawn_all(
+            &config.api_addr,
+            &config.api_secret,
+            app_handle.clone(),
+        );
+
+        // 5.5 移动端（iOS/Android）：内核就绪后按三级规则自动选点
         // （用户可随后在 UI 手动指定）；桌面平台不自动选点
         #[cfg(any(target_os = "ios", target_os = "android"))]
         {
-            let auto_api = api.clone();
             // 主选择组 = route.final 直指 selector（与 resolve_main_selector
             // 顶层语义一致，build 159）：不再取字母序第一个 selector——
             // 那可能是只含少量节点的地区子分组
@@ -310,20 +316,22 @@ impl KernelHandle {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let auto_api = api.clone();
+            let auto_group = final_group.clone();
             let auto_app = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = auto_select_best_proxy(&auto_api, &final_group, auto_app).await {
+                if let Err(e) = auto_select_best_proxy(&auto_api, &auto_group, auto_app).await {
                     tracing::warn!("自动选择节点失败: {e:#}");
                 }
             });
-        }
 
-        // 5. 订阅内核 WebSocket 数据流（traffic / connections / memory）
-        let mut stream_tasks = super::events::spawn_all(
-            &config.api_addr,
-            &config.api_secret,
-            app_handle.clone(),
-        );
+            // 【APP-4.3】运行期被动故障转移：与事件流同生命周期（stop 时 abort）
+            let failover_api = api.clone();
+            let failover_app = app_handle.clone();
+            stream_tasks.push(tokio::spawn(async move {
+                run_node_failover(failover_api, final_group, failover_app).await;
+            }));
+        }
 
         // 6. iOS：VPN 唯一性实时监控（build 157 用户方案）。系统可在任意
         // 时刻杀掉扩展进程/注销 VPN 会话（用户在系统设置关闭、其他 VPN
@@ -992,9 +1000,15 @@ async fn auto_select_best_proxy(
 ) -> Result<()> {
     const TEST_URL: &str = "http://www.gstatic.com/generate_204";
     const TEST_TIMEOUT_MS: u32 = 3000;
-    /// 内置出站与不可选择项（不做真实测速）
-    const EXCLUDED: [&str; 8] = [
-        "direct", "block", "dns-out", "REJECT", "REJECT-DROP", "COMPATIBLE", "GLOBAL", "PASS",
+    /// 内置出站与不可选择项（不做真实测速）。
+    /// 订阅里 direct 可能被当成最低延迟节点（延迟 1ms），若主组 default 漏设或
+    /// 订阅把 direct 加进组里，这里就会选到 direct 变成"假翻墙真直连"。
+    /// 同时 REJECT/COMPATIBLE/PASS 等内置出站也必须排除——它们有特殊语义（拦截、
+    /// 内嵌 DNS、规则直通），绝不能当代理节点测速。
+    const EXCLUDED: [&str; 12] = [
+        "direct", "DIRECT", "block", "BLOCK",
+        "REJECT", "REJECT-DROP", "COMPATIBLE", "GLOBAL", "PASS",
+        "dns-out", "DNS-OUT", "Dns-UDP",
     ];
 
     let proxies = api.get_proxies().await?;
@@ -1112,6 +1126,73 @@ async fn auto_select_best_proxy(
     let _ = app_handle.emit("proxies://changed", serde_json::json!({}));
     tracing::info!("自动选择节点: {node}（{delay}ms，组: {group}）");
     Ok(())
+}
+
+/// 【APP-4.3】运行期节点被动故障转移。
+/// 每 45s 用真实的 generate_204 探测主组当前节点；连续 2 次超时/失败
+/// （排除偶发抖动）才重新选点——复用 auto_select_best_proxy 的三级规则，
+/// 开启 Go AIM 时自然优先切到次低延迟的解锁节点。探测与选点均在后台
+/// 异步执行，不阻塞 UI 与事件流；用户手动切节点后下次探测以新节点为准。
+#[cfg(any(target_os = "ios", target_os = "android"))]
+async fn run_node_failover(api: KernelApi, final_group: String, app_handle: AppHandle) {
+    const TEST_URL: &str = "http://www.gstatic.com/generate_204";
+    const TEST_TIMEOUT_MS: u32 = 3000;
+    const FAIL_THRESHOLD: u8 = 2;
+
+    let mut consecutive_failures: u8 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        // 内核已停止则退出：本次 handle 的事件流也被 abort，避免任务重复累积
+        let running = *app_handle
+            .state::<crate::core::state::AppState>()
+            .status
+            .read()
+            == crate::core::state::CoreStatus::Running;
+        if !running {
+            break;
+        }
+        // 主组当前选中的节点
+        let current = api.get_proxies().await.ok().and_then(|p| {
+            p.get("proxies")
+                .and_then(|m| m.get(&final_group))
+                .and_then(|g| g.get("now"))
+                .and_then(|v| v.as_str().map(String::from))
+        });
+        let Some(current) = current else { continue };
+        // 策略组/内置出站不参与探测（组名或内置出口不可测速）
+        if current == final_group
+            || ["DIRECT", "REJECT", "PASS", "COMPATIBLE"].contains(&current.as_str())
+        {
+            continue;
+        }
+
+        if api.test_delay(&current, TEST_URL, TEST_TIMEOUT_MS).await.is_some() {
+            if consecutive_failures > 0 {
+                tracing::info!("节点 {current} 恢复可用，重置故障计数");
+            }
+            consecutive_failures = 0;
+            continue;
+        }
+
+        consecutive_failures += 1;
+        tracing::warn!(
+            "节点 {current} 探测失败（连续 {consecutive_failures}/{FAIL_THRESHOLD}）"
+        );
+        if consecutive_failures < FAIL_THRESHOLD {
+            continue;
+        }
+        consecutive_failures = 0;
+        match auto_select_best_proxy(&api, &final_group, app_handle.clone()).await {
+            Ok(()) => {
+                let _ = app_handle.emit(
+                    "failover://switched",
+                    serde_json::json!({ "from": current }),
+                );
+                tracing::warn!("故障转移：{current} 不可用，已按三级规则重新选点");
+            }
+            Err(e) => tracing::warn!("故障转移自动选点失败: {e:#}"),
+        }
+    }
 }
 
 /// 并发测速给定节点列表，返回延迟最低者（全部失败返回 None）

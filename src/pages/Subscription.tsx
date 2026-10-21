@@ -17,6 +17,7 @@ import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 import { useProStore } from "@/stores/pro";
 import { formatRelativeTime } from "@/utils/time";
+import { formatBytes } from "@/utils/format";
 
 function displayName(record: SubscriptionRecord): string {
   if (record.name) return record.name;
@@ -194,6 +195,52 @@ export default function Subscription() {
                       </span>
                     )}
                   </div>
+                  {/* 机场流量配额进度条（subscription-userinfo 下发才有） */}
+                  {record.totalBytes != null && record.totalBytes > 0 && (() => {
+                    const used =
+                      (record.uploadBytes ?? 0) + (record.downloadBytes ?? 0);
+                    const pct = Math.min(100, (used / record.totalBytes!) * 100);
+                    const expired =
+                      record.expireAt != null && record.expireAt * 1000 < Date.now();
+                    const barColor =
+                      expired || pct >= 90
+                        ? "bg-latency-bad"
+                        : pct >= 70
+                          ? "bg-latency-medium"
+                          : "bg-accent";
+                    return (
+                      <div className="mt-2 max-w-md">
+                        <div className="flex items-center justify-between text-[11px] text-gray-400">
+                          <span>
+                            {t("sub.traffic", {
+                              used: formatBytes(used),
+                              total: formatBytes(record.totalBytes!),
+                            })}
+                          </span>
+                          <span className="font-mono tabular-nums">
+                            {pct.toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-border">
+                          <div
+                            className={`h-full rounded-full transition-all ${barColor}`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        {record.expireAt != null && (
+                          <div className="mt-1 text-[11px] text-gray-500">
+                            {expired
+                              ? t("sub.expired")
+                              : t("sub.expireAt", {
+                                  date: new Date(
+                                    record.expireAt * 1000
+                                  ).toLocaleDateString(),
+                                })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 <div className="flex shrink-0 items-center gap-2">

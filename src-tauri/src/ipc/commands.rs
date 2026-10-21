@@ -652,6 +652,13 @@ pub async fn get_core_status(state: State<'_, AppState>) -> Result<CoreStatusDto
 }
 
 #[tauri::command]
+pub fn set_app_foreground(foreground: bool, state: State<'_, AppState>) {
+    state
+        .app_in_foreground
+        .store(foreground, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[tauri::command]
 pub async fn set_mode(
     mode: RunMode,
     app: AppHandle,
@@ -798,7 +805,7 @@ pub(crate) async fn refresh_subscription(
         .then(|| state.settings.read().mixed_port);
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let local_proxy: Option<u16> = None;
-    let mut text = fetch_remote_text(&url, local_proxy).await?;
+    let (mut text, quota) = fetch_remote_text(&url, local_proxy).await?;
 
     // base64 包裹：明文不含 YAML/JSON 结构时尝试解码
     if !text.contains("proxies") && !text.trim_start().starts_with('{') {
@@ -882,9 +889,14 @@ pub(crate) async fn refresh_subscription(
         .map_err(|e| format!("写入订阅文件失败: {}", e))?;
     tracing::info!("subscription saved to {}", profile_path.display());
 
-    // 持久化订阅记录
+    // 持久化订阅记录（机场下发了 subscription-userinfo 则同步流量配额）
     crate::core::store::upsert_subscription(&state.data_dir, &url)
         .map_err(|e| format!("保存订阅记录失败: {e}"))?;
+    if let Some(quota) = &quota
+        && let Err(e) = crate::core::store::set_subscription_quota(&state.data_dir, &url, quota)
+    {
+        tracing::warn!("保存订阅流量配额失败: {e}");
+    }
 
     // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
     refresh_providers(state, &url, &text).await;
@@ -908,7 +920,10 @@ pub(crate) async fn refresh_subscription(
 ///    响应），0.0.0.0 绑定后 v6 目标因地址族不匹配立即跳过，秒级回退 v4
 /// 3. 内核运行中 → 经本地 mixed 入站（127.0.0.1:mixed_port）转发——受限网络
 ///    直连被墙时走节点出境，实现「先启动内核再更新」的真实闭环
-async fn fetch_remote_text(url: &str, local_proxy: Option<u16>) -> Result<String, String> {
+async fn fetch_remote_text(
+    url: &str,
+    local_proxy: Option<u16>,
+) -> Result<(String, Option<crate::core::store::SubscriptionQuota>), String> {
     use futures_util::stream::{FuturesUnordered, StreamExt as _};
     use std::time::Instant;
 
@@ -947,12 +962,12 @@ async fn fetch_remote_text(url: &str, local_proxy: Option<u16>) -> Result<String
 
     while let Some((force_v4, result)) = attempts.next().await {
         match result {
-            Ok(text) => {
+            Ok((text, quota)) => {
                 tracing::info!(
                     "fetch succeeded (force_v4={force_v4}) in {}ms",
                     fetch_started.elapsed().as_millis()
                 );
-                return Ok(text);
+                return Ok((text, quota));
             }
             Err(e) => {
                 last_err = e;
@@ -976,9 +991,9 @@ async fn fetch_remote_text(url: &str, local_proxy: Option<u16>) -> Result<String
         match try_fetch_text(&builder.build().map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?, url)
             .await
         {
-            Ok(text) => {
+            Ok((text, quota)) => {
                 tracing::info!("fetch remote text succeeded via local mixed proxy :{port}");
-                return Ok(text);
+                return Ok((text, quota));
             }
             Err(e) => {
                 last_err = e;
@@ -996,7 +1011,10 @@ async fn fetch_remote_text(url: &str, local_proxy: Option<u16>) -> Result<String
 }
 
 /// 用给定客户端执行一次 GET 文本下载（状态码 / UTF-8 校验）
-async fn try_fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
+async fn try_fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(String, Option<crate::core::store::SubscriptionQuota>), String> {
     let mut resp = client
         .get(url)
         // 与 Clash 通行 UA 配套：部分面板按 Accept 头判定客户端类型
@@ -1013,6 +1031,12 @@ async fn try_fetch_text(client: &reqwest::Client, url: &str) -> Result<String, S
             resp.status()
         ));
     }
+    // 机场流量配额（Clash / SIP008 通用的 subscription-userinfo 响应头）
+    let quota = resp
+        .headers()
+        .get("subscription-userinfo")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::core::store::SubscriptionQuota::parse);
     // 分段流式读取（禁用 resp.text()/bytes 整包等待）：Cloudflare Worker
     // 类端点下发完正文后常不发 TLS close_notify（或 HTTP/2 提前重置流），
     // 整包读取会把已完整收到的数据包装成 error decoding response body
@@ -1034,7 +1058,8 @@ async fn try_fetch_text(client: &reqwest::Client, url: &str) -> Result<String, S
             }
         }
     }
-    String::from_utf8(buf).map_err(|_| "内容不是有效 UTF-8 文本".to_string())
+    let text = String::from_utf8(buf).map_err(|_| "内容不是有效 UTF-8 文本".to_string())?;
+    Ok((text, quota))
 }
 
 /// reqwest 顶层 Display 只有 "error sending request"，
@@ -1088,7 +1113,7 @@ async fn refresh_providers(state: &AppState, sub_url: &str, profile_text: &str) 
         tasks.push(
             async move {
                 match fetch_remote_text(&url, local_proxy).await {
-                    Ok(text) => {
+                    Ok((text, _)) => {
                         let path =
                             crate::core::store::provider_path(&data_dir, sub_url, &name);
                         if let Some(parent) = path.parent() {
@@ -1143,6 +1168,11 @@ pub struct SubscriptionDto {
     pub enabled: bool,
     /// 节点数（解析该订阅自己的 profile 文件统计；文件缺失/解析失败为 None）
     pub node_count: Option<usize>,
+    /// 机场流量配额（subscription-userinfo 头，未下发为 None）
+    pub upload_bytes: Option<u64>,
+    pub download_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub expire_at: Option<u64>,
 }
 
 /// 获取已保存的订阅记录（订阅页展示）
@@ -1164,6 +1194,10 @@ pub async fn list_subscriptions(
                 name: r.name,
                 enabled: r.enabled,
                 node_count,
+                upload_bytes: r.upload_bytes,
+                download_bytes: r.download_bytes,
+                total_bytes: r.total_bytes,
+                expire_at: r.expire_at,
             }
         })
         .collect())

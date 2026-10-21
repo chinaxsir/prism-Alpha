@@ -20,6 +20,7 @@ import {
   getGoAimStatus,
   getGoLanSettings,
   getGoCusSettings,
+  setAppForeground,
   type Entitlement,
 } from "@/api/ipc";
 import { isMobile } from "@/pro/gating";
@@ -121,6 +122,16 @@ export default function App() {
     };
   }, [refreshRuntime]);
 
+  // 运行期被动故障转移：内核连续 2 次探测到当前节点不可用并自动换点后轻提示
+  useEffect(() => {
+    const unlisten = listen<{ from: string }>("failover://switched", (event) => {
+      toast.info(t("proxies.failover", { from: event.payload.from }));
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
   // 实时速率与内存：内核每秒推送，驱动仪表盘曲线平滑刷新
   useEffect(() => {
     const traffic = listen<{ up: number; down: number }>("traffic://tick", (e) => {
@@ -140,22 +151,28 @@ export default function App() {
   // 前后台不间断：定时拉取后端快照，并在从后台切回前台（亮屏解锁）瞬间立即同步
   useEffect(() => {
     void refreshRuntime();
+    const syncForeground = () => {
+      const visible = document.visibilityState === "visible";
+      // 上报后端：后台时暂停事件推送与连接聚合，切回前台立即恢复
+      void setAppForeground(visible).catch(() => undefined);
+      if (visible) void refreshRuntime();
+    };
     const id = window.setInterval(() => {
+      // 隐藏（锁屏/切 App）时不再每 2s 唤醒 JS 线程，彻底静止待机
+      if (document.visibilityState !== "visible") return;
       if (useCoreStore.getState().status === "running") void refreshRuntime();
     }, 2000);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void refreshRuntime();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onVisible);
+    syncForeground();
+    document.addEventListener("visibilitychange", syncForeground);
+    window.addEventListener("focus", syncForeground);
     // pageshow：移动端系统回退缓存页（bfcache）恢复时 visibilitychange
     // 可能不触发，pageshow 兜底拉取快照（IPA-12）
-    window.addEventListener("pageshow", onVisible);
+    window.addEventListener("pageshow", syncForeground);
     return () => {
       window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onVisible);
-      window.removeEventListener("pageshow", onVisible);
+      document.removeEventListener("visibilitychange", syncForeground);
+      window.removeEventListener("focus", syncForeground);
+      window.removeEventListener("pageshow", syncForeground);
     };
   }, [refreshRuntime]);
 

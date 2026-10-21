@@ -1818,7 +1818,7 @@ final class PrismTunnelController {
         }
     }
 
-    /// 读取扩展心跳（prism_status.txt，扩展每 3s 刷新）。
+    /// 读取扩展心跳（prism_status.txt，扩展每 60s 刷新）。
     /// TrollStore 假团队配置下系统可能上报假 connected（扩展进程从未
     /// 被拉起），心跳是扩展存活的唯一可靠证据。
     static func readExtensionHeartbeat() -> (alive: Bool, stage: String, age: Int) {
@@ -1835,7 +1835,9 @@ final class PrismTunnelController {
         }
         let stage = parts.dropFirst().joined(separator: " ")
         let age = Int(Date().timeIntervalSince1970 - ts)
-        return (age <= 10, stage, age)
+        // 心跳间隔已由 3s 调整为 60s（低功耗）：宽限期取 90s，
+        // 允许一次心跳延迟仍判定存活，避免锁屏/后台挂起误判
+        return (age <= 90, stage, age)
     }
 
     /// 读取 App Group 共享错误文件（扩展写入的内核错误原文/断开原因）。
@@ -1856,7 +1858,7 @@ final class PrismTunnelController {
     // TrollStore App 的插件极易受到 iOS Jetsam 内存监控（15MB/50MB）
     // 的物理制裁直接被强杀，此时 iOS 可能静默丢弃断开通知，App 将
     // 永远显示"已连接"。连接成功后每 4s 轮询扩展心跳文件
-    //（prism_status.txt，扩展每 3s 刷新），时间戳冻结（>10s 未更新）
+    //（prism_status.txt，扩展每 60s 刷新），时间戳冻结（>90s 未更新）
     // 即判定内核死亡，强制重置本地 VPN 状态并回报错误。
 
     private func startVpnWatchdog() {
@@ -1937,8 +1939,8 @@ final class PrismTunnelController {
     ) {
         let generic = "扩展启动后立即断开（status=disconnected）"
 
-        // 0. 扩展心跳判死：prism_status.txt 由扩展每 3s 刷新，时间戳
-        // 超过 15s 未更新 = 扩展进程已崩溃/被杀（Go panic、jetsam）。
+        // 0. 扩展心跳判死：prism_status.txt 由扩展每 60s 刷新，时间戳
+        // 超过 75s（一次心跳 + 15s 裕度）未更新 = 扩展进程已崩溃/被杀。
         // 这一信息在扩展来不及写错误文件时是唯一的死因线索。
         if let groupURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: prismAppGroupID
@@ -1949,7 +1951,7 @@ final class PrismTunnelController {
                let ts = Double(tsText)
             {
                 let age = Date().timeIntervalSince1970 - ts
-                if age > 15 {
+                if age > 75 {
                     let stage = text.split(separator: " ").dropFirst().joined(separator: " ")
                     let crash = "扩展进程已崩溃（心跳停于 \(Int(age))s 前，阶段=\(stage)）"
                     NSLog("[PrismVPN] \(crash)")

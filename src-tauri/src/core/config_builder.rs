@@ -705,8 +705,36 @@ pub fn build(
         }
     }
 
+    // 【APP-4.1】Go Cus 边车容错：127.0.0.1:2081 只在水印检修（主 App 前台）
+    // 时可用。主 App 被系统冻结、边车崩溃或用户后台运行时，直接指向边车的
+    // 规则会整条断网。把边车出站包进一个 urltest 组（边车优先、主组兜底），
+    // 边车不可达时内核自动回落到主组，网络不中断。
+    if !proxy_target.is_empty() && proxy_target != crate::core::go_cus::SIDECAR_TAG
+        && outbounds
+            .iter()
+            .any(|o| o["tag"].as_str() == Some(crate::core::go_cus::SIDECAR_TAG))
+    {
+        const FALLBACK_TAG: &str = "go-cus-fallback";
+        outbounds.push(json!({
+            "type": "urltest",
+            "tag": FALLBACK_TAG,
+            "outbounds": [crate::core::go_cus::SIDECAR_TAG, proxy_target],
+            "url": "http://www.gstatic.com/generate_204",
+            "interval": "1m",
+            "tolerance": 50,
+        }));
+        for rule in route_rules.iter_mut() {
+            if rule.get("outbound").and_then(Value::as_str)
+                == Some(crate::core::go_cus::SIDECAR_TAG)
+            {
+                rule["outbound"] = json!(FALLBACK_TAG);
+            }
+        }
+        warnings.push("Go Cus 边车已配置主组容错回落（边车不可用时自动走节点）".into());
+    }
+
     match main_group_tag {
-        Some(main_tag) => {
+        Some(ref main_tag) => {
             if let Some(group) =
                 outbounds.iter_mut().find(|o| o["tag"].as_str() == Some(main_tag.as_str()))
             {
@@ -732,7 +760,20 @@ pub fn build(
                     .get("default")
                     .and_then(Value::as_str)
                     .map(|d| {
-                        d != "direct" && d != "block" && merged.iter().any(|m| m == d)
+                        // 订阅里 direct 可能因为延迟最低被设为 default——必须过滤
+                        // REJECT/PASS/COMPATIBLE/block/dns-out 这类内置出站绝不生效
+                        let is_builtin = matches!(
+                            d.to_ascii_uppercase().as_str(),
+                            "DIRECT"
+                                | "BLOCK"
+                                | "REJECT"
+                                | "REJECT-DROP"
+                                | "PASS"
+                                | "COMPATIBLE"
+                                | "DNS-OUT"
+                                | "GLOBAL"
+                        );
+                        !is_builtin && merged.iter().any(|m| m == d)
                     })
                     .unwrap_or(false);
                 if !default_valid {
@@ -783,7 +824,21 @@ pub fn build(
             "address": tun_addresses,
             "mtu": 9000,
             "auto_route": true,
-            "stack": "gvisor",
+            // mixed 栈（仅移动端）：TCP 走系统原生高性能协议栈，UDP 走 gvisor。
+            // 原 gvisor 强制用户态 TCP 实现（拥塞控制/滑动窗口全软件模拟）
+            // 单核吞吐明显低于系统栈，大流量下载/4K 播放时 CPU 占用高。
+            // 桌面端保持 gvisor（随包 sidecar 的编译标签不保证含 gvisor 栈）。
+            "stack": if cfg!(any(target_os = "ios", target_os = "android")) {
+                "mixed"
+            } else {
+                "gvisor"
+            },
+            // 首包嗅探：100ms 内取不到域名即按目标 IP 直连，避免固定等待
+            "sniff": true,
+            "sniff_override_destination": true,
+            "sniff_timeout": "100ms",
+            // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
+            "udp_timeout": "5m",
         });
         {
             let obj = tun.as_object_mut().expect("tun inbound is an object");
@@ -853,6 +908,21 @@ pub fn build(
         json!({ "tag": "dns-remote", "address": "https://dns.alidns.com/dns-query", "address_resolver": "dns-local", "detour": "direct" }),
         json!({ "tag": "dns-local", "address": dns_local_addr, "detour": "direct" }),
     ];
+
+    // Android DNS 清洗（APP-2 断层二修复）：
+    // Android 被墙环境下阿里 DoH（dns.alidns.com）本身也可能因域名污染/阻断
+    // 不可达，改用 tcp://8.8.8.8 并经主组出境更稳（绕过国内 DNS 封锁）。
+    // 本地直连 DNS（dns-local）仍用 223.5.5.5 兜底国内域名。
+    #[cfg(target_os = "android")]
+    {
+        if let Some(main_tag) = &main_group_tag {
+            dns_servers[0] = json!({
+                "tag": "dns-remote",
+                "address": "tcp://8.8.8.8",
+                "detour": main_tag,
+            });
+        }
+    }
     if let Some(server) = lan_dns_server {
         dns_servers.push(server);
     }
@@ -880,13 +950,29 @@ pub fn build(
         }
     });
 
+    // Android DNS 清洗（APP-2 断层二修复）：两条规则放在 route_rules 最顶部
+    // （最先匹配），确保所有 UDP/53 和 DNS 协议请求都被劫持到 dns-out，
+    // 再由 DNS 模块按 detour 走主组出境，防止内核绕过 sing-box DNS 流程
+    // 直连外发；非 Android 平台使用原始 route_rules
+    #[cfg(target_os = "android")]
+    let final_route_rules: Vec<serde_json::Value> = {
+        let mut android_sanitized = vec![
+            json!({ "protocol": "dns", "outbound": "dns-out" }),
+            json!({ "port": 53, "outbound": "dns-out" }),
+        ];
+        android_sanitized.extend(route_rules);
+        android_sanitized
+    };
+    #[cfg(not(target_os = "android"))]
+    let final_route_rules: Vec<serde_json::Value> = route_rules;
+
     let config = json!({
         "log": { "level": "info", "timestamp": true },
         "dns": dns,
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
-            "rules": route_rules,
+            "rules": final_route_rules,
             "final": final_tag,
             // Android（IPA-12 2.5）：必须关闭——auto_detect_interface 经
             // netlink 枚举默认网卡并按名绑定，Android 11+ SELinux 拦截普通
@@ -2315,10 +2401,15 @@ rules:
                     .unwrap_or(false)),
             "模块 REJECT 规则应编译为 block"
         );
-        // MitM 域名路由到边车，且不残留 PROXY 占位
+        // MitM 域名路由到边车容错组（边车不可达时回落主组），且不残留 PROXY 占位
         assert!(
-            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("go-cus-sidecar")),
-            "MitM 域名必须路由到边车"
+            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-cus-fallback")
+                && o["type"].as_str() == Some("urltest")),
+            "边车必须包进 urltest 容错组"
+        );
+        assert!(
+            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("go-cus-fallback")),
+            "MitM 域名必须路由到边车容错组"
         );
         assert!(
             rules.iter().all(|r| r.get("outbound").and_then(Value::as_str) != Some("PROXY")),

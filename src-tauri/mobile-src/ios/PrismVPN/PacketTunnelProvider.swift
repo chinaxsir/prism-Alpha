@@ -192,6 +192,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var currentState: TunnelState = .stopped
     private let stateLock = NSLock()
     private var heartbeatTimer: Timer?
+    /// 【APP-3】事件驱动网络切换监听：系统网络路径变化时才回调，
+    /// 取代原先每 3 秒轮询 getifaddrs 的心跳定时器
+    private var pathMonitor: NWPathMonitor?
 
     private var resolvedSharedDirURL: URL?
     private var lastOpenTunError: String?
@@ -288,6 +291,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 【APP-2】启动常驻 NWPathMonitor（幂等），供 findActivePhysicalInterface
         // 精准识别系统默认路由网卡（弱 Wi-Fi 自动切走 / 双卡 VoLTE 场景）
         startSystemPathMonitor()
+        // 【APP-3】事件驱动切网检测（替代 3 秒轮询定时器）
+        startNetworkPathMonitor()
         let phy = findActivePhysicalInterface()
         activeBoundInterface = phy.name
 
@@ -449,11 +454,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// 【APP-3】事件驱动切网：NWPathMonitor 在系统网络路径真正变化
+    ///（Wi-Fi ⇄ 蜂窝、断网恢复、默认路由切换）时才回调，网络稳定时
+    /// CPU / 磁盘开销为 0；替代原先每 3 秒调用一次 getifaddrs 的定时器。
+    /// NWPathMonitor 的回调在 vpnQueue 上执行，稍作延迟等待
+    /// startSystemPathMonitor 更新默认网卡名，再执行热重载判定。
+    private func startNetworkPathMonitor() {
+        pathMonitor?.cancel()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] _ in
+            self?.vpnQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.checkAndReloadIfNetworkChanged()
+            }
+        }
+        monitor.start(queue: vpnQueue)
+        pathMonitor = monitor
+    }
+
+    /// 低频心跳（60s）：仅用于主 App 看门狗判定扩展存活与故障阶段，
+    /// 不再承担网卡检测职责（切网由 NWPathMonitor 事件驱动）
     private func startHeartbeatTimer() {
         heartbeatTimer?.invalidate()
-        let t = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        let t = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            self.checkAndReloadIfNetworkChanged()
             self.writeHeartbeat("alive(\(self.activeBoundInterface))")
         }
         RunLoop.main.add(t, forMode: .common)
@@ -472,6 +495,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.heartbeatTimer?.invalidate()
             self.heartbeatTimer = nil
         }
+        pathMonitor?.cancel()
+        pathMonitor = nil
 
         writeHeartbeat("stopped:\(reason.rawValue)")
 
@@ -645,8 +670,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i]["strict_route"] = false
                     inbounds[i]["auto_route"] = true
                     inbounds[i]["mtu"] = 1400
+                    // mixed 栈：TCP 走系统原生栈、UDP 走 gvisor（sing-box 默认），
+                    // 大幅提升大流量下载吞吐并降低单核 CPU 占用
+                    inbounds[i]["stack"] = "mixed"
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = true
+                    inbounds[i]["sniff_timeout"] = "100ms"
+                    inbounds[i]["udp_timeout"] = "5m"
                 }
             }
             root["inbounds"] = inbounds
@@ -918,10 +948,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             root["experimental"] = experimental
         }
 
-        // 6. 开启 box.log
+        // 6. 开启 box.log（warn 级别）：正常上网的每条连接不再同步写盘，
+        // 消除高频磁盘 I/O 阻塞（info 级别会为每次路由匹配写一行）
         var logObj = (root["log"] as? [String: Any]) ?? [:]
         logObj["disabled"] = false
-        logObj["level"] = "info"
+        logObj["level"] = "warn"
         logObj["output"] = workDir.appendingPathComponent("box.log").path
         root["log"] = logObj
 

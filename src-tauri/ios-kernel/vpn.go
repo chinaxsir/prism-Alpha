@@ -75,11 +75,14 @@ func PrismVPNSetCallbacks(cbs C.prism_vpn_cbs) {
 func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 	// iOS 网络扩展的 Jetsam 物理内存红线极低（iOS 16 通常 15~50MB，
 	// build 144 实证：解析 2.47MB 配置时内存冲顶被 SIGKILL → code=12
-	// 且扩展来不及写任何错误文件）。收紧 GC 触发阈值并设置 Go 堆软上限，
-	// 宁可多 GC 换 CPU 也不许内存冲顶；仅 iOS 生效，Android 保持默认。
+	// 且扩展来不及写任何错误文件）。当前配置已瘦身至 30KB 以内，
+	// 恢复 GC 默认触发比例（100 = 堆增长 100% 才回收），消除高速转发时
+	// 每增长 10% 堆就触发一次全局 STW 造成的限速与发热；仅保留 38MB
+	// 软上限（离 50MB 硬红线留足安全裕度），逼近上限时才提前回收。
+	// 仅 iOS 生效，Android 保持默认。
 	if runtime.GOOS == "ios" {
-		debug.SetGCPercent(10)
-		debug.SetMemoryLimit(30 << 20) // 30MB
+		debug.SetGCPercent(100)
+		debug.SetMemoryLimit(38 << 20) // 38MB < iOS 50MB Jetsam 硬红线
 	}
 
 	vpnMu.Lock()

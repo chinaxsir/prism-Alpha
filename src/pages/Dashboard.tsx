@@ -169,8 +169,28 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!running) return;
-    const timer = setInterval(() => setNowMs(Date.now()), 250);
-    return () => clearInterval(timer);
+    let timer: number | undefined;
+    // 【APP-3】后台（锁屏/切 App）停掉 250ms 时钟：不再每秒 4 次唤醒 JS 线程，
+    // 回前台由下方 syncClockImmediately 立即校准，时长显示无跳变
+    const start = () => {
+      if (timer !== undefined) return;
+      setNowMs(Date.now());
+      timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    };
+    const stop = () => {
+      if (timer !== undefined) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const sync = () =>
+      document.visibilityState === "visible" ? start() : stop();
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", sync);
+    };
   }, [running]);
 
   // 关键唤醒监听（IPA-12）：亮屏/回前台瞬间第 1 步 0ms 刷新本地时钟

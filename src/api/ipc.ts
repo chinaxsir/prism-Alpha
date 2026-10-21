@@ -38,6 +38,9 @@ export interface CoreStatusDto {
 }
 
 export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");
+/// 前后台切换上报：后台时后端暂停高频事件推送与连接聚合，降低待机功耗
+export const setAppForeground = (foreground: boolean) =>
+  invoke<void>("set_app_foreground", { foreground });
 export const setMode = (mode: RunMode) => invoke<void>("set_mode", { mode });
 export const setOutboundMode = (mode: OutboundMode) =>
   invoke<void>("set_outbound_mode", { mode });
@@ -58,6 +61,12 @@ export interface SubscriptionRecord {
   enabled: boolean;
   /** 节点数 */
   nodeCount?: number | null;
+  /** 机场流量配额（subscription-userinfo 头解析） */
+  uploadBytes?: number | null;
+  downloadBytes?: number | null;
+  totalBytes?: number | null;
+  /** 到期时间（Unix 秒） */
+  expireAt?: number | null;
 }
 
 export const listSubscriptions = () =>

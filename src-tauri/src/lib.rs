@@ -142,6 +142,7 @@ pub fn run() {
             ipc::commands::start_core,
             ipc::commands::stop_core,
             ipc::commands::get_core_status,
+            ipc::commands::set_app_foreground,
             ipc::commands::set_mode,
             ipc::commands::url_test,
             ipc::commands::set_outbound_mode,

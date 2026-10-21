@@ -523,51 +523,70 @@ export default function Proxies() {
           const delay = lastDelay(node);
           const selected = current === node.name;
           const aimResult = aim?.results[node.name];
+          /// 未激活授权不渲染解锁徽章（与原先 Pro 守卫保持一致）
+          const unlockedTags = proActive ? (aimResult?.unlockedTags ?? []) : [];
           return (
             <button
               key={node.name}
               onClick={() => handleSelect(node.name)}
               disabled={coreStatus !== "running"}
               className={clsx(
-                "w-full flex items-center gap-3 px-4 py-3 text-left transition-colors",
+                "w-full px-3.5 py-2.5 text-left transition-colors",
                 selected ? "bg-accent/10" : "hover:bg-glass",
                 coreStatus !== "running" && "cursor-default opacity-80",
                 idx !== sorted.length - 1 && "border-b border-border"
               )}
             >
-              {/* 选中指示器 */}
-              <span
-                className={clsx(
-                  "shrink-0 w-2 h-2 rounded-full transition-colors",
-                  selected ? "bg-accent" : "bg-transparent"
-                )}
-              />
+              {/* 第一行（主信息）：选中圆点 + 完整节点名（独占剩余宽度）+ 延迟 + 箭头。
+                  节点名与延迟绝不和徽章挤在同一行，彻底消除截断 */}
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <span
+                    className={clsx(
+                      "shrink-0 w-2 h-2 rounded-full transition-colors",
+                      selected ? "bg-accent" : "bg-transparent"
+                    )}
+                  />
+                  <span
+                    className={clsx(
+                      "truncate text-sm",
+                      selected ? "text-gray-100 font-medium" : "text-gray-300"
+                    )}
+                  >
+                    {node.name}
+                  </span>
+                  {/* 无解锁徽章时保持紧凑单行：协议标签内联显示 */}
+                  {unlockedTags.length === 0 && (
+                    <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide bg-glass text-gray-400">
+                      {protocolTag(node.type)}
+                    </span>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <span
+                    className={clsx(
+                      "text-xs font-mono tabular-nums font-medium",
+                      delayClass(delay)
+                    )}
+                  >
+                    {delayText(delay)}
+                  </span>
+                  <ChevronRight size={14} className="shrink-0 text-gray-600" />
+                </div>
+              </div>
 
-              {/* 节点名 */}
-              <span
-                className={clsx(
-                  "flex-1 truncate text-sm",
-                  selected ? "text-gray-100 font-medium" : "text-gray-300"
-                )}
-              >
-                {node.name}
-              </span>
-
-              {/* 协议标签 */}
-              <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide bg-glass text-gray-400">
-                {protocolTag(node.type)}
-              </span>
-
-              {/* Go AIM 解锁徽章（APP 任务3：具体平台细分徽章，
-                  最多展示前 5 个 + 超出显示 +N；未激活授权不渲染） */}
-              {proActive && aimResult && aimResult.unlockedTags.length > 0 && (
-                <>
-                  {aimResult.unlockedTags.slice(0, 5).map((tag) => (
+              {/* 第二行（自适应）：协议标签 + 全部 Go AIM 平台徽章，flex-wrap
+                  自然换行，不挤占第一行的名称与延迟；无徽章时不渲染 */}
+              {unlockedTags.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-4">
+                  <span className="px-1.5 py-0.5 rounded bg-surface-hover text-[10px] font-mono uppercase tracking-wide text-gray-400">
+                    {protocolTag(node.type)}
+                  </span>
+                  {unlockedTags.map((tag) => (
                     <span
                       key={tag}
-                      title={aimResult.unlockedTags.join(" ")}
                       className={clsx(
-                        "shrink-0 px-1 py-0.5 rounded border text-[9px] font-medium",
+                        "px-1.5 py-0.5 rounded border text-[10px] font-medium",
                         AIM_BADGE_STYLE[tag] ??
                           "bg-glass text-gray-400 border-border"
                       )}
@@ -575,28 +594,8 @@ export default function Proxies() {
                       {tag}
                     </span>
                   ))}
-                  {aimResult.unlockedTags.length > 5 && (
-                    <span
-                      title={aimResult.unlockedTags.join(" ")}
-                      className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-glass text-gray-400"
-                    >
-                      +{aimResult.unlockedTags.length - 5}
-                    </span>
-                  )}
-                </>
+                </div>
               )}
-
-              {/* 延迟 */}
-              <span
-                className={clsx(
-                  "shrink-0 w-14 text-right text-xs font-mono",
-                  delayClass(delay)
-                )}
-              >
-                {delayText(delay)}
-              </span>
-
-              <ChevronRight size={14} className="shrink-0 text-gray-600" />
             </button>
           );
         })}

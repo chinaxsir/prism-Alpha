@@ -255,6 +255,10 @@ pub struct AppState {
     pub today_bytes_cache: RwLock<u64>,
     /// 连接保留序号发生器（单调递增，用于活跃/近期连接池的排序与淘汰）
     pub conn_seq: std::sync::atomic::AtomicU64,
+    /// 前端是否处于前台（由 App.tsx visibilitychange 经 IPC 上报）。
+    /// 后台（锁屏/切到其他 App）时暂停向 WebView 推送高频事件与连接聚合，
+    /// 主 App 静默零唤醒耗电；扩展内核仍在底层持续累计总流量。
+    pub app_in_foreground: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -294,6 +298,7 @@ impl AppState {
             analytics: RwLock::new(AnalyticsAgg::default()),
             today_bytes_cache: RwLock::new(0),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
+            app_in_foreground: std::sync::atomic::AtomicBool::new(true),
         }
     }
 

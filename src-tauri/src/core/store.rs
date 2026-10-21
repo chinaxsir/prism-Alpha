@@ -25,6 +25,50 @@ pub struct SubscriptionRecord {
     /// 是否参与配置合并（多订阅模型；旧记录缺省视为启用）
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// 订阅流量配额（机场下发 subscription-userinfo 头才有值）
+    #[serde(default)]
+    pub upload_bytes: Option<u64>,
+    #[serde(default)]
+    pub download_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    /// 到期时间（Unix 秒）
+    #[serde(default)]
+    pub expire_at: Option<u64>,
+}
+
+/// 机场通过 `subscription-userinfo` 响应头下发的流量配额
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionQuota {
+    pub upload_bytes: Option<u64>,
+    pub download_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub expire_at: Option<u64>,
+}
+
+impl SubscriptionQuota {
+    /// 解析 `upload=1; download=2; total=100; expire=1700000000`
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut quota = SubscriptionQuota::default();
+        let mut matched = false;
+        for part in raw.split(';') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let Ok(num) = value.trim().parse::<u64>() else {
+                continue;
+            };
+            match key.trim() {
+                "upload" => quota.upload_bytes = Some(num),
+                "download" => quota.download_bytes = Some(num),
+                "total" => quota.total_bytes = Some(num),
+                "expire" => quota.expire_at = Some(num),
+                _ => continue,
+            }
+            matched = true;
+        }
+        matched.then_some(quota)
+    }
 }
 
 fn default_enabled() -> bool {
@@ -327,8 +371,30 @@ pub fn upsert_subscription(data_dir: &Path, url: &str) -> anyhow::Result<()> {
             updated_at: now,
             name: None,
             enabled: true,
+            upload_bytes: None,
+            download_bytes: None,
+            total_bytes: None,
+            expire_at: None,
         });
     }
+    write_subscriptions(data_dir, &records)
+}
+
+/// 更新订阅流量配额（机场在 `subscription-userinfo` 响应头下发；
+/// 未下发时保留旧值，避免一次无头响应把已展示的配额清空）
+pub fn set_subscription_quota(
+    data_dir: &Path,
+    url: &str,
+    quota: &SubscriptionQuota,
+) -> anyhow::Result<()> {
+    let mut records = load_subscriptions(data_dir);
+    let Some(record) = records.iter_mut().find(|r| r.url == url) else {
+        return Ok(());
+    };
+    record.upload_bytes = quota.upload_bytes;
+    record.download_bytes = quota.download_bytes;
+    record.total_bytes = quota.total_bytes;
+    record.expire_at = quota.expire_at;
     write_subscriptions(data_dir, &records)
 }
 
@@ -346,6 +412,10 @@ pub fn upsert_subscription_pending(data_dir: &Path, url: &str) -> anyhow::Result
             updated_at: 0,
             name: None,
             enabled: true,
+            upload_bytes: None,
+            download_bytes: None,
+            total_bytes: None,
+            expire_at: None,
         });
     }
     write_subscriptions(data_dir, &records)

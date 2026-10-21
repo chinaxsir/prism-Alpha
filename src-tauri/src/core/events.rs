@@ -15,6 +15,7 @@
 //! 否则重连循环永不退出，stop/start 后订阅者翻倍导致事件重复。
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -79,9 +80,15 @@ fn spawn_stream(
                         if let Message::Text(text) = msg
                             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
                         {
-                            // 先维护运行时统计（同步段），再原样转发给前端
-                            apply_metrics(&app, path, &value);
-                            if app.emit(event_name, value).is_err() {
+                            // 前后台感知：后台（锁屏/切 App）时只维护累计总量，
+                            // 不做连接聚合、不向 WebView 发事件，主 App 静默零耗电；
+                            // 扩展内核仍在底层继续走流量，切回前台数据无缝续接
+                            let foreground = app
+                                .state::<AppState>()
+                                .app_in_foreground
+                                .load(Ordering::Relaxed);
+                            apply_metrics(&app, path, &value, foreground);
+                            if foreground && app.emit(event_name, value).is_err() {
                                 tracing::debug!("emit {} failed (no listeners)", event_name);
                             }
                         }
@@ -99,11 +106,11 @@ fn spawn_stream(
 }
 
 /// 按数据流类型更新 AppState 运行时统计（/memory 不做处理）
-fn apply_metrics(app: &AppHandle, path: &str, value: &serde_json::Value) {
+fn apply_metrics(app: &AppHandle, path: &str, value: &serde_json::Value, foreground: bool) {
     let state = app.state::<AppState>();
     match path {
         "/traffic" => apply_traffic_update(&state, value),
-        "/connections" => apply_connections_update(&state, value),
+        "/connections" => apply_connections_update(&state, value, foreground),
         _ => {}
     }
 }
@@ -124,7 +131,7 @@ fn apply_traffic_update(state: &AppState, value: &serde_json::Value) {
 }
 
 /// /connections：更新当前会话绝对累计值（落盘）、活跃连接快照、按维度聚合分析
-fn apply_connections_update(state: &AppState, value: &serde_json::Value) {
+fn apply_connections_update(state: &AppState, value: &serde_json::Value, foreground: bool) {
     let download_total = value
         .get("downloadTotal")
         .and_then(|v| v.as_u64())
@@ -141,7 +148,13 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value) {
     }
     *state.today_bytes_cache.write() = super::store::today_total_bytes(&state.data_dir);
 
-    // 2) 解析本帧连接快照（id → ConnSnapshot）
+    // 2) 后台时到此为止：连接池与聚合分析没有 UI 消费方，
+    //    纯属浪费 CPU/功耗（这也是锁屏耗电的主要来源之一）
+    if !foreground {
+        return;
+    }
+
+    // 3) 解析本帧连接快照（id → ConnSnapshot）
     let mut incoming: HashMap<String, ConnSnapshot> = HashMap::new();
     if let Some(arr) = value.get("connections").and_then(|v| v.as_array()) {
         for c in arr {

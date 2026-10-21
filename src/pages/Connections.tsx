@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { Pause, Play, Trash2, X, XCircle } from "lucide-react";
 
-import { closeAllConnections, closeConnection } from "@/api/ipc";
+import { closeAllConnections, closeConnection, getCustomRules, saveCustomRules } from "@/api/ipc";
 import { formatBytes } from "@/utils/format";
 import { useTranslation } from "@/i18n";
 import { useCoreStore, type ConnItem } from "@/stores/core";
@@ -25,6 +25,8 @@ export default function Connections() {
 
   const [filter, setFilter] = useState<FilterKey>("all");
   const [paused, setPaused] = useState(false);
+  // 快捷分流：点击「目标」列弹出规则菜单（域名/IP 自动判定匹配类型）
+  const [ruleHost, setRuleHost] = useState<string | null>(null);
   // 暂停时冻结的快照（纯 UI 状态，非数据源）
   const frozenRef = useRef<ConnItem[]>([]);
   // 清空视图：隐藏按下清空时的既有连接（其后新连接照常出现）
@@ -94,6 +96,28 @@ export default function Connections() {
       toast.success(t("proxies.conn.allClosed"));
     } catch (e) {
       console.error("close all connections failed:", e);
+      toast.error(String(e));
+    }
+  };
+
+  /// 快捷分流：把当前连接的目标域名/IP 写成一条自定义规则（内核运行中会自动重启生效）
+  const applyQuickRule = async (action: "DIRECT" | "PROXY" | "REJECT") => {
+    const host = ruleHost;
+    if (!host) return;
+    // 纯 IP / IPv6 用 IP-CIDR 精确匹配，其余按域名后缀匹配（含子域）
+    const isIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(":");
+    const rule = isIp
+      ? `IP-CIDR,${host}${host.includes(":") ? "/128" : "/32"},${action}`
+      : `DOMAIN-SUFFIX,${host},${action}`;
+    try {
+      const existing = await getCustomRules();
+      if (!existing.includes(rule)) {
+        await saveCustomRules([...existing, rule]);
+      }
+      toast.success(t("proxies.conn.ruleAdded", { rule }));
+      setRuleHost(null);
+    } catch (e) {
+      console.error("quick rule failed:", e);
       toast.error(String(e));
     }
   };
@@ -196,8 +220,17 @@ export default function Connections() {
                     {r.sourceIP}:{r.sourcePort}
                   </td>
                   <td className="px-4 py-2.5 font-mono text-xs">
-                    {r.host || r.destinationIP || t("common.unknown")}
-                    <span className="text-gray-500">:{r.destinationPort}</span>
+                    <button
+                      onClick={() => {
+                        const host = r.host || r.destinationIP;
+                        if (host) setRuleHost(host);
+                      }}
+                      title={t("proxies.conn.quickRule")}
+                      className="text-left transition-colors hover:text-accent"
+                    >
+                      {r.host || r.destinationIP || t("common.unknown")}
+                      <span className="text-gray-500">:{r.destinationPort}</span>
+                    </button>
                   </td>
                   <td className="px-4 py-2.5 text-xs text-gray-300">
                     {r.rule
@@ -229,6 +262,46 @@ export default function Connections() {
           </tbody>
         </table>
       </div>
+
+      {/* 快捷分流弹层：为选中连接的目标添加自定义规则 */}
+      {ruleHost && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setRuleHost(null)}
+        >
+          <div
+            className="w-full max-w-xs rounded-xl bg-surface-card p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 text-sm font-medium">
+              {t("proxies.conn.quickRuleTitle", { host: ruleHost })}
+            </div>
+            <div className="space-y-2">
+              {(
+                [
+                  ["DIRECT", "proxies.conn.quickRuleDirect"],
+                  ["PROXY", "proxies.conn.quickRuleProxy"],
+                  ["REJECT", "proxies.conn.quickRuleReject"],
+                ] as const
+              ).map(([action, key]) => (
+                <button
+                  key={action}
+                  onClick={() => void applyQuickRule(action)}
+                  className="w-full rounded-lg bg-surface-hover px-3 py-2 text-left text-sm text-gray-200 transition-colors hover:bg-accent/20 hover:text-accent"
+                >
+                  {t(key)}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setRuleHost(null)}
+              className="mt-3 w-full rounded-lg bg-surface-card py-1.5 text-xs text-gray-400 hover:text-gray-200"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
