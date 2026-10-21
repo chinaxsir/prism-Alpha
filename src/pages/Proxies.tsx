@@ -60,6 +60,17 @@ const AIM_FILTERS: Array<{ value: AimFilter; labelKey: string }> = [
   { value: "media", labelKey: "proxies.aim.media" },
 ];
 
+/** Go AIM 平台细分徽章配色（APP 任务3，与指令 1:1 对齐） */
+const AIM_BADGE_STYLE: Record<string, string> = {
+  GPT: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+  Claude: "bg-amber-500/15 text-amber-400 border-amber-500/30",
+  Gemini: "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
+  NF: "bg-red-500/15 text-red-400 border-red-500/30",
+  YT: "bg-rose-500/15 text-rose-400 border-rose-500/30",
+  "Disney+": "bg-sky-500/15 text-sky-400 border-sky-500/30",
+  TK: "bg-pink-500/15 text-pink-400 border-pink-500/30",
+};
+
 export default function Proxies() {
   const { t } = useTranslation();
 
@@ -278,11 +289,20 @@ export default function Proxies() {
         string,
         number
       > | null;
-      const ok = new Set(Object.keys(result ?? {}));
+      const res = result ?? {};
+      // APP 任务4：res[name] 不存在或为 0 一律进 failed 集合（显示超时），
+      // 绝不允许测速完成后任何节点残留空白「—」未检测状态
+      const ok = new Set(
+        Object.entries(res)
+          .filter(([, d]) => d > 0)
+          .map(([n]) => n)
+      );
       setFailed(
         new Set(nodes.map((n) => n.name).filter((n) => !ok.has(n)))
       );
-      setDelays(result ?? {});
+      setDelays(
+        Object.fromEntries(Object.entries(res).filter(([, d]) => d > 0))
+      );
     } catch (e) {
       console.error("url test failed:", e);
       toast.error(t("proxies.err.testFailed", { error: String(e) }));
@@ -538,22 +558,32 @@ export default function Proxies() {
                 {protocolTag(node.type)}
               </span>
 
-              {/* Go AIM 解锁徽章（探测评级后显示；未激活授权不渲染） */}
-              {proActive && aimResult?.aiUnlocked && (
-                <span
-                  title={t("proxies.badge.ai")}
-                  className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-accent/15 text-accent"
-                >
-                  AI
-                </span>
-              )}
-              {proActive && aimResult?.mediaUnlocked && (
-                <span
-                  title={t("proxies.badge.netflix")}
-                  className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-latency-good/15 text-latency-good"
-                >
-                  NF
-                </span>
+              {/* Go AIM 解锁徽章（APP 任务3：具体平台细分徽章，
+                  最多展示前 5 个 + 超出显示 +N；未激活授权不渲染） */}
+              {proActive && aimResult && aimResult.unlockedTags.length > 0 && (
+                <>
+                  {aimResult.unlockedTags.slice(0, 5).map((tag) => (
+                    <span
+                      key={tag}
+                      title={aimResult.unlockedTags.join(" ")}
+                      className={clsx(
+                        "shrink-0 px-1 py-0.5 rounded border text-[9px] font-medium",
+                        AIM_BADGE_STYLE[tag] ??
+                          "bg-glass text-gray-400 border-border"
+                      )}
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                  {aimResult.unlockedTags.length > 5 && (
+                    <span
+                      title={aimResult.unlockedTags.join(" ")}
+                      className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-glass text-gray-400"
+                    >
+                      +{aimResult.unlockedTags.length - 5}
+                    </span>
+                  )}
+                </>
               )}
 
               {/* 延迟 */}

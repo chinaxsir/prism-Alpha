@@ -27,6 +27,56 @@ const PLAN_LABEL: Record<string, string> = {
   team: "pro.plan.team",
 };
 
+/** APK-3 任务2：激活错误码 → 错误卡片文案（与《软件激活（客户端提示）》1:1 逐字对齐） */
+const LICENSE_ERROR_MAP: Record<
+  string,
+  { code: string; title: string; detail: string }
+> = {
+  invalid_input: {
+    code: "invalid_input",
+    title: "激活信息不完整或格式不正确",
+    detail: "将客户端更新至最新版本后重试。",
+  },
+  activation_failed: {
+    code: "activation_failed",
+    title: "License Key 与邮箱不匹配，或授权已过期 / 被停用",
+    detail:
+      "核对 Key 与注册邮箱是否一致（建议复制粘贴，注意大小写与空格）；确认订阅未过期。确认无误仍失败时，请通过工单联系我们。",
+  },
+  seat_limit_reached: {
+    code: "seat_limit_reached",
+    title: "设备数已达当前档位上限（试用 1 台 / Pro 3 台 / 买断 5 台）",
+    detail:
+      "登录用户面板，在「设备管理」中解绑不再使用的设备，再用同一 License Key 重新激活。",
+  },
+  activation_throttled: {
+    code: "activation_throttled",
+    title: "短时间内激活失败次数过多，触发安全保护",
+    detail:
+      "按客户端提示的倒计时等待后再试（锁定最长 30 分钟）。期间请勿反复重试，每次失败都会延长锁定时间。",
+  },
+  server_error: {
+    code: "server_error",
+    title: "服务器临时异常",
+    detail: "稍后重试；若持续出现，请提交工单。",
+  },
+};
+
+/** 从后端错误字符串提取标准错误码并映射到错误卡片文案。
+ *  后端约定（见 license.rs）：
+ *  - "err_code:{code}"（非 429 失败）
+ *  - "rate_limited:{秒数}:{code}"（429 限流） */
+function parseLicenseError(
+  message: string
+): { code: string; title: string; detail: string } | null {
+  if (!message) return null;
+  const errCode = message.match(/err_code:([a-z_]+)/i);
+  const rate = message.match(/rate_limited:\d+:([a-z_]+)/i);
+  const code = errCode?.[1] ?? rate?.[1] ?? null;
+  if (!code) return null;
+  return LICENSE_ERROR_MAP[code] ?? null;
+}
+
 /** 门控功能名 → 文案 key */
 const FEATURE_KEY: Record<Feature, string> = {
   [Feature.MultiSubscription]: "feature.multiSubscription",
@@ -67,6 +117,12 @@ export function ActivateProModal({
   const [busy, setBusy] = useState(false);
   const [retryAfter, setRetryAfter] = useState(0);
   const [activated, setActivated] = useState<Entitlement | null>(null);
+  // 激活失败的结构化错误卡片（错误码 + 加粗标题 + 详细说明，APK-3 任务2）
+  const [parsedError, setParsedError] = useState<{
+    code: string;
+    title: string;
+    detail: string;
+  } | null>(null);
 
   // 429 倒计时：每秒递减，归零后恢复按钮
   useEffect(() => {
@@ -109,6 +165,7 @@ export function ActivateProModal({
       return;
     }
     setBusy(true);
+    setParsedError(null);
     const ok = await activate(licenseKey.trim(), email.trim());
     setBusy(false);
     if (ok) {
@@ -119,11 +176,16 @@ export function ActivateProModal({
     } else {
       const wait = parseRetryAfter(error ?? "");
       if (wait > 0) setRetryAfter(wait);
-      toast.error(
-        wait > 0
-          ? t("pro.rateLimited", { secs: wait })
-          : (error ?? t("pro.activateFailed"))
-      );
+      // 命中标准错误码 → 弹窗内渲染错误卡片；未命中 → 维持原 toast
+      const mapped = parseLicenseError(error ?? "");
+      setParsedError(mapped);
+      if (!mapped) {
+        toast.error(
+          wait > 0
+            ? t("pro.rateLimited", { secs: wait })
+            : (error ?? t("pro.activateFailed"))
+        );
+      }
     }
   };
 
@@ -213,6 +275,21 @@ export function ActivateProModal({
               </div>
               <p className="text-xs text-gray-500">{t("pro.modalHint")}</p>
               <p className="text-[11px] text-gray-600">{t("pro.modalHint2")}</p>
+              {parsedError && (
+                <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 space-y-1.5 text-left">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <code className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 font-mono text-[11px]">
+                      {parsedError.code}
+                    </code>
+                    <span className="font-semibold text-xs text-red-200">
+                      {parsedError.title}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-red-200/80 leading-relaxed">
+                    {parsedError.detail}
+                  </p>
+                </div>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   onClick={dismiss}

@@ -83,6 +83,10 @@ pub struct AimNodeResult {
     pub delay_ms: u64,
     /// 更新时间戳（秒）
     pub updated_at: u64,
+    /// APP 任务4：是否已完成探测（含死节点——死节点也生成 probed=true
+    /// 的空结果，确保没有任何节点遗漏在"未检测"状态）
+    #[serde(default)]
+    pub probed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,61 +151,96 @@ pub fn start_probe(app: AppHandle) {
     });
 }
 
-/// 从 /proxies 响应中收集存活节点（type 非组、历史延迟 0 < d < PROBE_MAX_DELAY_MS）
-fn collect_alive(proxies: &serde_json::Value) -> Vec<(String, u64)> {
+/// 从 /proxies 响应中收集全部真实节点（type 非组），附带历史延迟
+/// （0 < d < PROBE_MAX_DELAY_MS 时视为存活基线，否则为 None 待补测）。
+/// APP 任务4：严禁跳过未测速节点——返回全部节点，由探测循环逐一覆盖。
+fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
     const GROUP_TYPES: [&str; 10] = [
         "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject", "Compatible",
         "Pass", "RejectDrop", "Global",
     ];
-    let mut alive = Vec::new();
+    let mut nodes = Vec::new();
     let Some(map) = proxies.get("proxies").and_then(serde_json::Value::as_object) else {
-        return alive;
+        return nodes;
     };
     for (name, p) in map {
         let type_ = p.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
         if GROUP_TYPES.contains(&type_) {
             continue;
         }
-        if let Some(hist) = p.get("history").and_then(serde_json::Value::as_array).and_then(|a| a.last()) {
-            let delay = hist.get("delay").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            if delay > 0 && delay < PROBE_MAX_DELAY_MS {
-                alive.push((name.clone(), delay));
-            }
-        }
+        let delay = p
+            .get("history")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.last())
+            .and_then(|h| h.get("delay"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS);
+        nodes.push((name.clone(), delay));
     }
-    alive
+    nodes
 }
 
-/// 全量探测：读取存活节点 → 并发二值信号探测 → 写缓存 + 推事件。
+/// 全量探测：读取全部节点 → 无延迟数据的先补基线测速 → 并发二值信号探测
+/// → 写缓存 + 推事件。APP 任务4：每个节点都必须生成 AimNodeResult
+/// （死节点 unlocked_tags=[] 且 probed=true），绝不遗漏"未检测"状态。
 async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     let api = state.kernel_api();
 
-    // 1. 读取全量节点列表并筛出存活节点
+    // 1. 读取全量节点列表
     let proxies = api.get_proxies().await.map_err(|e| format!("读取节点列表失败: {e}"))?;
-    let mut alive = collect_alive(&proxies);
+    let mut nodes = collect_nodes(&proxies);
 
-    // 2. 无延迟数据 → 先做一次组测速拿基线
-    if alive.is_empty() {
+    // 2. 全部节点都没有延迟数据 → 先做一次组测速拿基线
+    if !nodes.is_empty() && nodes.iter().all(|(_, d)| d.is_none()) {
         tracing::info!("[go-aim] 无历史延迟数据，先执行组基线测速");
         let _ = api
             .group_url_test("PROXY", Some(BASELINE_URL), Some(BASELINE_TIMEOUT_MS as u32), None)
             .await;
         let proxies = api.get_proxies().await.map_err(|e| format!("读取节点列表失败: {e}"))?;
-        alive = collect_alive(&proxies);
+        nodes = collect_nodes(&proxies);
     }
-    if alive.is_empty() {
-        return Err("没有存活节点可供探测".into());
+    if nodes.is_empty() {
+        return Err("节点列表为空，无可探测节点".into());
     }
-    alive.sort_by_key(|(_, d)| *d);
-    let total = alive.len();
+    // 有基线延迟的优先探测（延迟从低到高），无延迟的排后（探测循环内逐个补测）
+    nodes.sort_by_key(|(_, d)| d.unwrap_or(u64::MAX));
+    let total = nodes.len();
 
     // 4. 并发探测：节点级并行（限流），节点内串行 7 个探测点
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY));
     let mut set = tokio::task::JoinSet::new();
-    for (name, base_delay) in alive {
+    for (name, history_delay) in nodes {
         let api = api.clone();
         let sem = semaphore.clone();
         set.spawn(async move {
+            // APP 任务4：无延迟数据的节点先自动执行一次快速连通性测速，
+            // 严禁直接跳过
+            let base_delay = match history_delay {
+                Some(d) => d,
+                None => match api
+                    .test_delay(&name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32)
+                    .await
+                {
+                    Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
+                    _ => {
+                        // 死节点：生成 probed=true 的空结果并正常推送，
+                        // 确保没有任何节点遗漏在"未检测"状态
+                        return AimProbeOutcome {
+                            result: AimNodeResult {
+                                node_name: name,
+                                unlocked_tags: vec![],
+                                ai_unlocked: false,
+                                media_unlocked: false,
+                                score: 0,
+                                delay_ms: 0,
+                                updated_at: now_secs(),
+                                probed: true,
+                            },
+                        };
+                    }
+                },
+            };
+
             let mut tags: Vec<String> = Vec::new();
             let mut ai = false;
             let mut media = false;
@@ -235,6 +274,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     score: 0,
                     delay_ms: base_delay,
                     updated_at: now_secs(),
+                    probed: true,
                 },
             }
         });
@@ -377,6 +417,7 @@ mod tests {
             score: tags.len() as u32,
             delay_ms: delay,
             updated_at: 0,
+            probed: true,
         }
     }
 

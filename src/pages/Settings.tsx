@@ -36,6 +36,7 @@ import {
   getGoLanSettings,
   saveGoLanSettings,
   syncGoLanManaged,
+  isGoLanConfigured,
   type KernelInfo,
   type EntitlementState,
   type GoLanSettings,
@@ -679,7 +680,15 @@ export default function Settings() {
           headerRight={
             <Switch
               checked={goLan.enabled}
-              onChange={(v) => patchGoLan({ enabled: v })}
+              onChange={(v) => {
+                // APP 任务5：未配置时拦截开启，Toast 引导并展开配置区
+                if (v && !isGoLanConfigured(buildGoLanPayload())) {
+                  toast.error(t("dashboard.lan.configureFirst"));
+                  setGoLanExpanded(true);
+                  return;
+                }
+                patchGoLan({ enabled: v });
+              }}
             />
           }
         >

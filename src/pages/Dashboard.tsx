@@ -36,13 +36,12 @@ import {
   getGoAimStatus,
   setGoAimEnabled,
   runGoAimProbe,
+
   getGoLanSettings,
   saveGoLanSettings,
   getGoCusSettings,
   saveGoCusSettings,
-  type GoAimStatus,
-  type GoLanSettings,
-  type GoCusSettings,
+  isGoLanConfigured,
 } from "@/api/ipc";
 import { useCoreStore, type RunMode } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
@@ -99,10 +98,12 @@ export default function Dashboard() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [selecting, setSelecting] = useState(false);
 
-  // Pro 引擎矩阵状态（Go AIM / Go Lan / Go Cus）
-  const [aim, setAim] = useState<GoAimStatus | null>(null);
-  const [lan, setLan] = useState<GoLanSettings | null>(null);
-  const [cus, setCus] = useState<GoCusSettings | null>(null);
+  // Pro 引擎矩阵状态（Go AIM / Go Lan / Go Cus）：APP 任务1 提升到全局
+  // store（App.tsx 启动预加载），切页切回仪表盘时直接命中缓存渲染，
+  // 消除「先关后开」闪烁
+  const aim = useCoreStore((s) => s.goAimStatus);
+  const lan = useCoreStore((s) => s.goLanSettings);
+  const cus = useCoreStore((s) => s.goCusSettings);
 
   const running = status === "running";
   const modeLabel = (m: RunMode) => t(m === "tun" ? "runMode.tun" : "runMode.systemProxy");
@@ -231,13 +232,17 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Pro 引擎状态：挂载时拉取一次；Go AIM 评级结果经事件实时刷新
+  // Pro 引擎状态：挂载时静默刷新一次全局缓存（绝不重置为 null/false）；
+  // Go AIM 评级结果经事件实时刷新
   useEffect(() => {
-    getGoAimStatus().then(setAim).catch(() => undefined);
-    getGoLanSettings().then(setLan).catch(() => undefined);
-    getGoCusSettings().then(setCus).catch(() => undefined);
+    const store = useCoreStore.getState();
+    getGoAimStatus().then(store.setGoAimStatus).catch(() => undefined);
+    getGoLanSettings().then(store.setGoLanSettings).catch(() => undefined);
+    getGoCusSettings().then(store.setGoCusSettings).catch(() => undefined);
     const unAim = listen("go-aim://updated", () => {
-      getGoAimStatus().then(setAim).catch(() => undefined);
+      getGoAimStatus()
+        .then(useCoreStore.getState().setGoAimStatus)
+        .catch(() => undefined);
     });
     return () => {
       unAim.then((fn) => fn());
@@ -247,7 +252,9 @@ export default function Dashboard() {
   const toggleAim = async (v: boolean) => {
     try {
       await setGoAimEnabled(v);
-      setAim((prev) => (prev ? { ...prev, enabled: v } : prev));
+      const store = useCoreStore.getState();
+      const prev = store.goAimStatus;
+      if (prev) store.setGoAimStatus({ ...prev, enabled: v });
     } catch (e) {
       toast.error(String(e));
     }
@@ -256,9 +263,15 @@ export default function Dashboard() {
   const toggleLan = async (v: boolean) => {
     try {
       const s = await getGoLanSettings();
+      // APP 任务5：未配置时拦截开启，Toast 引导并跳转配置区
+      if (v && !isGoLanConfigured(s)) {
+        toast.error(t("dashboard.lan.configureFirst"));
+        navigate("/settings?focus=goLan");
+        return;
+      }
       s.enabled = v;
       await saveGoLanSettings(s);
-      setLan(s);
+      useCoreStore.getState().setGoLanSettings(s);
     } catch (e) {
       toast.error(String(e));
     }
@@ -267,9 +280,15 @@ export default function Dashboard() {
   const toggleCus = async (v: boolean) => {
     try {
       const s = await getGoCusSettings();
+      // APP 任务5：无模块时拦截开启，Toast 引导并跳转 Go Cus 模块页
+      if (v && s.modules.length === 0) {
+        toast.error(t("dashboard.cus.configureFirst"));
+        navigate("/proxies?tab=goCus");
+        return;
+      }
       s.enabled = v;
       await saveGoCusSettings(s);
-      setCus(s);
+      useCoreStore.getState().setGoCusSettings(s);
     } catch (e) {
       toast.error(String(e));
     }

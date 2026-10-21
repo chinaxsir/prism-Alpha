@@ -10,7 +10,6 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.Keep
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -18,7 +17,9 @@ import java.util.concurrent.TimeUnit
 //
 // 生命周期顺序（Rust 侧保证）：
 //   ensurePermission() → startServiceAndWait() → [libbox openTun/protect] → stopService()
-@Keep
+//
+// Release 构建已关闭 R8 压缩混淆（isMinifyEnabled=false），JNI 反射调用的
+// 方法不会被裁剪/改名，无需 @Keep 注解（避免引入 androidx.annotation 依赖）
 object PrismVpnBridge {
     private const val TAG = "PrismVpn"
 
@@ -37,7 +38,6 @@ object PrismVpnBridge {
     @Volatile
     private var ready = CountDownLatch(1)
 
-    @Keep
     @JvmStatic
     external fun nativeVpnRevoked()
 
@@ -45,13 +45,11 @@ object PrismVpnBridge {
     // com/prism/proxy/PrismVpnBridge 并缓存为 JNI GlobalRef。
     // 由 attach() 调用，彻底规避 Rust 后台线程 FindClass 走系统 ClassLoader
     // 导致的 ClassNotFoundException。
-    @Keep
     @JvmStatic
     external fun initNative()
 
     // 由 MainActivity 的 init 块调用（必须早于 Activity STARTED，
     // 因为 registerForActivityResult 要求注册在启动之前）
-    @Keep
     @JvmStatic
     fun attach(activity: ComponentActivity) {
         this.activity = activity
@@ -81,7 +79,6 @@ object PrismVpnBridge {
     // 系统 VPN 授权检查：
     //   true  —— 已授权（或弹窗后用户点击“确定”完成授权）
     //   false —— 用户拒绝授权或当前无法拉起弹窗
-    @Keep
     @JvmStatic
     fun ensurePermission(): Boolean {
         return try {
@@ -140,7 +137,6 @@ object PrismVpnBridge {
     }
 
     // 启动前台 VPN 服务并阻塞等待其就绪（Go 索要 TUN fd 前服务必须已前台化）
-    @Keep
     @JvmStatic
     fun startServiceAndWait(): Boolean {
         return try {
@@ -163,14 +159,12 @@ object PrismVpnBridge {
         }
     }
 
-    @Keep
     fun onServiceReady(service: PrismVpnService) {
         this.service = service
         ready.countDown()
     }
 
     // 停止并销毁前台 VPN 服务
-    @Keep
     @JvmStatic
     fun stopService() {
         val act = this.activity
@@ -191,7 +185,6 @@ object PrismVpnBridge {
         service = null
     }
 
-    @Keep
     @JvmStatic
     fun openTun(optionsJson: String): Int {
         val svc = this.service ?: run {
@@ -206,7 +199,6 @@ object PrismVpnBridge {
         }
     }
 
-    @Keep
     @JvmStatic
     fun protectSocket(fd: Int): Boolean {
         val svc = this.service ?: return false

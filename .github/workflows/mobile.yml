@@ -63,14 +63,13 @@ jobs:
           node-version: 20
           cache: npm
 
+      # APK-3：仅构建 aarch64（arm64-v8a）真机架构。同时编译 armv7/i686/
+      # x86_64 四个架构是 17 分钟构建瓶颈的主要来源；32 位与模拟器不在
+      # 分发范围内，单架构可将 Android 构建压缩到 6 分钟量级
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: >-
-            aarch64-linux-android,
-            armv7-linux-androideabi,
-            i686-linux-android,
-            x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -155,9 +154,27 @@ jobs:
         run: npx tauri android init
 
       # 注入系统 VPN 原生组件：PrismVpnBridge / PrismVpnService（Kotlin）、
-      # MainActivity 桥接与 AndroidManifest 权限/Service 声明（幂等）
+      # MainActivity 桥接与 AndroidManifest 权限/Service 声明（幂等）。
+      # 脚本同时关闭 Release R8（isMinifyEnabled/isShrinkResources/
+      # optimization.enable → false）并以无 BOM UTF-8 重写 proguard-rules.pro
       - name: Inject Android VPN components
         run: node scripts/inject-android-vpn.cjs
+
+      # APK-3 保险：注入脚本已关闭 R8，此处再强制兜底一次（两种 DSL 写法
+      # 都覆盖），防止 CI 环境中 build.gradle.kts 被重新生成或覆盖后
+      # :app:minifyUniversalReleaseWithR8 复活导致构建失败
+      - name: Force-disable R8 minify (belt & suspenders)
+        shell: bash
+        run: |
+          set -e
+          F=src-tauri/gen/android/app/build.gradle.kts
+          sed -i 's/isMinifyEnabled = true/isMinifyEnabled = false/g' "$F"
+          sed -i 's/isShrinkResources = true/isShrinkResources = false/g' "$F"
+          sed -i '/optimization/,/}/ s/enable = true/enable = false/' "$F"
+          echo "--- release buildType ---"
+          sed -n '/getByName("release")/,/^        }/p' "$F"
+          # 首字节 BOM 校验：proguard-rules.pro 绝不允许 0xEF 开头
+          head -c1 src-tauri/gen/android/app/proguard-rules.pro | od -An -tx1
 
       # tauri android init 只放置模板自带图标，不会把 src-tauri/icons/android
       # 同步进 gen 工程；这里用定制的满幅海军蓝图标覆盖 mipmap/values/anydpi
@@ -202,23 +219,19 @@ jobs:
                 -trimpath -ldflags="-s -w" \
                 -o "libprismkernel-$arch.so" .
           }
+          # APK-3：仅构建 arm64（与 Rust target 单架构化一致），
+          # 32 位与 x86_64 模拟器不在分发范围内
           build arm64  arm64 aarch64-linux-android24-clang       aarch64-linux-android24
-          build arm    arm   armv7a-linux-androideabi24-clang   armv7a-linux-androideabi24
-          build 386    386   i686-linux-android24-clang          i686-linux-android24
-          build amd64  amd64 x86_64-linux-android24-clang        x86_64-linux-android24
           ls -lh libprismkernel-*.so
 
-      # 将四个架构的 .so 拷入 Tauri Android 工程的 jniLibs，确保被打包进 APK
+      # 将 .so 拷入 Tauri Android 工程的 jniLibs，确保被打包进 APK
       - name: Stage Android kernel .so into jniLibs
         shell: bash
         run: |
           set -e
           JNI="src-tauri/gen/android/app/src/main/jniLibs"
-          mkdir -p "$JNI/arm64-v8a" "$JNI/armeabi-v7a" "$JNI/x86" "$JNI/x86_64"
+          mkdir -p "$JNI/arm64-v8a"
           cp src-tauri/ios-kernel/libprismkernel-arm64.so "$JNI/arm64-v8a/"
-          cp src-tauri/ios-kernel/libprismkernel-arm.so   "$JNI/armeabi-v7a/"
-          cp src-tauri/ios-kernel/libprismkernel-386.so   "$JNI/x86/"
-          cp src-tauri/ios-kernel/libprismkernel-amd64.so "$JNI/x86_64/"
           ls -lhR "$JNI"
 
       # Gradle rust 插件会把 cargo 详细输出重定向到文件，失败时控制台只见
@@ -264,10 +277,8 @@ jobs:
           }
 
           set +e
+          # APK-3：仅预构建 aarch64 单架构
           build aarch64-linux-android    aarch64-linux-android24-clang
-          build armv7-linux-androideabi  armv7a-linux-androideabi24-clang
-          build i686-linux-android       i686-linux-android24-clang
-          build x86_64-linux-android     x86_64-linux-android24-clang
 
           if [ "$failed" -ne 0 ]; then
             echo "prebuild-failed=true" >> "$GITHUB_OUTPUT"
@@ -285,9 +296,9 @@ jobs:
         if: steps.prebuild.outputs.prebuild-failed == 'true'
         run: echo "Android cargo pre-build failed; see annotations / log artifact" && exit 1
 
-      # 开启详细日志，以便定位移动端编译具体报错
+      # 开启详细日志，以便定位移动端编译具体报错；APK-3：--target aarch64 单架构
       - name: Build APK
-        run: npx tauri android build --apk --verbose
+        run: npx tauri android build --apk --target aarch64 --verbose
 
       # release 未配置 signingConfig，Gradle 产出 *-unsigned.apk，无法安装。
       # CI 内生成一把自签证书（仅用于内测分发，不可上架），zipalign 后

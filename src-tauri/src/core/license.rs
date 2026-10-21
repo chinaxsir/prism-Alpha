@@ -414,16 +414,27 @@ async fn error_message(resp: reqwest::Response) -> String {
     }
 }
 
-/// 激活失败时按 HTTP 状态码给出精准的用户提示（对齐 api-license-activate.md §1/§4.5）：
-/// - 400 invalid_input：本地参数问题，给出可比对的固定文案；
-/// - 409 seat_limit_reached：席位已满，提示解绑旧设备；
-/// - 其余（含 403 activation_failed）：透传服务端更具体的 message + 错误码。
-fn activation_error(http: u16, server_message: String) -> String {
-    match http {
-        400 => "请求参数格式错误：请检查 License Key（ASKC- 开头）与邮箱格式是否正确".into(),
-        409 => "当前授权绑定设备数已达上限（试用版 1 台 / Pro 3 台 / 买断版 5 台），请前往官网用户面板解绑旧设备后重试".into(),
-        _ => server_message,
+/// 从非 200 响应提取标准机器错误码（APK-3 任务2）。
+/// 优先取 JSON 的 "error" 字符串字段；解析失败按 HTTP 状态码映射：
+/// 400→invalid_input、403→activation_failed、409→seat_limit_reached、
+/// 429→activation_throttled、5xx→server_error。
+async fn extract_error_code(http: u16, resp: reqwest::Response) -> String {
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if let Some(c) = parsed.get("error").and_then(|e| e.as_str()) {
+        if !c.is_empty() {
+            return c.to_string();
+        }
     }
+    match http {
+        400 => "invalid_input",
+        403 => "activation_failed",
+        409 => "seat_limit_reached",
+        429 => "activation_throttled",
+        s if s >= 500 => "server_error",
+        _ => "activation_failed",
+    }
+    .to_string()
 }
 
 /// 从 429 响应体提取 retry_after（秒）；缺失/非法时回退 30
@@ -583,18 +594,19 @@ pub async fn activate(
     )
     .await?;
 
-    // 429 频率限制：把 retry_after 编进错误文本透传给前端。
-    // 前端解析约定：错误字符串以 "rate_limited:" 开头，冒号后为等待秒数（整数），
-    // 例如 "rate_limited:30" 表示 30 秒后可重试。
+    // 429 频率限制：把 retry_after 与标准错误码编进错误文本透传给前端。
+    // 前端解析约定："rate_limited:{secs}:activation_throttled"，
+    // 例如 "rate_limited:30:activation_throttled" 表示 30 秒后可重试。
     if resp.status().as_u16() == 429 {
         let secs = retry_after_secs(resp).await;
-        bail!("rate_limited:{secs}");
+        bail!("rate_limited:{secs}:activation_throttled");
     }
-    // 400/403/409 等按状态码给出精准文案（403 透传服务端 message + 错误码）
+    // 非 200：透传标准机器错误码（"err_code:{code}"），
+    // 前端 LICENSE_ERROR_MAP 按错误码 1:1 逐字渲染提示卡片
     if !resp.status().is_success() {
         let http = resp.status().as_u16();
-        let msg = error_message(resp).await;
-        bail!(activation_error(http, msg));
+        let code = extract_error_code(http, resp).await;
+        bail!("err_code:{code}");
     }
     let data: ActivateResponse = resp.json().await?;
     if !data.ok {
@@ -695,9 +707,9 @@ pub async fn verify_remote(
         }
         Err(StatusError::RateLimited(secs)) => {
             // 429 同样透传给前端（refresh_entitlement 按钮会展示）；
-            // 前端解析约定同 activate："rate_limited:N"
+            // 前端解析约定同 activate："rate_limited:N:activation_throttled"
             tracing::warn!("license status rate limited (retry after {secs}s)");
-            bail!("rate_limited:{secs}");
+            bail!("rate_limited:{secs}:activation_throttled");
         }
         Err(StatusError::Rejected(code, message)) => {
             tracing::warn!("license rejected by server (HTTP {code}): {message}");

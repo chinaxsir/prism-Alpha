@@ -1413,6 +1413,13 @@ final class PrismTunnelController {
         attemptsRemaining: Int,
         completion: @escaping (Error?) -> Void
     ) {
+        // 【APP-2】启动前清场：非已连接状态下先 killext 清理残留/僵死的旧
+        // PrismVPN 扩展进程（可能仍绑定旧基站 Socket），达到"先开一下其他
+        // 代理软件"的同效清场，根治跨基站移动/弱 Wi-Fi 切换后全超时
+        if activeManager?.connection.status != .connected {
+            PrismTunnelController.killStaleExtensionProcess()
+        }
+
         // 【build 150】clearSharedErrorFile 已上移到 start() 入口只清一次；
         // 重试/自愈路径保留上一轮心跳与错误现场，诊断串才能看到真实卡点
 

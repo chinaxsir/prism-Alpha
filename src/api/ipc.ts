@@ -165,6 +165,8 @@ export interface AimNodeResult {
   score: number;
   delayMs: number;
   updatedAt: number;
+  /** 是否已完成探测（APP 任务4：死节点也会生成 probed=true 的空结果） */
+  probed?: boolean;
 }
 
 export interface GoAimStatus {
@@ -209,6 +211,25 @@ export const getGoLanSettings = () => invoke<GoLanSettings>("get_go_lan_settings
 export const saveGoLanSettings = (settings: GoLanSettings) =>
   invoke<string[]>("save_go_lan_settings", { settings });
 export const syncGoLanManaged = () => invoke<GoLanSettings>("sync_go_lan_managed");
+
+/** APP 任务5：Go Lan 配置完整性检查（未配置时前端拦截开启操作）
+ *  - manual：lanCidrs 非空，且（nodeUri 非空，或 wgConfig 的
+ *    server/privateKey/peerPublicKey 均非空）
+ *  - managed：deviceCode 非空且 lanCidrs 非空（已成功拉取过配置） */
+export const isGoLanConfigured = (cfg: GoLanSettings): boolean => {
+  if (cfg.mode === "manual") {
+    const hasCidrs = cfg.lanCidrs.length > 0;
+    const hasUri = cfg.nodeUri.trim().length > 0;
+    const wg = cfg.wgConfig;
+    const hasWg =
+      !!wg &&
+      wg.server.trim().length > 0 &&
+      wg.privateKey.trim().length > 0 &&
+      wg.peerPublicKey.trim().length > 0;
+    return hasCidrs && (hasUri || hasWg);
+  }
+  return cfg.deviceCode.trim().length > 0 && cfg.lanCidrs.length > 0;
+};
 
 // ---- Go Cus ----
 

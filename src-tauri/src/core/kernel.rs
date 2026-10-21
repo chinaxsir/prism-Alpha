@@ -784,15 +784,16 @@ impl KernelApi {
         }
 
         let test_url = url.unwrap_or("http://www.gstatic.com/generate_204");
-        // 单节点超时强制 2000ms：真实反映可用性——2s 内无响应的节点视为不可用，
-        // 拉满超时只会拖慢整体测速。并发 32 路下整体耗时 ≈ ceil(节点数/32) × 2s；
-        // 每个结果完成后立即推送 url-test-update，前端逐节点实时刷新
-        let timeout = timeout_ms.unwrap_or(2000).min(2000);
+        // APP 任务4：并发 12 + 单次超时 3000ms（避免 32 并发 TLS 握手阻塞
+        // 手机网络队列）。每个结果完成后立即推送 url-test-update；
+        // 第一轮结束后对失败节点以 6 并发 2500ms 补测一次。
+        let timeout = timeout_ms.unwrap_or(3000).min(3000);
+        let retry_timeout: u64 = 2500;
         let group_tag = name.to_string();
 
         use futures_util::StreamExt;
-        const TEST_CONCURRENCY: usize = 32;
-        let results: Vec<(String, Option<u64>)> = futures_util::stream::iter(members)
+        const TEST_CONCURRENCY: usize = 12;
+        let first_results: Vec<(String, Option<u64>)> = futures_util::stream::iter(members.clone())
             .map(|member| {
                 let endpoint = format!("{}/proxies/{}/delay", self.base, member);
                 let req = self.client.get(&endpoint).query(&[
@@ -834,10 +835,67 @@ impl KernelApi {
             .collect::<Vec<_>>()
             .await;
 
+        // 第一轮失败节点 → 以 6 并发 2500ms 补测一次（100% 收口）
+        let retry_members: Vec<String> = first_results
+            .iter()
+            .filter_map(|(m, d)| if d.is_none() { Some(m.clone()) } else { None })
+            .collect();
+
+        let retry_results: Vec<(String, Option<u64>)> = if retry_members.is_empty() {
+            vec![]
+        } else {
+            futures_util::stream::iter(retry_members)
+                .map(|member| {
+                    let endpoint = format!("{}/proxies/{}/delay", self.base, member);
+                    let req = self.client.get(&endpoint).query(&[
+                        ("url", test_url.to_string()),
+                        ("timeout", retry_timeout.to_string()),
+                    ]);
+                    let app = app.map(|a| a.clone());
+                    let group_tag = group_tag.clone();
+                    async move {
+                        let delay = match req.send().await {
+                            Ok(resp) if resp.status().is_success() => resp
+                                .json::<serde_json::Value>()
+                                .await
+                                .ok()
+                                .and_then(|j| j.get("delay").and_then(|d| d.as_u64())),
+                            Ok(resp) => {
+                                tracing::warn!("delay retry {}: HTTP {}", member, resp.status());
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!("delay retry {}: {}", member, e);
+                                None
+                            }
+                        };
+                        if let Some(app) = app {
+                            let _ = app.emit(
+                                "url-test-update",
+                                serde_json::json!({
+                                    "group": group_tag,
+                                    "name": member,
+                                    "delay": delay,
+                                }),
+                            );
+                        }
+                        (member, delay)
+                    }
+                })
+                .buffer_unordered(6)
+                .collect::<Vec<_>>()
+                .await
+        };
+
         let mut map = serde_json::Map::new();
-        for (member, delay) in results {
+        for (member, delay) in &first_results {
             if let Some(d) = delay {
-                map.insert(member, serde_json::json!(d));
+                map.insert(member.clone(), serde_json::json!(d));
+            }
+        }
+        for (member, delay) in &retry_results {
+            if let Some(d) = delay {
+                map.insert(member.clone(), serde_json::json!(d));
             }
         }
         Ok(serde_json::Value::Object(map))

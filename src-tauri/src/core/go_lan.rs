@@ -123,6 +123,30 @@ impl GoLanSettings {
     }
 }
 
+/// APP 任务5：Go Lan 配置完整性检查（未配置时后端兜底拦截启用）。
+/// 与前端 ipc.ts `isGoLanConfigured` 逻辑保持一致：
+/// - manual：lan_cidrs 非空，且（node_uri 非空，或 wg_config 的
+///   server/private_key/peer_public_key 均非空）
+/// - managed：device_code 非空且 lan_cidrs 非空（已成功拉取过配置）
+pub fn is_configured(lan: &GoLanSettings) -> bool {
+    if lan.mode == "manual" {
+        let has_cidrs = !lan.lan_cidrs.is_empty();
+        let has_uri = !lan.node_uri.trim().is_empty();
+        let has_wg = lan
+            .wg_config
+            .as_ref()
+            .map(|wg| {
+                !wg.server.trim().is_empty()
+                    && !wg.private_key.trim().is_empty()
+                    && !wg.peer_public_key.trim().is_empty()
+            })
+            .unwrap_or(false);
+        has_cidrs && (has_uri || has_wg)
+    } else {
+        !lan.device_code.trim().is_empty() && !lan.lan_cidrs.is_empty()
+    }
+}
+
 // ---------------------------------------------------------------- 持久化
 
 pub fn load(data_dir: &std::path::Path) -> GoLanSettings {

@@ -17,6 +17,9 @@ import {
   getRuntimeSnapshot,
   getSettings,
   stopCore,
+  getGoAimStatus,
+  getGoLanSettings,
+  getGoCusSettings,
   type Entitlement,
 } from "@/api/ipc";
 import { isMobile } from "@/pro/gating";
@@ -44,6 +47,16 @@ export default function App() {
   useEffect(() => {
     initPro();
   }, [initPro]);
+
+  // 启动预加载 Go 三引擎状态到全局 store（APP 任务1：消除切页闪烁，
+  // Dashboard 直接从 store 读作渲染数据源，切回仪表盘不再「先关后开」；
+  // 非 Pro 时 get_go_lan_settings / get_go_cus_settings 会 reject，静默忽略）
+  useEffect(() => {
+    const store = useCoreStore.getState();
+    getGoAimStatus().then(store.setGoAimStatus).catch(() => undefined);
+    getGoLanSettings().then(store.setGoLanSettings).catch(() => undefined);
+    getGoCusSettings().then(store.setGoCusSettings).catch(() => undefined);
+  }, []);
 
   // 启动时恢复语言与外观偏好（持久化于后端 settings.json）
   useEffect(() => {

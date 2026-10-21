@@ -1,6 +1,11 @@
 import { create } from "zustand";
 
 import type { Language, ThemePref } from "@/stores/prefs";
+import type {
+  GoAimStatus,
+  GoCusSettings,
+  GoLanSettings,
+} from "@/api/ipc";
 
 export type CoreStatus = "stopped" | "starting" | "running" | "stopping" | "error";
 export type RunMode = "systemProxy" | "tun";
@@ -124,6 +129,17 @@ interface CoreState {
   applyRuntimeSnapshot: (snap: RuntimeSnapshot) => void;
   /** 内核停止时清空运行时数据 */
   clearRuntime: () => void;
+
+  // ---- Go 三引擎状态缓存（APP 任务1：提升到全局 store，消除切页闪烁） ----
+  /** Go AIM 状态缓存；null = 尚未加载（页面静默刷新后填充） */
+  goAimStatus: GoAimStatus | null;
+  /** Go Lan 设置缓存；null = 尚未加载 */
+  goLanSettings: GoLanSettings | null;
+  /** Go Cus 设置缓存；null = 尚未加载 */
+  goCusSettings: GoCusSettings | null;
+  setGoAimStatus: (s: GoAimStatus | null) => void;
+  setGoLanSettings: (s: GoLanSettings | null) => void;
+  setGoCusSettings: (s: GoCusSettings | null) => void;
 }
 
 // 环形缓冲：仅保留最近 60 个采样点（1 分钟）
@@ -222,4 +238,12 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       analytics: { hosts: [], outbounds: [], rules: [] },
       sessionTraffic: 0,
     }),
+
+  // ---- Go 三引擎状态缓存 ----
+  goAimStatus: null,
+  goLanSettings: null,
+  goCusSettings: null,
+  setGoAimStatus: (goAimStatus) => set({ goAimStatus }),
+  setGoLanSettings: (goLanSettings) => set({ goLanSettings }),
+  setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
 }));

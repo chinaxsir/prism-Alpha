@@ -14,9 +14,8 @@ import org.json.JSONObject
 
 // Prism 系统 VPN 服务：建立 TUN 并把文件描述符交给 Go libbox。
 // 参考 sing-box 官方 Android 实现 VPNService.kt。
-// @Keep（IPA-12 2.2）：openTun/shutdown 由 Rust 经 JNI 反射调用，
-// R8 裁剪/改名将导致真机 NoSuchMethodError
-@androidx.annotation.Keep
+// Release 构建已关闭 R8（isMinifyEnabled=false），JNI 方法不会被裁剪/改名，
+// 无需 @Keep 注解（避免引入 androidx.annotation 依赖）
 class PrismVpnService : VpnService() {
 
     companion object {
@@ -38,8 +37,7 @@ class PrismVpnService : VpnService() {
         return START_STICKY
     }
 
-    // 由 Go（经 JNI）在 libbox 启动时调用（IPA-12 2.2：@Keep 防 R8 裁剪）
-    @androidx.annotation.Keep
+    // 由 Go（经 JNI）在 libbox 启动时调用
     fun openTun(optionsJson: String): Int {
         val options = JSONObject(optionsJson)
         val builder = Builder()

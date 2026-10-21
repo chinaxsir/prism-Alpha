@@ -1,5 +1,6 @@
 import Foundation
 import NetworkExtension
+import Network
 import Darwin
 
 private let prismAppGroupID = "group.com.prism.proxy"
@@ -8,6 +9,39 @@ private var prismProviderRef: PacketTunnelProvider?
 /// 缓存当前活跃的物理网卡索引与名称（en0 / pdp_ip0）
 private var cachedPhysicalIfIndex: UInt32 = 0
 private var cachedPhysicalIfName: String = "en0"
+
+/// 【APP-2】常驻 NWPathMonitor 观测的系统默认路由信息：
+/// 弱 Wi-Fi 被系统自动切走时 currentPath 的首选接口精确变为 pdp_ip* 而非
+/// 断网 en0；双卡/VoLTE 多 pdp_ip* 场景据此识别真正的数据网卡
+private var systemDefaultInterfaceName: String = ""
+private var systemDefaultIsCellular: Bool = false
+private var prismPathMonitor: NWPathMonitor?
+
+/// 启动常驻 NWPathMonitor（幂等），实时记录系统默认路由使用的物理网卡
+private func startSystemPathMonitor() {
+    guard prismPathMonitor == nil else { return }
+    let monitor = NWPathMonitor()
+    prismPathMonitor = monitor
+    monitor.pathUpdateHandler = { path in
+        let cellular = path.usesInterfaceType(.cellular)
+        systemDefaultIsCellular = cellular
+        if cellular {
+            systemDefaultInterfaceName =
+                path.availableInterfaces.first { $0.type == .cellular }?.name ?? ""
+        } else if path.usesInterfaceType(.wifi) {
+            systemDefaultInterfaceName =
+                path.availableInterfaces.first { $0.type == .wifi }?.name ?? ""
+        } else {
+            // 排除虚拟网卡后的首个物理接口
+            systemDefaultInterfaceName = path.availableInterfaces.first {
+                !$0.name.hasPrefix("utun") && !$0.name.hasPrefix("ipsec")
+                    && !$0.name.hasPrefix("ppp") && !$0.name.hasPrefix("llw")
+                    && !$0.name.hasPrefix("awdl") && !$0.name.hasPrefix("lo")
+            }?.name ?? ""
+        }
+    }
+    monitor.start(queue: DispatchQueue(label: "com.prism.proxy.pathMonitor", qos: .utility))
+}
 
 private struct PhysicalInterface {
     let name: String
@@ -52,6 +86,13 @@ private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
 }
 
 /// 获取当前真正联网的物理网卡（Wi-Fi 在家选 en0，出门断 Wi-Fi 自动选蜂窝流量 pdp_ip0）
+///
+/// 【APP-2】双卡/VoLTE 与弱 Wi-Fi 增强：
+/// - 多 pdp_ip* 候选中，与 NWPathMonitor 观测的系统默认路由同名者最优先；
+///   其次拥有可路由 IPv4(AF_INET) 的数据网卡，仅 IPv6 的 IMS 语音专网垫底
+///   （IMS 专网只有运营商内网 IPv6，不能上公网）
+/// - NWPathMonitor 指示默认路由已是蜂窝（弱 Wi-Fi 信号区 iOS 已自动切流量）
+///   时，直接选用最优 pdp_ip*，忽略有局域网 IP 但无外网连通性的弱 en0
 private func findActivePhysicalInterface() -> PhysicalInterface {
     var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else {
@@ -61,7 +102,10 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     defer { freeifaddrs(ifaddrPtr) }
 
     var wifiCandidate: PhysicalInterface?
-    var cellCandidate: PhysicalInterface?
+    // 蜂窝候选细分：系统默认路由同名 > 有可路由 IPv4 > 仅 IPv6（IMS 专网）
+    var cellNamedCandidate: PhysicalInterface?
+    var cellV4Candidate: PhysicalInterface?
+    var cellV6Candidate: PhysicalInterface?
     var otherCandidate: PhysicalInterface?
 
     var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
@@ -78,8 +122,15 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
                     if name == "en0" {
                         wifiCandidate = PhysicalInterface(name: name, index: idx, hasRoutableIP: true)
                     } else if name.hasPrefix("pdp_ip") {
-                        if cellCandidate == nil || name == "pdp_ip0" {
-                            cellCandidate = PhysicalInterface(name: name, index: idx, hasRoutableIP: true)
+                        let iface = PhysicalInterface(name: name, index: idx, hasRoutableIP: true)
+                        let isV4 = Int32(addr.pointee.sa_family) == AF_INET
+                        if name == systemDefaultInterfaceName && cellNamedCandidate == nil {
+                            cellNamedCandidate = iface
+                        }
+                        if isV4 {
+                            if cellV4Candidate == nil { cellV4Candidate = iface }
+                        } else if cellV6Candidate == nil {
+                            cellV6Candidate = iface
                         }
                     } else if otherCandidate == nil {
                         otherCandidate = PhysicalInterface(name: name, index: idx, hasRoutableIP: true)
@@ -90,12 +141,22 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
         ptr = current.pointee.ifa_next
     }
 
+    // 最优蜂窝候选：系统默认路由同名 > 有可路由 IPv4 > 仅 IPv6（IMS 专网）
+    let bestCell = cellNamedCandidate ?? cellV4Candidate ?? cellV6Candidate
+
+    // NWPathMonitor 指示系统默认路由已是蜂窝（弱 Wi-Fi 已被 iOS 自动切走）
+    // → 忽略有局域网 IP 但无外网连通性的弱 en0，直接选用最优 pdp_ip*
+    if systemDefaultIsCellular, let cell = bestCell {
+        cachedPhysicalIfIndex = cell.index
+        cachedPhysicalIfName = cell.name
+        return cell
+    }
     if let wifi = wifiCandidate {
         cachedPhysicalIfIndex = wifi.index
         cachedPhysicalIfName = wifi.name
         return wifi
     }
-    if let cell = cellCandidate {
+    if let cell = bestCell {
         cachedPhysicalIfIndex = cell.index
         cachedPhysicalIfName = cell.name
         return cell
@@ -224,6 +285,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler: @escaping (Error?) -> Void
     ) {
         prismProviderRef = self
+        // 【APP-2】启动常驻 NWPathMonitor（幂等），供 findActivePhysicalInterface
+        // 精准识别系统默认路由网卡（弱 Wi-Fi 自动切走 / 双卡 VoLTE 场景）
+        startSystemPathMonitor()
         let phy = findActivePhysicalInterface()
         activeBoundInterface = phy.name
 
@@ -718,9 +782,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
+            // 【APP-2】dns-direct 双备份（防移动蜂窝网拦截 UDP 53）：
+            // 主用 AliDNS TCP、备用 DNSPod TCP（sing-box 无服务器 failover
+            // 语义，双 server 条目 + 不同直连规则分流落地，两者均承载真实流量）
             [
                 "tag": "dns-direct",
-                "address": "223.5.5.5",
+                "address": "tcp://223.5.5.5",
+                "detour": "direct",
+                "strategy": "prefer_ipv4"
+            ],
+            [
+                "tag": "dns-direct-bak",
+                "address": "tcp://119.29.29.29",
                 "detour": "direct",
                 "strategy": "prefer_ipv4"
             ]
@@ -730,8 +803,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var dnsRules: [[String: Any]] = preservedDnsRules
         dnsRules.append(contentsOf: [
             [
+                // 节点域名解析（内核出站侧发起）走备用 DNSPod，
+                // 与国内域名解析的 AliDNS 主用互为主备
                 "outbound": "any",
-                "server": "dns-direct"
+                "server": "dns-direct-bak"
             ],
             [
                 "clash_mode": "direct",

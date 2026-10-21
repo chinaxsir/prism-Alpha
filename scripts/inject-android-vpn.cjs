@@ -5,9 +5,11 @@
  * gen/android 由 CLI 在 CI/本地现生成（不入库），因此所有定制必须
  * 在 init 之后经本脚本幂等注入：
  *   1. 拷贝 mobile-src/android（PrismVpnBridge / PrismVpnService）
- *   2. MainActivity.kt 增加 PrismVpnBridge.attach(this) 与 @Keep
+ *   2. MainActivity.kt 增加 PrismVpnBridge.attach(this)
  *   3. AndroidManifest.xml 增加 BIND_VPN_SERVICE/前台服务权限与 VPN Service
- *   4. proguard-rules.pro 增加 JNI 防裁剪与防混淆规则（IPA-12 2.2）
+ *   4. build.gradle.kts 关闭 Release R8 压缩混淆（APK-3 任务1）：
+ *      isMinifyEnabled / isShrinkResources / optimization.enable → false
+ *   5. proguard-rules.pro 以无 BOM 纯 UTF-8 整体重写（APK-3 任务1）
  */
 const fs = require('fs')
 const path = require('path')
@@ -35,7 +37,9 @@ function copyDir(from, to) {
 copyDir(SRC, GEN)
 console.log('[inject-android-vpn] copied mobile-src/android -> gen/android')
 
-// 2. MainActivity 注入 attach 与 @Keep
+// 2. MainActivity 注入 attach
+// （APK-3：不再注入 @Keep——Release 已关闭 R8，混淆裁剪不存在；
+//   且 @Keep 需要 androidx.annotation 依赖，缺失时直接编译失败）
 function patchMainActivity() {
   const rel = path.join('app', 'src', 'main', 'java', 'com', 'prism', 'proxy', 'MainActivity.kt')
   const file = path.join(GEN, rel)
@@ -54,15 +58,6 @@ function patchMainActivity() {
       // class MainActivity : TauriActivity() —— 无类体
       text = text.replace(/(class\s+MainActivity[^\n]*)/, `$1 {\n${initBlock}\n}`)
     }
-    touched = true
-  }
-  // @Keep（IPA-12 2.2）：MainActivity 被 Tauri 宿主/外部反射引用，
-  // Release 构建禁止 R8 裁剪与改名
-  if (!text.includes('@Keep')) {
-    if (!text.includes('import androidx.annotation.Keep')) {
-      text = text.replace(/(package [^\n]+\n)/, `$1\nimport androidx.annotation.Keep\n`)
-    }
-    text = text.replace(/(class\s+MainActivity[^\n{]*)/, '@Keep\n$1')
     touched = true
   }
   if (touched) {
@@ -120,46 +115,65 @@ function patchManifest() {
 }
 patchManifest()
 
-// 4. ProGuard 注入防混淆规则（IPA-12 2.2）
+// 4. 关闭 Release 构建的 R8 压缩混淆（APK-3 任务1）
 //
-// 根因：Release 构建启用 R8 后，ensurePermission / startServiceAndWait /
-// openTun / protectSocket 等方法仅由 Rust 经 JNI 反射调用，Kotlin 侧无
-// 直接引用，R8 会将其裁剪或改名（a()/b()），真机首次启动即抛
-// NoSuchMethodError（表现为 "call ensurePermission: Java exception was thrown"）
+// 根因：R8 在 :app:minifyUniversalReleaseWithR8 阶段即可能因 proguard 配置
+// 编码问题（PowerShell 写入的 UTF-8 BOM）或严格检查直接编译失败；即便构建
+// 通过，R8 也会把仅由 Rust 经 JNI 反射调用的 Kotlin 方法（ensurePermission /
+// startServiceAndWait / openTun / protectSocket）当成无用代码裁剪或改名，
+// 真机首次启动即抛 NoSuchMethodError（"call ensurePermission: Java exception
+// was thrown"）。彻底根治：关闭 minify/shrinkResources，直接跳过 R8 任务。
+// 幂等：重复执行结果不变。
+function patchBuildGradle() {
+  const file = path.join(GEN, 'app', 'build.gradle.kts')
+  if (!fs.existsSync(file)) {
+    console.error('[inject-android-vpn] build.gradle.kts 未找到')
+    process.exit(1)
+  }
+  let text = fs.readFileSync(file, 'utf8')
+  const before = text
+  // 经典 DSL（AGP ≤ 8 模板）与 AGP 9 的 optimization DSL 两种写法都覆盖
+  text = text
+    .replace(/isMinifyEnabled\s*=\s*true/g, 'isMinifyEnabled = false')
+    .replace(/isShrinkResources\s*=\s*true/g, 'isShrinkResources = false')
+    .replace(
+      /(optimization\s*\{[^}]*?)enable\s*=\s*true/g,
+      '$1enable = false',
+    )
+  if (text !== before) {
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] build.gradle.kts: R8 minify/shrink disabled')
+  } else {
+    console.log('[inject-android-vpn] build.gradle.kts: R8 already disabled')
+  }
+}
+patchBuildGradle()
+
+// 5. proguard-rules.pro 以无 BOM 纯 UTF-8 整体重写（APK-3 任务1）
+//
+// R8 已关闭，本文件实际不再参与构建；保留一份简洁规则仅作防御（若未来
+// 重新开启混淆时 JNI 入口仍受保护）。严禁 PowerShell Set-Content 写入
+// （PS 5.1 默认带 0xEF 0xBB 0xBF BOM 头，R8/Gradle 解析器直接报错）——
+// Node fs.writeFileSync 默认输出无 BOM 的 UTF-8。
 function patchProguard() {
   const file = path.join(GEN, 'app', 'proguard-rules.pro')
-  let text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
-  if (text.includes('IPA-12 2.2')) {
-    console.log('[inject-android-vpn] proguard-rules.pro already patched')
-    return
-  }
-
-  const rules = `
-# --- Prism VPN JNI Keep Rules（IPA-12 2.2）---
-# Prism 全部 Kotlin 类（PrismVpnBridge / PrismVpnService / MainActivity）
-# 的成员原样保留：JNI 按名反射调用，禁止裁剪与混淆改名
+  const rules = `-dontwarn **
+-dontoptimize
+-dontobfuscate
 -keep class com.prism.proxy.** { *; }
--keepclassmembers class com.prism.proxy.** { *; }
-# Tauri 宿主层同样被反射与 JNI 引用
 -keep class app.tauri.** { *; }
--keepclassmembers class app.tauri.** { *; }
-# native 方法名必须与 SO 导出符号严格对应
 -keepclasseswithmembernames class * {
     native <methods>;
 }
-# 标注 @androidx.annotation.Keep 的类/字段/方法强制保留
--keep class * {
-    @androidx.annotation.Keep *;
-}
--keepclassmembers class * {
-    @androidx.annotation.Keep <fields>;
-    @androidx.annotation.Keep <methods>;
-}
--dontwarn com.prism.proxy.**
--dontwarn app.tauri.**
 `
-  fs.writeFileSync(file, text + '\n' + rules)
-  console.log('[inject-android-vpn] proguard-rules.pro patched')
+  fs.writeFileSync(file, rules, 'utf8')
+  // 校验首字节不是 BOM（防御性自检，失败即中断注入）
+  const first = fs.readFileSync(file)[0]
+  if (first === 0xef) {
+    console.error('[inject-android-vpn] proguard-rules.pro 检测到 BOM 头，写入失败')
+    process.exit(1)
+  }
+  console.log('[inject-android-vpn] proguard-rules.pro rewritten (no BOM)')
 }
 patchProguard()
 

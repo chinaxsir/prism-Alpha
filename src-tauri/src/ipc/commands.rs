@@ -1740,6 +1740,10 @@ pub async fn save_go_lan_settings(
     }
     let lan: crate::core::go_lan::GoLanSettings =
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
+    // APP 任务5 后端兜底：未配置完整参数时严禁启用
+    if lan.enabled && !crate::core::go_lan::is_configured(&lan) {
+        return Err("请先填写完整的回家节点参数与内网网段后再启用 Go Lan".into());
+    }
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
     // 运行中 → 重建内核配置立即生效
