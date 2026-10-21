@@ -227,6 +227,8 @@ pub struct AppState {
     pub main_selector: RwLock<Option<String>>,
     /// 当前 Pro 授权状态（启动时由 license 缓存恢复；后台校验后刷新）
     pub entitlement: RwLock<super::license::EntitlementStatus>,
+    /// entitlement 的会话签名（防内存篡改：status 被改写后签名校验失败）
+    pub entitlement_sign: RwLock<u64>,
     /// 系统代理备份：启动时备份原设置，停止/切换时恢复，确保代理独占
     pub proxy_backup: RwLock<Option<crate::platform::ProxyBackup>>,
 
@@ -271,6 +273,14 @@ impl AppState {
         let mode = RunMode::Tun;
         #[cfg(not(target_os = "ios"))]
         let mode = settings.mode;
+        // 启动即执行到期熔断（本地缓存可能跨过了 expires_at）
+        let mut entitlement = super::license::cached_entitlement(&data_dir);
+        super::license::enforce_expiry(&mut entitlement, super::license::now_unix());
+        let entitlement_sign = super::security::entitlement_signature(
+            &entitlement.status,
+            entitlement.expires_at,
+            entitlement.last_verified_at,
+        );
         Self {
             app_handle,
             data_dir: data_dir.clone(),
@@ -285,7 +295,8 @@ impl AppState {
             api_secret: RwLock::new(String::new()),
             kernel_version: RwLock::new(None),
             main_selector: RwLock::new(None),
-            entitlement: RwLock::new(super::license::cached_entitlement(&data_dir)),
+            entitlement: RwLock::new(entitlement),
+            entitlement_sign: RwLock::new(entitlement_sign),
             proxy_backup: RwLock::new(None),
             aim_results: RwLock::new(std::collections::HashMap::new()),
             aim_probing: std::sync::atomic::AtomicBool::new(false),
@@ -316,9 +327,46 @@ impl AppState {
 
     /// 更新内存授权状态并广播 pro://status 事件。
     /// IPC 命令与后台周期校验任务共用，保证前端 gating 实时一致。
-    pub fn apply_entitlement(&self, next: super::license::EntitlementStatus) {
+    /// 写入前强制执行到期熔断，并刷新会话签名。
+    pub fn apply_entitlement(&self, mut next: super::license::EntitlementStatus) {
+        super::license::enforce_expiry(&mut next, super::license::now_unix());
+        let sign = super::security::entitlement_signature(
+            &next.status,
+            next.expires_at,
+            next.last_verified_at,
+        );
+        // 两把锁顺序获取（禁止嵌套），避免与 is_pro_active 并发时死锁
         *self.entitlement.write() = next.clone();
+        *self.entitlement_sign.write() = sign;
         let _ = self.app_handle.emit("pro://status", &next);
+    }
+
+    /// 当前是否拥有有效 Pro 授权（所有 Pro 守卫的唯一入口）：
+    /// 1. 运行环境未被判定受损（调试器附加 / 内存篡改）；
+    /// 2. 内存授权状态签名自洽（防内存修改器把 expired 改回 active）；
+    /// 3. 状态为 active 且当前系统时间早于 expires_at（离线也生效）。
+    pub fn is_pro_active(&self) -> bool {
+        if super::security::is_compromised() {
+            return false;
+        }
+        let now = super::license::now_unix();
+        let (status, expires_at, last_verified_at, unlocked) = {
+            let ent = self.entitlement.read();
+            (
+                ent.status.clone(),
+                ent.expires_at,
+                ent.last_verified_at,
+                ent.is_unlocked(),
+            )
+        };
+        let sign = *self.entitlement_sign.read();
+        let expect =
+            super::security::entitlement_signature(&status, expires_at, last_verified_at);
+        if sign != expect {
+            super::security::mark_compromised("entitlement signature mismatch");
+            return false;
+        }
+        unlocked && !super::license::is_expired(&self.entitlement.read(), now)
     }
 
     /// 保存设置到内存 + settings.json

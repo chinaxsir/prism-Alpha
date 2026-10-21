@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # 源码路径脱敏：APK/IPA 中不残留 GitHub Actions 工作目录/本地绝对路径
+  RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/prism
+
 jobs:
   android:
     name: Build Android APK

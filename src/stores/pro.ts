@@ -22,6 +22,9 @@ const INACTIVE: Entitlement = {
 /** 可使用 Pro：仅服务端联网校验有效（active）；offline/expired/revoked/inactive 一律锁定 */
 const unlockedOf = (e: Entitlement) => e.status === "active";
 
+/** 前端本地到期巡检定时器（5 秒）；后端另有 10 秒巡检做最终收口 */
+let expiryTimer: ReturnType<typeof setInterval> | null = null;
+
 interface ProState {
   entitlement: Entitlement;
   /** 首次状态拉取完成（避免启动瞬间误弹 Pro 窗） */
@@ -36,9 +39,11 @@ interface ProState {
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
   deactivate: () => Promise<void>;
+  /** 本地到期检查：到点立即锁定 UI 并同步后端终止 Pro 功能 */
+  checkExpiry: () => Promise<void>;
 }
 
-export const useProStore = create<ProState>((set) => ({
+export const useProStore = create<ProState>((set, get) => ({
   entitlement: INACTIVE,
   ready: false,
   unlocked: false,
@@ -52,6 +57,33 @@ export const useProStore = create<ProState>((set) => ({
     } catch (err) {
       console.error("get entitlement failed:", err);
       set({ ready: true });
+    }
+    // 前端本地双重定时器：每 5 秒比对一次到期时间（后端另有 10 秒巡检收口）
+    if (!expiryTimer) {
+      expiryTimer = setInterval(() => {
+        void useProStore.getState().checkExpiry();
+      }, 5000);
+    }
+  },
+
+  checkExpiry: async () => {
+    const { entitlement, unlocked, ready } = get();
+    if (!ready || !unlocked) return;
+    const exp = entitlement.expiresAt;
+    // 买断版 expiresAt 为 null，永久有效
+    if (!exp || Date.now() < exp * 1000) return;
+
+    // 到点：本地立即锁定，再同步后端（后端会把 license.dat 落盘为 expired
+    // 并终止 Go AIM / Go Lan / Go Cus 与内核 Pro 路由）
+    set({
+      entitlement: { ...entitlement, status: "expired" },
+      unlocked: false,
+    });
+    try {
+      const e = await refreshEntitlement();
+      set({ entitlement: e, unlocked: unlockedOf(e) });
+    } catch {
+      // 离线时后端已按本地到期判定锁定，网络错误忽略
     }
   },
 

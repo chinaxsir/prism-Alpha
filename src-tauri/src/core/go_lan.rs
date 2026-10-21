@@ -314,11 +314,8 @@ pub(crate) fn go_lan_dns(lan: &GoLanSettings) -> (Option<Value>, Option<Value>) 
 pub async fn sync_managed(app: &AppHandle) -> Result<GoLanSettings, String> {
     let state = app.state::<AppState>();
     // Pro 门控
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
     let data_dir = state.data_dir.clone();
     let (lan, creds) = {

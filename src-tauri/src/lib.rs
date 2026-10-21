@@ -42,6 +42,9 @@ pub fn run() {
         .unwrap_or_else(|_| EnvFilter::new("info,want=off,mio=off,polling=off"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // 运行时安全自检（仅 Release 生效）：iOS 反调试附加、Android TracerPid 检测
+    core::security::init_runtime_guard();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_http::init())
@@ -92,6 +95,32 @@ pub fn run() {
                     }
                     core::sync_links::reconcile(&handle).await;
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            });
+
+            // 授权到期实时巡检（每 10 秒一次纯内存整数比较）：
+            // 无论是否联网，跨过 expires_at 立即终止全部 Pro 功能并通知前端；
+            // 同时维护进程内时钟高水位线，运行中被调回系统时间也立即熔断。
+            let expiry_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut high_water = core::license::now_unix();
+                loop {
+                    let now = core::license::now_unix();
+                    let state = expiry_handle.state::<core::state::AppState>();
+                    let expired = {
+                        let ent = state.entitlement.read();
+                        // 仅 active 态触发一次收口，避免已锁定后每轮重复重启内核
+                        ent.status == "active"
+                            && (core::license::is_expired(&ent, now)
+                                || now + core::license::CLOCK_ROLLBACK_TOLERANCE < high_water)
+                    };
+                    if expired {
+                        ipc::commands::terminate_pro_features_on_expiry(&expiry_handle, &state)
+                            .await;
+                    }
+                    high_water = high_water.max(now);
+                    drop(state);
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
             });
 

@@ -189,7 +189,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     // 配置构建：自定义规则 + Clash YAML（多订阅合并）→ sing-box runtime JSON
     // Go Lan / Go Cus 仅在授权激活时生效（未激活传入默认配置 = 完全关闭）
     let custom_rules = crate::core::store::load_custom_rules(&state.data_dir);
-    let pro_unlocked = state.entitlement.read().is_unlocked();
+    let pro_unlocked = state.is_pro_active();
     let (go_lan_cfg, go_cus_cfg) = if pro_unlocked {
         (state.go_lan.read().clone(), state.go_cus.read().clone())
     } else {
@@ -306,7 +306,7 @@ async fn apply_prepared(
 
     // Go Cus 边车：授权激活且启用覆写时拉起本地处理服务（进程内单例）
     {
-        let pro_unlocked = state.entitlement.read().is_unlocked();
+        let pro_unlocked = state.is_pro_active();
         if pro_unlocked && state.go_cus.read().enabled {
             crate::core::go_cus::ensure_sidecar(app.clone());
         }
@@ -314,7 +314,7 @@ async fn apply_prepared(
 
     // Go AIM（Pro）：授权激活即后台探测评级；开关打开时自动锁定 + 故障转移监控
     {
-        let pro_unlocked = state.entitlement.read().is_unlocked();
+        let pro_unlocked = state.is_pro_active();
         if pro_unlocked {
             let enabled = state.settings.read().go_aim_enabled;
             if enabled {
@@ -1486,6 +1486,59 @@ pub async fn deactivate_pro(
     Ok(next)
 }
 
+/// 授权到期收口函数：启动加载 / 每 10 秒巡检 / 手动校验任一路径检测到到期后
+/// 统一调用——强制关闭全部 Pro 专属功能、清理运行态、按新配置重载内核，
+/// 并向前端广播 expired 与专门的 `pro://expired` 通知。
+pub(crate) async fn terminate_pro_features_on_expiry(app: &AppHandle, state: &AppState) {
+    // 1. 本地缓存同步落盘为 expired（重启后不会被旧缓存复活）
+    match crate::core::license::mark_expired(&state.data_dir) {
+        Some(next) => state.apply_entitlement(next),
+        None => {
+            if state.entitlement.read().status != "expired" {
+                let mut ent = state.entitlement.read().clone();
+                ent.status = "expired".into();
+                state.apply_entitlement(ent);
+            }
+        }
+    }
+
+    // 2. 强制关闭 Pro 专属开关并落盘
+    let mut settings = state.settings.read().clone();
+    settings.go_aim_enabled = false;
+    let _ = state.save_settings(settings);
+
+    let mut lan = state.go_lan.read().clone();
+    if lan.enabled {
+        lan.enabled = false;
+        let _ = crate::core::go_lan::save(&state.data_dir, &lan);
+        *state.go_lan.write() = lan;
+    }
+    let mut cus = state.go_cus.read().clone();
+    if cus.enabled {
+        cus.enabled = false;
+        let _ = crate::core::go_cus::save(&state.data_dir, &cus);
+        *state.go_cus.write() = cus;
+    }
+
+    // 3. 清空 Go AIM 运行态并通知前端
+    state.aim_results.write().clear();
+    *state.aim_locked_node.write() = None;
+    let _ = app.emit(
+        crate::core::go_aim::AIM_EVENT,
+        serde_json::json!({ "locked": null }),
+    );
+
+    // 4. 内核运行中：按关闭 Pro 功能后的配置重载，剥离回家隧道与覆写规则
+    if *state.status.read() == CoreStatus::Running
+        && let Err(e) = restart_core(app, state).await
+    {
+        tracing::error!("restart after license expiry failed: {e}");
+    }
+
+    // 5. 专门的到期通知（前端弹出醒目提示）
+    let _ = app.emit("pro://expired", serde_json::json!({}));
+}
+
 /// 移动端商店收据上报（apple | google），服务端校验后签发授权
 #[tauri::command]
 pub async fn submit_receipt(
@@ -1581,6 +1634,9 @@ pub async fn close_connection(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if !state.is_pro_active() {
+        return Err("该功能需要有效的 Pro 授权".to_string());
+    }
     state
         .kernel_api()
         .close_connection(&id)
@@ -1591,6 +1647,9 @@ pub async fn close_connection(
 /// 关闭全部连接（连接页头部按钮）
 #[tauri::command]
 pub async fn close_all_connections(state: State<'_, AppState>) -> Result<(), String> {
+    if !state.is_pro_active() {
+        return Err("该功能需要有效的 Pro 授权".to_string());
+    }
     state
         .kernel_api()
         .close_all_connections()
@@ -1703,11 +1762,8 @@ pub async fn set_go_aim_enabled(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
-        let ent = state.entitlement.read();
-        if enabled && !ent.is_unlocked() {
-            return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
-        }
+    if enabled && !state.is_pro_active() {
+        return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
     let mut settings = state.settings.read().clone();
     settings.go_aim_enabled = enabled;
@@ -1728,11 +1784,8 @@ pub async fn set_go_aim_enabled(
 /// 手动触发一轮全量探测（需内核运行中 + 授权激活）
 #[tauri::command]
 pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
     if *state.status.read() != CoreStatus::Running {
         return Err("内核未运行，无法探测".into());
@@ -1749,11 +1802,8 @@ pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Res
 /// 读取回家网络配置
 #[tauri::command]
 pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
     let lan = state.go_lan.read().clone();
     serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
@@ -1766,11 +1816,8 @@ pub async fn save_go_lan_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
     let lan: crate::core::go_lan::GoLanSettings =
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
@@ -1808,11 +1855,8 @@ pub async fn sync_go_lan_managed(
 /// 读取覆写引擎配置
 #[tauri::command]
 pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let cus = state.go_cus.read().clone();
     serde_json::to_value(cus).map_err(|e| sanitize_err(&e.to_string()))
@@ -1825,11 +1869,8 @@ pub async fn save_go_cus_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let cus: crate::core::go_cus::GoCusSettings =
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
@@ -1849,11 +1890,8 @@ pub async fn import_go_cus_module(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -1894,11 +1932,8 @@ pub async fn toggle_go_cus_module(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let mut cus = state.go_cus.read().clone();
     let Some(module) = cus.modules.iter_mut().find(|m| m.id == id) else {
@@ -1920,11 +1955,8 @@ pub async fn delete_go_cus_module(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let mut cus = state.go_cus.read().clone();
     let before = cus.modules.len();
@@ -1946,11 +1978,8 @@ pub async fn generate_or_get_ca_url(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    {
-        let ent = state.entitlement.read();
-        if !ent.is_unlocked() {
-            return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-        }
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let info = crate::core::go_cus::generate_or_get_ca(&state, app)?;
     serde_json::to_value(info).map_err(|e| sanitize_err(&e.to_string()))

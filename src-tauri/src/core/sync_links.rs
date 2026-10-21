@@ -67,8 +67,7 @@ fn save_mirror(data_dir: &std::path::Path, links: &[CloudLink]) {
 
 /// 同步是否可用：授权 active + 服务端允许 + 本地有完整凭据对
 fn sync_eligible(state: &AppState) -> Option<(String, String)> {
-    let ent = state.entitlement.read();
-    if !ent.is_unlocked() || !ent.sync_available {
+    if !state.is_pro_active() || !state.entitlement.read().sync_available {
         return None;
     }
     license::cached_credentials(&state.data_dir)

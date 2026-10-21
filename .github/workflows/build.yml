@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # 源码路径脱敏：发布包中不残留 GitHub Actions 工作目录/本地绝对路径
+  RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/prism
 
 jobs:
   build-desktop:

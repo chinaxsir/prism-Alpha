@@ -1066,6 +1066,18 @@ export default function Settings() {
           </div>
         )}
 
+        {/* 已到期：红色提示行（后端已自动停止全部 Pro 功能） */}
+        {entitlement.status === "expired" && (
+          <div className="flex items-start gap-2 px-3 py-2.5 bg-latency-bad/5 text-latency-bad text-xs border-b border-border">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>
+              {t("pro.expiredAt", {
+                time: fmtDateTime(entitlement.expiresAt),
+              })}
+            </span>
+          </div>
+        )}
+
         {/* 设备 ID：激活时与服务端绑定，点击复制 */}
         <button
           onClick={copyDeviceId}
@@ -1203,7 +1215,9 @@ export default function Settings() {
                 className="flex-1 min-w-[120px] flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-accent hover:bg-accent-hover text-white text-xs font-medium transition-colors"
               >
                 <Sparkles size={12} />
-                {t("pro.activateNow")}
+                {entitlement.status === "expired"
+                  ? t("pro.reactivate")
+                  : t("pro.activateNow")}
               </button>
               <button
                 onClick={handleVerifyEntitlement}

@@ -144,6 +144,15 @@ const zh: Record<string, string> = {
   "pro.status.expired": "已过期",
   "pro.status.revoked": "已吊销",
   "pro.status.inactive": "未激活",
+  "pro.expiredBanner":
+    "授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」续期后恢复。",
+  "pro.expiredAt": "授权已于 {time} 到期，Pro 功能已自动停止。",
+  "pro.renew": "续期授权",
+  "pro.reactivate": "重新激活 / 更换授权码",
+  "pro.conn.expiredTitle": "授权已到期 · 实时连接监控已暂停",
+  "pro.conn.lockedTitle": "实时连接监控与快捷分流为 Pro 功能",
+  "pro.conn.lockedDesc":
+    "查看每条活跃连接的目标域名、上下行速率，一键断开连接，或点击目标快速添加 DIRECT / PROXY / REJECT 分流规则。",
   "pro.status.teamPermanent": "买断版 · 永久有效",
   "pro.status.proActive": "Pro 订阅 · 已激活",
   "pro.status.freeActive": "试用版 · 已激活",
@@ -304,6 +313,15 @@ const en: Record<string, string> = {
   "pro.status.expired": "Expired",
   "pro.status.revoked": "Revoked",
   "pro.status.inactive": "Inactive",
+  "pro.expiredBanner":
+    "Your license has expired. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Renew in Settings → Prism Pro to restore them.",
+  "pro.expiredAt": "License expired at {time}. Pro features have been stopped.",
+  "pro.renew": "Renew License",
+  "pro.reactivate": "Reactivate / Change License",
+  "pro.conn.expiredTitle": "License expired · Live connection monitor paused",
+  "pro.conn.lockedTitle": "Live connection monitor & quick routing are Pro features",
+  "pro.conn.lockedDesc":
+    "Inspect every active connection's target, upload/download speed, close connections instantly, and click a target to add DIRECT / PROXY / REJECT rules.",
   "pro.status.teamPermanent": "Lifetime · Permanent",
   "pro.status.proActive": "Pro Subscription · Active",
   "pro.status.freeActive": "Trial · Active",

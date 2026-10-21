@@ -5,6 +5,9 @@ import { closeAllConnections, closeConnection, getCustomRules, saveCustomRules }
 import { formatBytes } from "@/utils/format";
 import { useTranslation } from "@/i18n";
 import { useCoreStore, type ConnItem } from "@/stores/core";
+import { useProStore } from "@/stores/pro";
+import { Feature } from "@/pro/gating";
+import ProGate from "@/components/ProGate";
 import { toast } from "@/components/ui/Toast";
 
 type FilterKey = "all" | "active" | "tcp" | "udp";
@@ -22,6 +25,10 @@ const FILTERS: { key: FilterKey; labelKey: string }[] = [
 export default function Connections() {
   const { t, resolved } = useTranslation();
   const connections = useCoreStore((s) => s.connections);
+  // 连接监控与快捷分流为 Pro 功能：未激活/已到期一律只展示引导卡
+  const proUnlocked = useProStore((s) => s.unlocked);
+  const proReady = useProStore((s) => s.ready);
+  const proStatus = useProStore((s) => s.entitlement.status);
 
   const [filter, setFilter] = useState<FilterKey>("all");
   const [paused, setPaused] = useState(false);
@@ -121,6 +128,21 @@ export default function Connections() {
       toast.error(String(e));
     }
   };
+
+  // 未授权 / 已到期：只渲染干净的引导卡，不渲染搜索框、统计条与实时连接流
+  if (proReady && !proUnlocked) {
+    const expired = proStatus === "expired";
+    return (
+      <ProGate
+        feature={Feature.Connections}
+        title={t(expired ? "pro.conn.expiredTitle" : "pro.conn.lockedTitle")}
+        description={t("pro.conn.lockedDesc")}
+        actionLabel={expired ? t("pro.renew") : undefined}
+      >
+        {null}
+      </ProGate>
+    );
+  }
 
   return (
     <div className="space-y-6">

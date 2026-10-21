@@ -26,11 +26,14 @@ use sha2::{Digest, Sha256};
 
 use crate::core::state::UserSettings;
 
-/// 编译期固定授权服务地址（构建时可用 PRISM_LICENSE_URL 覆盖；App 内置，用户无需输入）
-const DEFAULT_SERVER: &str = match option_env!("PRISM_LICENSE_URL") {
-    Some(v) => v,
-    None => "https://prism.sarl",
-};
+/// 编译期固定授权服务地址（构建时可用 PRISM_LICENSE_URL 覆盖；App 内置，用户无需输入）。
+/// 默认地址经 `obf!` 编译期加密，发布包二进制中不含明文域名。
+fn default_server() -> String {
+    match option_env!("PRISM_LICENSE_URL") {
+        Some(v) => v.to_string(),
+        None => crate::obf!("https://prism.sarl"),
+    }
+}
 
 /// 新协议要求的请求来源标识头
 const REQUEST_SOURCE: &str = "prism-app";
@@ -88,6 +91,59 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 当前 Unix 秒（供 state / 巡检协程复用）
+pub fn now_unix() -> i64 {
+    now_secs()
+}
+
+/// 系统时间回拨容忍阈值（秒）：超过 3 分钟视为人为改时间作弊
+pub const CLOCK_ROLLBACK_TOLERANCE: i64 = 180;
+
+/// 统一到期判定：买断版（plan=team）永久有效；其余存在 expires_at 时，
+/// 只要 `now >= expires_at` 即视为已过期（与是否联网、当天是否已校验无关）。
+pub fn is_expired(ent: &EntitlementStatus, now: i64) -> bool {
+    if ent.plan.as_deref() == Some("team") {
+        return false;
+    }
+    ent.expires_at.map(|exp| now >= exp).unwrap_or(false)
+}
+
+/// 强制到期熔断：已过期则把 status 置为 expired，返回是否发生变更。
+/// 每次读取缓存 / 刷新内存授权 / 判断 Pro 可用性前都必须调用。
+pub fn enforce_expiry(ent: &mut EntitlementStatus, now: i64) -> bool {
+    if ent.status != "expired" && is_expired(ent, now) {
+        ent.status = "expired".into();
+        true
+    } else {
+        false
+    }
+}
+
+/// 本地缓存的运行期规范化：先做时钟回拨检测，再强制到期熔断。
+/// 返回 true 表示内容有变更（调用方负责写回 license.dat）。
+fn normalize_cache(cache: &mut CachedLicense) -> bool {
+    let now = now_secs();
+    let mut changed = false;
+
+    if cache.max_seen_unix > 0 && now + CLOCK_ROLLBACK_TOLERANCE < cache.max_seen_unix {
+        // 系统时间被调回（例如到期后改回到期前）：离线授权立即失效
+        if cache.entitlement.status != "expired" {
+            cache.entitlement.status = "expired".into();
+            changed = true;
+        }
+        // 高水位线绝不回退：保留观测到的最大时间
+    } else if now > cache.max_seen_unix {
+        cache.max_seen_unix = now;
+        changed = true;
+    }
+
+    // 核心：无论是否联网，到达 expires_at 立即熔断
+    if enforce_expiry(&mut cache.entitlement, now) {
+        changed = true;
+    }
+    changed
 }
 
 /// 当前 UTC 日期（YYYY-MM-DD），用于「每天首次启动同步」节流。
@@ -150,6 +206,10 @@ struct CachedLicense {
     /// 最近一次与服务器同步成功的日期（UTC YYYY-MM-DD）
     #[serde(default)]
     synced_on: String,
+    /// 运行期观测到的最大系统时间（Unix 秒）：防时钟回拨作弊的高水位线。
+    /// 旧版缓存缺失时默认 0，首次读取自动补写为当前时间。
+    #[serde(default)]
+    max_seen_unix: i64,
     entitlement: EntitlementStatus,
 }
 
@@ -167,7 +227,7 @@ const CACHE_MAGIC: &[u8; 6] = b"PRLIC1";
 const NONCE_LEN: usize = 12;
 
 fn cache_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("license.dat")
+    data_dir.join(crate::obf!("license.dat"))
 }
 
 fn legacy_cache_path(data_dir: &Path) -> PathBuf {
@@ -220,8 +280,12 @@ fn load_cache(data_dir: &Path) -> Option<CachedLicense> {
     let key = cache_key(data_dir);
 
     if let Ok(raw) = std::fs::read(cache_path(data_dir))
-        && let Some(cache) = decrypt_cache(&key, &raw)
+        && let Some(mut cache) = decrypt_cache(&key, &raw)
     {
+        // 每次读取都执行「时钟回拨检测 + 到期熔断」，变更即时写回
+        if normalize_cache(&mut cache) {
+            let _ = save_cache(data_dir, &cache);
+        }
         return Some(cache);
     }
 
@@ -229,15 +293,16 @@ fn load_cache(data_dir: &Path) -> Option<CachedLicense> {
     if let Ok(text) = std::fs::read_to_string(legacy_cache_path(data_dir))
         && let Ok(legacy) = serde_json::from_str::<LegacyCache>(&text)
     {
-        let migrated = CachedLicense {
+        let mut migrated = CachedLicense {
             license: legacy.license,
             email: String::new(),
             synced_on: String::new(),
+            max_seen_unix: 0,
             entitlement: legacy.entitlement,
         };
+        normalize_cache(&mut migrated);
         if save_cache(data_dir, &migrated).is_ok() {
             std::fs::remove_file(legacy_cache_path(data_dir)).ok();
-            return Some(migrated);
         }
         return Some(migrated);
     }
@@ -274,15 +339,26 @@ pub fn cached_entitlement_opt(data_dir: &Path) -> Option<EntitlementStatus> {
     })
 }
 
+/// 到期熔断落盘：把本地缓存中的授权状态强制写为 expired。
+/// 无缓存（未激活）时返回 None；返回 Some 供调用方同步内存态。
+pub fn mark_expired(data_dir: &Path) -> Option<EntitlementStatus> {
+    let mut cache = load_cache(data_dir)?;
+    if cache.entitlement.status != "expired" {
+        cache.entitlement.status = "expired".into();
+        save_cache(data_dir, &cache).ok();
+    }
+    Some(cache.entitlement)
+}
+
 // ---------------- 服务端通信 ----------------
 
 fn server_base(_settings: &UserSettings) -> String {
-    DEFAULT_SERVER.trim_end_matches('/').to_string()
+    default_server().trim_end_matches('/').to_string()
 }
 
 /// 授权/同步 API 共用基地址（订阅云端同步与授权同域）
 pub(crate) fn api_base(_settings: &UserSettings) -> String {
-    DEFAULT_SERVER.trim_end_matches('/').to_string()
+    default_server().trim_end_matches('/').to_string()
 }
 
 pub(crate) fn http_builder() -> Result<reqwest::ClientBuilder> {
@@ -448,9 +524,12 @@ async fn retry_after_secs(resp: reqwest::Response) -> i64 {
 
 /// GET /api/license/status：200 返回状态体，其余按 StatusError 分类
 async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<StatusResponse, StatusError> {
-    let resp = get_with_fallback(&format!("{base}/api/license/status"), license_key)
-        .await
-        .map_err(|e| StatusError::Transient(e.to_string()))?;
+    let resp = get_with_fallback(
+        &format!("{base}{}", crate::obf!("/api/license/status")),
+        license_key,
+    )
+    .await
+    .map_err(|e| StatusError::Transient(e.to_string()))?;
     let code = resp.status().as_u16();
     if code == 429 {
         return Err(StatusError::RateLimited(retry_after_secs(resp).await));
@@ -584,7 +663,7 @@ pub async fn activate(
     let device_id_str = device_id(data_dir)?;
 
     let resp = post_with_fallback(
-        &format!("{base}/api/license/activate"),
+        &format!("{base}{}", crate::obf!("/api/license/activate")),
         &serde_json::json!({
             "license_key": license_key.clone(),
             "email": email,
@@ -648,6 +727,7 @@ pub async fn activate(
             license: license_key.to_string(),
             email,
             synced_on: today_utc(),
+            max_seen_unix: now_secs(),
             entitlement: ent.clone(),
         },
     )?;
@@ -670,9 +750,23 @@ pub async fn verify_remote(
         return Ok(EntitlementStatus::inactive());
     };
 
-    // 每日自动同步路径：当天已同步则只读本地缓存（ipa-8：手动校验走 force=true 不短路）
+    // 每日自动同步路径：当天已同步则只读本地缓存（ipa-8：手动校验走 force=true 不短路）。
+    // 短路也必须强制执行到期熔断——当天校验过不代表这一天内不会到期。
     if !force && cache.synced_on == today_utc() && cache.entitlement.status != "offline" {
-        return Ok(cache.entitlement);
+        let mut ent = cache.entitlement.clone();
+        if enforce_expiry(&mut ent, now_secs()) {
+            save_cache(
+                data_dir,
+                &CachedLicense {
+                    license: cache.license,
+                    email: cache.email,
+                    synced_on: cache.synced_on,
+                    max_seen_unix: cache.max_seen_unix,
+                    entitlement: ent.clone(),
+                },
+            )?;
+        }
+        return Ok(ent);
     }
 
     let base = server_base(settings);
@@ -700,6 +794,7 @@ pub async fn verify_remote(
                     license: cache.license,
                     email: cache.email,
                     synced_on: today_utc(),
+                    max_seen_unix: now_secs(),
                     entitlement: ent.clone(),
                 },
             )?;
@@ -810,4 +905,73 @@ pub fn cached_credentials(data_dir: &Path) -> Option<(String, String)> {
         (!c.license.is_empty() && !email.is_empty())
             .then(|| (c.license, email))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截图场景：试用版 2026-10-21 18:43 到期，系统时间 18:48 仍显示已激活
+    fn trial(expires_at: i64) -> EntitlementStatus {
+        EntitlementStatus {
+            status: "active".into(),
+            kind: Some("subscription".into()),
+            expires_at: Some(expires_at),
+            source: Some("code".into()),
+            last_verified_at: 0,
+            plan: Some("free".into()),
+            max_seats: Some(1),
+            used_seats: Some(1),
+            sync_available: false,
+        }
+    }
+
+    #[test]
+    fn expired_trial_immediately_flips_to_expired_offline() {
+        let exp = parse_expires_at("2026-10-21 18:43").expect("parse expires_at");
+        let now = exp + 5 * 60; // 18:48
+
+        // 到期前：保持 active
+        let mut fresh = trial(exp);
+        assert!(!is_expired(&fresh, now - 600));
+        assert!(!enforce_expiry(&mut fresh, now - 600));
+        assert_eq!(fresh.status, "active");
+        assert!(fresh.is_unlocked());
+
+        // 到期后（离线、当天已校验过）：立即熔断
+        let mut ent = trial(exp);
+        assert!(is_expired(&ent, now));
+        assert!(enforce_expiry(&mut ent, now));
+        assert_eq!(ent.status, "expired");
+        assert!(!ent.is_unlocked());
+    }
+
+    #[test]
+    fn lifetime_plan_never_expires() {
+        let exp = parse_expires_at("2026-10-21 18:43").unwrap();
+        let mut ent = trial(exp);
+        ent.plan = Some("team".into());
+        ent.kind = Some("lifetime".into());
+        assert!(!is_expired(&ent, exp + 86_400));
+        assert!(!enforce_expiry(&mut ent, exp + 86_400));
+        assert_eq!(ent.status, "active");
+    }
+
+    #[test]
+    fn clock_rollback_locks_cache() {
+        let exp = parse_expires_at("2026-10-21 18:43").unwrap();
+        let now = now_secs();
+        let mut cache = CachedLicense {
+            license: "KEY".into(),
+            email: "a@b.com".into(),
+            synced_on: String::new(),
+            // 高水位线远超前于当前系统时间 → 判定为人为回拨
+            max_seen_unix: now + CLOCK_ROLLBACK_TOLERANCE + 60,
+            entitlement: trial(exp),
+        };
+        normalize_cache(&mut cache);
+        assert_eq!(cache.entitlement.status, "expired");
+        // 高水位线绝不回退
+        assert!(cache.max_seen_unix >= now + CLOCK_ROLLBACK_TOLERANCE + 60);
+    }
 }

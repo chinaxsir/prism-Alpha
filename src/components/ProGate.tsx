@@ -328,9 +328,18 @@ export function ActivateProModal({
  */
 export default function ProGate({
   feature,
+  title,
+  description,
+  actionLabel,
   children,
 }: {
   feature: Feature;
+  /** 自定义标题（缺省用「{feature} 为 Pro 功能」） */
+  title?: string;
+  /** 自定义说明文案（可选） */
+  description?: string;
+  /** 自定义按钮文案（缺省「激活 Pro」） */
+  actionLabel?: string;
   children: ReactNode;
 }) {
   const { t } = useTranslation();
@@ -348,13 +357,18 @@ export default function ProGate({
       <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-border bg-surface-card px-5 py-6 text-center">
         <Lock size={18} className="text-accent" />
         <p className="text-sm text-gray-300">
-          {t("pro.featureLocked", { feature: t(FEATURE_KEY[feature]) })}
+          {title ?? t("pro.featureLocked", { feature: t(FEATURE_KEY[feature]) })}
         </p>
+        {description && (
+          <p className="max-w-md text-xs leading-relaxed text-gray-500">
+            {description}
+          </p>
+        )}
         <button
           onClick={() => setShowActivate(true)}
           className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
         >
-          {t("pro.activatePro")}
+          {actionLabel ?? t("pro.activatePro")}
         </button>
       </div>
       <ActivateProModal

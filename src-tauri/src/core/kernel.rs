@@ -1068,7 +1068,7 @@ async fn auto_select_best_proxy(
 
     // ---- 三级规则：确定候选优先级池 + 是否需要触发 Go AIM 探测 ----
     let state = app_handle.state::<crate::core::state::AppState>();
-    let pro_unlocked = state.entitlement.read().is_unlocked();
+    let pro_unlocked = state.is_pro_active();
     let go_aim_enabled = pro_unlocked && state.settings.read().go_aim_enabled;
 
     // C：Go AIM 已解锁节点优先池（探测结果异步写入，启动瞬间可能为空）
