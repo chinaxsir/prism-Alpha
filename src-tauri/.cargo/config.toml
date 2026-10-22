@@ -1,0 +1,30 @@
+# Per-target Cargo configuration.
+# 
+# IMPORTANT: Global env var `RUSTFLAGS` was intentionally removed from CI
+# workflow (mobile.yml). Cargo makes it completely override ALL per-target
+# CARGO_TARGET_*_RUSTFLAGS, which would silently drop Android NDK linker args
+# (-landroid -llog -lOpenSLES) and cause link failure.
+#
+# All path-desensitization remap flags and platform-specific link args live
+# HERE, in per-target tables, so Cargo merges them correctly.
+
+[target.aarch64-linux-android]
+rustflags = [
+    # APK path desensitization (empty locally, resolved from GITHUB_WORKSPACE in CI)
+    "--remap-path-prefix=${GITHUB_WORKSPACE}=/prism",
+    # Android NDK mandatory link libraries
+    "-Clink-arg=-landroid",
+    "-Clink-arg=-llog",
+    "-Clink-arg=-lOpenSLES",
+]
+
+[target.aarch64-apple-ios]
+rustflags = [
+    # IPA path desensitization
+    "--remap-path-prefix=${GITHUB_WORKSPACE}=/prism",
+]
+
+[target.aarch64-apple-ios-sim]
+rustflags = [
+    "--remap-path-prefix=${GITHUB_WORKSPACE}=/prism",
+]

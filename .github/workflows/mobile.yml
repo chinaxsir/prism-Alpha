@@ -11,10 +11,6 @@ on:
 permissions:
   contents: write
 
-env:
-  # 源码路径脱敏：APK/IPA 中不残留 GitHub Actions 工作目录/本地绝对路径
-  RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/prism
-
 jobs:
   android:
     name: Build Android APK
@@ -312,7 +308,18 @@ jobs:
 
       - name: Assert pre-build result
         if: steps.prebuild.outputs.prebuild-failed == 'true'
-        run: echo "Android cargo pre-build failed; see annotations / log artifact" && exit 1
+        shell: bash
+        run: |
+          set +e
+          echo "=== Android pre-build FAILED ==="
+          echo "--- full cargo logs ---"
+          for f in src-tauri/cargo-*.log; do
+            echo "===== $f ====="
+            cat "$f"
+          done
+          echo
+          echo "Uploaded log artifact: android-prebuild-logs"
+          exit 1
 
       # 开启详细日志，以便定位移动端编译具体报错；APK-3：--target aarch64 单架构
       - name: Build APK

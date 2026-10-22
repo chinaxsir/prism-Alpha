@@ -34,7 +34,9 @@ def inject
   # 默认值仅用于日志；真正的扩展 bundle ID 在下面按各构建配置分别匹配，
   # 避免 Debug/Release 主 App bundle ID 不一致时 appex 固定跟随第一个配置
   app_bundle_id = app_target.build_configurations.first.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] || 'com.prism.proxy'
-  version = JSON.parse(File.read(File.join(ROOT, 'src-tauri', 'tauri.conf.json')))['version']
+  tauri_conf_path = File.join(ROOT, 'src-tauri', 'tauri.conf.json')
+  raw_json = File.read(tauri_conf_path, encoding: 'bom|utf-8').sub(/\A\uFEFF/, '')
+  version = JSON.parse(raw_json)['version']
   # CI 构建把 commit 短 SHA 写入 CFBundleVersion，App 启动失败时输出，
   # 用于远程确认用户实际安装的是哪个构建（排除装到旧 IPA 的歧义）
   # CI 构建在 mobile.yml 中用 GITHUB_RUN_NUMBER 覆盖 CFBundleVersion；
