@@ -17,6 +17,24 @@ GEN_APPLE = File.join(ROOT, 'src-tauri', 'gen', 'apple')
 KERNEL_DIR = File.join(ROOT, 'src-tauri', 'ios-kernel')
 EXT_NAME = 'PrismVPN'
 
+# IPA-3 任务1：强制竖屏。
+# Info.plist 里可能已存在 UISupportedInterfaceOrientations（Tauri 默认四方向），
+# 必须先 Delete 再 Add，否则 PlistBuddy 的 Add 会因键已存在而失败。
+#   - UISupportedInterfaceOrientations      → iPhone
+#   - UISupportedInterfaceOrientations~ipad → iPad（不覆盖则 iPad 横屏仍可旋转）
+def lock_portrait(plist)
+  pb = '/usr/libexec/PlistBuddy'
+  %w[UISupportedInterfaceOrientations UISupportedInterfaceOrientations~ipad].each do |key|
+    system(pb, '-c', "Delete :#{key}", plist, out: File::NULL, err: File::NULL)
+    ok = system(pb, '-c', "Add :#{key} array", plist, out: File::NULL, err: File::NULL)
+    ok &&= system(pb, '-c', "Add :#{key}:0 string UIInterfaceOrientationPortrait",
+                  plist, out: File::NULL, err: File::NULL)
+    puts "  [orientation] #{key} => portrait (#{ok ? 'ok' : 'FAILED'})"
+  end
+  # 保险：plutil 校验 plist 仍是合法 XML/binary，防止注入损坏导致签名失败
+  system('/usr/bin/plutil', '-lint', plist, out: File::NULL, err: File::NULL)
+end
+
 def inject
   project_path = Dir[File.join(GEN_APPLE, '*.xcodeproj')].first
   abort "[inject-ios-vpn] #{GEN_APPLE} 不存在，请先执行 npx tauri ios init" unless project_path
@@ -57,6 +75,10 @@ def inject
     system('/usr/libexec/PlistBuddy', '-c',
            "Set :CFBundleVersion 1", app_plist)
   end
+
+  # IPA-3 任务1：全终端强制竖屏，禁止随设备旋转横屏（移动端布局仅适配竖屏）。
+  # iPhone 与 iPad 两个方向键都要覆盖，否则 iPad 横屏仍会旋转。
+  lock_portrait(app_plist) if File.exist?(app_plist)
 
   # ---- 1. 拷贝扩展源文件 ----
   ext_dir = File.join(GEN_APPLE, EXT_NAME)

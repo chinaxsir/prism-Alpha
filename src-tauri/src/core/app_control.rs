@@ -112,6 +112,42 @@ pub fn load_runtime_cache(data_dir: &std::path::Path) -> Option<(RuntimePercepti
     Some((runtime, saved_at))
 }
 
+// ---------------- 授权剥夺原因持久化（IPA-3 任务2）----------------
+//
+// 解绑时 license.dat 会被删除，授权到期时 status 只有 expired 一个值，
+// 两种情况的「原因」都无法从授权文件里还原。若不落盘，用户重启 App 后
+// 横幅就消失了，无法引导他去官网重新激活。这里用独立的 revoke_state.json
+// 记录最近一次剥夺原因，激活成功 / 恢复有效授权时清除。
+
+fn revoke_state_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("revoke_state.json")
+}
+
+pub fn persist_revoke_reason(data_dir: &std::path::Path, reason: &str) {
+    let Ok(raw) = serde_json::to_string(&serde_json::json!({
+        "reason": reason,
+        "saved_at": license::now_secs(),
+    })) else {
+        return;
+    };
+    let _ = super::store::atomic_write(&revoke_state_path(data_dir), raw.as_bytes());
+}
+
+pub fn load_revoke_reason(data_dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(revoke_state_path(data_dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let reason = v.get("reason")?.as_str()?.to_string();
+    if reason == REVOKE_UNBOUND || reason == REVOKE_EXPIRED {
+        Some(reason)
+    } else {
+        None
+    }
+}
+
+pub fn clear_revoke_reason(data_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(revoke_state_path(data_dir));
+}
+
 // ---------------- apply_runtime：授权级熔断 ----------------
 
 /// 根据权威 runtime 执行授权级熔断（APP-7 任务2.2 §3）。
@@ -130,9 +166,22 @@ pub fn apply_runtime(
     let pro_revoked = is_unbound || is_expired || runtime.plan.is_none();
 
     if !pro_revoked {
+        clear_revoke_reason(data_dir);
         sync_entitlement_from_runtime(state, runtime);
         return None;
     }
+
+    // IPA-3 任务2：解绑与到期必须是两个互斥的独立原因，严禁混用文案。
+    // 解绑优先判定——设备已不在绑定表时，订阅是否到期都不影响「设备已解绑」
+    // 这一事实，提示必须引导用户去官网重新激活而不是续费。
+    let reason = if is_unbound {
+        REVOKE_UNBOUND
+    } else {
+        REVOKE_EXPIRED
+    };
+    let (zh, en) = revoke_message(reason);
+    // 落盘原因：重启 App 后横幅仍能按 unbound / expired 精准还原
+    persist_revoke_reason(data_dir, reason);
 
     let was_active = state
         .entitlement
@@ -140,23 +189,8 @@ pub fn apply_runtime(
         .status
         .eq_ignore_ascii_case("active");
     if !was_active {
-        let msg = if is_unbound {
-            "此设备已从您的账户解绑。如需继续使用 Pro 功能，请在官网重新激活。"
-        } else if is_expired {
-            "订阅已过期。续费后 Pro 功能将自动恢复。"
-        } else {
-            "Pro 授权已失效。"
-        };
-        let _ = app.emit(
-            "pro://revoked",
-            &serde_json::json!({
-                "reason": "runtime",
-                "message": msg,
-                "unbound": is_unbound,
-                "expired": is_expired,
-            }),
-        );
-        return Some((true, msg.to_string()));
+        emit_revoked(app, reason, zh, en, None);
+        return Some((true, zh.to_string()));
     }
 
     let entitlement = if is_unbound {
@@ -167,31 +201,59 @@ pub fn apply_runtime(
 
     state.apply_entitlement(entitlement.clone());
     disable_pro_switches(state);
-
-    let msg = if is_unbound {
-        "此设备已从您的账户解绑。如需继续使用 Pro 功能，请在官网重新激活。"
-    } else {
-        "订阅已过期。续费后 Pro 功能将自动恢复。"
-    };
-
-    let _ = app.emit(
-        "pro://revoked",
-        &serde_json::json!({
-            "reason": "runtime",
-            "message": msg,
-            "unbound": is_unbound,
-            "expired": is_expired,
-            "entitlement": entitlement,
-        }),
-    );
+    emit_revoked(app, reason, zh, en, Some(&entitlement));
 
     if *state.status.read() == CoreStatus::Running {
         tracing::info!(
-            "[runtime] Pro 授权被剥夺（unbound={is_unbound}, expired={is_expired}），关闭所有 Pro 开关，保留基础 VPN"
+            "[runtime] Pro 授权被剥夺（reason={reason}），关闭所有 Pro 开关，保留基础 VPN"
         );
     }
 
-    Some((true, msg.to_string()))
+    Some((true, zh.to_string()))
+}
+
+// ---------------- 授权剥夺原因（IPA-3 任务2）----------------
+
+/// 设备被官网解绑（`runtime.device_bound === false`）
+pub const REVOKE_UNBOUND: &str = "unbound";
+/// 授权时间到期（`runtime.subscription_active === false` 且非买断）
+pub const REVOKE_EXPIRED: &str = "expired";
+
+/// 原因 → (中文, 英文) 提示文案。前端按 reason 精准渲染，禁止复用同一句。
+pub fn revoke_message(reason: &str) -> (&'static str, &'static str) {
+    if reason == REVOKE_UNBOUND {
+        (
+            "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
+            "This device has been unbound from your account. Pro features (Go AIM / Go Lan / Go Cus / Connections) have been stopped. Please re-activate in Settings → Prism Pro.",
+        )
+    } else {
+        (
+            "授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」续期后恢复。",
+            "Your license has expired. Pro features (Go AIM / Go Lan / Go Cus / Connections) have been stopped. Please renew in Settings → Prism Pro.",
+        )
+    }
+}
+
+/// 广播 `pro://revoked`：payload 携带 reason + zh/en 双语文案，
+/// 前端按 reason 渲染对应横幅，绝不再把解绑显示成「授权已到期」。
+pub fn emit_revoked(
+    app: &AppHandle,
+    reason: &str,
+    zh: &str,
+    en: &str,
+    entitlement: Option<&EntitlementStatus>,
+) {
+    let _ = app.emit(
+        "pro://revoked",
+        &serde_json::json!({
+            "reason": reason,
+            "zh": zh,
+            "en": en,
+            "unbound": reason == REVOKE_UNBOUND,
+            "expired": reason == REVOKE_EXPIRED,
+            "entitlement": entitlement,
+        }),
+    );
 }
 
 fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) {
@@ -573,56 +635,27 @@ pub async fn force_runtime_check(
         ));
     }
 
-    // 授权级熔断
-    let (ent, revoke_msg) = if let Some(runtime) = parsed.runtime.as_ref() {
-        persist_runtime(&state.data_dir, runtime);
-        let is_unbound = runtime.device_bound == Some(false);
-        let is_expired = !runtime.subscription_active
-            && runtime.plan.as_deref() != Some("team");
-        if is_unbound || is_expired || runtime.plan.is_none() {
-            let msg = if is_unbound {
-                license::deactivate(&state.data_dir);
-                "此设备已从您的账户解绑。如需继续使用 Pro 功能，请在官网重新激活。"
-                    .to_string()
+    // 授权级熔断：与心跳走完全相同的 apply_runtime（含 pro://revoked 广播），
+    // 避免「立即校验」与后台心跳出现两套不一致的解绑/到期判定。
+    let mut revoke_reason: Option<String> = None;
+    if let Some(runtime) = parsed.runtime.as_ref() {
+        if let Some((_, _msg)) = apply_runtime(app, state, &state.data_dir, runtime) {
+            revoke_reason = Some(if runtime.device_bound == Some(false) {
+                REVOKE_UNBOUND.to_string()
             } else {
-                license::mark_expired(&state.data_dir)
-                    .unwrap_or_else(EntitlementStatus::inactive);
-                "订阅已过期。续费后 Pro 功能将自动恢复。".to_string()
-            };
-            let ent = license::cached_entitlement(&state.data_dir);
-            (ent, Some(msg))
-        } else {
-            let mut ent = state.entitlement.read().clone();
-            if let Some(plan) = runtime.plan.as_ref() {
-                ent.plan = Some(plan.clone());
-                ent.kind = Some(
-                    if plan == "team" {
-                        "lifetime"
-                    } else {
-                        "subscription"
-                    }
-                    .into(),
-                );
-            }
-            ent.max_seats = runtime.max_seats;
-            if let Some(exp_str) = runtime.expires_at.as_deref()
-                && let Some(exp) = license::parse_expires_at(exp_str)
-            {
-                ent.expires_at = Some(exp);
-            }
-            ent.last_verified_at = license::now_secs();
-            (ent, None)
+                REVOKE_EXPIRED.to_string()
+            });
         }
     } else {
         // 服务端 runtime 缺失 → 回落到旧的 GET /api/license/status 兼容路径
         match license::verify_remote_forced(&state.data_dir, &settings).await {
-            Ok(ent) => (ent, None),
+            Ok(ent) => state.apply_entitlement(ent),
             Err(e) => return Err(sanitize(&e.to_string())),
         }
-    };
+    }
 
-    state.apply_entitlement(ent.clone());
-    Ok((ent, revoke_msg))
+    let ent = state.entitlement.read().clone();
+    Ok((ent, revoke_reason))
 }
 
 fn sanitize(s: &str) -> String {

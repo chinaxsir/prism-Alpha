@@ -19,9 +19,9 @@ const zh: Record<string, string> = {
   "dashboard.lan.managed": "组网模式",
   "dashboard.lan.manual": "手动模式",
   "dashboard.lan.configured": "{mode} · 内网 {cidrs}",
-  "dashboard.lan.unset": "未配置回家网络 · 点击右侧配置回家参数",
+  "dashboard.lan.unset": "未配置回家网络 · 点击右侧配置",
   "dashboard.cus.enabled": "已启用 {modules} 个模块 · {rewrites} 改写 / {scripts} 脚本",
-  "dashboard.cus.unset": "未配置模块 · 点击右侧导入小火箭模块与脚本",
+  "dashboard.cus.unset": "未配置模块 · 点击右侧导入",
   "dashboard.lan.configureFirst":
     "请先配置 Go Lan 回家网络参数并保存后，再启用该功能",
   "dashboard.cus.configureFirst": "请先添加或导入至少一个 Go Cus 模块后再启用",
@@ -48,9 +48,9 @@ const en: Record<string, string> = {
   "dashboard.lan.managed": "Managed",
   "dashboard.lan.manual": "Manual",
   "dashboard.lan.configured": "{mode} · LAN {cidrs}",
-  "dashboard.lan.unset": "Home network not configured · tap Configure on the right",
+  "dashboard.lan.unset": "Home network not configured · tap Configure",
   "dashboard.cus.enabled": "{modules} modules enabled · {rewrites} rewrites / {scripts} scripts",
-  "dashboard.cus.unset": "No modules configured · import modules and scripts on the right",
+  "dashboard.cus.unset": "No modules configured · tap Import",
   "dashboard.lan.configureFirst":
     "Please configure and save Go Lan home network parameters before enabling",
   "dashboard.cus.configureFirst":

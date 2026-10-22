@@ -100,7 +100,7 @@ const zh: Record<string, string> = {
     "https://example.com/module.snippet 或粘贴模块内容",
   "proxies.goCus.noModules": "暂无模块",
   "proxies.goCus.noModulesDesc":
-    "粘贴模块链接或内容后点击导入，模块中的规则 / 改写 / 脚本 / MitM 声明将分别在此展示",
+    "支持导入兼容格式的模块、覆写规则与脚本（.sgmodule / .conf / .plugin / .stoverride），导入后规则 / 改写 / 脚本 / MitM 声明将分别在此展示",
   "proxies.goCus.remote": "远程",
   "proxies.goCus.local": "本地",
   "proxies.goCus.disableModule": "停用模块",
@@ -250,7 +250,7 @@ const en: Record<string, string> = {
     "https://example.com/module.snippet or paste module content",
   "proxies.goCus.noModules": "No modules",
   "proxies.goCus.noModulesDesc":
-    "Paste a module link or content and click import; rules / rewrites / scripts / MitM declarations will be shown here",
+    "Compatible formats: .sgmodule / .conf / .plugin / .stoverride. Imported rules / rewrites / scripts / MitM declarations appear here",
   "proxies.goCus.remote": "Remote",
   "proxies.goCus.local": "Local",
   "proxies.goCus.disableModule": "Disable module",

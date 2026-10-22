@@ -4,9 +4,13 @@ import {
   activatePro,
   deactivatePro,
   getEntitlement,
+  getRevokeReason,
   refreshEntitlement,
   type Entitlement,
 } from "@/api/ipc";
+
+/** 授权被剥夺的原因：unbound=设备被官网解绑，expired=授权到期（IPA-3 任务2） */
+export type RevokeReason = "unbound" | "expired" | null;
 
 const INACTIVE: Entitlement = {
   status: "inactive",
@@ -32,9 +36,12 @@ interface ProState {
   unlocked: boolean;
   busy: boolean;
   error: string | null;
+  /** 授权被剥夺的原因（unbound/expired）；重新激活成功后自动清空 */
+  revokeReason: RevokeReason;
 
   init: () => Promise<void>;
   setEntitlement: (e: Entitlement) => void;
+  setRevokeReason: (r: RevokeReason) => void;
   /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
@@ -49,11 +56,21 @@ export const useProStore = create<ProState>((set, get) => ({
   unlocked: false,
   busy: false,
   error: null,
+  revokeReason: null,
 
   init: async () => {
     try {
       const e = await getEntitlement();
       set({ entitlement: e, unlocked: unlockedOf(e), ready: true });
+      // 重启后按落盘原因还原横幅：解绑 ≠ 到期，严禁统一显示成「已到期」
+      if (!unlockedOf(e)) {
+        try {
+          const reason = await getRevokeReason();
+          if (reason) set({ revokeReason: reason });
+        } catch {
+          /* 读取失败按无横幅处理，不影响主流程 */
+        }
+      }
     } catch (err) {
       console.error("get entitlement failed:", err);
       set({ ready: true });
@@ -78,6 +95,7 @@ export const useProStore = create<ProState>((set, get) => ({
     set({
       entitlement: { ...entitlement, status: "expired" },
       unlocked: false,
+      revokeReason: "expired",
     });
     try {
       const e = await refreshEntitlement();
@@ -87,8 +105,24 @@ export const useProStore = create<ProState>((set, get) => ({
     }
   },
 
-  setEntitlement: (e) =>
-    set({ entitlement: e, unlocked: unlockedOf(e), error: null }),
+  setEntitlement: (e) => {
+    const unlocked = unlockedOf(e);
+    set({
+      entitlement: e,
+      unlocked,
+      error: null,
+      // 重新激活成功（unlocked）→ 立即清除解绑/到期横幅；
+      // 状态为 expired 时归因到「授权到期」；其余（含解绑后的 inactive）
+      // 保留后端 pro://revoked 已写入的原因，避免横幅被误清。
+      revokeReason: unlocked
+        ? null
+        : e.status === "expired"
+          ? "expired"
+          : get().revokeReason,
+    });
+  },
+
+  setRevokeReason: (r) => set({ revokeReason: r }),
 
   activate: async (licenseKey, email) => {
     set({ busy: true, error: null });

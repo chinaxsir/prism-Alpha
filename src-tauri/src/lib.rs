@@ -254,6 +254,7 @@ pub fn run() {
             ipc::commands::save_custom_rules,
             ipc::commands::activate_pro,
             ipc::commands::get_entitlement,
+            ipc::commands::get_revoke_reason,
             ipc::commands::get_device_id,
             ipc::commands::refresh_entitlement,
             ipc::commands::deactivate_pro,

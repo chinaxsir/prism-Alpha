@@ -115,6 +115,35 @@ function patchManifest() {
 }
 patchManifest()
 
+// 3.1 强制竖屏（IPA-3 任务1）
+//
+// Tauri 生成的 MainActivity 默认不限制方向，随设备传感器旋转；移动端布局
+// 只适配竖屏，转横屏会挤压卡片与底部导航。给 activity 加
+// android:screenOrientation="portrait" 即可由系统层面锁死（无需改 Kotlin）。
+// 幂等：已存在 portrait 时不动；存在其他方向值时改写为 portrait。
+function patchManifestOrientation() {
+  const file = path.join(GEN, 'app', 'src', 'main', 'AndroidManifest.xml')
+  let text = fs.readFileSync(file, 'utf8')
+  const re = /<activity\b[^>]*android:name="[^"]*MainActivity"[^>]*>/m
+  const m = text.match(re)
+  if (!m) {
+    console.warn('[inject-android-vpn] MainActivity activity 未找到，跳过竖屏锁定')
+    return
+  }
+  const tag = m[0]
+  if (/android:screenOrientation\s*=\s*"portrait"/.test(tag)) {
+    console.log('[inject-android-vpn] Android orientation already portrait')
+    return
+  }
+  // 先删掉可能存在的旧方向值，再在标签尾插入 portrait
+  let next = tag.replace(/\s*android:screenOrientation\s*=\s*"[^"]*"/, '')
+  next = next.replace(/\/?>$/, (end) => ` android:screenOrientation="portrait"${end}`)
+  text = text.replace(tag, next)
+  fs.writeFileSync(file, text)
+  console.log('[inject-android-vpn] Android orientation locked to portrait')
+}
+patchManifestOrientation()
+
 // 4. 关闭 Release 构建的 R8 压缩混淆（APK-3 任务1）
 //
 // 根因：R8 在 :app:minifyUniversalReleaseWithR8 阶段即可能因 proguard 配置

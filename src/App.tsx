@@ -30,6 +30,7 @@ import ProxiesHub from "@/pages/ProxiesHub";
 export default function App() {
   const initPro = useProStore((s) => s.init);
   const proStatus = useProStore((s) => s.entitlement.status);
+  const revokeReason = useProStore((s) => s.revokeReason);
   const { t } = useTranslation();
   const theme = usePrefsStore((s) => s.theme);
   const language = usePrefsStore((s) => s.language);
@@ -102,18 +103,40 @@ export default function App() {
     };
   }, []);
 
-  // 授权到期广播：后端每 10 秒巡检跨过 expires_at 后推送，弹窗提示并同步锁定
+  // 授权到期广播（兼容旧事件）：与 pro://revoked 同时发出，这里只做状态收口，
+  // 提示统一由下方 pro://revoked 处理，避免重复弹两次 Toast。
   useEffect(() => {
     const unlisten = listen("pro://expired", () => {
-      useProStore
-        .getState()
-        .setEntitlement({ ...useProStore.getState().entitlement, status: "expired" });
-      toast.error(t("pro.expiredBanner"));
+      const store = useProStore.getState();
+      store.setRevokeReason("expired");
+      store.setEntitlement({ ...store.entitlement, status: "expired" });
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [t]);
+  }, []);
+
+  // IPA-3 任务2：授权剥夺广播（设备解绑 / 授权到期）——按 reason 精准提示，
+  // 严禁把「设备已解绑」显示成「授权已到期」。payload 由后端统一给出 zh/en。
+  useEffect(() => {
+    const unlisten = listen<{
+      reason?: "unbound" | "expired";
+      zh?: string;
+      en?: string;
+    }>("pro://revoked", (event) => {
+      const reason =
+        event.payload?.reason === "unbound" ? "unbound" : "expired";
+      useProStore.getState().setRevokeReason(reason);
+      const localized =
+        language === "en" ? event.payload?.en : event.payload?.zh;
+      toast.error(
+        localized || t(reason === "unbound" ? "pro.unboundBanner" : "pro.expiredBanner"),
+      );
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t, language]);
 
   // 监听内核状态广播：订阅增删改/设置变更触发的 restart_core
   // 对前端透明，重启成功或失败转 Error 都能即时对齐，无需轮询
@@ -252,11 +275,20 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
         <main className="flex-1 overflow-y-auto overflow-x-hidden px-6 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-          {/* 授权到期横幅：所有 Pro 功能已自动停止，引导前往设置页续期 */}
-          {proStatus === "expired" && (
+          {/* 授权剥夺横幅（IPA-3 任务2）：按原因精准区分「设备已解绑」与
+              「授权已到期」，两者文案完全不同，严禁混用 */}
+          {(revokeReason === "unbound" ||
+            revokeReason === "expired" ||
+            proStatus === "expired") && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-latency-bad/30 bg-latency-bad/10 px-3 py-2.5 text-xs text-latency-bad">
               <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-              <span>{t("pro.expiredBanner")}</span>
+              <span>
+                {t(
+                  revokeReason === "unbound"
+                    ? "pro.unboundBanner"
+                    : "pro.expiredBanner",
+                )}
+              </span>
             </div>
           )}
           <Routes>

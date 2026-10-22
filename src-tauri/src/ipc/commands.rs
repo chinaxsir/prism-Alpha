@@ -1465,6 +1465,10 @@ pub async fn activate_pro(
         .await
         .map_err(|e| sanitize_err(&e.to_string()))?;
     state.apply_entitlement(next.clone());
+    // 激活成功：清除历史剥夺原因，前端横幅随 proUnlocked=true 一并消失
+    if next.is_unlocked() {
+        crate::core::app_control::clear_revoke_reason(&data_dir);
+    }
     // Pro/买断：激活成功后立即做一次云端订阅对账（静默）
     if next.is_unlocked() && next.sync_available {
         tauri::async_runtime::spawn(async move {
@@ -1480,6 +1484,13 @@ pub async fn get_entitlement(
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
     Ok(state.entitlement.read().clone())
+}
+
+/// 读取最近一次授权剥夺原因（IPA-3 任务2：unbound / expired / null）。
+/// 前端启动时调用一次，保证重启后横幅仍是「设备已解绑」而不是「已到期」。
+#[tauri::command]
+pub async fn get_revoke_reason(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(crate::core::app_control::load_revoke_reason(&state.data_dir))
 }
 
 /// 读取本机设备 ID（激活绑定与设置页展示用；首次调用时生成并落盘）
@@ -1518,6 +1529,8 @@ pub async fn deactivate_pro(
 ) -> Result<EntitlementStatus, String> {
     let next = crate::core::license::deactivate(&state.data_dir);
     state.apply_entitlement(next.clone());
+    // 用户主动移除授权：不是「被解绑/已到期」，清掉历史原因避免误弹横幅
+    crate::core::app_control::clear_revoke_reason(&state.data_dir);
 
     // Go AIM：落盘关闭 + 清理锁定节点并通知前端
     let mut settings = state.settings.read().clone();
@@ -1595,7 +1608,18 @@ pub(crate) async fn terminate_pro_features_on_expiry(app: &AppHandle, state: &Ap
         tracing::error!("restart after license expiry failed: {e}");
     }
 
-    // 5. 专门的到期通知（前端弹出醒目提示）
+    // 5. 专门的到期通知（前端按 reason 渲染「授权已到期」专属横幅）
+    let (zh, en) = crate::core::app_control::revoke_message(
+        crate::core::app_control::REVOKE_EXPIRED,
+    );
+    crate::core::app_control::emit_revoked(
+        app,
+        crate::core::app_control::REVOKE_EXPIRED,
+        zh,
+        en,
+        None,
+    );
+    // 兼容旧前端：保留空 payload 的 pro://expired 广播
     let _ = app.emit("pro://expired", serde_json::json!({}));
 }
 

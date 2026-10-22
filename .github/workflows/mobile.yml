@@ -482,6 +482,17 @@ jobs:
           fi
           echo "app: $APP  exec: $EXEC  appex: $APPEX"
 
+          # ==================== 0. 强制竖屏双重保险（IPA-3 任务1）====================
+          # inject-ios-vpn.rb 已在工程层写入 portrait；这里对最终 .app 再锁一次，
+          # 防止 gen/apple 被重新 init 覆盖。plutil -replace 对缺失键无效，
+          # 因此先 -remove（忽略失败）再 -insert，两个方向键都要处理。
+          for KEY in UISupportedInterfaceOrientations UISupportedInterfaceOrientations~ipad; do
+            plutil -remove "$KEY" "$APP/Info.plist" >/dev/null 2>&1 || true
+            plutil -insert "$KEY" -json '["UIInterfaceOrientationPortrait"]' "$APP/Info.plist"
+            echo "locked $KEY = portrait"
+          done
+          plutil -lint "$APP/Info.plist"
+
           # ==================== 1. 深度清理（必须在签名前）====================
           # 注：appex 的 _CodeSignature 由下方 v4 流程显式删除（对齐
           # FlClash 终态：TrollStore 重签后不重建 CodeResources，设备上

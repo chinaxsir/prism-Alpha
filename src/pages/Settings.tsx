@@ -275,6 +275,9 @@ export default function Settings() {
     const st = s.entitlement.status;
     if (st === "active") {
       toast.success(t("pro.verifySuccess"));
+    } else if (s.revokeReason === "unbound") {
+      // IPA-3 任务2：设备被官网解绑 ≠ 授权到期，必须给出独立的重新激活引导
+      toast.error(t("pro.verifyUnbound"));
     } else if (st === "expired" || st === "revoked") {
       toast.error(t("pro.verifyExpired"));
     } else if (st === "offline") {

@@ -124,8 +124,9 @@ const zh: Record<string, string> = {
   "pro.activateFailed": "激活失败，请检查 License Key 与注册邮箱",
   "pro.licensingBusy": "校验中...",
   "pro.verifyNow": "立即校验",
-  "pro.verifySuccess": "授权校验成功：当前方案与有效期已同步",
-  "pro.verifyExpired": "授权已过期或失效",
+  "pro.verifySuccess": "授权校验成功：当前设备绑定与有效期正常",
+  "pro.verifyUnbound": "校验完成：当前设备已在控制台解除绑定，本机授权已移除",
+  "pro.verifyExpired": "校验完成：当前授权已到期，请续期后使用",
   "pro.verifyOffline": "网络不可用，授权校验失败，联网恢复后自动重试",
   "pro.verifyNone": "本机暂无授权记录",
   "pro.verifyTooFrequent": "校验过于频繁，请 {secs} 秒后再试",
@@ -145,6 +146,8 @@ const zh: Record<string, string> = {
   "pro.status.expired": "已过期",
   "pro.status.revoked": "已吊销",
   "pro.status.inactive": "未激活",
+  "pro.unboundBanner":
+    "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
   "pro.expiredBanner":
     "授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」续期后恢复。",
   "pro.expiredAt": "授权已于 {time} 到期，Pro 功能已自动停止。",
@@ -297,8 +300,9 @@ const en: Record<string, string> = {
   "pro.activateFailed": "Activation failed, check your License Key and email",
   "pro.licensingBusy": "Verifying...",
   "pro.verifyNow": "Verify Now",
-  "pro.verifySuccess": "License verified: plan and expiry synced",
-  "pro.verifyExpired": "License expired or revoked",
+  "pro.verifySuccess": "License verified: device binding and expiry look good",
+  "pro.verifyUnbound": "Verification done: this device was unbound in console and its license was removed",
+  "pro.verifyExpired": "Verification done: license expired, please renew",
   "pro.verifyOffline": "Network unavailable, verification failed; retrying automatically",
   "pro.verifyNone": "No license record on this device",
   "pro.verifyTooFrequent": "Too frequent, retry in {secs}s",
@@ -318,6 +322,8 @@ const en: Record<string, string> = {
   "pro.status.expired": "Expired",
   "pro.status.revoked": "Revoked",
   "pro.status.inactive": "Inactive",
+  "pro.unboundBanner":
+    "This device has been unbound from your account. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Re-activate in Settings → Prism Pro.",
   "pro.expiredBanner":
     "Your license has expired. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Renew in Settings → Prism Pro to restore them.",
   "pro.expiredAt": "License expired at {time}. Pro features have been stopped.",
