@@ -34,6 +34,10 @@ private let managerServerTag = "Prism"
 func prismIosVpnStart(_ config: UnsafePointer<CChar>) -> Int32 {
     let configText = String(cString: config)
 
+    // APP-5 任务2：启动前强制做一次覆盖升级检查（Rust setup 已调用过，
+    // 此处兜底——指纹一致时是 O(1) 直接返回，不会重复杀进程）
+    PrismTunnelController.handleUpgradeIfNeededOnLaunch()
+
     // 写到 App Group 共享容器，避开 NETunnelProviderManager
     // providerConfiguration 512KB 限制（用户配置 2.47MB）
     let configPath: String
@@ -177,6 +181,28 @@ func prismIosVpnConnectedTimestamp() -> Int64 {
         return 0
     }
     return Int64(connectedDate.timeIntervalSince1970 * 1000.0)
+}
+
+// MARK: - APP-5 任务2：覆盖升级启动自愈（C ABI 入口）
+
+/// App 启动时由 Rust 调用：比对安装指纹，升级后首次启动时清理驻留的旧版
+/// 扩展进程（否则系统里跑的仍是旧 appex，UI 会一直显示未连接而实际已在
+/// 代理）。返回 1 = 本次为升级后首次启动且已执行清理。
+@_cdecl("prism_ios_upgrade_selfheal")
+func prismIosUpgradeSelfheal() -> Int32 {
+    PrismTunnelController.handleUpgradeIfNeededOnLaunch() ? 1 : 0
+}
+
+/// 取走并清除「升级后待自动重启」标记（一次性）：Rust 在启动流程末尾据此
+/// 自动重建隧道，用户升级后无需手动点连接。
+@_cdecl("prism_ios_take_pending_restart")
+func prismIosTakePendingRestart() -> Int32 {
+    let defaults = UserDefaults.standard
+    guard defaults.bool(forKey: PrismTunnelController.kPendingRestartKey) else {
+        return 0
+    }
+    defaults.set(false, forKey: PrismTunnelController.kPendingRestartKey)
+    return 1
 }
 
 // MARK: - 控制器
@@ -1228,6 +1254,79 @@ final class PrismTunnelController {
         tryRootHelperUICache()
     }
 
+    // MARK: - APP-5 任务2：升级指纹 + 启动自愈
+
+    /// 已处理的安装指纹（版本号|build|二进制 mtime）
+    private static let kUpgradeFingerprintKey = "prism_upgrade_fingerprint"
+    /// 升级后待自动重启标记（Rust 读取后清除）
+    static let kPendingRestartKey = "prism_pending_restart_after_upgrade"
+    /// 上一次进入连接状态记录（用于判断升级前隧道是否在使用中）
+    private static let kWasConnectedKey = "prism_tunnel_was_connected"
+
+    /// 计算当前安装指纹。
+    /// 仅比较版本号/build 无法感知「同 build 重签覆盖」或 TrollStore 覆盖重装，
+    /// 因此引入主程序与扩展二进制的磁盘修改时间：二进制一旦被替换，
+    /// mtime 必然变化，指纹 100% 改变。
+    static func computeInstallFingerprint() -> String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        return "\(version)|\(build)|\(mainBinaryStamp())|\(extensionBinaryStamp())"
+    }
+
+    /// 单个文件/目录的 mtime（Unix 秒），不可得时返回 0
+    private static func modificationStamp(ofPath path: String) -> Int {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = attrs[.modificationDate] as? Date
+        else {
+            return 0
+        }
+        return Int(date.timeIntervalSince1970)
+    }
+
+    /// 主 App 可执行文件 mtime（回落到 bundle 目录属性）
+    private static func mainBinaryStamp() -> Int {
+        let stamp = Bundle.main.executablePath.map { modificationStamp(ofPath: $0) } ?? 0
+        return stamp != 0 ? stamp : modificationStamp(ofPath: Bundle.main.bundlePath)
+    }
+
+    /// 隧道扩展二进制 mtime（PlugIns/PrismVPN.appex/PrismVPN）。
+    /// 扩展才是真正执行代理的进程——只换主 App 不换扩展时，必须靠它感知。
+    private static func extensionBinaryStamp() -> Int {
+        let appex = "\(Bundle.main.bundlePath)/PlugIns/PrismVPN.appex"
+        let binary = "\(appex)/PrismVPN"
+        let stamp = modificationStamp(ofPath: binary)
+        return stamp != 0 ? stamp : modificationStamp(ofPath: appex)
+    }
+
+    /// 覆盖升级自愈统一入口（APP-5 任务2）：App 启动时（Rust setup）与
+    /// prismIosVpnStart 开头都会调用，指纹比对保证只在升级后首次启动执行一次。
+    /// 返回 true 表示本次是升级后首次启动且已执行清理。
+    @discardableResult
+    static func handleUpgradeIfNeededOnLaunch() -> Bool {
+        let fingerprint = computeInstallFingerprint()
+        let defaults = UserDefaults.standard
+        let last = defaults.string(forKey: kUpgradeFingerprintKey)
+        guard last != fingerprint else { return false }
+
+        defaults.set(fingerprint, forKey: kUpgradeFingerprintKey)
+        // 同步旧键，保持既有清理路径（preCleanAndSyncVersion）行为一致
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        defaults.set(build, forKey: "prism_last_build_version")
+        NSLog("[PrismVPN] 升级指纹变化 \(last ?? "无") -> \(fingerprint)，执行启动自愈")
+
+        // 1. 杀掉驻留的旧版 PrismVPN 扩展进程：不做这步，系统里运行的
+        //    仍是旧 appex，新版主 App 无法与它共享配置版本
+        killStaleExtensionProcess()
+
+        // 2. 升级前隧道处于连接状态 → 标记待自动重启，由 Rust 在启动
+        //    流程末尾重建隧道（用户无需手动点「连接」）
+        if defaults.bool(forKey: kWasConnectedKey) {
+            defaults.set(true, forKey: kPendingRestartKey)
+            NSLog("[PrismVPN] 升级前隧道在使用中，已标记升级后自动重建")
+        }
+        return true
+    }
+
     /// 调用随包 PrismHelper killext（killall -9 PrismVPN）
     static func killStaleExtensionProcess() {
         let helperPath = Bundle.main.bundleURL
@@ -1721,6 +1820,10 @@ final class PrismTunnelController {
                     let hb = PrismTunnelController.readExtensionHeartbeat()
                     if hb.alive {
                         NSLog("[PrismVPN] 心跳验证通过 (stage=\(hb.stage), age=\(hb.age)s)")
+                        // APP-5 任务2：记录「隧道曾成功连接」，供覆盖升级后
+                        // 判断是否需要自动重建隧道
+                        UserDefaults.standard.set(
+                            true, forKey: PrismTunnelController.kWasConnectedKey)
                         finish(nil)
                         // 连接成功后启动巨魔看门狗：扩展被 Jetsam 静默强杀
                         // 且系统丢弃断开通知时，靠心跳时间戳兜底判死
@@ -1996,6 +2099,10 @@ final class PrismTunnelController {
     func stop(completion: @escaping (Error?) -> Void) {
         // 主动停止：先拆看门狗，避免停止期间心跳冻结被误判为崩溃
         stopVpnWatchdog()
+        // APP-5 任务2：用户主动断开 → 清除「曾连接」标记，
+        // 避免下次升级时误判为需要自动重建隧道
+        UserDefaults.standard.set(
+            false, forKey: PrismTunnelController.kWasConnectedKey)
         loadOrCreateManager { result in
             switch result {
             case .failure(let error):

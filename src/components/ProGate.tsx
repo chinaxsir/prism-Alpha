@@ -77,16 +77,6 @@ function parseLicenseError(
   return LICENSE_ERROR_MAP[code] ?? null;
 }
 
-/** 门控功能名 → 文案 key */
-const FEATURE_KEY: Record<Feature, string> = {
-  [Feature.MultiSubscription]: "feature.multiSubscription",
-  [Feature.Connections]: "feature.connections",
-  [Feature.Rules]: "feature.rules",
-  [Feature.GoAim]: "feature.goAim",
-  [Feature.GoLan]: "feature.goLan",
-  [Feature.GoCus]: "feature.goCus",
-};
-
 /** Unix 秒 → "YYYY-MM-DD HH:mm"（本地时区） */
 function formatExpiry(secs: number): string {
   const d = new Date(secs * 1000);
@@ -327,16 +317,16 @@ export function ActivateProModal({
  * 已授权（active，服务端联网校验有效）时完全透明穿透。
  */
 export default function ProGate({
-  feature,
   title,
   description,
   actionLabel,
   children,
 }: {
+  /** 门控的功能标识（保留用于埋点/扩展；文案已统一，APP-5 任务4） */
   feature: Feature;
-  /** 自定义标题（缺省用「{feature} 为 Pro 功能」） */
+  /** 自定义标题（缺省用统一标题「解锁 Prism Pro 全场景智联」） */
   title?: string;
-  /** 自定义说明文案（可选） */
+  /** 自定义说明文案（缺省用统一说明） */
   description?: string;
   /** 自定义按钮文案（缺省「激活 Pro」） */
   actionLabel?: string;
@@ -357,13 +347,11 @@ export default function ProGate({
       <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-border bg-surface-card px-5 py-6 text-center">
         <Lock size={18} className="text-accent" />
         <p className="text-sm text-gray-300">
-          {title ?? t("pro.featureLocked", { feature: t(FEATURE_KEY[feature]) })}
+          {title ?? t("pro.featureLocked")}
         </p>
-        {description && (
-          <p className="max-w-md text-xs leading-relaxed text-gray-500">
-            {description}
-          </p>
-        )}
+        <p className="max-w-md text-xs leading-relaxed text-gray-500">
+          {description ?? t("pro.gate.desc")}
+        </p>
         <button
           onClick={() => setShowActivate(true)}
           className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"

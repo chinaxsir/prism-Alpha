@@ -133,6 +133,10 @@ pub struct TrafficStats {
     /// 当前会话最新绝对累计值（内核 uploadTotal + downloadTotal）
     #[serde(default)]
     pub current_session_bytes: u64,
+    /// 当前会话起始 Unix 毫秒时间戳（APP-5）：强退重开后认领后台隧道时，
+    /// 用它恢复「已连接时长」的连续计时（0 = 无有效会话）
+    #[serde(default)]
+    pub session_started_at_ms: u64,
 }
 
 impl Default for TrafficStats {
@@ -152,6 +156,7 @@ impl Default for TrafficStats {
             today_date: format!("day-{}", days),
             today_archived_bytes: 0,
             current_session_bytes: 0,
+            session_started_at_ms: 0,
         }
     }
 }
@@ -242,6 +247,18 @@ pub fn set_current_session(data_dir: &Path, bytes: u64) -> anyhow::Result<()> {
     save_traffic_stats(data_dir, &stats)
 }
 
+/// 记录当前会话起始时间戳（进入 Running 时落盘，供强退重开后恢复计时）
+pub fn set_session_started_at(data_dir: &Path, ms: u64) -> anyhow::Result<()> {
+    let mut stats = load_traffic_stats(data_dir);
+    stats.session_started_at_ms = ms;
+    save_traffic_stats(data_dir, &stats)
+}
+
+/// 读取当前会话起始时间戳（0 = 无有效会话记录）
+pub fn session_started_at(data_dir: &Path) -> u64 {
+    load_traffic_stats(data_dir).session_started_at_ms
+}
+
 /// 归档当前会话：把 current_session_bytes 累加进 today_archived_bytes 并归零。
 /// 跨天则清空 archived 与 legacy today_bytes（新的一天从零重新累计）
 pub fn archive_session(data_dir: &Path) -> anyhow::Result<()> {
@@ -257,6 +274,7 @@ pub fn archive_session(data_dir: &Path) -> anyhow::Result<()> {
             .saturating_add(stats.current_session_bytes);
     }
     stats.current_session_bytes = 0;
+    stats.session_started_at_ms = 0;
     save_traffic_stats(data_dir, &stats)
 }
 

@@ -425,6 +425,146 @@ impl KernelHandle {
         tracing::info!("sing-box process {} stopped", self.pid);
         Ok(())
     }
+
+    /// 认领一个「内核侧已在运行、本进程却没有句柄」的隧道（APP-5 任务3）。
+    /// 不启动任何进程：仅重建事件流订阅，使流量/连接/内存统计立即续接。
+    /// 停止时由平台侧 stop_tunnel / stop_service 回收，不依赖子进程句柄。
+    pub(crate) fn reattach(config: KernelConfig, app_handle: AppHandle) -> Self {
+        let stream_tasks =
+            super::events::spawn_all(&config.api_addr, &config.api_secret, app_handle);
+        Self {
+            config,
+            child: Mutex::new(None),
+            // 无真实子进程：pid 置 0，避免误杀或清错 PID 记录
+            pid: 0,
+            stream_tasks: Mutex::new(stream_tasks),
+        }
+    }
+}
+
+/// 强退重开后自动认领后台仍在运行的 VPN 隧道（APP-5 任务3）。
+///
+/// 用户未点「停止」直接划掉主 App 时，系统底层隧道（iOS 的
+/// NEPacketTunnelProvider / Android 的 VpnService）仍在转发流量。重开 App
+/// 时 Rust 侧 AppState 全新初始化为 Stopped，必须主动认领，否则 UI 显示
+/// 「未连接」而实际已在代理，且连接时长/流量统计全部归零。
+///
+/// 返回 true 表示已成功认领（状态已迁移到 Running 并广播事件）。
+pub async fn try_reattach_running_kernel(
+    app: &AppHandle,
+    state: &crate::core::state::AppState,
+) -> bool {
+    // 已有句柄 / 非 Stopped：无需认领
+    if state.kernel_handle.read().is_some() {
+        return false;
+    }
+    if *state.status.read() != crate::core::state::CoreStatus::Stopped {
+        return false;
+    }
+
+    // 1. 读取上次运行写入的运行时配置，恢复 clash_api 地址与鉴权密钥
+    //    （密钥每次启动随机生成，只能从落盘的 config.json 还原）
+    let work_dir = state.work_dir();
+    let Ok(raw) = std::fs::read_to_string(work_dir.join("config.json")) else {
+        return false;
+    };
+    let Ok(runtime_config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let api_addr = runtime_config
+        .pointer("/experimental/clash_api/external_controller")
+        .and_then(|v| v.as_str())
+        .unwrap_or(PREFERRED_API_ADDR)
+        .to_string();
+    let api_secret = runtime_config
+        .pointer("/experimental/clash_api/secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // 2. 平台侧确认隧道仍在运行（iOS 由系统 nesessionmanagerd 维护连接状态）
+    #[cfg(target_os = "ios")]
+    if !crate::platform::ios::vpn_is_connected() {
+        return false;
+    }
+
+    // 3. 内核 API 必须在线：事件流、节点同步、Go AIM 探测都依赖它
+    let api = KernelApi::new(&api_addr, &api_secret);
+    if api.get_version().await.is_err() {
+        tracing::debug!("[reattach] 内核 API 不在线，跳过认领");
+        return false;
+    }
+
+    // 4. 重建句柄 + 事件流订阅
+    *state.api_addr.write() = api_addr.clone();
+    *state.api_secret.write() = api_secret.clone();
+    let kernel_config = KernelConfig {
+        // 认领场景不需要二进制路径（内核不在本进程内）
+        binary_path: std::path::PathBuf::new(),
+        work_dir: work_dir.clone(),
+        api_addr: api_addr.clone(),
+        api_secret,
+        runtime_config: runtime_config.clone(),
+    };
+    *state.kernel_handle.write() = Some(std::sync::Arc::new(KernelHandle::reattach(
+        kernel_config,
+        app.clone(),
+    )));
+
+    // 5. 恢复主选择组（节点页/仪表盘需要真实出口）。
+    //    优先用运行时配置的 route.final；缺失时回落到第一个 Selector。
+    if let Ok(proxies) = api.get_proxies().await
+        && let Some(map) = proxies.get("proxies").and_then(|p| p.as_object())
+    {
+        let is_selector = |name: &str| {
+            map.get(name)
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("Selector")
+        };
+        let preferred = runtime_config
+            .pointer("/route/final")
+            .and_then(|v| v.as_str())
+            .filter(|name| is_selector(name))
+            .map(str::to_string)
+            .or_else(|| {
+                map.iter()
+                    .find(|(name, _)| is_selector(name) && name.as_str() != "GLOBAL")
+                    .map(|(name, _)| name.clone())
+            });
+        if let Some(group) = preferred {
+            *state.main_selector.write() = Some(group);
+        }
+    }
+
+    // 6. 状态迁移 Stopped → Starting → Running（transition 内部会写入
+    //    started_at_ms 并广播 core://status）
+    if state
+        .transition(crate::core::state::CoreStatus::Starting)
+        .is_err()
+    {
+        return false;
+    }
+    // iOS 的 transition 已用系统 connectedDate 写入 started_at_ms；
+    // 其他平台用落盘的会话起点覆盖，保证「已连接时长」连续
+    if state
+        .transition(crate::core::state::CoreStatus::Running)
+        .is_err()
+    {
+        return false;
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let persisted = crate::core::store::session_started_at(&state.data_dir);
+        if persisted > 0 {
+            *state.started_at_ms.write() = Some(persisted);
+        }
+    }
+    *state.started_at.write() = Some(std::time::Instant::now());
+
+    tracing::info!("[reattach] 已认领后台运行中的隧道（api={api_addr}）");
+    let _ = app.emit("proxies://changed", ());
+    true
 }
 
 /// 静态校验待应用的配置：sing-box check -c <path>。

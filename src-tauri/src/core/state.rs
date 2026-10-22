@@ -270,6 +270,9 @@ pub struct AppState {
     /// APP 远程管控阻断状态（app-control：服务端返回 allowed=false 时置位）。
     /// None = 无管控；Some(block) = 阻止 start_core 并已广播前端。
     pub control_block: RwLock<Option<super::app_control::ControlBlock>>,
+    /// 强退重开认领流程是否已尝试过（进程内只尝试一次，避免每次状态
+    /// 查询都重复读配置 + 探测内核 API）
+    pub reattach_attempted: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -320,6 +323,7 @@ impl AppState {
             conn_seq: std::sync::atomic::AtomicU64::new(0),
             app_in_foreground: std::sync::atomic::AtomicBool::new(true),
             control_block: RwLock::new(None),
+            reattach_attempted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -512,6 +516,10 @@ impl AppState {
             #[cfg(not(target_os = "ios"))]
             let started = unix_now_ms();
             *self.started_at_ms.write() = Some(started);
+            // 会话起点落盘：强退重开后认领后台隧道时用它恢复连续计时
+            if let Err(e) = super::store::set_session_started_at(&self.data_dir, started) {
+                tracing::warn!("持久化会话起始时间失败: {e}");
+            }
         } else if matches!(next, CoreStatus::Stopped | CoreStatus::Error) {
             *self.started_at_ms.write() = None;
         }

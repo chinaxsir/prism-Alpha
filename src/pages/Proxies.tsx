@@ -11,6 +11,7 @@ import {
   urlTest,
   getGoAimStatus,
   runGoAimProbe,
+  type AimNodeResult,
   type GoAimStatus,
 } from "@/api/ipc";
 import { useCoreStore } from "@/stores/core";
@@ -70,6 +71,30 @@ const AIM_BADGE_STYLE: Record<string, string> = {
   "Disney+": "bg-sky-500/15 text-sky-400 border-sky-500/30",
   TK: "bg-pink-500/15 text-pink-400 border-pink-500/30",
 };
+
+/** AI 平台标签集合（用于筛选与布尔字段失配时的交叉校验） */
+const AI_TAGS = ["GPT", "Claude", "Gemini", "AI"];
+/** 流媒体平台标签集合 */
+const MEDIA_TAGS = ["NF", "Disney+", "YT", "TK"];
+
+/** 节点是否解锁任一 AI 平台：兼容后端布尔字段与 unlockedTags 数组 */
+const isNodeAiUnlocked = (r?: AimNodeResult) =>
+  Boolean(
+    r &&
+      (r.aiUnlocked || r.unlockedTags?.some((t) => AI_TAGS.includes(t)))
+  );
+
+/** 节点是否解锁任一流媒体平台 */
+const isNodeMediaUnlocked = (r?: AimNodeResult) =>
+  Boolean(
+    r &&
+      (r.mediaUnlocked ||
+        r.unlockedTags?.some((t) => MEDIA_TAGS.includes(t)))
+  );
+
+/** 节点是否解锁任一平台（Go AIM 汇总筛选） */
+const isNodeAimUnlocked = (r?: AimNodeResult) =>
+  isNodeAiUnlocked(r) || isNodeMediaUnlocked(r);
 
 export default function Proxies() {
   const { t } = useTranslation();
@@ -343,16 +368,38 @@ export default function Proxies() {
   };
 
   /// 关键字 + Go AIM 解锁状态联合过滤
+  /// （兼容后端布尔字段与 unlockedTags 数组，APP-5）
   const keywordLower = keyword.trim().toLowerCase();
   const filtered = nodes.filter((n) => {
     if (keywordLower && !n.name.toLowerCase().includes(keywordLower)) return false;
     if (filter === "all") return true;
     const r = aim?.results[n.name];
     if (!r) return false;
-    if (filter === "aim") return r.aiUnlocked || r.mediaUnlocked;
-    if (filter === "ai") return r.aiUnlocked;
-    return r.mediaUnlocked;
+    if (filter === "aim") return isNodeAimUnlocked(r);
+    if (filter === "ai") return isNodeAiUnlocked(r);
+    return isNodeMediaUnlocked(r);
   });
+
+  /// 已探测到的结果数：为 0 说明还没跑过探测（切到 AI/流媒体栏时自动补一次）
+  const aimResultCount = Object.keys(aim?.results ?? {}).length;
+  const aimProbing = Boolean(aim?.probing);
+
+  // 切到 Go AIM / AI / 流媒体栏且尚无结果时自动触发一次探测，
+  // 避免用户看到空白列表而误以为「没有可用节点」
+  const aimAutoProbeRef = useRef(false);
+  useEffect(() => {
+    if (filter === "all") {
+      aimAutoProbeRef.current = false;
+      return;
+    }
+    if (!proActive || coreStatus !== "running") return;
+    if (aimAutoProbeRef.current || aimProbing || aimResultCount > 0) return;
+    aimAutoProbeRef.current = true;
+    runGoAimProbe().catch(() => undefined);
+  }, [filter, proActive, coreStatus, aimProbing, aimResultCount]);
+
+  /// 筛选态下探测尚未产生结果：列表区展示加载提示而非「无匹配节点」
+  const aimPending = filter !== "all" && (aimProbing || aimResultCount === 0);
 
   const resetFilters = () => {
     setFilter("all");
@@ -507,16 +554,26 @@ export default function Proxies() {
 
       {/* 节点列表流（Shadowrocket 风格；测速完成后按延迟升序） */}
       {sorted.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-border py-12 px-6 text-center">
-          <Search size={22} className="text-gray-600" />
-          <p className="mt-3 text-sm text-gray-400">{t("proxies.empty.noMatch")}</p>
-          <button
-            onClick={resetFilters}
-            className="mt-4 rounded-lg border border-border-strong px-4 py-1.5 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
-          >
-            {t("proxies.resetFilter")}
-          </button>
-        </div>
+        aimPending ? (
+          <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-border py-12 px-6 text-center">
+            <RefreshCw size={22} className="animate-spin text-accent" />
+            <p className="mt-3 text-sm text-gray-300">{t("proxies.aim.probing")}</p>
+            <p className="mt-2 max-w-sm text-xs leading-relaxed text-gray-500">
+              {t("proxies.aim.probingDesc")}
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center rounded-2xl bg-surface-card border border-border py-12 px-6 text-center">
+            <Search size={22} className="text-gray-600" />
+            <p className="mt-3 text-sm text-gray-400">{t("proxies.empty.noMatch")}</p>
+            <button
+              onClick={resetFilters}
+              className="mt-4 rounded-lg border border-border-strong px-4 py-1.5 text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+            >
+              {t("proxies.resetFilter")}
+            </button>
+          </div>
+        )
       ) : (
       <div className="rounded-2xl bg-surface-card overflow-hidden border border-border">
         {sorted.map((node, idx) => {

@@ -44,6 +44,11 @@ pub struct KernelInfoDto {
 
 #[tauri::command]
 pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    start_core_inner(&app, state.inner()).await
+}
+
+/// 启动内核的实际实现（Tauri 命令与「升级后自动重建隧道」共用）
+async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     // APP 远程管控（APP-4 任务2）：管控优先级最高——被管控的设备禁止启动内核
     if let Some(block) = state.control_block.read().clone() {
         return Err(block.message);
@@ -61,8 +66,8 @@ pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<()
     }
 
     // 启动失败时统一回滚，避免半成品状态
-    if let Err(e) = do_start(&app, &state).await {
-        let _ = do_stop(&state).await;
+    if let Err(e) = do_start(app, state).await {
+        let _ = do_stop(state).await;
         let _ = state.transition(CoreStatus::Error);
         return Err(e);
     }
@@ -82,6 +87,15 @@ pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<()
         );
     }
     Ok(())
+}
+
+/// 覆盖升级后自动重建隧道（APP-5 任务2，仅 iOS 由 lib.rs setup 调用）。
+/// 升级前隧道在使用中且旧扩展已被清理时，用户无需手动点「连接」。
+pub async fn auto_start_after_upgrade(
+    app: AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
+    start_core_inner(&app, state).await
 }
 
 /// 启动准备结果：校验通过但尚未停机/启动（restart 时先产出它再做静态校验）
@@ -331,7 +345,7 @@ async fn apply_prepared(
     Ok(())
 }
 
-async fn do_start(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
+async fn do_start(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let prepared = prepare_start(app, state).await?;
     apply_prepared(prepared, app, state).await
 }
@@ -642,7 +656,22 @@ pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
 }
 
 #[tauri::command]
-pub async fn get_core_status(state: State<'_, AppState>) -> Result<CoreStatusDto, String> {
+pub async fn get_core_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreStatusDto, String> {
+    // APP-5 任务3：强退重开后首帧即认领后台仍在运行的隧道。
+    // 进程内只尝试一次（reattach_attempted），避免状态轮询反复探测。
+    if *state.status.read() == CoreStatus::Stopped
+        && !state
+            .reattach_attempted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        if crate::core::kernel::try_reattach_running_kernel(&app, state.inner()).await {
+            tracing::info!("[reattach] 状态已恢复为 Running");
+        }
+    }
+
     let uptime_secs = state
         .started_at
         .read()

@@ -2,7 +2,9 @@ package com.prism.proxy
 
 import android.app.Activity
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Looper
@@ -22,6 +24,8 @@ import java.util.concurrent.TimeUnit
 // 方法不会被裁剪/改名，无需 @Keep 注解（避免引入 androidx.annotation 依赖）
 object PrismVpnBridge {
     private const val TAG = "PrismVpn"
+    /// 已处理的安装指纹（APP-5 任务2）
+    private const val PREF_UPGRADE_FP = "prism_android_install_fingerprint"
 
     @Volatile
     private var activity: ComponentActivity? = null
@@ -53,6 +57,11 @@ object PrismVpnBridge {
     @JvmStatic
     fun attach(activity: ComponentActivity) {
         this.activity = activity
+
+        // APP-5 任务2：覆盖升级检测（必须在任何 VPN 服务交互前执行）。
+        // 升级会杀掉旧进程，系统侧残留的前台服务/TUN fd/静态引用全部失效，
+        // 不做清理会出现「设置里显示 VPN 已连接但实际无内核」的假连接状态。
+        handleUpgradeIfNeeded(activity)
 
         // 主线程主动触发 Rust 初始化：先确保 so 已加载，再回调 initNative()
         try {
@@ -162,6 +171,42 @@ object PrismVpnBridge {
     fun onServiceReady(service: PrismVpnService) {
         this.service = service
         ready.countDown()
+    }
+
+    // APP-5 任务2：覆盖升级检测。
+    // 指纹 = versionCode|lastUpdateTime：版本号相同但被重装/重签时
+    // lastUpdateTime 也会变化，比单纯 versionCode 更可靠。
+    private fun installFingerprint(activity: Activity): String {
+        return try {
+            val pm = activity.packageManager
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(activity.packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(activity.packageName, 0)
+            }
+            "${info.longVersionCode}|${info.lastUpdateTime}"
+        } catch (t: Throwable) {
+            Log.w(TAG, "read install fingerprint failed", t)
+            ""
+        }
+    }
+
+    private fun handleUpgradeIfNeeded(activity: Activity) {
+        val fingerprint = installFingerprint(activity)
+        if (fingerprint.isEmpty()) return
+        val prefs = activity.getSharedPreferences("prism_state", Context.MODE_PRIVATE)
+        val last = prefs.getString(PREF_UPGRADE_FP, null)
+        if (last == fingerprint) return
+        prefs.edit().putString(PREF_UPGRADE_FP, fingerprint).apply()
+        Log.i(TAG, "检测到覆盖安装 $last -> $fingerprint，清理陈旧 VPN 状态")
+        // 旧服务的 TUN fd 与前台通知随旧进程销毁已失效，这里只清引用并
+        // 尽力停掉可能残留的服务，避免下次启动复用无效 fd
+        try {
+            stopService()
+        } catch (t: Throwable) {
+            Log.w(TAG, "cleanup stale vpn service failed", t)
+        }
     }
 
     // 停止并销毁前台 VPN 服务

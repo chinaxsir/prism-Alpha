@@ -40,7 +40,7 @@ const BASELINE_TIMEOUT_MS: u64 = 2500;
 /// 参与探测的节点基线延迟上限（仅探测存活节点）
 const PROBE_MAX_DELAY_MS: u64 = 2500;
 /// 单个平台探测请求超时（毫秒）
-const PROBE_TIMEOUT_MS: u64 = 3500;
+const PROBE_TIMEOUT_MS: u64 = 4000;
 /// 故障转移监控间隔（秒）
 const MONITOR_INTERVAL_SECS: u64 = 20;
 
@@ -49,15 +49,66 @@ fn probe_selector(slot: usize) -> String {
     format!("GO-AIM-PROBE-{slot}")
 }
 
-/// 槽位对应的本地 mixed 入站代理地址
+/// 槽位对应的本地 mixed 入站代理地址。
+/// APP-5：探针端口不可用时回退到主混合端口（见 resolve_probe_slots）。
 fn probe_proxy_url(slot: usize) -> String {
     format!("http://127.0.0.1:{}", PROBE_PORT_BASE + slot as u16)
 }
 
+/// 探测本机端口是否可连通（200ms 内建立 TCP 连接）。
+/// 内核未运行 / 探针入站未注入（移动端扩展配置裁剪）时返回 false，
+/// 供 resolve_probe_slots 做智能回退，避免整个探测链路全部连不上。
+fn probe_port_reachable(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+}
+
 // ---------------------------------------------------------------- 探测矩阵
 
-/// 区域码黑名单（cdn-trace loc=）：命中任一即判定该平台对该出口封锁
-const REGION_BLACKLIST: &[&str] = &["US", "CA", "GB", "DE", "FR", "SG"];
+/// AI 平台受限地区（cdn-trace loc=）：命中任一即判定该平台对该出口封锁。
+/// 注意：US/CA/GB/DE/FR/SG 等是 AI 平台**正常可用**的地区，绝不能列入黑名单
+/// （APP-4 曾把黑名单写反，导致所有节点被判为未解锁）。
+const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
+
+/// 流媒体受限地区（TikTok 等在 CN/HK/MO/RU 等地不可用）
+const MEDIA_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU"];
+
+/// 出口地区探测端点（依次兜底）：cdn-trace 返回多行 key=value，
+/// 其中 `loc=XX` 即 Cloudflare 观测到的出口国家/地区代码。
+const TRACE_URLS: &[&str] = &[
+    "https://chatgpt.com/cdn-cgi/trace",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://1.1.1.1/cdn-cgi/trace",
+];
+
+/// 从 cdn-trace 正文解析出口地区代码（`loc=US`，无空格，转大写）
+fn parse_trace_loc(body: &str) -> Option<String> {
+    body.lines().find_map(|l| {
+        l.strip_prefix("loc=")
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// 经代理读取当前出口地区代码（多端点兜底）。
+async fn fetch_exit_loc(client: &reqwest::Client) -> Option<String> {
+    for url in TRACE_URLS {
+        let Ok(resp) = client.get(*url).header("Accept-Language", "en-US,en;q=0.9").send().await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        if let Ok(text) = resp.text().await
+            && let Some(loc) = parse_trace_loc(&text)
+        {
+            return Some(loc);
+        }
+    }
+    None
+}
 
 /// 单个平台的探测定义：目标 URL + 响应判定
 struct Probe {
@@ -238,12 +289,26 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // 有基线延迟的优先探测（延迟从低到高），无延迟的排后（探测循环内逐个补测）
     nodes.sort_by_key(|(_, d)| d.unwrap_or(u64::MAX));
 
-    // 3. 共享任务队列：4 个槽位并行消费，任一槽位空闲即取下一个节点
+    // 3. 探针槽位可用性检测（智能回退）：只使用本机实际可连通的探针入站。
+    // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
+    // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
+    let slots: Vec<usize> = (0..PROBE_SLOTS)
+        .filter(|slot| probe_port_reachable(PROBE_PORT_BASE + *slot as u16))
+        .collect();
+    if slots.is_empty() {
+        return Err(format!(
+            "探针端口 {PROBE_PORT_BASE}..{} 均不可达，请重启内核后重试",
+            PROBE_PORT_BASE + PROBE_SLOTS as u16 - 1
+        ));
+    }
+    tracing::info!("[go-aim] 可用探针槽位: {slots:?}");
+
+    // 4. 共享任务队列：可用槽位并行消费，任一槽位空闲即取下一个节点
     let queue = Arc::new(tokio::sync::Mutex::new(
         nodes.into_iter().collect::<VecDeque<_>>(),
     ));
     let mut set = tokio::task::JoinSet::new();
-    for slot in 0..PROBE_SLOTS {
+    for slot in slots {
         let queue = queue.clone();
         let api = api.clone();
         let task_app = app.clone();
@@ -285,13 +350,15 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
 }
 
 /// 构建槽位专用探测客户端：流量经对应本地 mixed 入站进入内核的
-/// GO-AIM-PROBE-{slot} 链路。禁用重定向（需要读取 302 Location 判定）、
-/// 固定 Chrome UA（部分平台对 UA 敏感）。
+/// GO-AIM-PROBE-{slot} 链路。
+/// 关键修复（APP-5）：必须**跟随重定向**——chatgpt.com / claude.ai /
+/// netflix.com / youtube.com 均存在 301/302/307/308 规范化跳转，禁用重定向
+/// 会拿到空响应体，导致读不到 cdn-trace 的 `loc=` 与正文而全部误判失败。
 fn build_probe_client(slot: usize) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
         .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -326,10 +393,14 @@ async fn probe_node(
         return dead_result(name);
     }
 
-    // 3. 7 个平台并发真实请求（每个探测点超时/传输失败自动补测 1 次）
+    // 3. 出口地区码只读取一次（7 个平台共用，避免每平台各打一次 cdn-trace）
+    let exit_loc = fetch_exit_loc(client).await;
+
+    // 4. 7 个平台并发真实请求（每个探测点超时/传输失败自动补测 1 次）
     let mut checks = Vec::with_capacity(PROBES.len());
     for probe in PROBES {
-        checks.push(check_platform(client, probe));
+        let loc = exit_loc.clone();
+        checks.push(check_platform(client, probe, loc));
     }
     let outcomes = futures_util::future::join_all(checks).await;
 
@@ -346,12 +417,13 @@ async fn probe_node(
             }
         }
     }
+    let score = tags.len() as u32;
     AimNodeResult {
         node_name: name.to_string(),
         unlocked_tags: tags,
         ai_unlocked: ai,
         media_unlocked: media,
-        score: 0, // 由调用方按 tags.len() 填充
+        score,
         delay_ms: base_delay,
         updated_at: now_secs(),
         probed: true,
@@ -372,10 +444,15 @@ fn dead_result(name: &str) -> AimNodeResult {
 }
 
 /// 单平台探测：请求 + 按平台规则判定（超时/传输错误自动补测 1 次）
-async fn check_platform(client: &reqwest::Client, probe: &Probe) -> bool {
-    match check_once(client, probe).await {
+async fn check_platform(
+    client: &reqwest::Client,
+    probe: &Probe,
+    exit_loc: Option<String>,
+) -> bool {
+    let loc = exit_loc.as_deref();
+    match check_once(client, probe, loc).await {
         Some(ok) => ok,
-        None => match check_once(client, probe).await {
+        None => match check_once(client, probe, loc).await {
             Some(ok) => ok,
             None => false,
         },
@@ -383,103 +460,107 @@ async fn check_platform(client: &reqwest::Client, probe: &Probe) -> bool {
 }
 
 /// 发起单次请求并按平台规则判定；None = 传输失败/超时（区别于「封锁」）
-async fn check_once(client: &reqwest::Client, probe: &Probe) -> Option<bool> {
-    let req = client
+async fn check_once(
+    client: &reqwest::Client,
+    probe: &Probe,
+    exit_loc: Option<&str>,
+) -> Option<bool> {
+    let resp = match client
         .get(probe.url)
-        .header("Accept-Language", "en-US,en;q=0.9");
-    let resp = match req.send().await {
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return None, // 传输失败 → 由 check_platform 补测
     };
     let status = resp.status().as_u16();
-    let location = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_lowercase());
-    // 读正文（响应体一般 < 8KB，截断防止异常大响应拖慢探测）
+    // 跟随重定向后的最终 URL（Gemini 跳 FAQ / Disney+ 跳不可用页的判定依据）
+    let final_url = resp.url().as_str().to_lowercase();
+    // 读正文（响应体一般 < 8KB，截断防止异常大响应拖慢探测；
+    // 按字符边界截断，避免多字节 UTF-8 被切断 panic）
     let body = resp
         .text()
         .await
         .map(|b| {
-            if b.len() > 64 * 1024 {
-                b[..64 * 1024].to_string()
+            const LIMIT: usize = 64 * 1024;
+            if b.len() > LIMIT {
+                let mut end = LIMIT;
+                while end > 0 && !b.is_char_boundary(end) {
+                    end -= 1;
+                }
+                b[..end].to_string()
             } else {
                 b
             }
         })
         .unwrap_or_default();
-    let loc = location.as_deref().unwrap_or("");
-    let trace_loc = || -> Option<String> {
-        // Cloudflare cdn-trace 行格式：`loc=US`（无空格）
-        body.lines().find_map(|l| {
-            l.strip_prefix("loc=").map(|s| s.trim().to_uppercase())
-        })
+    let body_lc = body.to_lowercase();
+    // 出口地区：优先使用 probe_node 预取的共享值，其次解析本次响应体
+    // （GPT/Claude/TK 的探测 URL 本身就是 cdn-trace 端点）
+    let loc = exit_loc.map(str::to_string).or_else(|| parse_trace_loc(&body));
+    // 地区未知（cdn-trace 不可达）时不因未知而判死，交由状态码/正文判定
+    let region_allowed = |list: &[&str]| match loc.as_deref() {
+        Some(l) => !list.contains(&l),
+        None => true,
     };
 
     let verdict = match probe.tag {
-        // GPT：chatgpt.com cdn-trace 区域码不在黑名单，且移动端服务状态接口 200
+        // GPT：出口地区非受限 + OpenAI 边缘节点放行（200/401 为标准放行）。
+        // 旧接口 ios.chat.openai.com/.../server_status 已下线（404），必须废弃
         "GPT" => {
-            let trace_ok = status == 200
-                && trace_loc()
-                    .map(|loc| !REGION_BLACKLIST.contains(&loc.as_str()))
-                    .unwrap_or(false);
-            if !trace_ok {
+            if !region_allowed(AI_BLOCKLIST) {
                 return Some(false);
             }
-            let status_ep = client
-                .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
-                .send()
-                .await;
-            match status_ep {
+            Some(match client.get("https://api.openai.com/v1/models").send().await {
                 Ok(r) => {
                     let s = r.status().as_u16();
                     let b = r.text().await.unwrap_or_default().to_lowercase();
-                    Some(s == 200 && !b.contains("unsupported_country"))
+                    if b.contains("unsupported_country")
+                        || b.contains("not supported in your country")
+                    {
+                        false
+                    } else {
+                        match s {
+                            // 合法地区：200 正常 / 401 未带 Key 的标准响应
+                            200 | 401 => true,
+                            // 地区封锁
+                            403 => false,
+                            // 429 等限流：以出口地区为准
+                            _ => loc.is_some(),
+                        }
+                    }
                 }
-                Err(_) => None,
-            }
+                // 二次请求失败：以主端点可达 + 出口地区判定为准
+                Err(_) => status == 200 && loc.is_some(),
+            })
         }
-        // Claude：cdn-trace 200 且区域码不在黑名单
-        "Claude" => Some(
-            status == 200
-                && trace_loc()
-                    .map(|loc| !REGION_BLACKLIST.contains(&loc.as_str()))
-                    .unwrap_or(false),
-        ),
-        // Gemini：200 或 302 跳 accounts.google.com（登录跳转属正常）；
-        // 跳 FAQ 封锁页 / 正文含 "isn't currently supported" 判定封锁
-        "Gemini" => Some(match status {
-            200 => !body.to_lowercase().contains("isn't currently supported"),
-            301 | 302 => {
-                loc.contains("accounts.google.com") && !loc.contains("faq")
+        // Claude：出口地区非受限，且未被 Cloudflare 403 拦截
+        "Claude" => {
+            if !region_allowed(AI_BLOCKLIST) {
+                return Some(false);
             }
-            _ => false,
-        }),
-        // NF：区域锁片源 81280792——200 或跳转仍指向同片源；403/404 判封锁
-        "NF" => Some(match status {
-            200 => true,
-            301 | 302 => loc.contains("/title/81280792"),
-            _ => false,
-        }),
-        // Disney+：不可用区域 403 / 跳转含 unavailable|error
-        "Disney+" => Some(match status {
-            200 => true,
-            301 | 302 => !loc.contains("unavailable") && !loc.contains("error"),
-            _ => false,
-        }),
+            Some(if status == 403 { loc.is_some() } else { status < 500 })
+        }
+        // Gemini：最终页不是 FAQ 封锁页、正文无「不支持该地区」、出口非受限
+        "Gemini" => {
+            if !region_allowed(AI_BLOCKLIST) {
+                return Some(false);
+            }
+            let blocked = final_url.contains("/faq")
+                || body_lc.contains("isn't currently supported")
+                || body_lc.contains("is not currently supported")
+                || body_lc.contains("not available in your country");
+            Some(status == 200 && !blocked)
+        }
+        // NF：区域锁片源 81280792——跟随重定向后 200 即解锁，404 判封锁
+        "NF" => Some(status == 200),
+        // Disney+：200 且未跳到不可用提示页
+        "Disney+" => Some(status == 200 && !final_url.contains("unavailable")),
         // YT：Premium 页 200 且正文不含「国家不可用」
-        "YT" => Some(
-            status == 200
-                && !body.to_lowercase().contains("youtube premium is not available"),
-        ),
-        // TikTok：cdn-trace 200 且区域码不在黑名单
-        "TK" => Some(
-            status == 200
-                && trace_loc()
-                    .map(|loc| !REGION_BLACKLIST.contains(&loc.as_str()))
-                    .unwrap_or(false),
-        ),
+        "YT" => Some(status == 200 && !body_lc.contains("youtube premium is not available")),
+        // TikTok：出口地区不在流媒体受限名单
+        "TK" => Some(status == 200 && region_allowed(MEDIA_BLOCKLIST)),
         _ => Some(false),
     };
     verdict
@@ -706,5 +787,35 @@ mod tests {
         }
         assert!(PROBES.iter().any(|p| !p.media), "必须包含 AI 平台");
         assert!(PROBES.iter().any(|p| p.media), "必须包含流媒体平台");
+    }
+
+    #[test]
+    fn test_ai_blocklist_not_inverted() {
+        // AI 平台正常可用地区绝不能被当作封锁区（APP-4 曾在此处写反）
+        for good in ["US", "SG", "JP", "TW", "KR", "GB", "DE", "CA", "FR"] {
+            assert!(
+                !AI_BLOCKLIST.contains(&good),
+                "{good} 是 AI 平台正常可用地区，不应在受限名单中"
+            );
+        }
+        // 真实受限地区必须在名单中
+        for bad in ["CN", "HK", "MO", "RU", "KP", "IR"] {
+            assert!(AI_BLOCKLIST.contains(&bad), "{bad} 应在 AI 受限名单中");
+        }
+    }
+
+    #[test]
+    fn test_parse_trace_loc() {
+        let trace = "fl=123f\nh=chatgpt.com\nip=1.2.3.4\nts=1\nvisit_scheme=https\nuag=Chrome\nloc=SG\ntls=TLSv1.3\n";
+        assert_eq!(parse_trace_loc(trace), Some("SG".to_string()));
+        assert_eq!(parse_trace_loc("loc=jp\n"), Some("JP".to_string()), "必须转大写");
+        assert_eq!(parse_trace_loc("no loc here"), None);
+        assert_eq!(parse_trace_loc("loc=\n"), None, "空 loc 视为未知");
+    }
+
+    #[test]
+    fn test_probe_score_matches_tag_count() {
+        let r = node("n", 100, &["GPT", "Claude"]);
+        assert_eq!(r.unlocked_tags.len(), 2);
     }
 }

@@ -6,6 +6,9 @@ const zh: Record<string, string> = {
   // ---- 节点 / Go AIM 筛选 ----
   "proxies.aim.ai": "AI",
   "proxies.aim.media": "流媒体",
+  "proxies.aim.probing": "正在检测节点的 AI 与流媒体解锁能力，请稍候…",
+  "proxies.aim.probingDesc":
+    "检测逐节点进行，结果会实时刷新到列表中；检测期间可继续浏览「全部」节点。",
   "proxies.proto.direct": "直连",
   "proxies.proto.block": "阻断",
   "proxies.goAim.guard": "请先激活 Pro 授权以使用 Go AIM 智能筛选与检测",
@@ -142,6 +145,10 @@ const en: Record<string, string> = {
   // ---- Nodes / Go AIM filter ----
   "proxies.aim.ai": "AI",
   "proxies.aim.media": "Streaming",
+  "proxies.aim.probing":
+    "Detecting AI & streaming unlock capability for each node, please wait…",
+  "proxies.aim.probingDesc":
+    "Detection runs node by node and results stream into the list in real time. You can keep browsing the All tab meanwhile.",
   "proxies.proto.direct": "Direct",
   "proxies.proto.block": "Block",
   "proxies.goAim.guard":

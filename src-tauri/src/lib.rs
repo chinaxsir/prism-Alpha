@@ -131,6 +131,68 @@ pub fn run() {
             core::app_control::spawn_startup_check(control_handle.clone());
             core::app_control::spawn_heartbeat(control_handle);
 
+            // APP-5 任务2：iOS 覆盖升级启动自愈。指纹（版本号|build|二进制
+            // mtime）变化即清理驻留的旧版扩展进程——不清理则系统里运行的是
+            // 旧 appex，UI 显示未连接而实际仍在代理。
+            #[cfg(target_os = "ios")]
+            {
+                if platform::ios::upgrade_selfheal() {
+                    tracing::info!("[upgrade] 检测到覆盖升级，已清理驻留的旧版扩展进程");
+                }
+            }
+
+            // APP-5 任务3：强退重开自动认领后台仍在运行的隧道。
+            // 延迟 1s 启动，给 iOS 侧的覆盖升级自愈（杀旧扩展 + 删旧配置）
+            // 留出清理窗口，避免刚认领就被清理流程打断。
+            let reattach_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let state = reattach_handle.state::<core::state::AppState>();
+                if state
+                    .reattach_attempted
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return;
+                }
+                if core::kernel::try_reattach_running_kernel(&reattach_handle, state.inner()).await
+                {
+                    tracing::info!("[reattach] 后台隧道已认领，状态恢复为运行中");
+                }
+            });
+
+            // APP-5 任务2：升级前隧道在使用中 → 清理完成后自动重建隧道，
+            // 避免用户升级后看到「未连接」而误以为配置/订阅丢失
+            #[cfg(target_os = "ios")]
+            {
+                let upgrade_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if !platform::ios::take_pending_restart() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let state = upgrade_handle.state::<core::state::AppState>();
+                    // 已被「强退重开认领」接管则不再重建（避免双启动）
+                    if *state.status.read() != core::state::CoreStatus::Stopped {
+                        return;
+                    }
+                    // 旧扩展可能仍处于 connecting/connected：先同步停掉，
+                    // 否则 startVPNTunnel 会因会话被占用而失败
+                    if platform::ios::vpn_is_connected() {
+                        platform::ios::stop_tunnel();
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    }
+                    tracing::info!("[upgrade] 升级前隧道在使用中，自动重建隧道");
+                    if let Err(e) = ipc::commands::auto_start_after_upgrade(
+                        upgrade_handle.clone(),
+                        state.inner(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("[upgrade] 自动重建隧道失败: {e}");
+                    }
+                });
+            }
+
             // 系统托盘（仅桌面端；menu/tray API 在移动端被 cfg 移除）：
             // 左键单击显示主窗口；菜单提供 显示/退出
             #[cfg(desktop)]

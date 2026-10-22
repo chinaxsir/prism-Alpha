@@ -19,6 +19,12 @@ unsafe extern "C" {
     /// 返回系统级 VPN 连接起始 Unix 毫秒时间戳（NEVPNConnection.connectedDate）；
     /// 未连接时返回 0（IPA-12，见 PrismTunnelController.swift @_cdecl）
     fn prism_ios_vpn_connected_timestamp() -> i64;
+    /// 覆盖升级启动自愈（APP-5 任务2）：返回 1 = 本次为升级后首次启动且
+    /// 已执行清理（杀驻留旧扩展 + 标记待重启），0 = 非升级启动
+    fn prism_ios_upgrade_selfheal() -> i32;
+    /// 取走并清除「升级后待自动重启」标记（APP-5 任务2）；
+    /// 返回 1 = 需要在清理后自动重建隧道
+    fn prism_ios_take_pending_restart() -> i32;
 }
 
 pub fn start_tunnel(config_content: &str) -> Result<()> {
@@ -63,4 +69,16 @@ pub fn vpn_is_connected() -> bool {
 pub fn vpn_connected_timestamp_ms() -> u64 {
     let ts = unsafe { prism_ios_vpn_connected_timestamp() };
     if ts > 0 { ts as u64 } else { 0 }
+}
+
+/// 覆盖升级启动自愈（APP-5 任务2）：比对「版本号|build|二进制 mtime」指纹，
+/// 变化时清理驻留的旧版扩展进程并标记待重启。返回 true 表示本次是升级后
+/// 首次启动（调用方据此决定是否自动重建隧道）。
+pub fn upgrade_selfheal() -> bool {
+    unsafe { prism_ios_upgrade_selfheal() == 1 }
+}
+
+/// 取走并清除「升级后待自动重启」标记（一次性）
+pub fn take_pending_restart() -> bool {
+    unsafe { prism_ios_take_pending_restart() == 1 }
 }

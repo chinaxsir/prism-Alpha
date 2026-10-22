@@ -1177,37 +1177,11 @@ export default function Settings() {
               <div className="text-xs font-medium text-gray-200">
                 {t("pro.benefitsTitle")}
               </div>
-              <ul className="space-y-1 text-[11px] leading-relaxed text-gray-500">
-                <li>
-                  •{" "}
-                  <span className="font-medium text-gray-300">
-                    {t("pro.name.goAim")}
-                  </span>
-                  {t("pro.benefit1")}
-                </li>
-                <li>
-                  •{" "}
-                  <span className="font-medium text-gray-300">
-                    {t("pro.name.goLan")}
-                  </span>
-                  {t("pro.benefit2")}
-                </li>
-                <li>
-                  •{" "}
-                  <span className="font-medium text-gray-300">
-                    {t("pro.name.goCus")}
-                  </span>
-                  {t("pro.benefit3")}
-                </li>
-                <li>
-                  •{" "}
-                  <span className="font-medium text-gray-300">{t("pro.name.sync")}</span>
-                  {t("pro.benefit4")}
-                </li>
-              </ul>
-              <div className="border-t border-border pt-1 text-[11px] text-gray-500/80">
-                {t("pro.seatsHint")}
-              </div>
+              {/* APP-5 任务4：精简为 3 项核心权益，用「 · 」分隔；
+                  移除多端同步 / 订阅同步 / 设备额度等旁支信息 */}
+              <p className="text-[11px] leading-relaxed text-gray-500">
+                {t("pro.benefitsLine")}
+              </p>
             </div>
             <div className="flex flex-wrap gap-2 px-3 py-3">
               <button
