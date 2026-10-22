@@ -7,6 +7,7 @@
 //! - `config_builder`: Clash YAML 订阅 → sing-box runtime JSON
 //! - `tun`: TUN 虚拟网卡挂载（跨平台抽象）
 
+pub mod app_control;
 pub mod config_builder;
 pub mod events;
 pub mod go_aim;

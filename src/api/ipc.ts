@@ -182,6 +182,10 @@ export interface GoAimStatus {
   enabled: boolean;
   lockedNode: string | null;
   probing: boolean;
+  /** 手动指定的锁定节点（APP-4 任务3.3；null = 自动评级模式） */
+  pinnedNode: string | null;
+  /** 选点模式："manual"（手动指定优先）| "auto"（评级自动） */
+  selectionMode: "manual" | "auto";
   results: Record<string, AimNodeResult>;
 }
 
@@ -189,6 +193,9 @@ export const getGoAimStatus = () => invoke<GoAimStatus>("get_go_aim_status");
 export const setGoAimEnabled = (enabled: boolean) =>
   invoke<void>("set_go_aim_enabled", { enabled });
 export const runGoAimProbe = () => invoke<boolean>("run_go_aim_probe");
+/** 清除 Go AIM 手动指定节点，回到自动评级选点（APP-4 任务3.3） */
+export const clearGoAimPinnedNode = () =>
+  invoke<void>("clear_go_aim_pinned_node");
 
 // ---- Go Lan ----
 

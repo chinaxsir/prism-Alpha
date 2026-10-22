@@ -44,6 +44,10 @@ pub struct KernelInfoDto {
 
 #[tauri::command]
 pub async fn start_core(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // APP 远程管控（APP-4 任务2）：管控优先级最高——被管控的设备禁止启动内核
+    if let Some(block) = state.control_block.read().clone() {
+        return Err(block.message);
+    }
     // 幂等：启动含下载内核/构建配置等长耗时步骤，期间重复点击或前端自动
     // 重试会再次进入本函数。只有一个调用完成 Stopped/Error -> Starting，
     // 其余若已在 Starting（启动进行中）或 Running（已启动）直接成功返回，
@@ -402,6 +406,10 @@ fn load_enabled_profiles(state: &AppState) -> Vec<(String, String, String)> {
 /// 重建配置并重启内核（调用方保证当前为 Running）。
 /// 先构建并静态校验新配置，通过后才停旧内核；校验失败则网络不中断。
 pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    // APP 远程管控：被管控的设备禁止重启内核（与 start_core 同一优先级）
+    if let Some(block) = state.control_block.read().clone() {
+        return Err(block.message);
+    }
     // 1. 准备新配置（不改变任何状态）
     let prepared = prepare_start(app, state).await?;
 
@@ -748,6 +756,7 @@ pub async fn set_outbound_mode(
 
 #[tauri::command]
 pub async fn select_proxy(
+    app: AppHandle,
     group: String,
     name: String,
     state: State<'_, AppState>,
@@ -765,10 +774,33 @@ pub async fn select_proxy(
         let _ = state.kernel_api().select_proxy("GLOBAL", &name).await;
     }
 
+    // Go AIM 手动指定（APP-4 任务3.3）：用户在节点页手动选中节点时，
+    // 若 Go AIM 开启，立即写入 go_aim_pinned_node 并落盘——此后探测评级
+    // 照跑，但选点始终尊重该节点（手动指定优先级高于自动评级，绝不覆盖）
+    let main_group = state.main_selector.read().clone();
+    if state.settings.read().go_aim_enabled && Some(&group) == main_group.as_ref() {
+        let mut settings = state.settings.read().clone();
+        if settings.go_aim_pinned_node.as_deref() != Some(name.as_str()) {
+            settings.go_aim_pinned_node = Some(name.clone());
+            if let Err(e) = state.save_settings(settings.clone()) {
+                tracing::error!("save go_aim_pinned_node failed: {e}");
+            }
+            *state.aim_locked_node.write() = Some(name.clone());
+            let _ = app.emit(
+                crate::core::go_aim::AIM_EVENT,
+                serde_json::json!({ "locked": name }),
+            );
+        }
+    }
+
     // 「切换策略时关闭连接」：断开后由应用按新节点重建，避免旧连接继续走旧节点
     if state.settings.read().close_connections_on_switch {
         let _ = state.kernel_api().close_all_connections().await;
     }
+
+    // 仪表盘「当前节点」卡与 Go AIM 卡一致性（APP-4 任务4.1）：
+    // 切换节点后广播 proxies://changed，Dashboard 立即重拉主组 now
+    let _ = app.emit("proxies://changed", serde_json::json!({ "group": group }));
     Ok(())
 }
 
@@ -1788,13 +1820,35 @@ pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Res
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
     if *state.status.read() != CoreStatus::Running {
-        return Err("内核未运行，无法探测".into());
+        return Err("请先启动代理内核后再执行 Go AIM 真实节点检测".into());
     }
     let already = state.aim_probing.load(std::sync::atomic::Ordering::Acquire);
     if !already {
         crate::core::go_aim::start_probe(app);
     }
     Ok(already)
+}
+
+/// 清除 Go AIM 手动指定的锁定节点，回到自动评级选点（APP-4 任务3.3）。
+/// 内核运行中时立即触发一轮重新探测评级，自动模式即刻生效。
+#[tauri::command]
+pub async fn clear_go_aim_pinned_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if !state.is_pro_active() {
+        return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
+    }
+    let mut settings = state.settings.read().clone();
+    settings.go_aim_pinned_node = None;
+    state
+        .save_settings(settings)
+        .map_err(|e| format!("保存设置失败: {e}"))?;
+    // 解除手动指定后立即重新评级选点（运行中才有意义）
+    if state.settings.read().go_aim_enabled
+        && *state.status.read() == CoreStatus::Running
+    {
+        crate::core::go_aim::spawn_monitor(app.clone());
+        crate::core::go_aim::start_probe(app);
+    }
+    Ok(())
 }
 
 // ============================== Go Lan（Pro） ==============================

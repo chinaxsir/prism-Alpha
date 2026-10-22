@@ -31,7 +31,7 @@ fn default_mode() -> String {
 }
 
 fn default_managed_server() -> String {
-    "https://prism.sarl".into()
+    crate::obf!("https://prism.sarl")
 }
 
 fn default_mtu() -> u32 {

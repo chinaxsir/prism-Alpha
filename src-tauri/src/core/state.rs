@@ -99,6 +99,11 @@ pub struct UserSettings {
     /// Go AIM（Pro）：AI/流媒体自动探测锁定开关
     #[serde(default)]
     pub go_aim_enabled: bool,
+    /// Go AIM（Pro）：用户手动指定的锁定节点（APP-4 任务3.3）。
+    /// Some(node) = 手动指定模式（探测评级照跑，选点始终尊重该节点，绝不覆盖）；
+    /// None = 自动模式。节点页手动选中节点时自动写入。
+    #[serde(default)]
+    pub go_aim_pinned_node: Option<String>,
     /// 界面语言（system | zh | en；随设置表单一起落盘）
     #[serde(default = "default_system")]
     pub language: String,
@@ -130,6 +135,7 @@ impl Default for UserSettings {
             block_quic: false,
             close_connections_on_switch: false,
             go_aim_enabled: false,
+            go_aim_pinned_node: None,
             language: "system".to_string(),
             theme: "system".to_string(),
         }
@@ -261,6 +267,9 @@ pub struct AppState {
     /// 后台（锁屏/切到其他 App）时暂停向 WebView 推送高频事件与连接聚合，
     /// 主 App 静默零唤醒耗电；扩展内核仍在底层持续累计总流量。
     pub app_in_foreground: std::sync::atomic::AtomicBool,
+    /// APP 远程管控阻断状态（app-control：服务端返回 allowed=false 时置位）。
+    /// None = 无管控；Some(block) = 阻止 start_core 并已广播前端。
+    pub control_block: RwLock<Option<super::app_control::ControlBlock>>,
 }
 
 impl AppState {
@@ -310,6 +319,7 @@ impl AppState {
             today_bytes_cache: RwLock::new(0),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
             app_in_foreground: std::sync::atomic::AtomicBool::new(true),
+            control_block: RwLock::new(None),
         }
     }
 

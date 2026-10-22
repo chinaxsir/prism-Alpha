@@ -897,6 +897,13 @@ pub fn deactivate(data_dir: &Path) -> EntitlementStatus {
     EntitlementStatus::inactive()
 }
 
+/// 本地已激活的 License Key（app-control 心跳上报用；未激活返回 None）
+pub fn get_saved_license_key(data_dir: &Path) -> Option<String> {
+    load_cache(data_dir)
+        .map(|c| c.license)
+        .filter(|k| !k.trim().is_empty())
+}
+
 /// 从加密缓存读取同步凭据对 (license_key, email)；
 /// 未激活或邮箱缺失（旧版迁移缓存）时返回 None —— 云端同步不可用。
 pub fn cached_credentials(data_dir: &Path) -> Option<(String, String)> {

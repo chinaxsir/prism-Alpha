@@ -124,6 +124,13 @@ pub fn run() {
                 }
             });
 
+            // APP 远程管控（APP-4 任务2）：启动单次上报 + 每 5 分钟心跳。
+            // fail-open——服务不可达/断网完全不影响使用；仅服务端明确
+            // allowed=false 时停止内核并阻止启动（管控优先级最高）。
+            let control_handle = app.handle().clone();
+            core::app_control::spawn_startup_check(control_handle.clone());
+            core::app_control::spawn_heartbeat(control_handle);
+
             // 系统托盘（仅桌面端；menu/tray API 在移动端被 cfg 移除）：
             // 左键单击显示主窗口；菜单提供 显示/退出
             #[cfg(desktop)]
@@ -202,6 +209,7 @@ pub fn run() {
             ipc::commands::get_go_aim_status,
             ipc::commands::set_go_aim_enabled,
             ipc::commands::run_go_aim_probe,
+            ipc::commands::clear_go_aim_pinned_node,
             ipc::commands::get_go_lan_settings,
             ipc::commands::save_go_lan_settings,
             ipc::commands::sync_go_lan_managed,

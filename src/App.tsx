@@ -1,6 +1,6 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
-import { ShieldAlert } from "lucide-react";
+import { ShieldAlert, ShieldBan } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import Sidebar from "@/components/Sidebar";
 import TitleBar from "@/components/TitleBar";
@@ -35,6 +35,11 @@ export default function App() {
   const language = usePrefsStore((s) => s.language);
   const setLanguage = usePrefsStore((s) => s.setLanguage);
   const setTheme = usePrefsStore((s) => s.setTheme);
+  // APP 远程管控阻断状态（app://control 事件维护；null = 无管控）
+  const [controlBlock, setControlBlock] = useState<{
+    reason: "version_blocked" | "user_blocked";
+    message: string;
+  } | null>(null);
 
   /** 拉取后端运行时快照并写入全局 store（今日流量 / 速率 / 60s 曲线 / 连接 / 分析） */
   const refreshRuntime = useCallback(async () => {
@@ -211,6 +216,28 @@ export default function App() {
     };
   }, [t]);
 
+  // APP 远程管控广播（APP-4 任务2）：allowed=false → 全屏不可关闭阻断框；
+  // allowed=true（解除管控）→ 撤下阻断框。后端已同步停止内核并禁止启动。
+  useEffect(() => {
+    const unlisten = listen<{
+      allowed: boolean;
+      reason: string;
+      message: string;
+    }>("app://control", (event) => {
+      if (event.payload.allowed) {
+        setControlBlock(null);
+        return;
+      }
+      setControlBlock({
+        reason: event.payload.reason === "user_blocked" ? "user_blocked" : "version_blocked",
+        message: event.payload.message,
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   return (
     <div className="flex flex-col h-screen bg-surface text-gray-200 overflow-hidden">
       <TitleBar />
@@ -246,6 +273,25 @@ export default function App() {
       </div>
       <BottomNav />
       <ToastViewport />
+      {/* APP 远程管控阻断框（APP-4 任务2）：全屏遮罩、不可关闭——被管控设备
+          内核已被后端停止且无法启动，用户只能按提示更新版本或联系客服 */}
+      {controlBlock && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-6">
+          <div className="w-full max-w-sm space-y-4 rounded-2xl border border-latency-bad/40 bg-surface-card p-6 text-center">
+            <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-latency-bad/15">
+              <ShieldBan size={22} className="text-latency-bad" />
+            </span>
+            <h2 className="text-base font-semibold text-gray-100">
+              {controlBlock.reason === "user_blocked"
+                ? t("appControl.userBlocked")
+                : t("appControl.versionBlocked")}
+            </h2>
+            <p className="break-all text-xs leading-relaxed text-gray-400">
+              {controlBlock.message}
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

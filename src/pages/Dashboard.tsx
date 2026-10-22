@@ -506,6 +506,7 @@ export default function Dashboard() {
               : currentNode || nodes[0]?.name || "—"
           }
           onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
+          wrap
         />
         {mobile ? (
           <StatChip
@@ -786,11 +787,14 @@ function StatChip({
   label,
   value,
   onClick,
+  /** APP-4 任务4.1：节点名可长达数十字符——不截断，最多两行完整展示 */
+  wrap = false,
 }: {
   icon: ReactNode;
   label: string;
   value: string;
   onClick?: () => void;
+  wrap?: boolean;
 }) {
   return (
     <div
@@ -808,7 +812,15 @@ function StatChip({
         <span>{label}</span>
       </div>
       <div className="mt-1 flex items-center gap-0.5 min-w-0">
-        <span className="text-sm font-semibold tabular-nums text-gray-100 truncate">
+        <span
+          className={clsx(
+            "text-sm font-semibold tabular-nums text-gray-100",
+            wrap
+              ? "break-all line-clamp-2 leading-snug"
+              : "truncate"
+          )}
+          title={value}
+        >
           {value}
         </span>
         {onClick && <ChevronRight size={12} className="shrink-0 text-gray-600" />}
@@ -848,7 +860,12 @@ function EngineCard({
             {tag}
           </span>
         </div>
-        <div className="mt-1 text-xs text-gray-400 truncate" title={status}>
+        {/* APP-4 任务4.1：状态副标题（含 Go AIM 锁定节点名）不再单行截断，
+            最多两行完整展示——与「当前节点」卡保持同一节点名一致性 */}
+        <div
+          className="mt-1 text-xs text-gray-400 break-all line-clamp-2 leading-snug"
+          title={status}
+        >
           {status}
         </div>
       </div>

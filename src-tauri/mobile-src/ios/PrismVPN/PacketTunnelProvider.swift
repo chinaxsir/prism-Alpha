@@ -777,6 +777,46 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         root["outbounds"] = outbounds
 
+        // 2.5 GO-AIM 4 路隔离探针兜底（APP-4 任务3.1）
+        // Rust 端 config_builder 已注入探针入站（127.0.0.1:2083-2086）与
+        // 选择组 GO-AIM-PROBE-0..3；此处确保扩展收到的配置即便由旧版后端
+        // 生成也具备探针设施——Go AIM 真实探测引擎启动即依赖它们存在。
+        // 仅存在真实代理节点时注入（空配置注入无意义）。
+        if !allRealProxyTags.isEmpty {
+            var probeInbounds = (root["inbounds"] as? [[String: Any]]) ?? []
+            var inboundsChanged = false
+            for slot in 0..<4 {
+                let tag = "aim-probe-in-\(slot)"
+                let port = 2083 + slot
+                if !probeInbounds.contains(where: { ($0["tag"] as? String) == tag }) {
+                    probeInbounds.append([
+                        "type": "mixed",
+                        "tag": tag,
+                        "listen": "127.0.0.1",
+                        "listen_port": port,
+                        "sniff": false
+                    ])
+                    inboundsChanged = true
+                }
+            }
+            if inboundsChanged {
+                root["inbounds"] = probeInbounds
+            }
+
+            var probeOutbounds = (root["outbounds"] as? [[String: Any]]) ?? []
+            for slot in 0..<4 {
+                let tag = "GO-AIM-PROBE-\(slot)"
+                if !probeOutbounds.contains(where: { ($0["tag"] as? String) == tag }) {
+                    probeOutbounds.append([
+                        "type": "selector",
+                        "tag": tag,
+                        "outbounds": allRealProxyTags
+                    ])
+                }
+            }
+            root["outbounds"] = probeOutbounds
+        }
+
         // 3. 重构 DNS：
         //    - dns-remote 使用 ipv4_only（确保返回给 Safari 的全为 IPv4，100% 流量进入 utun）
         //    - dns-direct 使用 prefer_ipv4（确保蜂窝流量下解析 VLESS 节点域名时同时支持 IPv4 与 IPv6）
@@ -906,6 +946,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rules.insert(contentsOf: headRules, at: 0)
             let lastGoLanIdx = goLanIndices.max()! + headRules.count
             rules.insert(["ip_is_private": true, "outbound": "direct"], at: lastGoLanIdx + 1)
+        }
+
+        // GO-AIM 探针路由兜底（APP-4 任务3.1）：inbound -> GO-AIM-PROBE-N。
+        // 必须紧随 DNS 劫持头规则之后、clash_mode 规则之前（inbound 匹配
+        // 优先于模式规则，否则全局模式下探针流量被 GLOBAL 组吞掉）。
+        // Rust 配置已携带这 4 条规则，此处仅防缺失。
+        if !allRealProxyTags.isEmpty {
+            var insertAt = headRules.count
+            for slot in 0..<4 {
+                let tag = "GO-AIM-PROBE-\(slot)"
+                let exists = rules.contains { ($0["outbound"] as? String) == tag }
+                if !exists {
+                    rules.insert(
+                        ["inbound": ["aim-probe-in-\(slot)"], "outbound": tag],
+                        at: insertAt
+                    )
+                }
+                insertAt += 1
+            }
         }
         route["rules"] = rules
 

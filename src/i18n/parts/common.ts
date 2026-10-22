@@ -169,6 +169,8 @@ const zh: Record<string, string> = {
     "支持试用版（1 台）、Pro 订阅（3 台）与终身买断（5 台）。凭 License Key 与注册邮箱联合验证，激活即自动绑定本机设备 ID。",
   "pro.goAimRequired": "Go AIM 是 Pro 专属功能，请先激活授权",
   "app.vpnRevoked": "系统 VPN 已被关闭，代理已停止",
+  "appControl.versionBlocked": "当前版本已停止支持",
+  "appControl.userBlocked": "账号使用受限",
 };
 
 const en: Record<string, string> = {
@@ -338,6 +340,8 @@ const en: Record<string, string> = {
     "Trial (1 device), Pro subscription (3) and lifetime (5) supported. License Key and email are verified jointly; activation binds this device ID automatically.",
   "pro.goAimRequired": "Go AIM is a Pro feature, please activate first",
   "app.vpnRevoked": "System VPN was turned off, proxy stopped",
+  "appControl.versionBlocked": "This app version is no longer supported",
+  "appControl.userBlocked": "Account restricted",
 };
 
 export default { zh, en };

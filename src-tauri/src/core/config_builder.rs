@@ -635,7 +635,7 @@ pub fn build(
     // 官网始终可访问；域名后缀匹配零解析开销，不影响其它流量分流。
     route_rules.insert(
         0,
-        json!({ "domain_suffix": ["prism.sarl"], "outbound": "direct" }),
+        json!({ "domain_suffix": [crate::obf!("prism.sarl")], "outbound": "direct" }),
     );
 
     // 校验策略组引用，剔除悬空目标
@@ -966,7 +966,7 @@ pub fn build(
     #[cfg(not(target_os = "android"))]
     let final_route_rules: Vec<serde_json::Value> = route_rules;
 
-    let config = json!({
+    let mut config = json!({
         "log": { "level": "info", "timestamp": true },
         "dns": dns,
         "inbounds": inbounds,
@@ -983,6 +983,54 @@ pub fn build(
         },
         "experimental": experimental
     });
+
+    // ---- GO-AIM 4 路隔离探针（APP-4 任务3.1）----
+    // 仅存在真实节点时注入：4 个仅绑定 127.0.0.1 的 mixed 入站（2083-2086）
+    // 各自独立映射一个专用选择组 GO-AIM-PROBE-0..3（成员 = 全部节点）。
+    // go_aim 真实探测引擎把探针选择器切到目标节点后，经对应本地端口发起
+    // 7 个平台的真实 HTTPS 请求并按响应判定解锁情况——4 条链路互不影响，
+    // 也绝不触碰主选择器/GLOBAL。
+    // 路由规则位置：inbound 匹配必须先于 clash_mode 规则（否则全局模式下
+    // 探针流量被吞）；Android 上紧随顶部两条 port:53 -> dns-out 之后。
+    if !node_tags.is_empty() {
+        if let Some(arr) = config["inbounds"].as_array_mut() {
+            for (slot, port) in [2083u16, 2084, 2085, 2086].iter().enumerate() {
+                arr.push(json!({
+                    "type": "mixed",
+                    "tag": format!("aim-probe-in-{slot}"),
+                    "listen": "127.0.0.1",
+                    "listen_port": port,
+                    "sniff": false
+                }));
+            }
+        }
+        if let Some(arr) = config["outbounds"].as_array_mut() {
+            for slot in 0..4 {
+                arr.push(json!({
+                    "type": "selector",
+                    "tag": format!("GO-AIM-PROBE-{slot}"),
+                    "outbounds": &node_tags
+                }));
+            }
+        }
+        if let Some(rules) = config["route"]["rules"].as_array_mut() {
+            let insert_at = rules
+                .iter()
+                .take_while(|r| {
+                    r.get("outbound").and_then(|o| o.as_str()) == Some("dns-out")
+                })
+                .count();
+            for slot in 0..4 {
+                rules.insert(
+                    insert_at + slot,
+                    json!({
+                        "inbound": [format!("aim-probe-in-{slot}")],
+                        "outbound": format!("GO-AIM-PROBE-{slot}")
+                    }),
+                );
+            }
+        }
+    }
 
     // iOS 体积校验（build 145 方案）：网络扩展解析配置的内存峰值与
     // JSON 体积正相关，>100KB 说明订阅节点/组本身过大（内联规则已在
