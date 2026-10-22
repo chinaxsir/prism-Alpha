@@ -362,6 +362,17 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
+      # tag 构建时直接把 APK 追加到 Release Draft（与 build.yml 的 Windows 共用同一 Release）
+      - name: Upload APK to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          fail_on_unmatched_files: false
+          overwrite_files: true
+
   ios:
     name: Build TrollStore IPA
     runs-on: macos-15
@@ -852,6 +863,17 @@ jobs:
           path: Prism-*-TrollStore.ipa
           if-no-files-found: error
 
+      # tag 构建时直接把 IPA 追加到 Release Draft
+      - name: Upload IPA to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: Prism-*-TrollStore.ipa
+          fail_on_unmatched_files: false
+          overwrite_files: true
+
   build-macos:
     name: Build macOS DMG
     runs-on: macos-14
@@ -938,37 +960,15 @@ jobs:
           path: src-tauri/target/Prism_*_macOS_x86_64.dmg
           if-no-files-found: warn
 
-  # tag 构建时把三端产物（APK / IPA / macOS DMG）统一上传到 Release
-  # （build.yml 负责创建 Release Draft + 上传 Windows，此处追加上传移动端产物）
-  release-by-tag:
-    name: Upload all artifacts to Release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [android, ios, build-macos]
-    runs-on: ubuntu-latest
-    steps:
-      # 下载所有三端 artifact（actions/download-artifact 默认按 artifact 名分目录）
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: false
-
-      # 合并到单一目录，统一文件列表喂给 softprops
-      - name: Flatten artifacts
-        shell: bash
-        run: |
-          set -e
-          mkdir -p release-assets
-          find artifacts -type f | while read -r f; do
-            mv -v "$f" release-assets/
-          done
-          ls -lh release-assets/
-
-      - name: Upload to Release
+      # tag 构建时把两套 DMG（ARM + Intel）直接追加到 Release Draft
+      - name: Upload DMG to Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: |
+            src-tauri/target/Prism_*_macOS_aarch64.dmg
+            src-tauri/target/Prism_*_macOS_x86_64.dmg
           fail_on_unmatched_files: false
-
-  # push main / workflow_dispatch 时 macOS DMG 也要单独上传 artifact（无需 Release）
-  # 但 build-macos job 已经在末尾做了 upload-artifact，这里不再重复。
-  # release-by-tag 仅在 tag 时触发，push main 时三端产物都在 artifacts tab 可见。
+          overwrite_files: true
