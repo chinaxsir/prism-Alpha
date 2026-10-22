@@ -21,10 +21,6 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +78,7 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
-  # Android APK / TrollStore IPA 由 mobile.yml 构建；同一 tag 触发时
-  # mobile.yml 会将其产物作为 Release asset 上传到本 workflow 创建的 Release。
+  # Android APK / TrollStore IPA / macOS DMG 统一由 mobile.yml 构建；
+  # 同一 tag 触发时 mobile.yml 的 release-by-tag job 会将三端产物
+  # 追加上传到本 workflow 创建的 Release Draft。
 

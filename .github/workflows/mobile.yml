@@ -362,13 +362,6 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
-      # tag 构建时把 APK 作为 Release asset 上传（与桌面端 build.yml 共用同一 Release）
-      - name: Upload APK to Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-
   ios:
     name: Build TrollStore IPA
     runs-on: macos-15
@@ -859,9 +852,123 @@ jobs:
           path: Prism-*-TrollStore.ipa
           if-no-files-found: error
 
-      # tag 构建时把 IPA 作为 Release asset 上传（与桌面端共用同一 Release）
-      - name: Upload IPA to Release
-        if: startsWith(github.ref, 'refs/tags/')
+  build-macos:
+    name: Build macOS DMG
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # 桌面端 sing-box 以 sidecar 随包分发（bundle.externalBin），
+      # 构建前必须按目标平台抓取，否则 tauri build 会因缺少 externalBin 失败
+      - name: Fetch sing-box sidecar (aarch64)
+        run: node scripts/fetch-kernel.cjs --triplet aarch64-apple-darwin
+
+      - name: Fetch sing-box sidecar (x86_64)
+        run: node scripts/fetch-kernel.cjs --triplet x86_64-apple-darwin
+
+      # 硬校验：sidecar + geo 数据库必须就位（无 runtime 下载）
+      - name: Verify bundled kernel & geo databases
+        shell: bash
+        run: |
+          set -e
+          test -f src-tauri/binaries/sing-box-aarch64-apple-darwin
+          test -f src-tauri/binaries/sing-box-x86_64-apple-darwin
+          test -f src-tauri/binaries/geoip.db
+          test -f src-tauri/binaries/geosite.db
+          echo "all required files present"
+
+      - name: Build frontend
+        run: npm run build
+
+      # Apple Silicon 主分发架构
+      - name: Build aarch64 DMG
+        run: npx tauri build --bundles dmg --target aarch64-apple-darwin
+
+      # Intel 兼容
+      - name: Build x86_64 DMG
+        run: npx tauri build --bundles dmg --target x86_64-apple-darwin
+
+      - name: Rename DMGs with version
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version: $VERSION"
+          cd src-tauri/target
+          for TRIPLET in aarch64-apple-darwin x86_64-apple-darwin; do
+            for DMG in "$TRIPLET"/release/bundle/dmg/*.dmg; do
+              [ -f "$DMG" ] || continue
+              ARCH=$(echo "$TRIPLET" | sed 's/-apple-darwin//')
+              NEW="Prism_${VERSION}_macOS_${ARCH}.dmg"
+              mv -v "$DMG" "$NEW"
+            done
+          done
+          ls -lh *.dmg
+
+      - name: Upload macOS DMG (aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-macos-dmg-aarch64
+          path: src-tauri/target/Prism_*_macOS_aarch64.dmg
+          if-no-files-found: error
+
+      - name: Upload macOS DMG (x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-macos-dmg-x86_64
+          path: src-tauri/target/Prism_*_macOS_x86_64.dmg
+          if-no-files-found: warn
+
+  # tag 构建时把三端产物（APK / IPA / macOS DMG）统一上传到 Release
+  # （build.yml 负责创建 Release Draft + 上传 Windows，此处追加上传移动端产物）
+  release-by-tag:
+    name: Upload all artifacts to Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, ios, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      # 下载所有三端 artifact（actions/download-artifact 默认按 artifact 名分目录）
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      # 合并到单一目录，统一文件列表喂给 softprops
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release-assets
+          find artifacts -type f | while read -r f; do
+            mv -v "$f" release-assets/
+          done
+          ls -lh release-assets/
+
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: Prism-*-TrollStore.ipa
+          files: release-assets/*
+          fail_on_unmatched_files: false
+
+  # push main / workflow_dispatch 时 macOS DMG 也要单独上传 artifact（无需 Release）
+  # 但 build-macos job 已经在末尾做了 upload-artifact，这里不再重复。
+  # release-by-tag 仅在 tag 时触发，push main 时三端产物都在 artifacts tab 可见。
