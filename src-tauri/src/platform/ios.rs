@@ -25,6 +25,9 @@ unsafe extern "C" {
     /// 取走并清除「升级后待自动重启」标记（APP-5 任务2）；
     /// 返回 1 = 需要在清理后自动重建隧道
     fn prism_ios_take_pending_restart() -> i32;
+    /// 返回 Keychain 持久化的 64 字符 hex SHA-256 硬件指纹
+    /// （APP-7 任务2.3）；nilptr 表示 Swift 侧拿不到
+    fn prism_ios_get_device_id() -> *const std::os::raw::c_char;
 }
 
 pub fn start_tunnel(config_content: &str) -> Result<()> {
@@ -81,4 +84,17 @@ pub fn upgrade_selfheal() -> bool {
 /// 取走并清除「升级后待自动重启」标记（一次性）
 pub fn take_pending_restart() -> bool {
     unsafe { prism_ios_take_pending_restart() == 1 }
+}
+
+/// iOS 设备 ID：经 Swift Keychain 读取（持久化、绝不同步 iCloud）。
+/// 返回 64 字符小写 hex SHA-256；None = Swift 侧 nilptr 或 UTF-8 转换失败。
+pub fn get_device_id() -> Option<String> {
+    unsafe {
+        let p = prism_ios_get_device_id();
+        if p.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(p);
+        Some(cstr.to_string_lossy().into_owned())
+    }
 }

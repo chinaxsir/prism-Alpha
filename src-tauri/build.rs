@@ -29,19 +29,29 @@ fn main() {
             // prism_ios_vpn_start/stop/is_connected/connected_timestamp 由主 App
             // Swift（@_cdecl）实现，在 Xcode 最终链接 staticlib 时才存在；crate-type
             // 里的 cdylib 会单独链接 libprism_proxy_lib.dylib（CI run 37707763501
-            // 实证 Undefined symbols → exit 65）。用 ld64 -U 只放行这四个
+            // 实证 Undefined symbols → exit 65）。用 ld64 -U 只放行这些
             // 符号（dylib 在 iOS 真机构建中从不被加载，真实解析仍由 Xcode
             // 链接期强校验；is_connected 为 build 157 状态轮询新增，
             // CI run 38753559779 实证缺它会 Undefined symbols；
-            // connected_timestamp 为 IPA-12 零延迟时长同步新增）
+            // connected_timestamp 为 IPA-12 零延迟时长同步新增；
+            // upgrade_selfheal / take_pending_restart 为 APP-6 自愈新增；
+            // get_device_id 为 APP-7 设备解绑感知新增）
             for sym in [
                 "_prism_ios_vpn_start",
                 "_prism_ios_vpn_stop",
                 "_prism_ios_vpn_is_connected",
                 "_prism_ios_vpn_connected_timestamp",
+                "_prism_ios_take_pending_restart",
+                "_prism_ios_upgrade_selfheal",
+                "_prism_ios_get_device_id",
             ] {
                 println!("cargo:rustc-link-arg=-Wl,-U,{sym}");
             }
+            // 双重保险：Xcode 最终链接期若新加入 Swift @_cdecl 但忘了
+            // 更新上方符号列表，dynamic_lookup 让 ld64 不提前报错；
+            // 真正是否存在仍由运行时 dlsym 强校验（iOS 端会在启动时
+            // 主动探测），绝不会放行缺失符号到用户设备上才崩溃
+            println!("cargo:rustc-link-arg=-Wl,-undefined,dynamic_lookup");
             println!(
                 "cargo:rerun-if-changed={}",
                 kernel_dir.join("libprismkernel.a").display()

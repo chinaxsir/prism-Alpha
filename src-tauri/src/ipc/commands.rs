@@ -1488,25 +1488,24 @@ pub async fn get_device_id(state: State<'_, AppState>) -> Result<String, String>
     crate::core::license::device_id(&state.data_dir).map_err(|e| sanitize_err(&e.to_string()))
 }
 
-/// 主动联网刷新授权（设置页「立即校验」按钮；ipa-8：强制实时请求服务端，
-/// 无视当日缓存短路；断网时返回 offline 锁定态。校验成功后异步触发一次
-/// 云端订阅对账，同步云端订阅链接）
+/// 主动联网刷新授权（设置页「立即校验」按钮；APP-7：改用权威 runtime 校验，
+/// 自动感知解绑/过期/plan 缺失并执行授权级熔断）
 #[tauri::command]
 pub async fn refresh_entitlement(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
-    let data_dir = state.data_dir.clone();
-    let settings = state.settings.read().clone();
-    let next = crate::core::license::verify_remote_forced(&data_dir, &settings)
+    let (ent, revoke_msg) = crate::core::app_control::force_runtime_check(&app, &state)
         .await
-        .map_err(|e| sanitize_err(&e.to_string()))?;
-    state.apply_entitlement(next.clone());
+        .map_err(|e| sanitize_err(&e))?;
     // 校验成功：对账云端订阅链接（reconcile 内部自校验同步资格并幂等去重）
     tauri::async_runtime::spawn(async move {
         super::super::core::sync_links::reconcile(&app).await;
     });
-    Ok(next)
+    // 如果触发了授权剥夺（解绑/过期），force_runtime_check 内部已经 apply_entitlement
+    // 并 emit pro://revoked；这里正常返回 entitlement 给前端显示即可
+    let _ = revoke_msg; // force_runtime_check 内部已 emit 事件
+    Ok(ent)
 }
 
 /// 移除本机授权：清理本地授权/同步缓存文件，并自动关闭依赖 Pro 授权的开关

@@ -4,6 +4,7 @@
 
 import Foundation
 import NetworkExtension
+import Security
 
 /// 扩展 Bundle ID：优先取 App 包 PlugIns 内【实际存在】的
 /// packet-tunnel-provider appex 的真实 CFBundleIdentifier（防构建侧
@@ -203,6 +204,37 @@ func prismIosTakePendingRestart() -> Int32 {
     }
     defaults.set(false, forKey: PrismTunnelController.kPendingRestartKey)
     return 1
+}
+
+// MARK: - Device ID（Keychain 持久化，绝不同步）
+
+/// 返回堆分配的 UTF-8 C 字符串（Rust 侧负责 free）。
+/// 内容为 64 字符小写 hex SHA-256 硬件指纹。
+/// 铁律：Keychain 已存在则直接返回（向后兼容）；仅首次生成。
+/// 必须设 kSecAttrSynchronizable = false（绝不能 iCloud 同步，
+/// 否则用户换 Apple ID 设备会共享 device_id → 一解绑全解绑）。
+@_cdecl("prism_ios_get_device_id")
+func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
+    let account = "prism.device_id" as CFString
+
+    // 1. 先查 Keychain
+    if let existing = PrismKeychain.get(account: account) {
+        return strdup(existing)
+    }
+
+    // 2. 首次生成：identifierForVendor + hostname → SHA-256 hex
+    let vendor = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-vendor"
+    let hostname = Host.current().localizedName ?? "unknown-host"
+    let raw = "\(vendor)|\(hostname)"
+    let hex = raw.sha256Hex()
+
+    // 3. 写入 Keychain（kSecAttrSynchronizable = false 是核心）
+    if PrismKeychain.set(account: account, value: hex) {
+        return strdup(hex)
+    }
+
+    // 4. Keychain 写入失败（极罕见）：直接返回生成值，下次启动重试
+    return strdup(hex)
 }
 
 // MARK: - 控制器
@@ -2251,5 +2283,62 @@ final class PrismTunnelController {
                 )))
             }
         }
+    }
+}
+
+// MARK: - Keychain 辅助（kSecAttrSynchronizable = false）
+
+private enum PrismKeychain {
+    /// 从 Keychain 读字符串值；不存在返回 nil
+    static func get(account: CFString) -> String? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: account,
+            kSecAttrSynchronizable: false,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let str = String(data: data, encoding: .utf8)
+        else { return nil }
+        return str
+    }
+
+    /// 写入 Keychain（不存在则 add，存在则 update）；成功返回 true
+    static func set(account: CFString, value: String) -> Bool {
+        let data = Data(value.utf8)
+        let base: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: account,
+            kSecAttrSynchronizable: false,
+        ]
+        let addQuery = base
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecSuccess {
+            return SecItemUpdate(addQuery as CFDictionary, [kSecValueData: data] as CFDictionary) == errSecSuccess
+        }
+        if status == errSecDuplicateItem {
+            return SecItemUpdate(addQuery as CFDictionary, [kSecValueData: data] as CFDictionary) == errSecSuccess
+        }
+        return false
+    }
+}
+
+// MARK: - SHA-256 工具
+
+import CommonCrypto
+
+private extension String {
+    /// 返回 64 字符小写 hex SHA-256
+    func sha256Hex() -> String {
+        let data = Data(self.utf8)
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_SHA256($0.baseAddress, UInt32(data.count), &hash)
+        }
+        return hash.map { String(format: "%02x", $0) }.joined()
     }
 }
