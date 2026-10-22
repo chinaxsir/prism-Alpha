@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "verify:ios": "node scripts/verify-ios-ready.mjs",
     "preview": "vite preview",
     "fetch:kernel": "node scripts/fetch-kernel.cjs",
     "tauri": "tauri",

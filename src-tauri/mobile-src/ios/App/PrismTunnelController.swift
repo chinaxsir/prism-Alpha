@@ -3,8 +3,10 @@
 // 内核（Go libbox）与 TUN 全部运行在扩展进程内。
 
 import Foundation
+import UIKit
 import NetworkExtension
 import Security
+import Darwin
 
 /// 扩展 Bundle ID：优先取 App 包 PlugIns 内【实际存在】的
 /// packet-tunnel-provider appex 的真实 CFBundleIdentifier（防构建侧
@@ -224,7 +226,7 @@ func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
 
     // 2. 首次生成：identifierForVendor + hostname → SHA-256 hex
     let vendor = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-vendor"
-    let hostname = Host.current().localizedName ?? "unknown-host"
+    let hostname = ProcessInfo.processInfo.hostName
     let raw = "\(vendor)|\(hostname)"
     let hex = raw.sha256Hex()
 
@@ -1138,9 +1140,9 @@ final class PrismTunnelController {
                 let setNP = unsafeBitCast(p, to: PersonaNP.self)
                 let setUID = unsafeBitCast(u, to: PersonaID.self)
                 let setGID = unsafeBitCast(g, to: PersonaID.self)
-                setNP(&attr, 99, 1)
-                setUID(&attr, 0)
-                setGID(&attr, 0)
+                _ = setNP(&attr, 99, 1)
+                _ = setUID(&attr, 0)
+                _ = setGID(&attr, 0)
             }
         }
 
