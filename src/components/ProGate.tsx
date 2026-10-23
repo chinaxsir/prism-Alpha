@@ -102,6 +102,8 @@ export function ActivateProModal({
   const { t } = useTranslation();
   const activate = useProStore((s) => s.activate);
   const error = useProStore((s) => s.error);
+  const revokeReason = useProStore((s) => s.revokeReason);
+  const entitlementStatus = useProStore((s) => s.entitlement.status);
   const [licenseKey, setLicenseKey] = useState("");
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -234,6 +236,24 @@ export function ActivateProModal({
               <Sparkles size={18} className="text-accent" />
               <h3 className="text-base font-semibold">{t("pro.activateTitle")}</h3>
             </div>
+
+            {/* APP-5 任务1：到期 / 解绑提示移入激活弹窗内部展示（柔和橙色调，
+                不是常驻红色横幅）；解绑与到期文案严格区分 */}
+            {(revokeReason === "unbound" ||
+              revokeReason === "expired" ||
+              entitlementStatus === "expired") && (
+              <div
+                className={
+                  revokeReason === "unbound"
+                    ? "rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+                    : "rounded-lg border border-orange-500/30 bg-orange-500/10 px-3 py-2 text-xs text-orange-200"
+                }
+              >
+                {revokeReason === "unbound"
+                  ? t("pro.unboundBanner")
+                  : t("pro.expiredBanner")}
+              </div>
+            )}
 
             {/* License Key + 注册邮箱（联合校验，均为必填） */}
             <div className="space-y-3">

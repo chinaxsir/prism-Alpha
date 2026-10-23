@@ -1211,6 +1211,26 @@ async fn auto_select_best_proxy(
     let pro_unlocked = state.is_pro_active();
     let go_aim_enabled = pro_unlocked && state.settings.read().go_aim_enabled;
 
+    // APP-5 任务3 最高守卫：用户手动指定了节点（go_aim_pinned_node）时，
+    // 无论 VPN 启动自动选点、后台 failover、还是重测，**一律严格锁定**用户
+    // 手动选择的节点，绝不再自动回跳延迟最低的节点——除非用户主动
+    // 「恢复自动」清除 pinned（clear_go_aim_pinned_node 命令）。
+    // 与 go_aim.rs apply_selection 中的 pinned 检查完全对齐，两条链路一致。
+    let pinned = state.settings.read().go_aim_pinned_node.clone();
+    if let Some(pinned_node) = pinned
+        && go_aim_enabled
+        && nodes.iter().any(|n| n == &pinned_node)
+    {
+        tracing::info!(
+            "[auto_select] 命中 go_aim_pinned_node={pinned_node}，跳过自动测速，严格锁定用户手动指定"
+        );
+        let _ = api.select_proxy(&group, &pinned_node).await;
+        let _ = api.select_proxy("GLOBAL", &pinned_node).await;
+        let _ = api.close_all_connections().await;
+        let _ = app_handle.emit("proxies://changed", serde_json::json!({}));
+        return Ok(());
+    }
+
     // C：Go AIM 已解锁节点优先池（探测结果异步写入，启动瞬间可能为空）
     let mut priority: Vec<String> = Vec::new();
     if go_aim_enabled {

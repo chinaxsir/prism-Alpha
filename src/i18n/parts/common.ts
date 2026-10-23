@@ -150,6 +150,8 @@ const zh: Record<string, string> = {
     "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
   "pro.expiredBanner":
     "授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」续期后恢复。",
+  "pro.proxySuite": "Pro 代理套件",
+  "pro.proxySuiteDesc": "激活授权解锁实时连接监控、分流规则与 Go Cus 覆写引擎",
   "pro.expiredAt": "授权已于 {time} 到期，Pro 功能已自动停止。",
   "pro.renew": "续期授权",
   "pro.reactivate": "重新激活 / 更换授权码",
@@ -326,6 +328,8 @@ const en: Record<string, string> = {
     "This device has been unbound from your account. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Re-activate in Settings → Prism Pro.",
   "pro.expiredBanner":
     "Your license has expired. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Renew in Settings → Prism Pro to restore them.",
+  "pro.proxySuite": "Pro Proxy Suite",
+  "pro.proxySuiteDesc": "Activate Pro to unlock Connections, Rules & Go Cus",
   "pro.expiredAt": "License expired at {time}. Pro features have been stopped.",
   "pro.renew": "Renew License",
   "pro.reactivate": "Reactivate / Change License",

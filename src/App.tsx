@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
-import { ShieldAlert, ShieldBan } from "lucide-react";
+import { ShieldBan } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import Sidebar from "@/components/Sidebar";
 import TitleBar from "@/components/TitleBar";
@@ -28,10 +28,10 @@ import { isMobile } from "@/pro/gating";
 import ProxiesHub from "@/pages/ProxiesHub";
 
 export default function App() {
-  const initPro = useProStore((s) => s.init);
-  const proStatus = useProStore((s) => s.entitlement.status);
-  const revokeReason = useProStore((s) => s.revokeReason);
   const { t } = useTranslation();
+  const initPro = useProStore((s) => s.init);
+
+  // 窗口尺寸变化监听（移动端安全区适配）
   const theme = usePrefsStore((s) => s.theme);
   const language = usePrefsStore((s) => s.language);
   const setLanguage = usePrefsStore((s) => s.setLanguage);
@@ -275,22 +275,8 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
         <main className="flex-1 overflow-y-auto overflow-x-hidden px-6 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-          {/* 授权剥夺横幅（IPA-3 任务2）：按原因精准区分「设备已解绑」与
-              「授权已到期」，两者文案完全不同，严禁混用 */}
-          {(revokeReason === "unbound" ||
-            revokeReason === "expired" ||
-            proStatus === "expired") && (
-            <div className="mb-4 flex items-start gap-2 rounded-lg border border-latency-bad/30 bg-latency-bad/10 px-3 py-2.5 text-xs text-latency-bad">
-              <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-              <span>
-                {t(
-                  revokeReason === "unbound"
-                    ? "pro.unboundBanner"
-                    : "pro.expiredBanner",
-                )}
-              </span>
-            </div>
-          )}
+          {/* APP-5 任务1：全局常驻横幅已移除。到期/解绑提示仅在激活 Pro 弹窗
+              与设置 → PRISM PRO 激活区内展示，平时界面保持清爽。 */}
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />

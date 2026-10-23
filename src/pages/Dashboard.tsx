@@ -36,6 +36,7 @@ import {
   getGoAimStatus,
   setGoAimEnabled,
   runGoAimProbe,
+  clearGoAimPinnedNode,
 
   getGoLanSettings,
   saveGoLanSettings,
@@ -381,11 +382,14 @@ export default function Dashboard() {
     ? Object.values(aim.results).filter((r) => r.aiUnlocked || r.mediaUnlocked)
         .length
     : 0;
+  // APP-5 任务3：Go AIM 状态副标题严格区分「手动锁定」与「自动优选」
   const aimStatus = aim?.enabled
-    ? t("dashboard.aim.locked", {
-        node: aim.lockedNode || currentNode || "—",
-        count: aimUnlocked,
-      })
+    ? aim.pinnedNode
+      ? t("dashboard.aim.pinned", { node: aim.pinnedNode })
+      : t("dashboard.aim.locked", {
+          node: aim.lockedNode || currentNode || "—",
+          count: aimUnlocked,
+        })
     : t("dashboard.aim.idle");
   const lanStatus =
     lan && lan.lanCidrs.length > 0
@@ -542,13 +546,29 @@ export default function Dashboard() {
             onToggle={toggleAim}
             action={
               aim?.enabled ? (
-                <button
-                  onClick={runAimProbe}
-                  disabled={aim.probing}
-                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
-                >
-                  {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
-                </button>
+                aim.pinnedNode ? (
+                  // APP-5 任务3：用户手动指定节点 → 显示"恢复自动"轻按钮
+                  // 点击后清空 pinned，回到自动评级选点
+                  <button
+                    onClick={async () => {
+                      await clearGoAimPinnedNode();
+                      // 立即刷新状态：pinned 清后端已落盘，前端
+                      // 事件 go-aim://updated 会自然回流 selectionMode
+                      runAimProbe();
+                    }}
+                    className="text-xs text-amber-400 hover:underline px-1.5 py-1 whitespace-nowrap"
+                  >
+                    {t("dashboard.aim.restoreAuto")}
+                  </button>
+                ) : (
+                  <button
+                    onClick={runAimProbe}
+                    disabled={aim.probing}
+                    className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
+                  >
+                    {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
+                  </button>
+                )
               ) : undefined
             }
           />
@@ -588,21 +608,22 @@ export default function Dashboard() {
       ) : proReady ? (
         <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3">
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-1.5">
+            {/* APP-5 任务2：标题 + 三个胶囊强制一行，不再折行 */}
+            <div className="flex flex-nowrap items-center gap-1.5 overflow-hidden">
               <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
                 ✨ {t("dashboard.proEngines")}
               </span>
-              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
                 Go AIM
               </span>
-              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
                 Go Lan
               </span>
-              <span className="whitespace-nowrap rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400">
+              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
                 Go Cus
               </span>
             </div>
-            <p className="mt-1 truncate text-xs text-gray-400">
+            <p className="mt-1 truncate text-[11px] text-gray-400">
               {t("dashboard.proBannerDesc")}
             </p>
           </div>

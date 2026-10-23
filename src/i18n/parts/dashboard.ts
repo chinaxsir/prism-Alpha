@@ -12,6 +12,8 @@ const zh: Record<string, string> = {
     "激活授权解锁 AI/流媒体智选、回家内网直通与脚本覆写引擎",
   "dashboard.proEngines": "Pro 智联引擎",
   "dashboard.aim.locked": "已锁定: {node} · 已评级解锁 {count} 个节点",
+  "dashboard.aim.pinned": "已指定: {node}（手动锁定）",
+  "dashboard.aim.restoreAuto": "恢复自动",
   "dashboard.aim.idle": "自动优选解锁 ChatGPT / Claude / Netflix 的最低延迟节点",
   "dashboard.aim.probing": "探测中",
   "dashboard.aim.retest": "重测",
@@ -40,6 +42,8 @@ const en: Record<string, string> = {
     "Activate to unlock Go AIM, Go Lan home network and the Go Cus rewrite engine",
   "dashboard.proEngines": "Pro Engines",
   "dashboard.aim.locked": "Locked: {node} · {count} nodes rated & unlocked",
+  "dashboard.aim.pinned": "Pinned: {node} (manual lock)",
+  "dashboard.aim.restoreAuto": "Auto",
   "dashboard.aim.idle":
     "Auto-picks the lowest-latency node unlocking ChatGPT / Claude / Netflix",
   "dashboard.aim.probing": "Probing",
