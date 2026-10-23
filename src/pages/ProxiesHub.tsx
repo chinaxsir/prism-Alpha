@@ -51,50 +51,16 @@ export default function ProxiesHub() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-2xl font-bold">{t("nav.proxies")}</h1>
+      {/* 顶部页面标题：保持干净，不放激活按钮（APP-7 任务1） */}
+      <h1 className="text-2xl font-bold">{t("nav.proxies")}</h1>
 
-        {!proReady || !proUnlocked ? (
-          // APP-5 任务2：未激活 → Pro 套件卡片（与仪表盘样式统一）
-          // 隐藏 3 个带锁标签；激活后完整 4 栏导航
-          <button
-            onClick={openProModal}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90"
-          >
-            {t("pro.activatePro")}
-          </button>
-        ) : (
-          <div className="flex rounded-lg border border-border bg-surface-hover p-1">
-            {TABS.map((tabItem) => (
-              <button
-                key={tabItem.key}
-                onClick={() =>
-                  setParams(tabItem.key === "nodes" ? {} : { tab: tabItem.key })
-                }
-                className={clsx(
-                  "flex items-center gap-1.5 rounded-md px-4 py-1.5 text-sm transition-colors",
-                  tab === tabItem.key
-                    ? "bg-accent text-white"
-                    : "text-gray-400 hover:text-gray-200"
-                )}
-              >
-                {tabItem.icon && <tabItem.icon size={14} />}
-                {t(tabItem.labelKey)}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* 未激活时的 Pro 套件卡片（居中、紧凑、与仪表盘黄框一致） */}
       {!proReady || !proUnlocked ? (
-        <div className="rounded-xl border border-border bg-surface-card px-3.5 py-3">
-          <div className="min-w-0">
+        /* 未激活：Pro 代理套件卡片，激活按钮位于卡片内部右侧垂直居中，
+           与仪表盘 Pro 智联引擎卡片样式 100% 对齐 */
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-3.5 py-3">
+          <div className="min-w-0 flex-1">
             <div className="flex flex-nowrap items-center gap-1.5 overflow-hidden">
-              <Sparkles
-                size={14}
-                className="shrink-0 text-amber-400"
-              />
+              <Sparkles size={14} className="shrink-0 text-amber-400" />
               <span className="whitespace-nowrap text-sm font-semibold text-text">
                 {t("pro.proxySuite")}
               </span>
@@ -112,8 +78,36 @@ export default function ProxiesHub() {
               {t("pro.proxySuiteDesc")}
             </p>
           </div>
+          <button
+            type="button"
+            onClick={openProModal}
+            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90"
+          >
+            {t("pro.activatePro")}
+          </button>
         </div>
-      ) : null}
+      ) : (
+        /* 已激活：4 栏分段导航 */
+        <div className="flex rounded-lg border border-border bg-surface-hover p-1">
+          {TABS.map((tabItem) => (
+            <button
+              key={tabItem.key}
+              onClick={() =>
+                setParams(tabItem.key === "nodes" ? {} : { tab: tabItem.key })
+              }
+              className={clsx(
+                "flex items-center gap-1.5 rounded-md px-4 py-1.5 text-sm transition-colors",
+                tab === tabItem.key
+                  ? "bg-accent text-white"
+                  : "text-gray-400 hover:text-gray-200"
+              )}
+            >
+              {tabItem.icon && <tabItem.icon size={14} />}
+              {t(tabItem.labelKey)}
+            </button>
+          ))}
+        </div>
+      )}
 
       {tab === "nodes" && <Proxies />}
       {tab === "connections" && <Connections />}

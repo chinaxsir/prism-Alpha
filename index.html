@@ -8,15 +8,24 @@
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
     <title>Prism Proxy</title>
+    <!-- 初始 theme-color（首屏 script 会立即覆盖为实际主题色） -->
+    <meta name="theme-color" content="#0B0D13" />
+    <meta name="color-scheme" content="dark light" />
     <script>
       // 首屏主题引导：默认跟随系统，避免加载时白/黑闪屏。
       // 持久化的 theme 由应用读取后端 settings.json 后再覆盖。
+      // APP-7 任务2：同步设置 color-scheme，浅色模式下状态栏文字自动变深。
       (function () {
         try {
           var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
           var t = dark ? "dark" : "light";
-          document.documentElement.setAttribute("data-theme", t);
-          document.documentElement.classList.toggle("dark", t === "dark");
+          var bg = dark ? "#0B0D13" : "#F4F5F9";
+          var root = document.documentElement;
+          root.setAttribute("data-theme", t);
+          root.classList.toggle("dark", t === "dark");
+          root.style.colorScheme = t;
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute("content", bg);
         } catch (e) {
           document.documentElement.setAttribute("data-theme", "dark");
           document.documentElement.classList.add("dark");
