@@ -1428,16 +1428,33 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
                 }
             }
 
+            // APP-6 任务2：密钥强制二次规范化——非法密钥（未解码 %3D / 引号 /
+            // URL-safe / 长度不对 / 全 0）不得写入配置，防止内核
+            // decode pre shared key 失败导致整个 VPN 启动崩溃
+            let private_key = node
+                .private_key
+                .as_deref()
+                .and_then(crate::core::go_lan::normalize_wg_key);
+            let peer_public_key = node
+                .public_key
+                .as_deref()
+                .and_then(crate::core::go_lan::normalize_wg_key);
+            let (Some(private_key), Some(peer_public_key)) = (private_key, peer_public_key)
+            else {
+                return None;
+            };
+
             let mut o = json!({
                 "type": "wireguard",
-                "private_key": node.private_key.clone().unwrap_or_default(),
-                "peer_public_key": node.public_key.clone().unwrap_or_default(),
+                "private_key": private_key,
+                "peer_public_key": peer_public_key,
                 "local_address": local_address,
             });
+            // 仅当 PSK 通过 32 字节校验才写入；空串/未解码 %3D/损坏值一律不写
             if let Some(psk) = &node.preshared_key
-                && !psk.is_empty()
+                && let Some(valid) = crate::core::go_lan::normalize_wg_key(psk)
             {
-                o["pre_shared_key"] = json!(psk);
+                o["pre_shared_key"] = json!(valid);
             }
             if let Some(mtu) = node.mtu {
                 o["mtu"] = json!(mtu);
@@ -2215,19 +2232,30 @@ rules:
     /// 出站；WG 裸 IP 自动补 /32、/128 前缀；https 节点带 TLS 块。
     #[test]
     fn wireguard_socks_http_nodes_convert() {
-        let clash = r#"
+        // APP-6：WG 密钥必须为合法 32 字节 Base64（无效密钥节点会被拒收），
+        // PSK 写入前会被规范化重编码
+        let k = |seed: u8| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .encode((0..32u8).map(|i| i.wrapping_mul(31).wrapping_add(seed) | 1).collect::<Vec<u8>>())
+        };
+        let priv_key = k(1);
+        let peer_key = k(2);
+        let psk_raw = k(3);
+        let clash = format!(
+            r#"
 proxies:
   - name: WG-01
     type: wireguard
     server: 1.2.3.4
     port: 51820
-    private-key: eHpMh6Hc8S1p...example
-    public-key: bLvT9zWq2fQ...example
+    private-key: {priv_key}
+    public-key: {peer_key}
     ip: 10.0.0.2
     ipv6: fdfe:dcba:9876::2
     mtu: 1280
     reserved: [1, 2, 3]
-    preshared-key: psk-example
+    preshared-key: {psk_raw}
   - name: SOCKS-01
     type: socks5
     server: 5.6.7.8
@@ -2250,7 +2278,8 @@ proxy-groups:
     proxies: [WG-01, SOCKS-01, HTTP-01, HTTPS-01]
 rules:
   - MATCH,节点选择
-"#;
+"#
+        );
         let dir = std::env::temp_dir().join("prism-cb-test-protocols");
         std::fs::create_dir_all(dir.join("kernel")).unwrap();
         let built = build(
@@ -2287,7 +2316,8 @@ rules:
         assert!(addrs.contains(&"fdfe:dcba:9876::2/128"), "bare v6 normalized: {addrs:?}");
         assert_eq!(wg["mtu"].as_u64(), Some(1280));
         assert_eq!(wg["reserved"][0].as_u64(), Some(1));
-        assert_eq!(wg["pre_shared_key"].as_str(), Some("psk-example"));
+        // APP-6：PSK 已被规范化重编码为标准 44 位 Base64
+        assert_eq!(wg["pre_shared_key"].as_str(), Some(psk_raw.as_str()));
 
         let socks = find("SOCKS-01");
         assert_eq!(socks["type"].as_str(), Some("socks"));

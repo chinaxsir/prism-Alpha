@@ -652,6 +652,52 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - 配置清洗与物理网卡绑定
 
+    // MARK: - WireGuard 密钥兜底自愈（APP-6 任务3）
+
+    /// WireGuard 密钥规范化：URL 解码 → 去引号/空白 → URL-safe 转标准 →
+    /// 补齐 padding → Base64 解码；32 字节（且不全为 0）校验通过返回
+    /// 苹果原生标准 44 位 Base64，否则返回 nil。
+    /// 修复 `decode pre shared key ... illegal base64 data at input byte 43`：
+    /// 末尾 `=` 被编码成 `%3D`（byte 43 为 `%`）等历史脏数据在此自愈。
+    private func sanitizeWireGuardKey(_ raw: Any?) -> String? {
+        guard let s = raw as? String else { return nil }
+        var str = s
+        if let decoded = str.removingPercentEncoding {
+            str = decoded
+        }
+        str = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        if let idx = str.firstIndex(of: "#") {
+            str = String(str[..<idx])
+        }
+        str = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        if str.isEmpty { return nil }
+        // 64 位纯 Hex → 32 字节原始密钥
+        if str.count == 64, str.allSatisfy({ $0.isHexDigit }) {
+            var bytes = [UInt8]()
+            var it = str.startIndex
+            while let next = str.index(it, offsetBy: 2, limitedBy: str.endIndex) {
+                guard let b = UInt8(str[it..<next], radix: 16) else { break }
+                bytes.append(b)
+                it = next
+            }
+            guard bytes.count == 32, !bytes.allSatisfy({ $0 == 0 }) else { return nil }
+            return Data(bytes).base64EncodedString()
+        }
+        // URL-safe（-/ _）→ 标准 Base64 字符；只保留合法数据字符
+        let replaced = str.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let cleaned = String(replaced.filter {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) ||
+            ("0"..."9").contains($0) || $0 == "+" || $0 == "/"
+        })
+        // 32 字节密钥 = 43 个数据字符 + 1 个 `=` 填充
+        guard cleaned.count == 43 else { return nil }
+        guard let data = Data(base64Encoded: cleaned + "="), data.count == 32,
+              !data.allSatisfy({ $0 == 0 }) else { return nil }
+        return data.base64EncodedString()
+    }
+
     private func sanitizeConfigForExtension(_ rawJSON: String, workDir: URL, phyName: String) -> String {
         guard let data = rawJSON.data(using: .utf8),
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -709,6 +755,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else if t == "selector" && !tag.isEmpty {
                 if firstSelectorTag == nil {
                     firstSelectorTag = tag
+                }
+            } else if t == "wireguard" {
+                // APP-6 任务3：WireGuard 密钥兜底自愈——历史脏数据（%3D /
+                // 引号 / URL-safe / 损坏 PSK）自动修复为标准 44 位 Base64，
+                // 无法通过 32 字节校验的 pre_shared_key 直接剔除，
+                // 100% 永不再报 decode pre shared key ... illegal base64 data
+                if let fixed = sanitizeWireGuardKey(outbounds[i]["private_key"]) {
+                    outbounds[i]["private_key"] = fixed
+                }
+                if let fixed = sanitizeWireGuardKey(outbounds[i]["peer_public_key"]) {
+                    outbounds[i]["peer_public_key"] = fixed
+                }
+                if outbounds[i]["pre_shared_key"] != nil {
+                    if let fixed = sanitizeWireGuardKey(outbounds[i]["pre_shared_key"]) {
+                        outbounds[i]["pre_shared_key"] = fixed
+                    } else {
+                        outbounds[i].removeValue(forKey: "pre_shared_key")
+                    }
+                }
+                if var peers = outbounds[i]["peers"] as? [[String: Any]] {
+                    for j in peers.indices {
+                        if let fixed = sanitizeWireGuardKey(peers[j]["public_key"]) {
+                            peers[j]["public_key"] = fixed
+                        }
+                        if peers[j]["pre_shared_key"] != nil {
+                            if let fixed = sanitizeWireGuardKey(peers[j]["pre_shared_key"]) {
+                                peers[j]["pre_shared_key"] = fixed
+                            } else {
+                                peers[j].removeValue(forKey: "pre_shared_key")
+                            }
+                        }
+                    }
+                    outbounds[i]["peers"] = peers
+                }
+                if !phyName.isEmpty {
+                    outbounds[i]["bind_interface"] = phyName
                 }
             } else if proxyOutboundTypes.contains(t) {
                 if !tag.isEmpty {

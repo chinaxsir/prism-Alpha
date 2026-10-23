@@ -147,6 +147,253 @@ pub fn is_configured(lan: &GoLanSettings) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- WireGuard 密钥规范化（APP-6 任务1）
+
+/// WireGuard 密钥规范化：清洗 → 解码 → 校验 32 字节 → 重编码标准 Base64。
+///
+/// 背景：开启 Go Lan 后内核报 `decode pre shared key for peer 0: illegal
+/// base64 data at input byte 43`。标准 WG 密钥为 32 字节 = 44 位 Base64
+/// （第 44 字符固定 `=`）。`wireguard://` 导入时末尾 `=` 常被 URL 编码成
+/// `%3D`（byte 43 变成 `%`），或 .conf 解析时引入引号/换行/URL-safe 字符，
+/// 内核 `base64.StdEncoding` 解析失败直接拒绝启动。
+///
+/// 处理步骤：
+/// 1. URL 百分号解码（%3D/=、%2B/+、%2F//、%20/空格）；
+/// 2. 剥离首尾空白、`\r`/`\n`、单双引号，截断行内注释 `#`；
+/// 3. 兼容 URL-safe Base64（`-`→`+`、`_`→`/`）与 64 位 Hex 直通；
+/// 4. 只保留合法 Base64 数据字符，32 字节密钥有效数据位固定 43 字符；
+/// 5. 解码校验 32 字节（且不全为 0）后用标准 Base64 重编码返回。
+///
+/// 返回 None 表示输入不是合法密钥：必填密钥（private_key /
+/// peer_public_key）应跳过注入，可选 pre_shared_key 应忽略。
+pub fn normalize_wg_key(raw: &str) -> Option<String> {
+    use base64::engine::GeneralPurpose;
+    use base64::engine::GeneralPurposeConfig;
+    use base64::Engine as _;
+    // 宽松解码引擎：允许非规范尾位（与 Go base64.StdEncoding 行为一致），
+    // 但输出统一走标准重编码，保证内核拿到的一定是规范 44 位
+    let lenient = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
+    // 1. URL 百分号解码
+    let mut s = raw
+        .replace("%3D", "=")
+        .replace("%3d", "=")
+        .replace("%2B", "+")
+        .replace("%2b", "+")
+        .replace("%2F", "/")
+        .replace("%2f", "/")
+        .replace("%20", " ");
+    // 2. 剥离空白、引号、行内注释
+    s = s.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    if let Some(idx) = s.find('#') {
+        s.truncate(idx);
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 3a. Hex 直通：64 位纯十六进制即 32 字节原始密钥
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0))
+            .collect();
+        return valid_wg_bytes(&lenient, &bytes);
+    }
+    // 3b. URL-safe Base64 → 标准字符
+    let replaced = s.replace('-', "+").replace('_', "/");
+    // 4. 只保留合法 Base64 数据字符（空白/引号/换行残留一并剔除）；
+    //    32 字节 → 43 个数据字符 + 1 个 `=` 填充
+    let cleaned: String = replaced
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/')
+        .collect();
+    if cleaned.len() != 43 {
+        return None;
+    }
+    let bytes = lenient.decode(format!("{cleaned}=").as_bytes()).ok()?;
+    // 5. 校验 32 字节后重编码为标准 44 位 Base64
+    valid_wg_bytes(&lenient, &bytes)
+}
+
+fn valid_wg_bytes(engine: &impl base64::Engine, bytes: &[u8]) -> Option<String> {
+    if bytes.len() != 32 || bytes.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(engine.encode(bytes))
+}
+
+/// 手写百分号解码（%XX），用于 wireguard:// 链接的密钥/地址参数。
+/// 不把裸 `+` 转空格——Base64 的 `+` 必须保留（残余非法字符会在
+/// normalize_wg_key 的清洗步骤剔除，不影响结果）。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 解析 endpoint（host:port / [IPv6]:port），无端口默认 51820
+fn split_endpoint(hostport: &str) -> Result<(String, u16), String> {
+    let hostport = hostport.trim().trim_end_matches('/');
+    if let Some(stripped) = hostport.strip_prefix('[') {
+        let (host, rest) = stripped.split_once(']').ok_or("IPv6 endpoint 缺少 ']'")?;
+        let port = rest
+            .trim_start_matches(':')
+            .parse::<u16>()
+            .map_err(|_| "endpoint 端口无效")?;
+        return Ok((host.to_string(), port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p.parse::<u16>().map_err(|_| "endpoint 端口无效")?;
+            Ok((h.to_string(), port))
+        }
+        None => Ok((hostport.to_string(), 51820)),
+    }
+}
+
+/// 解析 `wireguard://`（含 `wg://`）分享链接 → WgManualConfig。
+///
+/// 格式：`wireguard://<私钥>@<host>:<port>/?address=10.0.0.2/32&publickey=...&presharedkey=...&mtu=...`
+/// 密钥参数先 percent_decode 再 normalize_wg_key；可选 presharedkey/psk
+/// 无效时置 None（忽略，不阻断连接）。
+pub fn parse_wireguard_uri(uri: &str) -> Result<WgManualConfig, String> {
+    let trimmed = uri.trim();
+    let rest = trimmed
+        .strip_prefix("wireguard://")
+        .or_else(|| trimmed.strip_prefix("wg://"))
+        .ok_or("不是 wireguard:// 链接")?;
+    let (userinfo, rest2) = rest.split_once('@').ok_or("缺少 '@'（私钥段）")?;
+    let (hostport, query) = match rest2.split_once('?') {
+        Some((h, q)) => (h, q),
+        None => (rest2, ""),
+    };
+    let private_key = normalize_wg_key(&percent_decode(userinfo))
+        .ok_or("私钥不是合法的 32 字节 WireGuard 密钥")?;
+    let (server, server_port) = split_endpoint(hostport)?;
+    let mut peer_public_key: Option<String> = None;
+    let mut pre_shared_key: Option<String> = None;
+    let mut local_ip = String::new();
+    let mut mtu = default_mtu();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let val = percent_decode(v);
+        match k.trim().to_ascii_lowercase().as_str() {
+            "publickey" | "peerpublickey" | "peer_public_key" => {
+                peer_public_key = normalize_wg_key(&val);
+            }
+            // 可选字段：无效 PSK 直接忽略
+            "presharedkey" | "psk" | "preshared_key" | "pre_shared_key" => {
+                pre_shared_key = normalize_wg_key(&val);
+            }
+            "address" | "ip" | "localaddress" | "local_address" => {
+                if local_ip.is_empty() {
+                    local_ip = val;
+                }
+            }
+            "mtu" => mtu = val.trim().parse().unwrap_or(default_mtu()),
+            _ => {}
+        }
+    }
+    let peer_public_key =
+        peer_public_key.ok_or("publickey 缺失或不是合法的 32 字节密钥")?;
+    if local_ip.is_empty() {
+        local_ip = "10.0.0.2/32".into();
+    }
+    Ok(WgManualConfig {
+        server,
+        server_port,
+        private_key,
+        peer_public_key,
+        pre_shared_key,
+        local_ip,
+        mtu,
+    })
+}
+
+/// 解析 wg-quick 风格 `.conf` 文本 → WgManualConfig。
+///
+/// 铁律：键值必须用 `split_once('=')` 切割——`split('=').nth(1)` 会把
+/// 密钥末尾的填充 `=` 吃掉，正是 byte 43 报错的来源之一。
+/// 可选 PresharedKey 无效时置 None。
+pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
+    let mut private_key: Option<String> = None;
+    let mut peer_public_key: Option<String> = None;
+    let mut pre_shared_key: Option<String> = None;
+    let mut local_ip = String::new();
+    let mut endpoint: Option<String> = None;
+    let mut mtu = default_mtu();
+    let mut in_peer = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[Interface]") {
+            in_peer = false;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[Peer]") {
+            in_peer = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match (in_peer, key.as_str()) {
+            (false, "privatekey") => private_key = Some(value.to_string()),
+            (false, "address") => {
+                if local_ip.is_empty() {
+                    local_ip = value.split(',').next().unwrap_or("").trim().to_string();
+                }
+            }
+            (false, "mtu") => mtu = value.parse().unwrap_or(default_mtu()),
+            (true, "publickey") => peer_public_key = Some(value.to_string()),
+            (true, "presharedkey") => pre_shared_key = Some(value.to_string()),
+            (true, "endpoint") => endpoint = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let private_key = normalize_wg_key(&private_key.ok_or("缺少 PrivateKey")?)
+        .ok_or("PrivateKey 不是合法的 32 字节密钥")?;
+    let peer_public_key =
+        normalize_wg_key(&peer_public_key.ok_or("缺少 Peer PublicKey")?)
+            .ok_or("Peer PublicKey 不是合法的 32 字节密钥")?;
+    let (server, server_port) = split_endpoint(&endpoint.ok_or("缺少 Endpoint")?)?;
+    Ok(WgManualConfig {
+        server,
+        server_port,
+        private_key,
+        peer_public_key,
+        pre_shared_key: pre_shared_key.and_then(|k| normalize_wg_key(&k)),
+        local_ip: if local_ip.is_empty() {
+            "10.0.0.2/32".into()
+        } else {
+            local_ip
+        },
+        mtu,
+    })
+}
+
 // ---------------------------------------------------------------- 持久化
 
 pub fn load(data_dir: &std::path::Path) -> GoLanSettings {
@@ -165,60 +412,127 @@ pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), 
 
 // ---------------------------------------------------------------- 出站构建
 
+/// 将 WgManualConfig 构建为 sing-box WireGuard 出站（APP-6 任务2）。
+/// 私钥/对端公钥必须通过 normalize_wg_key 校验（32 字节标准重编码），
+/// 否则返回 None——**严禁**把空串、未解码的 `%3D` 或长度不对的密钥写入
+/// 生成的 prism_config.json，防止内核 decode base64 失败导致启动崩溃。
+/// 可选 pre_shared_key 仅在通过校验时写入；无效 PSK 忽略并给出警告。
+fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
+    let private_key = normalize_wg_key(&wg.private_key)?;
+    let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
+    let mut outbound = json!({
+        "type": "wireguard",
+        "tag": GO_LAN_TAG,
+        "server": wg.server.trim(),
+        "server_port": wg.server_port,
+        "private_key": private_key,
+        "peer_public_key": peer_public_key,
+        "local_address": [wg.local_ip.trim()],
+    });
+    if let Some(psk) = &wg.pre_shared_key {
+        match normalize_wg_key(psk) {
+            Some(valid) => outbound["pre_shared_key"] = Value::String(valid),
+            None if !psk.trim().is_empty() => {
+                warnings.push("预共享密钥格式无效，已忽略（不影响连接）".into());
+            }
+            None => {}
+        }
+    }
+    if wg.mtu > 0 {
+        outbound["mtu"] = json!(wg.mtu);
+    }
+    Some(outbound)
+}
+
 /// 构建回家出站；配置无效返回 (None, 警告)
 pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
     let mut warnings = Vec::new();
     if !lan.enabled {
         return (None, warnings);
     }
-    // 1. 手动 WireGuard
+    // 1. 手动 WireGuard：密钥一律先规范化校验，无效必填密钥 → 不注入
     if let Some(wg) = &lan.wg_config {
-        if !wg.server.is_empty() && !wg.private_key.is_empty() && !wg.peer_public_key.is_empty() {
-            let mut outbound = json!({
-                "type": "wireguard",
-                "tag": GO_LAN_TAG,
-                "server": wg.server,
-                "server_port": wg.server_port,
-                "private_key": wg.private_key,
-                "peer_public_key": wg.peer_public_key,
-                "local_address": [wg.local_ip],
-            });
-            if let Some(psk) = &wg.pre_shared_key {
-                if !psk.is_empty() {
-                    outbound["pre_shared_key"] = Value::String(psk.clone());
-                }
+        if !wg.server.trim().is_empty() {
+            if let Some(outbound) = wg_outbound_value(wg, &mut warnings) {
+                return (Some(outbound), warnings);
             }
-            if wg.mtu > 0 {
-                outbound["mtu"] = json!(wg.mtu);
+            if normalize_wg_key(&wg.private_key).is_none()
+                || normalize_wg_key(&wg.peer_public_key).is_none()
+            {
+                warnings.push(
+                    "WireGuard 私钥/对端公钥不是合法的 32 字节密钥，已忽略（请检查是否带引号或未解码）"
+                        .into(),
+                );
             }
-            return (Some(outbound), warnings);
         }
         warnings.push("WireGuard 配置不完整（服务器/私钥/对端公钥缺失），已忽略".into());
     }
-    // 2. 手动分享链接
+    // 2. 手动分享链接：wireguard:// / wg:// / wg-quick .conf 走专用解析器
+    //    （密钥先 URL 解码 + normalize_wg_key 规范化），其余协议交给通用 uri_parser
     if !lan.node_uri.is_empty() {
-        match uri_parser::parse_line(&lan.node_uri) {
-            Ok(Some(node_value)) => match serde_json::from_value::<ClashNode>(node_value) {
-                Ok(node) => match node_to_outbound(&node) {
-                    Some((mut outbound, warn)) => {
-                        if let Some(w) = warn {
-                            warnings.push(w);
-                        }
-                        outbound["tag"] = json!(GO_LAN_TAG);
+        let uri = lan.node_uri.trim();
+        if uri.starts_with("wireguard://") || uri.starts_with("wg://") {
+            match parse_wireguard_uri(uri) {
+                Ok(wg) => {
+                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings) {
                         return (Some(outbound), warnings);
                     }
-                    None => warnings.push("回家链接节点类型不受支持，已忽略".into()),
+                }
+                Err(e) => warnings.push(format!("wireguard:// 链接解析失败: {e}")),
+            }
+        } else if uri.contains("[Interface]") {
+            match parse_wireguard_conf(uri) {
+                Ok(wg) => {
+                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings) {
+                        return (Some(outbound), warnings);
+                    }
+                }
+                Err(e) => warnings.push(format!(".conf 解析失败: {e}")),
+            }
+        } else {
+            match uri_parser::parse_line(&lan.node_uri) {
+                Ok(Some(node_value)) => match serde_json::from_value::<ClashNode>(node_value) {
+                    Ok(node) => match node_to_outbound(&node) {
+                        Some((mut outbound, warn)) => {
+                            if let Some(w) = warn {
+                                warnings.push(w);
+                            }
+                            outbound["tag"] = json!(GO_LAN_TAG);
+                            return (Some(outbound), warnings);
+                        }
+                        None => warnings.push("回家链接节点类型不受支持或密钥无效，已忽略".into()),
+                    },
+                    Err(e) => warnings.push(format!("回家链接解析失败: {e}")),
                 },
+                Ok(None) => warnings.push("回家链接为空或不支持的协议".into()),
                 Err(e) => warnings.push(format!("回家链接解析失败: {e}")),
-            },
-            Ok(None) => warnings.push("回家链接为空或不支持的协议".into()),
-            Err(e) => warnings.push(format!("回家链接解析失败: {e}")),
+            }
         }
     }
-    // 3. Managed 缓存的出站
+    // 3. Managed 缓存的出站（历史缓存可能带 URL 编码密钥，同样兜底规范化）
     if let Some(cached) = &lan.cached_managed_outbound {
-        if cached.get("type").and_then(|t| t.as_str()).is_some() {
-            let mut outbound = cached.clone();
+        let mut outbound = cached.clone();
+        if let Some(t) = outbound.get("type").and_then(Value::as_str) {
+            if t == "wireguard" {
+                for key in ["private_key", "peer_public_key"] {
+                    if let Some(raw) = outbound.get(key).and_then(Value::as_str) {
+                        if let Some(valid) = normalize_wg_key(raw) {
+                            outbound[key] = json!(valid);
+                        }
+                    }
+                }
+                if let Some(psk) = outbound.get("pre_shared_key").cloned() {
+                    match psk.as_str().and_then(normalize_wg_key) {
+                        Some(valid) => outbound["pre_shared_key"] = json!(valid),
+                        // 损坏/未解码的 PSK 直接移除，绝不写入非法值
+                        None => {
+                            if let Some(obj) = outbound.as_object_mut() {
+                                obj.remove("pre_shared_key");
+                            }
+                        }
+                    }
+                }
+            }
             outbound["tag"] = json!(GO_LAN_TAG);
             return (Some(outbound), warnings);
         }
@@ -407,9 +721,116 @@ pub async fn sync_managed(app: &AppHandle) -> Result<GoLanSettings, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    /// 生成确定性的合法 32 字节 WireGuard 密钥（标准 44 位 Base64）
+    fn test_key(seed: u8) -> String {
+        let bytes: Vec<u8> = (0..32u8)
+            .map(|i| i.wrapping_mul(31).wrapping_add(seed) | 1)
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
 
     #[test]
     fn test_build_wg_outbound() {
+        let lan = GoLanSettings {
+            enabled: true,
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(1),
+                peer_public_key: test_key(2),
+                pre_shared_key: None,
+                local_ip: "10.0.0.2/32".into(),
+                mtu: 1420,
+            }),
+            ..Default::default()
+        };
+        let (outbound, _) = build_outbound(&lan);
+        let ob = outbound.expect("应构建出 WireGuard 出站");
+        assert_eq!(ob["type"], "wireguard");
+        assert_eq!(ob["tag"], GO_LAN_TAG);
+        assert_eq!(ob["server_port"], 51820);
+        assert_eq!(ob["local_address"][0], "10.0.0.2/32");
+        // 密钥必须是重编码后的标准 44 位 Base64
+        assert_eq!(ob["private_key"].as_str(), Some(test_key(1).as_str()));
+        assert_eq!(
+            ob["private_key"].as_str().unwrap().len(),
+            44,
+            "输出必须是标准 44 位 Base64"
+        );
+    }
+
+    #[test]
+    fn test_normalize_url_encoded_psk() {
+        // 崩溃场景还原：末尾 '=' 被 URL 编码成 %3D，byte 43 变成 '%'
+        let std_b64 = test_key(3);
+        let url_encoded = std_b64.replace('=', "%3D");
+        assert_eq!(
+            normalize_wg_key(&url_encoded).as_deref(),
+            Some(std_b64.as_str()),
+            "%3D 必须还原为 '=' 并输出标准 44 位 Base64"
+        );
+    }
+
+    #[test]
+    fn test_normalize_variants() {
+        let std_b64 = test_key(4);
+        // 引号 + 换行 + \r
+        let quoted = format!("\"{}\"\r\n", std_b64.trim_end_matches('='));
+        assert_eq!(normalize_wg_key(&quoted).as_deref(), Some(std_b64.as_str()));
+        // URL-safe（-/ _）且缺末尾填充
+        let urlsafe = std_b64
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_");
+        assert_eq!(
+            normalize_wg_key(&urlsafe).as_deref(),
+            Some(std_b64.as_str())
+        );
+        // 43 位缺末尾 '='
+        assert_eq!(
+            normalize_wg_key(std_b64.trim_end_matches('=')).as_deref(),
+            Some(std_b64.as_str())
+        );
+        // Hex 64 位直通
+        let hex: String = (0..32u8).map(|i| format!("{:02x}", i ^ 0x3C)).collect();
+        assert!(normalize_wg_key(&hex).is_some(), "64 位 Hex 应可解码");
+        // 非法输入一律 None
+        assert!(normalize_wg_key("").is_none());
+        assert!(normalize_wg_key("   ").is_none());
+        assert!(normalize_wg_key(&"A".repeat(43)).is_none(), "全 0 密钥拒绝");
+        assert!(normalize_wg_key(&"A".repeat(42)).is_none(), "长度不对拒绝");
+        assert!(normalize_wg_key("short-broken").is_none());
+    }
+
+    #[test]
+    fn test_broken_psk_dropped() {
+        let lan = GoLanSettings {
+            enabled: true,
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(5),
+                peer_public_key: test_key(6),
+                // 模拟 %3D 未解码且长度损坏的 PSK
+                pre_shared_key: Some("short-broken%3D".into()),
+                local_ip: "10.0.0.2/32".into(),
+                mtu: 1420,
+            }),
+            ..Default::default()
+        };
+        let (outbound, warnings) = build_outbound(&lan);
+        let ob = outbound.expect("合法私钥/公钥仍应构建出站");
+        assert!(
+            ob.get("pre_shared_key").is_none(),
+            "损坏的 PSK 不得写入配置"
+        );
+        assert!(!warnings.is_empty(), "PSK 被忽略时应有警告");
+    }
+
+    #[test]
+    fn test_invalid_required_keys_skip_outbound() {
         let lan = GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -423,12 +844,75 @@ mod tests {
             }),
             ..Default::default()
         };
+        let (outbound, warnings) = build_outbound(&lan);
+        assert!(outbound.is_none(), "无效必填密钥不得注入出站");
+        assert!(warnings.iter().any(|w| w.contains("32 字节")));
+    }
+
+    #[test]
+    fn test_wireguard_uri_with_encoded_keys() {
+        let priv_key = test_key(7);
+        let peer = test_key(8);
+        let psk = test_key(9);
+        let uri = format!(
+            "wireguard://{priv_key}%3D@home.example.com:51820/?address=10.0.0.2%2F32&publickey={peer}&presharedkey={psk_trimmed}%3D&mtu=1420",
+            psk_trimmed = psk.trim_end_matches('='),
+        );
+        let wg = parse_wireguard_uri(&uri).expect("wireguard:// 解析成功");
+        assert_eq!(wg.private_key, priv_key);
+        assert_eq!(wg.peer_public_key, peer);
+        assert_eq!(wg.pre_shared_key.as_deref(), Some(psk.as_str()));
+        assert_eq!(wg.local_ip, "10.0.0.2/32");
+        assert_eq!(wg.mtu, 1420);
+        assert_eq!(wg.server, "home.example.com");
+        assert_eq!(wg.server_port, 51820);
+    }
+
+    #[test]
+    fn test_wireguard_uri_invalid_key_rejected() {
+        let uri = format!(
+            "wireguard://{}@home.example.com:51820/?publickey={}",
+            "not-a-valid-key",
+            test_key(10)
+        );
+        assert!(parse_wireguard_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn test_wireguard_conf_split_once() {
+        // 回归：PresharedKey 末尾的 '=' 必须保留——split_once('=') 铁律
+        let priv_key = test_key(11);
+        let peer = test_key(12);
+        let psk = test_key(13);
+        let conf = format!(
+            "[Interface]\r\nPrivateKey = {priv_key}\r\nAddress = 10.0.0.2/32\r\nMTU = 1400\r\n\r\n[Peer]\r\nPublicKey = {peer}\r\nPresharedKey = {psk}\r\nEndpoint = home.example.com:51820\r\nAllowedIPs = 192.168.0.0/16\r\n"
+        );
+        let wg = parse_wireguard_conf(&conf).expect(".conf 解析成功");
+        assert_eq!(wg.private_key, priv_key);
+        assert_eq!(wg.peer_public_key, peer);
+        assert_eq!(wg.pre_shared_key.as_deref(), Some(psk.as_str()));
+        assert_eq!(wg.local_ip, "10.0.0.2/32");
+        assert_eq!(wg.mtu, 1400);
+    }
+
+    #[test]
+    fn test_build_outbound_via_wireguard_uri() {
+        let priv_key = test_key(14);
+        let peer = test_key(15);
+        let lan = GoLanSettings {
+            enabled: true,
+            node_uri: format!(
+                "wireguard://{priv_key}@10.1.2.3:51820/?publickey={peer}&address=10.0.0.5/32"
+            ),
+            lan_cidrs: vec!["192.168.1.0/24".into()],
+            ..Default::default()
+        };
         let (outbound, _) = build_outbound(&lan);
-        let ob = outbound.expect("应构建出 WireGuard 出站");
-        assert_eq!(ob["type"], "wireguard");
+        let ob = outbound.expect("wireguard:// 链接应构建出出站");
         assert_eq!(ob["tag"], GO_LAN_TAG);
-        assert_eq!(ob["server_port"], 51820);
-        assert_eq!(ob["local_address"][0], "10.0.0.2/32");
+        assert_eq!(ob["private_key"].as_str(), Some(priv_key.as_str()));
+        assert_eq!(ob["peer_public_key"].as_str(), Some(peer.as_str()));
+        assert_eq!(ob["server"], "10.1.2.3");
     }
 
     #[test]
