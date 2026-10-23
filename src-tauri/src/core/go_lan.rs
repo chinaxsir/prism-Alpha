@@ -266,6 +266,48 @@ fn split_endpoint(hostport: &str) -> Result<(String, u16), String> {
     }
 }
 
+/// APP-8 任务2：将 WireGuard 对端域名预解析为 IP 地址（同步版）。
+///
+/// 内核在 post-start 阶段对 wireguard 出站必须同步解析 server 域名，
+/// 若 dns-direct 被运营商 RST（明文 TCP 53 嗅探 .indevs.in 等 DDNS），
+/// 会直接中断整个 VPN 启动。提前在配置生成阶段把域名换成 IP，post-start
+/// 阶段零 DNS 请求、0ms 瞬时启动。
+///
+/// 本函数在同步配置生成路径调用，仅做零网络请求的快速解析：
+/// 1. 已是合法 IP 字面量 → 原样返回；
+/// 2. 系统原生解析 `ToSocketAddrs`（优先 IPv4，无 IPv4 取 IPv6）；
+/// 3. 失败 → 原样返回域名（iOS 扩展侧 getaddrinfo + 兜底重试接管，
+///    见 PacketTunnelProvider.swift resolveHostToIP / go-lan-home 剥离重试）。
+pub fn resolve_endpoint_host_to_ip(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/');
+    if host.is_empty() {
+        return host.to_string();
+    }
+    // 1. 已是 IP 字面量
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    // 2. 系统原生解析（优先 IPv4）
+    if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 51820u16)) {
+        let mut v6: Option<String> = None;
+        for a in addrs.by_ref() {
+            match a {
+                std::net::SocketAddr::V4(v4) => return v4.ip().to_string(),
+                std::net::SocketAddr::V6(v6a) => {
+                    if v6.is_none() {
+                        v6 = Some(v6a.ip().to_string());
+                    }
+                }
+            }
+        }
+        if let Some(v6) = v6 {
+            return v6;
+        }
+    }
+    // 3. 失败，原样返回域名（扩展侧还有 getaddrinfo 预解析与 go-lan 剥离兜底）
+    host.to_string()
+}
+
 /// 解析 `wireguard://`（含 `wg://`）分享链接 → WgManualConfig。
 ///
 /// 格式：`wireguard://<私钥>@<host>:<port>/?address=10.0.0.2/32&publickey=...&presharedkey=...&mtu=...`
@@ -420,10 +462,15 @@ pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), 
 fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
+    // APP-8 任务2：预解析 WireGuard 对端域名为 IP——内核 post-start 阶段
+    // 对 wireguard 出站必须同步解析 server 域名，若 dns-direct(-bak) 解析
+    // 被 RST 会中断整个 VPN 启动。提前把 server 换成 IP，post-start 零 DNS
+    // 请求、瞬时启动；解析失败则原样保留域名（扩展侧还有兜底重试）。
+    let server = resolve_endpoint_host_to_ip(wg.server.trim());
     let mut outbound = json!({
         "type": "wireguard",
         "tag": GO_LAN_TAG,
-        "server": wg.server.trim(),
+        "server": server,
         "server_port": wg.server_port,
         "private_key": private_key,
         "peer_public_key": peer_public_key,

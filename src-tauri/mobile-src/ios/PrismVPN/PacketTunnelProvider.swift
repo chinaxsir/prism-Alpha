@@ -361,6 +361,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if let errorPtr = errorPtr {
                     let message = String(cString: errorPtr)
                     PrismKernelFree(errorPtr)
+                    // APP-8 任务4：go-lan-home 容错重试——若错误来自 WireGuard
+                    // 回家出站（如家庭 DDNS 域名已过期/无 A 记录导致 post-start
+                    // resolve endpoint domain 失败），自动剥离 go-lan-home 出站
+                    // 与相关路由规则后立即重试主隧道，保证手机正常代理上网，
+                    // 绝不因回家功能卡死整个 VPN 启动。
+                    if message.contains("go-lan-home") || message.contains("outbound/wireguard") {
+                        self.writeHeartbeat("go-lan-fallback-strip")
+                        let stripped = self.stripGoLanHome(from: sanitizedConfig)
+                        if stripped != sanitizedConfig {
+                            let retryPtr = stripped.withCString { configPtr in
+                                workDir.path.withCString { dirPtr in
+                                    PrismVPNStart(
+                                        UnsafeMutablePointer(mutating: configPtr),
+                                        UnsafeMutablePointer(mutating: dirPtr)
+                                    )
+                                }
+                            }
+                            if let retryPtr = retryPtr {
+                                let retryMsg = String(cString: retryPtr)
+                                PrismKernelFree(retryPtr)
+                                throw NSError(domain: "PrismVPN", code: 2, userInfo: [NSLocalizedDescriptionKey: "已剥离 go-lan-home 重试仍失败: \(retryMsg)"])
+                            }
+                            // 剥离后启动成功：进入 running
+                            self.stateLock.lock()
+                            self.currentState = .running
+                            self.stateLock.unlock()
+                            self.writeHeartbeat("running(\(currentPhy.name))-goLanStripped")
+                            DispatchQueue.main.async {
+                                self.startHeartbeatTimer()
+                                completionHandler(nil)
+                            }
+                            return
+                        }
+                    }
                     throw NSError(domain: "PrismVPN", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
                 }
 
@@ -698,6 +732,130 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return data.base64EncodedString()
     }
 
+    // MARK: - WireGuard 域名预解析（APP-8 任务3）
+
+    /// 基于 iOS 系统原生 getaddrinfo 的域名预解析。
+    /// 内核 post-start 阶段对 wireguard 出站必须同步解析 server 域名，
+    /// 若 dns-direct(-bak) 解析被 RST 会中断整个 VPN 启动。提前在扩展侧
+    /// 把 server 域名替换为 IP，post-start 零 DNS 请求、瞬时启动。
+    /// 优先返回 IPv4，无 IPv4 时返回第一个 IPv6；解析失败返回 nil。
+    private func resolveHostToIP(_ host: String) -> String? {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_DGRAM
+        var res: UnsafeMutablePointer<addrinfo>? = nil
+        let status = getaddrinfo(trimmed, nil, &hints, &res)
+        guard status == 0, let first = res else { return nil }
+        defer { freeaddrinfo(res) }
+
+        var ipv6Fallback: String? = nil
+        var ptr: UnsafeMutablePointer<addrinfo>? = first
+        while let info = ptr {
+            if info.pointee.ai_family == AF_INET, let addr = info.pointee.ai_addr {
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                var inAddr = sin.sin_addr
+                if inet_ntop(AF_INET, &inAddr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    return String(cString: buffer)
+                }
+            } else if info.pointee.ai_family == AF_INET6, ipv6Fallback == nil, let addr = info.pointee.ai_addr {
+                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                let sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+                var in6Addr = sin6.sin6_addr
+                if inet_ntop(AF_INET6, &in6Addr, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil {
+                    ipv6Fallback = String(cString: buffer)
+                }
+            }
+            ptr = info.pointee.ai_next
+        }
+        return ipv6Fallback
+    }
+
+    /// 判断字符串是否已是 IP 字面量（IPv4 或 IPv6）
+    private func isIPLiteral(_ s: String) -> Bool {
+        var v4 = in_addr()
+        if inet_pton(AF_INET, s, &v4) == 1 { return true }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, s, &v6) == 1 { return true }
+        return false
+    }
+
+    // MARK: - go-lan-home 剥离兜底（APP-8 任务4）
+
+    /// 从配置 JSON 中剥离 go-lan-home WireGuard 出站及其关联引用，
+    /// 用于家庭 DDNS 域名彻底无法解析时的降级启动。
+    /// 剥离范围：
+    ///   - outbounds[] 中 tag == "go-lan-home"
+    ///   - route.rules[] 中 outbound == "go-lan-home"
+    ///   - route.final / dns.rules[].server / dns.servers[] 中引用
+    ///     go-lan-home 的项（dns-home 服务器 detour 指向 go-lan-home 时移除）
+    /// 返回剥离后的 JSON 字符串；若无可剥离内容返回原串。
+    private func stripGoLanHome(from configJSON: String) -> String {
+        guard let data = configJSON.data(using: .utf8),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return configJSON }
+
+        let tag = "go-lan-home"
+        var changed = false
+
+        // 1. outbounds 中移除
+        if var outbounds = root["outbounds"] as? [[String: Any]] {
+            let before = outbounds.count
+            outbounds.removeAll { ($0["tag"] as? String) == tag }
+            if outbounds.count != before {
+                root["outbounds"] = outbounds
+                changed = true
+            }
+        }
+
+        // 2. route.rules 中移除 outbound == go-lan-home 的规则
+        if var route = root["route"] as? [String: Any] {
+            if var rules = route["rules"] as? [[String: Any]] {
+                let before = rules.count
+                rules.removeAll { ($0["outbound"] as? String) == tag }
+                if rules.count != before {
+                    route["rules"] = rules
+                    changed = true
+                }
+            }
+            // route.final 若指向 go-lan-home 则回退为 proxy
+            if (route["final"] as? String) == tag {
+                route["final"] = "proxy"
+                changed = true
+            }
+            root["route"] = route
+        }
+
+        // 3. dns：移除 detour 指向 go-lan-home 的 dns-home 服务器，及其规则
+        if var dns = root["dns"] as? [String: Any] {
+            if var servers = dns["servers"] as? [[String: Any]] {
+                let before = servers.count
+                servers.removeAll { ($0["detour"] as? String) == tag }
+                if servers.count != before {
+                    dns["servers"] = servers
+                    changed = true
+                }
+            }
+            if var rules = dns["rules"] as? [[String: Any]] {
+                let before = rules.count
+                rules.removeAll { ($0["server"] as? String) == "dns-home" }
+                if rules.count != before {
+                    dns["rules"] = rules
+                    changed = true
+                }
+            }
+            root["dns"] = dns
+        }
+
+        guard changed,
+              let out = try? JSONSerialization.data(withJSONObject: root),
+              let str = String(data: out, encoding: .utf8)
+        else { return configJSON }
+        return str
+    }
+
     private func sanitizeConfigForExtension(_ rawJSON: String, workDir: URL, phyName: String) -> String {
         guard let data = rawJSON.data(using: .utf8),
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -784,6 +942,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                 peers[j]["pre_shared_key"] = fixed
                             } else {
                                 peers[j].removeValue(forKey: "pre_shared_key")
+                            }
+                        }
+                    }
+                    outbounds[i]["peers"] = peers
+                }
+                // APP-8 任务3：wireguard 出站在内核 post-start 阶段必须同步
+                // 解析 server 域名，dns-direct 被 RST 会中断整个启动。
+                // 预解析顶层 server 与 peers[].server 为 IP，零 DNS 瞬时启动。
+                if let srv = outbounds[i]["server"] as? String, !isIPLiteral(srv) {
+                    if let ip = resolveHostToIP(srv) {
+                        outbounds[i]["server"] = ip
+                    }
+                }
+                if var peers = outbounds[i]["peers"] as? [[String: Any]] {
+                    for j in peers.indices {
+                        if let srv = peers[j]["server"] as? String, !isIPLiteral(srv) {
+                            if let ip = resolveHostToIP(srv) {
+                                peers[j]["server"] = ip
                             }
                         }
                     }
@@ -934,9 +1110,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP-2】dns-direct 双备份（防移动蜂窝网拦截 UDP 53）：
-            // 主用 AliDNS TCP、备用 DNSPod TCP（sing-box 无服务器 failover
-            // 语义，双 server 条目 + 不同直连规则分流落地，两者均承载真实流量）
+            // 【APP-8 任务1】dns-direct 双备份升级为加密 DoH：
+            // 废弃明文 tcp://119.29.29.29（TCP 53 被运营商对 .indevs.in
+            // 等 DDNS 域名嗅探后 RST：connection reset by peer）。
+            // 主用 AliDNS TCP，备用升级为阿里 IP 直连 DoH（https://223.5.5.5
+            // /dns-query，走 TCP 443 加密，无需 address_resolver 引导解析，
+            // 同时规避 iOS 沙盒 UDP 53 偶发 operation not permitted）。
             [
                 "tag": "dns-direct",
                 "address": "tcp://223.5.5.5",
@@ -945,7 +1124,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ],
             [
                 "tag": "dns-direct-bak",
-                "address": "tcp://119.29.29.29",
+                "address": "https://223.5.5.5/dns-query",
                 "detour": "direct",
                 "strategy": "prefer_ipv4"
             ]
