@@ -362,6 +362,19 @@ export default function Settings() {
     setSaved(false);
   };
 
+  /// 【APP-11 任务3】开关拨动即刻生效并持久化：
+  /// 同步写本地表单 + 全局 store + 后端 saveSettings（运行中自动热重载），
+  /// 不再依赖右上角「保存」按钮，彻底避免切页后开关回弹/两处状态不一致。
+  const patchSwitch = (p: Partial<UserSettings>) => {
+    const next = { ...form, ...p };
+    setForm(next);
+    useCoreStore.getState().setSettings(next);
+    setSaved(false);
+    saveSettings(next)
+      .then(() => setSaved(true))
+      .catch((e) => toast.error(String(e)));
+  };
+
   /// 语言 / 外观：立即生效 + 立即持久化（无需再点「保存」）
   const patchPrefs = (p: Partial<UserSettings>) => {
     const next = { ...form, ...p };
@@ -492,6 +505,31 @@ export default function Settings() {
       useCoreStore.getState().setGoLanSettings(payload);
       toast.success(t("settings.goLan.saveToast"));
     } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setGoLanBusy(false);
+    }
+  };
+
+  /// 【APP-11 任务3】设置页 Go Lan 开关拨动即刻保存生效（与仪表盘同一数据源），
+  /// 不再需要点「保存 Go Lan 配置」；全局 store 同步更新让仪表盘立即跟随。
+  const handleGoLanToggle = async (v: boolean) => {
+    if (v && !isGoLanConfigured(buildGoLanPayload())) {
+      toast.error(t("dashboard.lan.configureFirst"));
+      setGoLanExpanded(true);
+      return;
+    }
+    const nextForm = { ...goLan, enabled: v };
+    setGoLan(nextForm);
+    const payload: GoLanSettings = { ...buildGoLanPayload(), enabled: v };
+    setGoLanBusy(true);
+    try {
+      const warnings = await saveGoLanSettings(payload);
+      warnings?.forEach((w) => toast.info(w));
+      useCoreStore.getState().setGoLanSettings(payload);
+    } catch (e) {
+      // 失败回滚开关，避免前端显示"已开启"但后端未生效
+      setGoLan((f) => ({ ...f, enabled: !v }));
       toast.error(String(e));
     } finally {
       setGoLanBusy(false);
@@ -660,7 +698,7 @@ export default function Settings() {
               : t("settings.allowLanDesc")
           }
           checked={form.allowLan}
-          onChange={(v) => patch({ allowLan: v })}
+          onChange={(v) => patchSwitch({ allowLan: v })}
         />
         {!mobile && (
           <ToggleRow
@@ -668,7 +706,7 @@ export default function Settings() {
             title={t("settings.systemProxy")}
             desc={t("settings.systemProxyDesc")}
             checked={form.systemProxy}
-            onChange={(v) => patch({ systemProxy: v })}
+            onChange={(v) => patchSwitch({ systemProxy: v })}
           />
         )}
         {!mobile && (
@@ -677,7 +715,7 @@ export default function Settings() {
             title={t("settings.autoStart")}
             desc={t("settings.autoStartDesc")}
             checked={form.autoStart}
-            onChange={(v) => patch({ autoStart: v })}
+            onChange={(v) => patchSwitch({ autoStart: v })}
           />
         )}
       </SettingsGroup>
@@ -721,15 +759,7 @@ export default function Settings() {
           headerRight={
             <Switch
               checked={goLan.enabled}
-              onChange={(v) => {
-                // APP 任务5：未配置时拦截开启，Toast 引导并展开配置区
-                if (v && !isGoLanConfigured(buildGoLanPayload())) {
-                  toast.error(t("dashboard.lan.configureFirst"));
-                  setGoLanExpanded(true);
-                  return;
-                }
-                patchGoLan({ enabled: v });
-              }}
+              onChange={handleGoLanToggle}
             />
           }
         >
@@ -1044,21 +1074,21 @@ export default function Settings() {
           title={t("settings.ipv6")}
           desc={t("settings.ipv6Desc")}
           checked={form.ipv6 ?? false}
-          onChange={(v) => patch({ ipv6: v })}
+          onChange={(v) => patchSwitch({ ipv6: v })}
         />
         <ToggleRow
           icon={<Blocks size={16} className="text-gray-400" />}
           title={t("settings.blockQuic")}
           desc={t("settings.blockQuicDesc")}
           checked={form.blockQuic ?? false}
-          onChange={(v) => patch({ blockQuic: v })}
+          onChange={(v) => patchSwitch({ blockQuic: v })}
         />
         <ToggleRow
           icon={<RefreshCw size={16} className="text-gray-400" />}
           title={t("settings.closeConns")}
           desc={t("settings.closeConnsDesc")}
           checked={form.closeConnectionsOnSwitch ?? false}
-          onChange={(v) => patch({ closeConnectionsOnSwitch: v })}
+          onChange={(v) => patchSwitch({ closeConnectionsOnSwitch: v })}
         />
       </SettingsGroup>
 

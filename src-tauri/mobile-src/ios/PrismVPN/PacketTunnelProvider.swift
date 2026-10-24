@@ -361,40 +361,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if let errorPtr = errorPtr {
                     let message = String(cString: errorPtr)
                     PrismKernelFree(errorPtr)
-                    // APP-8 任务4：go-lan-home 容错重试——若错误来自 WireGuard
-                    // 回家出站（如家庭 DDNS 域名已过期/无 A 记录导致 post-start
-                    // resolve endpoint domain 失败），自动剥离 go-lan-home 出站
-                    // 与相关路由规则后立即重试主隧道，保证手机正常代理上网，
-                    // 绝不因回家功能卡死整个 VPN 启动。
-                    if message.contains("go-lan-home") || message.contains("outbound/wireguard") {
-                        self.writeHeartbeat("go-lan-fallback-strip")
-                        let stripped = self.stripGoLanHome(from: sanitizedConfig)
-                        if stripped != sanitizedConfig {
-                            let retryPtr = stripped.withCString { configPtr in
-                                workDir.path.withCString { dirPtr in
-                                    PrismVPNStart(
-                                        UnsafeMutablePointer(mutating: configPtr),
-                                        UnsafeMutablePointer(mutating: dirPtr)
-                                    )
-                                }
-                            }
-                            if let retryPtr = retryPtr {
-                                let retryMsg = String(cString: retryPtr)
-                                PrismKernelFree(retryPtr)
-                                throw NSError(domain: "PrismVPN", code: 2, userInfo: [NSLocalizedDescriptionKey: "已剥离 go-lan-home 重试仍失败: \(retryMsg)"])
-                            }
-                            // 剥离后启动成功：进入 running
-                            self.stateLock.lock()
-                            self.currentState = .running
-                            self.stateLock.unlock()
-                            self.writeHeartbeat("running(\(currentPhy.name))-goLanStripped")
-                            DispatchQueue.main.async {
-                                self.startHeartbeatTimer()
-                                completionHandler(nil)
-                            }
-                            return
-                        }
-                    }
+                    // 【APP-11 任务1.1】移除 go-lan-home 静默剥离降级：
+                    // 过去配置有误时自动剥掉回家出站并"启动成功"，用户以为
+                    // Go Lan 已生效，实际家里根本连不上，问题被长期掩盖。
+                    // 现在错误必须原样上抛到前端，让用户明确看到失败原因。
+                    self.writeHeartbeat("start-failed:\(message)")
                     throw NSError(domain: "PrismVPN", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
                 }
 
@@ -597,6 +568,61 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return NEIPv4Route(destinationAddress: $0.address, subnetMask: subnetMask(prefix: $0.prefix))
             }
         }
+        // 【APP-11 任务1.2】Go Lan 路由与 Socket 加固：
+        // 1) WireGuard 对端公网 IP 加入 excludedRoutes → 加密 UDP 由系统内核
+        //    直接走物理网卡直出，绝不回环进 utun，彻底消除
+        //    "listen outbound packet connection: operation not permitted"；
+        // 2) 回家内网网段（go-lan-home 规则的 ip_cidr）显式加入 includedRoutes，
+        //    强制系统把访问家庭内网 IP 的流量送入 utun 交给回家隧道，
+        //    而不是走当前 Wi-Fi 本地局域网丢包。
+        var excludedV4: [NEIPv4Route] = []
+        var includedV4: [NEIPv4Route] = ipv4.includedRoutes ?? []
+        if let outs = json["outbounds"] as? [[String: Any]] {
+            for ob in outs
+            where (ob["tag"] as? String) == "go-lan-home" && (ob["type"] as? String) == "wireguard" {
+                if let srv = ob["server"] as? String, isIPLiteral(srv) {
+                    excludedV4.append(
+                        NEIPv4Route(destinationAddress: srv, subnetMask: "255.255.255.255")
+                    )
+                }
+                if let peers = ob["peers"] as? [[String: Any]] {
+                    for peer in peers {
+                        if let srv = peer["server"] as? String, isIPLiteral(srv) {
+                            excludedV4.append(
+                                NEIPv4Route(destinationAddress: srv, subnetMask: "255.255.255.255")
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
+            for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
+                for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
+                    guard let p = parseCIDR(cidr), !p.address.isEmpty else { continue }
+                    let route = p.prefix <= 0
+                        ? NEIPv4Route.default()
+                        : NEIPv4Route(
+                            destinationAddress: p.address,
+                            subnetMask: subnetMask(prefix: p.prefix)
+                        )
+                    if !includedV4.contains(where: {
+                        $0.destinationAddress == route.destinationAddress
+                            && $0.destinationSubnetMask == route.destinationSubnetMask
+                    }) {
+                        includedV4.append(route)
+                    }
+                }
+            }
+        }
+        // 直连 DNS 223.5.5.5 直出物理网卡（零 403 / 零 EPERM）
+        excludedV4.append(
+            NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
+        )
+        if !excludedV4.isEmpty {
+            ipv4.excludedRoutes = excludedV4
+        }
+        ipv4.includedRoutes = includedV4
         settings.ipv4Settings = ipv4
 
         let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
@@ -914,7 +940,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if firstSelectorTag == nil {
                     firstSelectorTag = tag
                 }
+            } else if t == "urltest" {
+                // 【APP-11 任务2】清洗订阅自带 urltest 的畸形测速地址
+                // （APP.txt 中 http://gateway.icloud.com 带空格导致后台
+                // 疯狂报错刷屏耗电）：统一强制为 gstatic 204，间隔 10m。
+                var u = ((outbounds[i]["url"] as? String) ?? "")
+                    .replacingOccurrences(of: " ", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !u.lowercased().hasPrefix("http") {
+                    u = "https://www.gstatic.com/generate_204"
+                }
+                outbounds[i]["url"] = u
+                outbounds[i]["interval"] = "10m"
             } else if t == "wireguard" {
+                // 【APP-11 任务1.1】Legacy WireGuard 单节点顶层**没有**
+                // allowed_ips 字段，写入会触发内核
+                // "decode config: outbounds[n].allowed_ips: json: unknown field"，
+                // 直接拒绝启动。必须无条件剥离；peers 也统一收敛为顶层单节点结构。
+                outbounds[i].removeValue(forKey: "allowed_ips")
+                if tag == "go-lan-home" {
+                    outbounds[i].removeValue(forKey: "peers")
+                }
+                // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
+                if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
+                    outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }
+                } else if let la = outbounds[i]["local_address"] as? String, !la.isEmpty {
+                    outbounds[i]["local_address"] = [normalizePrefixString(la)]
+                }
+                // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
+                // 强制 ipv4_only 保证 WireGuard 握手包可正常发出
+                outbounds[i]["domain_strategy"] = "ipv4_only"
                 // APP-6 任务3：WireGuard 密钥兜底自愈——历史脏数据（%3D /
                 // 引号 / URL-safe / 损坏 PSK）自动修复为标准 44 位 Base64，
                 // 无法通过 32 字节校验的 pre_shared_key 直接剔除，
@@ -1129,21 +1184,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP-8 任务1】dns-direct 双备份升级为加密 DoH：
-            // 废弃明文 tcp://119.29.29.29（TCP 53 被运营商对 .indevs.in
-            // 等 DDNS 域名嗅探后 RST：connection reset by peer）。
-            // 主用 AliDNS TCP，备用升级为阿里 IP 直连 DoH（https://223.5.5.5
-            // /dns-query，走 TCP 443 加密，无需 address_resolver 引导解析，
-            // 同时规避 iOS 沙盒 UDP 53 偶发 operation not permitted）。
+            // 【APP-11 任务2】dns-direct 改加密 DoT：
+            // 阿里云 WAF 已拦截 Host 为纯 IP 的 https://223.5.5.5/dns-query
+            // 请求并返回 403 Forbidden（APP.txt:
+            // "dns: exchange failed ... unexpected HTTP response status: 403"）。
+            // 改用阿里云原生支持 IP 证书校验的 DoT（tls://223.5.5.5:853），
+            // 既走加密通道不被运营商 RST，也 100% 不触发 403；
+            // 备用保留 DoT 同一地址（不同 tag 维持规则引用完整）。
             [
                 "tag": "dns-direct",
-                "address": "tcp://223.5.5.5",
+                "address": "tls://223.5.5.5",
                 "detour": "direct",
                 "strategy": "prefer_ipv4"
             ],
             [
                 "tag": "dns-direct-bak",
-                "address": "https://223.5.5.5/dns-query",
+                "address": "tls://223.5.5.5",
                 "detour": "direct",
                 "strategy": "prefer_ipv4"
             ]
@@ -1388,6 +1444,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 private struct Prefix {
     let address: String
     let prefix: Int
+}
+
+/// 【APP-11 任务1.1】给无前缀的地址补默认子网前缀（IPv4 → /24，IPv6 → /64），
+/// 内核按 netip.Prefix 解析 local_address，缺前缀会直接失败。
+private func normalizePrefixString(_ raw: String) -> String {
+    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if s.isEmpty { return "10.0.0.2/24" }
+    if s.contains("/") { return s }
+    return s.contains(":") ? "\(s)/64" : "\(s)/24"
 }
 
 private func parseCIDR(_ cidr: String) -> Prefix? {

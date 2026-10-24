@@ -467,6 +467,12 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     // 被 RST 会中断整个 VPN 启动。提前把 server 换成 IP，post-start 零 DNS
     // 请求、瞬时启动；解析失败则原样保留域名（扩展侧还有兜底重试）。
     let server = resolve_endpoint_host_to_ip(wg.server.trim());
+    let local_address = normalize_local_address(&wg.local_ip);
+    // 【APP-11 任务1.1】严禁在 wireguard 出站**顶层**写入 "allowed_ips"！
+    // sing-box v1.11.3 的 Legacy WireGuard 单节点结构顶层不存在该字段，
+    // 写入会直接触发 `decode config: outbounds[n].allowed_ips: json: unknown
+    // field "allowed_ips"`，内核拒绝启动。单节点顶层模式内核已自动将
+    // AllowedIPs 视为 0.0.0.0/0 + ::/0（全量放行），无需也无法显式声明。
     let mut outbound = json!({
         "type": "wireguard",
         "tag": GO_LAN_TAG,
@@ -474,11 +480,10 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
         "server_port": wg.server_port,
         "private_key": private_key,
         "peer_public_key": peer_public_key,
-        "local_address": [wg.local_ip.trim()],
-        // 【APP-10 任务1.2】WireGuard Cryptokey Routing 默认只允许 /32 单 IP，
-        // 必须显式放行 0.0.0.0/0 + ::/0，否则发往家庭内网 192.168.x.0/24 的
-        // 加密数据包被底层路由表直接丢弃，表现为「能连 Google 但打不开家里 NAS」
-        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "local_address": [local_address],
+        // iOS 关闭 IPv6 时双栈 Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
+        // 强制 ipv4_only 保证 UDP（WireGuard）可正常发握手包
+        "domain_strategy": "ipv4_only",
     });
     if let Some(psk) = &wg.pre_shared_key {
         match normalize_wg_key(psk) {
@@ -594,6 +599,93 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
 
 // ---------------------------------------------------------------- 规则合成
 
+/// 【APP-11 任务1.1】规范化 local_address：内核按 `netip.Prefix` 解析，
+/// 缺少 `/子网前缀` 会直接失败。无前缀的 IPv4 补 `/24`（同网段设备可达），
+/// 无前缀 IPv6 补 `/64`。
+fn normalize_local_address(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return "10.0.0.2/24".into();
+    }
+    if s.contains('/') {
+        return s.to_string();
+    }
+    if s.contains(':') {
+        format!("{s}/64")
+    } else {
+        format!("{s}/24")
+    }
+}
+
+/// 【APP-11 任务1.1】规范化回家内网网段列表。
+///
+/// 用户常见填法是不带掩码的单个 IP（`192.168.1.1`）或主机位非零的 CIDR
+/// （`192.168.1.1/24`）。前者交给内核会解析失败/匹配不到网段，后者会被
+/// `netip.Prefix` 规范化成 `192.168.1.0/24` 但仍需保留精确主机路由。
+/// 处理策略：
+/// - 纯 IP（无 `/`）→ 同时产出 `/32` 精确路由与对应 `/24` 网段；
+/// - CIDR 主机位非零 → 保留原精确 `/32` + 归一化后的网络前缀；
+/// - 已规范的 CIDR → 原样保留；
+/// - 最后自动并入 WireGuard 虚拟子网（local_address 推导）。
+pub(crate) fn normalize_cidr_list(cidrs: &[String], local_addr: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !v.is_empty() && !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    for raw in cidrs {
+        let c = raw.trim();
+        if c.is_empty() {
+            continue;
+        }
+        match c.split_once('/') {
+            None => {
+                // 单个 IP：若合法则补 /32 与同网段 /24
+                if let Ok(ip) = c.parse::<std::net::Ipv4Addr>() {
+                    push(format!("{ip}/32"));
+                    push(network_of_v4(ip, 24));
+                } else if let Ok(ip) = c.parse::<std::net::Ipv6Addr>() {
+                    push(format!("{ip}/128"));
+                }
+            }
+            Some((ip_s, mask_s)) => {
+                if !is_valid_cidr(c) {
+                    continue;
+                }
+                if let (Ok(ip), Ok(mask)) =
+                    (ip_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>())
+                {
+                    // 主机位非零：保留精确 /32 并归一化为网络前缀
+                    let net = network_of_v4(ip, mask);
+                    if net != format!("{ip}/{mask}") {
+                        push(format!("{ip}/32"));
+                    }
+                    push(net);
+                } else {
+                    push(c.to_string());
+                }
+            }
+        }
+    }
+    if let Some(virtual_cidr) = extract_virtual_subnet(local_addr) {
+        push(virtual_cidr);
+    }
+    out
+}
+
+/// 计算 IPv4 网络前缀（掩码 0..=32），如 192.168.1.1/24 → 192.168.1.0/24
+fn network_of_v4(ip: std::net::Ipv4Addr, mask: u8) -> String {
+    let mask = mask.min(32);
+    let bits = u32::from(ip);
+    let net_mask: u32 = if mask == 0 {
+        0
+    } else {
+        u32::MAX << (32 - mask)
+    };
+    format!("{}/{mask}", std::net::Ipv4Addr::from(bits & net_mask))
+}
+
 /// 校验 CIDR 网段合法性
 pub(crate) fn is_valid_cidr(cidr: &str) -> bool {
     let Some((ip, mask)) = cidr.split_once('/') else {
@@ -628,28 +720,24 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
     if !domains.is_empty() {
         rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
     }
-    let mut cidrs: Vec<String> = lan
-        .lan_cidrs
-        .iter()
-        .map(|c| c.trim().to_string())
-        .filter(|c| {
-            let ok = is_valid_cidr(c);
-            if !ok {
-                warnings.push(format!("无效网段「{c}」已忽略"));
-            }
-            ok
-        })
-        .collect();
-    // 【APP-10 任务1.2】自动并入 WireGuard 虚拟子网：
-    // 从 local_ip（如 10.8.0.2/24 或 10.0.0.2/32）提取前三段生成 /24 网段，
-    // 使用户能直接访问虚拟网关（10.8.0.1）与同网段设备
-    if let Some(wg) = &lan.wg_config {
-        if let Some(virtual_cidr) = extract_virtual_subnet(&wg.local_ip) {
-            if !cidrs.contains(&virtual_cidr) {
-                cidrs.push(virtual_cidr);
-            }
+    // 【APP-11 任务1.1】统一走 normalize_cidr_list：单 IP 自动补 /32 + /24，
+    // 主机位非零 CIDR 归一化为网络前缀，并自动并入 WireGuard 虚拟子网
+    let local_addr = lan
+        .wg_config
+        .as_ref()
+        .map(|wg| wg.local_ip.as_str())
+        .unwrap_or("");
+    for raw in &lan.lan_cidrs {
+        let c = raw.trim();
+        if c.is_empty() {
+            continue;
+        }
+        // 无掩码的纯 IP 视为合法用户输入（会自动补全），带掩码才做严格校验
+        if c.contains('/') && !is_valid_cidr(c) {
+            warnings.push(format!("无效网段「{c}」已忽略"));
         }
     }
+    let cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
     if !cidrs.is_empty() {
         rules.push(json!({ "ip_cidr": cidrs, "outbound": GO_LAN_TAG }));
     }

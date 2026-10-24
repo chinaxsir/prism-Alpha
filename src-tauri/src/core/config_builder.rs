@@ -950,7 +950,10 @@ pub fn build(
     }
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
-    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
+    // 【APP-11 任务2】默认改用阿里云加密 DoT：其 WAF 已拦截 Host 为纯 IP 的
+    // https://223.5.5.5/dns-query（返回 403 Forbidden），DoT（853）走加密
+    // 通道且原生支持 IP 证书校验，不会再 403，也不会被运营商明文 RST。
+    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "tls://223.5.5.5".to_string());
     let mut dns_servers = vec![
         // DoH 地址是域名，需 address_resolver 经 dns-local（223.5.5.5）自举解析，
         // 否则 sing-box 报 missing address_resolver
@@ -1014,6 +1017,28 @@ pub fn build(
     };
     #[cfg(not(target_os = "android"))]
     let final_route_rules: Vec<serde_json::Value> = route_rules;
+
+    // 【APP-11 任务2】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
+    // 非法域名，导致内核后台疯狂报错刷屏耗电），统一强制 gstatic 204 且
+    // interval 固定 10m。
+    for ob in outbounds.iter_mut() {
+        if ob.get("type").and_then(Value::as_str) != Some("urltest") {
+            continue;
+        }
+        if let Some(obj) = ob.as_object_mut() {
+            let url = obj
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .replace(char::is_whitespace, "");
+            if !url.to_ascii_lowercase().starts_with("http") {
+                obj.insert("url".into(), json!("https://www.gstatic.com/generate_204"));
+            } else {
+                obj.insert("url".into(), json!(url));
+            }
+            obj.insert("interval".into(), json!("10m"));
+        }
+    }
 
     let mut config = json!({
         "log": { "level": "info", "timestamp": true },
@@ -2542,5 +2567,79 @@ rules:
             rules.iter().all(|r| r.get("outbound").and_then(Value::as_str) != Some("PROXY")),
             "PROXY 占位符必须全部解析为真实组 tag"
         );
+    }
+
+    /// 【APP-11 任务1.1】回归：go-lan-home 出站顶层严禁出现 allowed_ips
+    /// （sing-box 1.11.3 Legacy WireGuard 顶层无该字段，写入会报
+    /// `decode config: outbounds[n].allowed_ips: json: unknown field`），
+    /// 且 local_address 必须补全子网前缀、回家网段必须归一化。
+    #[test]
+    fn go_lan_wireguard_outbound_has_no_top_level_allowed_ips() {
+        let lan = crate::core::go_lan::GoLanSettings {
+            enabled: true,
+            mode: "manual".into(),
+            node_uri: String::new(),
+            wg_config: Some(crate::core::go_lan::WgManualConfig {
+                server: "10.0.0.1".into(),
+                server_port: 51820,
+                private_key: "QEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                peer_public_key: "QEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                pre_shared_key: None,
+                // 故意不带前缀，验证自动补 /24
+                local_ip: "10.8.0.2".into(),
+                mtu: 1420,
+            }),
+            // 故意填不带掩码的单个 IP，验证自动 /32 + /24 归一化
+            lan_cidrs: vec!["192.168.1.1".into()],
+            lan_dns: None,
+            lan_domains: Vec::new(),
+            managed_server: String::new(),
+            device_code: String::new(),
+            cached_managed_outbound: None,
+            home_name: None,
+        };
+        let built = build(
+            &[(
+                "https://sub.example".into(),
+                "订阅1".into(),
+                "proxies:\n  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}\nproxy-groups:\n  - {name: 节点选择, type: select, proxies: [HK1]}\nrules:\n  - MATCH,节点选择\n".to_string(),
+            )],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-golan"),
+            &std::env::temp_dir().join("prism-cb-test-golan/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &lan,
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let wg = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == crate::core::go_lan::GO_LAN_TAG)
+            .expect("go-lan-home outbound must exist");
+        assert!(
+            wg.get("allowed_ips").is_none(),
+            "顶层 allowed_ips 会触发内核 unknown field 报错"
+        );
+        assert_eq!(
+            wg["local_address"][0].as_str(),
+            Some("10.8.0.2/24"),
+            "local_address 必须补全子网前缀"
+        );
+        assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        let cidrs: Vec<String> = rules
+            .iter()
+            .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
+            .filter_map(|r| r.get("ip_cidr").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(cidrs.contains(&"192.168.1.0/24".to_string()), "网段需归一化: {cidrs:?}");
+        assert!(cidrs.contains(&"10.8.0.0/24".to_string()), "需并入虚拟子网: {cidrs:?}");
     }
 }

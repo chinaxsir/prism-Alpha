@@ -10,7 +10,7 @@ import Dashboard from "@/pages/Dashboard";
 import Subscription from "@/pages/Subscription";
 import Analytics from "@/pages/Analytics";
 import Settings from "@/pages/Settings";
-import { useCoreStore, type CoreStatus, type OutboundMode, type RunMode } from "@/stores/core";
+import { useCoreStore, type CoreStatus, type OutboundMode, type RunMode, type UserSettings } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { applyTheme, usePrefsStore } from "@/stores/prefs";
 import { resolveLang, useTranslation } from "@/i18n";
@@ -24,6 +24,8 @@ import {
   listSubscriptions,
   setAppForeground,
   type Entitlement,
+  type GoCusSettings,
+  type GoLanSettings,
 } from "@/api/ipc";
 import { isMobile } from "@/pro/gating";
 import ProxiesHub from "@/pages/ProxiesHub";
@@ -98,6 +100,25 @@ export default function App() {
   useEffect(() => {
     document.documentElement.lang = resolveLang(language) === "zh" ? "zh-CN" : "en";
   }, [language]);
+
+  // 【APP-11 任务3】后端权威状态广播 → 全局 store，实现全 APP 开关实时双向同步：
+  // 任意页面（仪表盘 / 设置 / 代理）改动开关，其余页面立即跟随，绝不回弹。
+  useEffect(() => {
+    const store = useCoreStore.getState();
+    const unsubs: Array<() => void> = [];
+    listen<UserSettings>("settings://updated", (e) => {
+      if (e.payload) store.setSettings(e.payload);
+    }).then((fn) => unsubs.push(fn));
+    listen<GoLanSettings>("go-lan://updated", (e) => {
+      if (e.payload) store.setGoLanSettings(e.payload);
+    }).then((fn) => unsubs.push(fn));
+    listen<GoCusSettings>("go-cus://updated", (e) => {
+      if (e.payload) store.setGoCusSettings(e.payload);
+    }).then((fn) => unsubs.push(fn));
+    return () => {
+      unsubs.forEach((fn) => fn());
+    };
+  }, []);
 
   // 授权状态广播（每日同步 / 激活 / 解绑后，Rust 侧推送；当天内只读本地缓存不联网）
   useEffect(() => {

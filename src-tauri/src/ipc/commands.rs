@@ -1870,8 +1870,11 @@ pub async fn save_settings(
 
     // 运行模式以 set_mode 为唯一入口（设置表单可能携带旧值，直接覆盖防止回退）
     settings.mode = *state.mode.read();
-    // Go AIM 开关由 set_go_aim_enabled 命令管理（设置表单不携带该字段，防止覆盖回退）
+    // 【APP-11 任务3】Go AIM 开关与锁定节点由 set_go_aim_enabled 命令专属管理：
+    // 设置表单不携带真实状态时会把仪表盘刚打开的 Go AIM 覆盖成 false，
+    // 这里强制保留内存中的权威值，杜绝跨页面状态互相踩踏。
     settings.go_aim_enabled = prev.go_aim_enabled;
+    settings.go_aim_pinned_node = prev.go_aim_pinned_node.clone();
 
     // 自启动立即生效
     crate::platform::set_auto_start(settings.auto_start).map_err(|e| sanitize_err(&e.to_string()))?;
@@ -1893,6 +1896,11 @@ pub async fn save_settings(
     if needs_restart && *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
     }
+    // 【APP-11 任务3】保存后广播最新设置，前端所有页面（仪表盘/设置）实时同步
+    let _ = app.emit(
+        "settings://updated",
+        serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
+    );
     Ok(())
 }
 
@@ -1943,6 +1951,11 @@ pub async fn set_go_aim_enabled(
         *state.aim_locked_node.write() = None;
         let _ = app.emit(crate::core::go_aim::AIM_EVENT, serde_json::json!({ "locked": null }));
     }
+    // 【APP-11 任务3】广播权威设置，仪表盘/代理页/设置页开关实时同步
+    let _ = app.emit(
+        "settings://updated",
+        serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
+    );
     Ok(())
 }
 
@@ -1996,6 +2009,57 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
     serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
 }
 
+/// 【APP-11 任务1.3】从回家网段推导探测目标网关（取每个 /24 的 .1 地址）。
+fn go_lan_gateway_targets(lan: &crate::core::go_lan::GoLanSettings) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |ip_str: &str| {
+        let parts: Vec<&str> = ip_str.split('.').collect();
+        if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+            let gw = format!("{}.{}.{}.1", parts[0], parts[1], parts[2]);
+            if !out.contains(&gw) {
+                out.push(gw);
+            }
+        }
+    };
+    for cidr in &lan.lan_cidrs {
+        push(cidr.trim().split('/').next().unwrap_or(""));
+    }
+    if let Some(wg) = &lan.wg_config {
+        push(wg.local_ip.trim().split('/').next().unwrap_or(""));
+    }
+    out
+}
+
+/// 【APP-11 任务1.3】主动触发 WireGuard 首次握手。
+/// 内核就绪后（延迟 800ms）对 go-lan-home 出站逐个探测家庭网关：
+/// 哪怕网关不响应 HTTP，探测包也会穿过隧道，立即在家庭路由器上
+/// 产生 WireGuard 握手与连接记录。
+fn spawn_go_lan_warmup(
+    api_addr: String,
+    api_secret: String,
+    lan: &crate::core::go_lan::GoLanSettings,
+) {
+    let targets = go_lan_gateway_targets(lan);
+    if targets.is_empty() || api_addr.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let api = KernelApi::new(&api_addr, &api_secret);
+        for gw in targets {
+            // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
+            let _ = api
+                .test_delay(
+                    crate::core::go_lan::GO_LAN_TAG,
+                    &format!("http://{gw}"),
+                    1500,
+                )
+                .await;
+        }
+        tracing::info!("[go-lan] 主动握手探测已完成");
+    });
+}
+
 /// 保存回家网络配置；内核运行中时重建配置生效
 #[tauri::command]
 pub async fn save_go_lan_settings(
@@ -2014,10 +2078,22 @@ pub async fn save_go_lan_settings(
     }
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
-    // 运行中 → 重建内核配置立即生效
+    // 运行中 → 重建内核配置立即生效（iOS 会重启扩展加载 go-lan-home）
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
+        // 【APP-11 任务1.3】开启后主动打一个回家探测包：WireGuard 只在
+        // 首个数据包进入隧道时才发起 Handshake Initiation，若不主动探测，
+        // 家里路由器在用户访问 NAS 前永远看不到连接记录。
+        if lan.enabled {
+            spawn_go_lan_warmup(
+                state.api_addr.read().clone(),
+                state.api_secret.read().clone(),
+                &lan,
+            );
+        }
     }
+    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
+    let _ = app.emit("settings://updated", serde_json::to_value(state.settings.read().clone()).unwrap_or_default());
     // 返回构建警告（无效网段等）
     let (_, warnings) = crate::core::go_lan::go_lan_route_rules(&lan);
     Ok(warnings)
@@ -2062,10 +2138,15 @@ pub async fn save_go_cus_settings(
     let cus: crate::core::go_cus::GoCusSettings =
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
     crate::core::go_cus::save(&state.data_dir, &cus)?;
-    *state.go_cus.write() = cus;
+    *state.go_cus.write() = cus.clone();
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
     }
+    // 【APP-11 任务3】广播 Go Cus 最新配置，仪表盘/代理页开关实时同步
+    let _ = app.emit(
+        "go-cus://updated",
+        serde_json::to_value(&cus).unwrap_or_default(),
+    );
     Ok(())
 }
 
