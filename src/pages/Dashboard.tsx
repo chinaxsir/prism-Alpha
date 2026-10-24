@@ -36,7 +36,6 @@ import {
   getGoAimStatus,
   setGoAimEnabled,
   runGoAimProbe,
-  clearGoAimPinnedNode,
 
   getGoLanSettings,
   saveGoLanSettings,
@@ -546,29 +545,16 @@ export default function Dashboard() {
             onToggle={toggleAim}
             action={
               aim?.enabled ? (
-                aim.pinnedNode ? (
-                  // APP-5 任务3：用户手动指定节点 → 显示"恢复自动"轻按钮
-                  // 点击后清空 pinned，回到自动评级选点
-                  <button
-                    onClick={async () => {
-                      await clearGoAimPinnedNode();
-                      // 立即刷新状态：pinned 清后端已落盘，前端
-                      // 事件 go-aim://updated 会自然回流 selectionMode
-                      runAimProbe();
-                    }}
-                    className="text-xs text-amber-400 hover:underline px-1.5 py-1 whitespace-nowrap"
-                  >
-                    {t("dashboard.aim.restoreAuto")}
-                  </button>
-                ) : (
-                  <button
-                    onClick={runAimProbe}
-                    disabled={aim.probing}
-                    className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
-                  >
-                    {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
-                  </button>
-                )
+                // 【APP-9 任务4.2】只保留「重测」按钮——恢复自动选点通过
+                // 关闭再打开 Go AIM 开关实现（后端 set_go_aim_enabled 已
+                // 清空 go_aim_pinned_node），不再单独提供「恢复自动」按钮
+                <button
+                  onClick={runAimProbe}
+                  disabled={aim.probing}
+                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
+                >
+                  {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
+                </button>
               ) : undefined
             }
           />

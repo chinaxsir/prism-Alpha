@@ -1775,7 +1775,59 @@ pub async fn add_traffic_tick(
 
 #[tauri::command]
 pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    state.kernel_api().get_rules().await.map_err(|e| sanitize_err(&e.to_string()))
+    let mut result = state.kernel_api().get_rules().await.map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP-9 任务2.1c】Go Lan 启用时，在规则列表最顶部附带展示当前生效的
+    // Go Lan 回家路由规则（type=IP-CIDR / DOMAIN-SUFFIX, proxy=go-lan-home），
+    // 让用户在「代理 -> 规则」页直观看到 Go Lan 与规则系统的联动状态。
+    let lan = state.go_lan.read().clone();
+    if lan.enabled && !lan.lan_cidrs.is_empty() {
+        if let Some(obj) = result.as_object_mut() {
+            let mut go_lan_rules: Vec<serde_json::Value> = Vec::new();
+            // 域名规则（若有）
+            let domains: Vec<&str> = lan.lan_domains.iter()
+                .map(|d| d.trim())
+                .filter(|d| !d.is_empty())
+                .collect();
+            if !domains.is_empty() {
+                go_lan_rules.push(serde_json::json!({
+                    "type": "DOMAIN-SUFFIX",
+                    "payload": format!("{} (Go Lan 回家域名)", domains.join(", ")),
+                    "proxy": "go-lan-home",
+                }));
+            }
+            // 网段规则
+            go_lan_rules.push(serde_json::json!({
+                "type": "IP-CIDR",
+                "payload": format!("{} (Go Lan 回家内网)", lan.lan_cidrs.join(", ")),
+                "proxy": "go-lan-home",
+            }));
+            if let Some(arr) = obj.get_mut("rules").and_then(|r| r.as_array_mut()) {
+                let mut new_rules = go_lan_rules;
+                new_rules.append(arr);
+                *arr = new_rules;
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 【APP-9 任务1.3】获取本机局域网 IPv4 地址。
+/// 通过 UDP socket connect("223.5.5.5:80") 读取 local_addr().ip()，
+/// 无需真实发送数据包即可获取系统默认出口的局域网 IP。
+/// 设置页「允许局域网连接」开启后展示给其他设备配置代理使用。
+#[tauri::command]
+pub async fn get_lan_ip() -> Result<Option<String>, String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    // 连接到一个公网地址（不会真实发包），让系统选择最佳出口网卡
+    socket.connect("223.5.5.5:80").map_err(|e| e.to_string())?;
+    let addr = socket.local_addr().map_err(|e| e.to_string())?;
+    let ip = addr.ip();
+    if ip.is_ipv4() && !ip.is_loopback() {
+        Ok(Some(ip.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -1840,6 +1892,12 @@ pub async fn get_go_aim_status(state: State<'_, AppState>) -> Result<serde_json:
 }
 
 /// 开关 Go AIM 自动锁定；开启且内核运行中时立即探测并锁定
+///
+/// 【APP-9 任务4.2】无论关闭还是重新打开，一律清空 go_aim_pinned_node，
+/// 确保「关闭再打开」即刻恢复自动优选模式：
+/// - enabled=false：清除锁定节点 + 清空手动指定；
+/// - enabled=true：pinned 已清空 → 恢复自动模式；若内存有探测结果立即
+///   按「全功能解锁 + 最低延迟」自动选点，否则启动新一轮探测后自动锁定。
 #[tauri::command]
 pub async fn set_go_aim_enabled(
     enabled: bool,
@@ -1851,12 +1909,21 @@ pub async fn set_go_aim_enabled(
     }
     let mut settings = state.settings.read().clone();
     settings.go_aim_enabled = enabled;
+    // 关键：无论开关方向，一律清空手动指定节点，恢复自动优选
+    settings.go_aim_pinned_node = None;
     state
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
     if enabled && *state.status.read() == CoreStatus::Running {
-        crate::core::go_aim::spawn_monitor(app.clone());
-        crate::core::go_aim::start_probe(app.clone());
+        // 内存已有探测结果 → 0ms 立即按评级规则自动锁定最优节点；
+        // 否则启动探测，完成后 apply_selection 会自动选中最佳节点
+        let has_results = !state.aim_results.read().is_empty();
+        if has_results {
+            let _ = crate::core::go_aim::apply_selection(&app, &state).await;
+        } else {
+            crate::core::go_aim::spawn_monitor(app.clone());
+            crate::core::go_aim::start_probe(app.clone());
+        }
     }
     if !enabled {
         *state.aim_locked_node.write() = None;

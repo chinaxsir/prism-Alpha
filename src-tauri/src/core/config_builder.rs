@@ -414,12 +414,16 @@ pub fn build(
 
     // ---- Go Lan 回家路由（Pro）：必须先于内置 geosite: private /
     // ip_is_private -> direct，否则会被"私网直连"抢先命中导致回家失效 ----
+    // 【APP-9 任务2】Go Lan 规则不立即入列，先缓存到 go_lan_rules，
+    // 待 clash_mode 注入前统一插入到「prism.sarl / block_quic 之后、
+    // clash_mode 之前」的黄金位置——确保全局/直连模式下回家流量仍走隧道。
     let (lan_outbound, lan_warnings) = crate::core::go_lan::build_outbound(go_lan_cfg);
     let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
     let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
+    let mut go_lan_rules: Vec<Value> = Vec::new();
     if let Some(outbound) = lan_outbound {
         outbounds.push(outbound);
-        route_rules.extend(lan_rules);
+        go_lan_rules = lan_rules;
     }
     warnings.extend(lan_warnings);
     warnings.extend(lan_rule_warnings);
@@ -616,6 +620,12 @@ pub fn build(
     // 行为变化完全由 clash_mode 规则驱动（route/rule/rule_item_clash_mode.go:
     // strings.EqualFold(clashServer.Mode(), r.mode)）。规则/直连模式回落
     // 到原 final 链，无需重建配置即可热切换
+    //
+    // 【APP-9 任务2.1a 黄金优先级】Go Lan 回家规则必须严格排在 clash_mode
+    // 与 ip_is_private 之前——家庭内网网段本身属于私有 IP，若 clash_mode:
+    // global 在前，全局模式下回家流量会被 GLOBAL 组吞掉走海外节点；
+    // 若 ip_is_private 在前，回家流量被误判为普通私网直连而丢包。
+    // 最终顺序：prism.sarl → block_quic → Go Lan → clash_mode → 自定义/订阅。
     if !node_tags.is_empty() {
         route_rules.insert(0, json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
         route_rules.insert(1, json!({ "clash_mode": "direct", "outbound": "direct" }));
@@ -627,6 +637,17 @@ pub fn build(
             0,
             json!({ "network": "udp", "port": 443, "outbound": "block" }),
         );
+    }
+
+    // 【APP-9 任务2.1a】Go Lan 回家规则插入：在 clash_mode 之前、
+    // block_quic / prism.sarl 之后的位置。此时 route_rules 头部为
+    // [block_quic?] [clash_mode x2] [custom ...]，Go Lan 插入到
+    // clash_mode 组的最前面（索引 = block_quic 占位）。
+    if !go_lan_rules.is_empty() {
+        let insert_at = if settings.block_quic { 1 } else { 0 };
+        for (i, rule) in go_lan_rules.into_iter().enumerate() {
+            route_rules.insert(insert_at + i, rule);
+        }
     }
 
     // 官网域名强制直连（最高优先级）：官方站点用于授权激活/续费与客户端下载，
@@ -789,16 +810,21 @@ pub fn build(
     }
 
     // 4. 入站
-    // 移动端（iOS/Android）所有流量经 TUN 接管，mixed 入站非必需且可能在
-    // NetworkExtension 沙箱内绑定端口失败导致内核启动失败，故移动端不包含。
+    // 移动端（iOS/Android）所有流量经 TUN 接管，默认不注入 mixed 入站
+    // （避免 NetworkExtension 沙箱内绑定端口失败导致内核启动失败）；
+    // 但开启「允许局域网连接」后必须注入 mixed 入站并监听 0.0.0.0，
+    // 否则局域网其他设备（192.168.x.x 等）的代理请求会在 TCP 握手阶段
+    // 被系统内核直接拒绝（Connection refused）。
     let mut inbounds: Vec<Value> = Vec::new();
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    inbounds.push(json!({
-        "type": "mixed",
-        "tag": MIXED_TAG,
-        "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
-        "listen_port": settings.mixed_port,
-    }));
+    let is_mobile = cfg!(any(target_os = "ios", target_os = "android"));
+    if settings.allow_lan || !is_mobile {
+        inbounds.push(json!({
+            "type": "mixed",
+            "tag": MIXED_TAG,
+            "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
+            "listen_port": settings.mixed_port,
+        }));
+    }
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
     // 普通 App 无法设置系统代理，libbox 经 tun 入站回调 PlatformInterface.OpenTun

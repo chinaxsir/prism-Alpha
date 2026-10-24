@@ -156,6 +156,9 @@ export const getSettings = () => invoke<UserSettings>("get_settings");
 export const saveSettings = (settings: UserSettings) =>
   invoke("save_settings", { settings });
 
+/** 获取本机局域网 IPv4 地址（UDP connect 223.5.5.5:80 读 local_addr） */
+export const getLanIp = () => invoke<string | null>("get_lan_ip");
+
 export interface KernelInfo {
   exists: boolean;
   path: string | null;

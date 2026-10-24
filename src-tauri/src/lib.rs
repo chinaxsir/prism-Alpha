@@ -268,6 +268,7 @@ pub fn run() {
             ipc::commands::get_rules,
             ipc::commands::get_proxy_groups,
             ipc::commands::get_settings,
+            ipc::commands::get_lan_ip,
             ipc::commands::save_settings,
             ipc::commands::get_go_aim_status,
             ipc::commands::set_go_aim_enabled,

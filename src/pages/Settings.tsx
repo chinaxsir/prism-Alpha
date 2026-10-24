@@ -30,6 +30,7 @@ import {
   getCoreStatus,
   getDeviceId,
   getKernelInfo,
+  getLanIp,
   getSettings,
   saveSettings,
   setMode,
@@ -223,6 +224,8 @@ export default function Settings() {
   const [kernelInfo, setKernelInfo] = useState<KernelInfo | null>(null);
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
+  // 【APP-9 任务1.3】本机局域网 IP（allow_lan 开启后展示给其他设备配置代理）
+  const [lanIp, setLanIp] = useState<string | null>(null);
 
   // Go Lan · 回家网络（Pro）：拷贝后端设置到本地表单编辑
   const [goLan, setGoLan] = useState<GoLanForm>(EMPTY_GO_LAN);
@@ -246,6 +249,18 @@ export default function Settings() {
       })
       .catch((e) => console.error("get go lan settings failed:", e));
   }, []);
+
+  // 【APP-9 任务1.3】开启「允许局域网连接」后动态获取本机局域网 IP，
+  // 在设置行副标题中展示完整代理地址，方便其他设备一键对照填写
+  useEffect(() => {
+    if (!form.allowLan) {
+      setLanIp(null);
+      return;
+    }
+    getLanIp()
+      .then(setLanIp)
+      .catch(() => setLanIp(null));
+  }, [form.allowLan]);
 
   const copyDeviceId = async () => {
     if (!deviceId) return;
@@ -620,7 +635,11 @@ export default function Settings() {
         <ToggleRow
           icon={<Globe size={16} className="text-gray-400" />}
           title={t("settings.allowLan")}
-          desc={t("settings.allowLanDesc")}
+          desc={
+            form.allowLan && lanIp
+              ? `${t("settings.allowLanOn")} · ${t("settings.allowLanAddr")}: ${lanIp}:${form.mixedPort}`
+              : t("settings.allowLanDesc")
+          }
           checked={form.allowLan}
           onChange={(v) => patch({ allowLan: v })}
         />

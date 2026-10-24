@@ -1085,6 +1085,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //
         //    Go Lan（回家网络）：先从原配置中提取 dns-home 服务器与其解析规则，
         //    重建时原样保留——回家域名必须经隧道内家庭 DNS 解析
+        // 【APP-9 任务3.1】同时保留 Go Cus 注入的自定义 DNS 规则
+        // （domain_suffix → dns-local，如 [Host] 非阻断映射），防止
+        // 去广告/改写模块的域名级 DNS 规则在扩展清洗时丢失。
         var preservedDnsServers: [[String: Any]] = []
         var preservedDnsRules: [[String: Any]] = []
         if let oldDns = root["dns"] as? [String: Any] {
@@ -1098,8 +1101,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
             if let oldRules = oldDns["rules"] as? [[String: Any]] {
-                for r in oldRules where (r["server"] as? String) == "dns-home" {
-                    preservedDnsRules.append(r)
+                for r in oldRules {
+                    let server = (r["server"] as? String) ?? ""
+                    // 保留 Go Lan 家庭 DNS 规则
+                    if server == "dns-home" {
+                        preservedDnsRules.append(r)
+                        continue
+                    }
+                    // 保留 Go Cus 自定义域名 DNS 规则（domain_suffix → dns-local），
+                    // 但排除内置的 .cn 兜底与 geosite cn 规则（下方重建覆盖）
+                    if server == "dns-local",
+                       r["domain_suffix"] != nil,
+                       r["geosite"] == nil {
+                        let suffixes = (r["domain_suffix"] as? [String]) ?? []
+                        let isDefaultCn = suffixes.count == 1 && suffixes[0] == ".cn"
+                        if !isDefaultCn {
+                            preservedDnsRules.append(r)
+                        }
+                    }
                 }
             }
         }
@@ -1191,42 +1210,53 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        let goLanIndices = rules.indices.filter { (rules[$0]["outbound"] as? String) == "go-lan-home" }
-        var headRules: [[String: Any]] = [
+        // 【APP-9 任务2.1a 黄金优先级】提取 Go Lan 回家规则并提升到
+        // headRules 之后、clash_mode / ip_is_private 之前——无论用户处于
+        // 「规则」「全局」还是「直连」模式，回家流量永远 100% 走 go-lan-home
+        // 隧道，绝不被 clash_mode: global 或 ip_is_private 抢先命中。
+        var goLanRules: [[String: Any]] = []
+        rules.removeAll { rule in
+            if (rule["outbound"] as? String) == "go-lan-home" {
+                goLanRules.append(rule)
+                return true
+            }
+            return false
+        }
+
+        let headRules: [[String: Any]] = [
             ["protocol": ["dns"], "outbound": finalDnsTag],
             ["port": [53], "outbound": finalDnsTag],
             ["protocol": ["quic"], "outbound": finalBlockTag],
             ["network": ["udp"], "port": [443], "outbound": finalBlockTag]
         ]
-        if goLanIndices.isEmpty {
-            headRules.append(["ip_is_private": true, "outbound": "direct"])
-            rules.insert(contentsOf: headRules, at: 0)
-        } else {
-            // 回家规则存在：ip_is_private 直连规则必须排在全部 go-lan-home 规则之后，
-            // 否则私网流量会被"私网直连"抢先命中，回家路由彻底失效
-            rules.insert(contentsOf: headRules, at: 0)
-            let lastGoLanIdx = goLanIndices.max()! + headRules.count
-            rules.insert(["ip_is_private": true, "outbound": "direct"], at: lastGoLanIdx + 1)
-        }
 
-        // GO-AIM 探针路由兜底（APP-4 任务3.1）：inbound -> GO-AIM-PROBE-N。
-        // 必须紧随 DNS 劫持头规则之后、clash_mode 规则之前（inbound 匹配
-        // 优先于模式规则，否则全局模式下探针流量被 GLOBAL 组吞掉）。
+        // GO-AIM 探针路由兜底（APP-4 任务3.1 + APP-9 任务4.1）：
+        // inbound -> GO-AIM-PROBE-N 必须紧随 DNS 劫持头规则之后、
+        // Go Lan 与 clash_mode 规则之前（inbound 匹配优先于模式规则，
+        // 否则全局模式下探针流量被 GLOBAL 组吞掉）。
         // Rust 配置已携带这 4 条规则，此处仅防缺失。
+        var aimProbeRules: [[String: Any]] = []
         if !allRealProxyTags.isEmpty {
-            var insertAt = headRules.count
             for slot in 0..<4 {
                 let tag = "GO-AIM-PROBE-\(slot)"
                 let exists = rules.contains { ($0["outbound"] as? String) == tag }
                 if !exists {
-                    rules.insert(
-                        ["inbound": ["aim-probe-in-\(slot)"], "outbound": tag],
-                        at: insertAt
-                    )
+                    aimProbeRules.append(["inbound": ["aim-probe-in-\(slot)"], "outbound": tag])
                 }
-                insertAt += 1
             }
         }
+
+        // 黄金优先级顺序（自上而下）：
+        // 1. DNS 劫持 + QUIC 拦截（headRules）
+        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N）
+        // 3. Go Lan 回家内网直通（ip_cidr → go-lan-home，必须在 clash_mode 之前！）
+        // 4. 私有地址直连（排除已被第 3 优先级命中的家庭网段）
+        // 5. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        var finalHead = headRules
+        finalHead.append(contentsOf: aimProbeRules)
+        finalHead.append(contentsOf: goLanRules)
+        finalHead.append(["ip_is_private": true, "outbound": "direct"])
+        rules.insert(contentsOf: finalHead, at: 0)
         route["rules"] = rules
 
         if var geoip = route["geoip"] as? [String: Any], geoip["path"] != nil {
