@@ -615,9 +615,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
-        // 直连 DNS 223.5.5.5 直出物理网卡（零 403 / 零 EPERM）
+        // 直连 DNS 223.5.5.5 / 114.114.114.114 直出物理网卡（零 403 / 零 EPERM）
         excludedV4.append(
             NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
+        )
+        excludedV4.append(
+            NEIPv4Route(destinationAddress: "114.114.114.114", subnetMask: "255.255.255.255")
         )
         if !excludedV4.isEmpty {
             ipv4.excludedRoutes = excludedV4
@@ -933,6 +936,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 blockOutboundTag = tag.isEmpty ? "block" : tag
             } else if t == "direct" {
                 hasDirectOutbound = true
+                // 【APP-11B 任务2】direct 出站强制 ipv4_only：iOS 16.5 NECP 沙盒下
+                // Go 默认创建 AF_INET6 双栈 UDP Socket 会被拒绝（EPERM），
+                // 锁定 ipv4_only 强制使用纯 IPv4 udp4 Socket，根治
+                // `listen outbound packet connection: operation not permitted`
+                outbounds[i]["domain_strategy"] = "ipv4_only"
                 if !phyName.isEmpty {
                     outbounds[i]["bind_interface"] = phyName
                 }
@@ -941,14 +949,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     firstSelectorTag = tag
                 }
             } else if t == "urltest" {
-                // 【APP-11 任务2】清洗订阅自带 urltest 的畸形测速地址
+                // 【APP-11B 任务3】清洗订阅自带 urltest 的畸形测速地址
                 // （APP.txt 中 http://gateway.icloud.com 带空格导致后台
-                // 疯狂报错刷屏耗电）：统一强制为 gstatic 204，间隔 10m。
+                // 疯狂报错刷屏耗电）：统一强制为 Cloudflare 204，间隔 10m。
+                // Cloudflare 的 cp.cloudflare.com 在国内可达性与稳定性优于
+                // gstatic，且响应体极小、无 TLS 指纹风险。
                 var u = ((outbounds[i]["url"] as? String) ?? "")
                     .replacingOccurrences(of: " ", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !u.lowercased().hasPrefix("http") {
-                    u = "https://www.gstatic.com/generate_204"
+                    u = "http://cp.cloudflare.com/generate_204"
                 }
                 outbounds[i]["url"] = u
                 outbounds[i]["interval"] = "10m"
@@ -1005,9 +1015,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // APP-8 任务3：wireguard 出站在内核 post-start 阶段必须同步
                 // 解析 server 域名，dns-direct 被 RST 会中断整个启动。
                 // 预解析顶层 server 与 peers[].server 为 IP，零 DNS 瞬时启动。
-                if let srv = outbounds[i]["server"] as? String, !isIPLiteral(srv) {
-                    if let ip = resolveHostToIP(srv) {
-                        outbounds[i]["server"] = ip
+                // 【APP-11B】先剔除 server 中的 \u2060 等隐形字符再判定/解析
+                // （server 可能是域名，必须用 cleanVisibleASCII 而非 cleanCIDR）
+                if let srv = outbounds[i]["server"] as? String {
+                    let cleanedSrv = cleanVisibleASCII(srv)
+                    if cleanedSrv != srv { outbounds[i]["server"] = cleanedSrv }
+                    if !cleanedSrv.isEmpty, !isIPLiteral(cleanedSrv) {
+                        if let ip = resolveHostToIP(cleanedSrv) {
+                            outbounds[i]["server"] = ip
+                        }
                     }
                 }
                 if var peers = outbounds[i]["peers"] as? [[String: Any]] {
@@ -1184,24 +1200,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP-11 任务2】dns-direct 改加密 DoT：
-            // 阿里云 WAF 已拦截 Host 为纯 IP 的 https://223.5.5.5/dns-query
-            // 请求并返回 403 Forbidden（APP.txt:
-            // "dns: exchange failed ... unexpected HTTP response status: 403"）。
-            // 改用阿里云原生支持 IP 证书校验的 DoT（tls://223.5.5.5:853），
-            // 既走加密通道不被运营商 RST，也 100% 不触发 403；
-            // 备用保留 DoT 同一地址（不同 tag 维持规则引用完整）。
+            // 【APP-11B 任务3】dns-direct 锁定纯 UDP/TCP 53：
+            // APP-11 的 DoT（tls://223.5.5.5:853）在部分运营商网络仍会被
+            // SNI 嗅探拦截；且 erro-2.txt 显示 https://223.5.5.5/dns-query
+            // 仍被阿里云 WAF 拦返回 403。dns-direct 直接用最经典的
+            // `223.5.5.5`（UDP/TCP 53 + ipv4_only），彻底告别 403 与 EPERM。
+            // direct 出站已强制 ipv4_only（见 sanitize 循环），UDP Socket
+            // 走纯 AF_INET，不存在双栈被 NECP 拒绝的问题。
             [
                 "tag": "dns-direct",
-                "address": "tls://223.5.5.5",
+                "address": "223.5.5.5",
                 "detour": "direct",
-                "strategy": "prefer_ipv4"
+                "strategy": "ipv4_only"
             ],
             [
                 "tag": "dns-direct-bak",
-                "address": "tls://223.5.5.5",
+                "address": "223.5.5.5",
                 "detour": "direct",
-                "strategy": "prefer_ipv4"
+                "strategy": "ipv4_only"
             ]
         ]
         dnsServers.append(contentsOf: preservedDnsServers)
@@ -1255,6 +1271,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 本机 Wi-Fi IP（en*）落在回家网段内时，对应 ip_cidr 规则改走直连，
         // 避免设备在家时把家庭局域网流量再绕回家庭隧道形成回环。
         // 豁免：蜂窝（pdp_ip*）出口的 CGNAT 10.x 与常见局域网网段重叠，不参与判定。
+        // 【APP-11B】先对 go-lan-home 规则的 ip_cidr 执行 cleanCIDR，物理剔除
+        // 历史脏缓存中的 \u2060 等隐形字符，避免内核 ParsePrefix 崩溃。
+        for i in rules.indices
+        where (rules[i]["outbound"] as? String) == "go-lan-home" {
+            if let cidrs = rules[i]["ip_cidr"] as? [String] {
+                rules[i]["ip_cidr"] = cidrs.map { cleanCIDR($0) }.filter { !$0.isEmpty }
+            }
+        }
         if phyName.hasPrefix("en"), let localIP = localInterfaceIPv4(phyName) {
             for i in rules.indices {
                 guard (rules[i]["outbound"] as? String) == "go-lan-home",
@@ -1446,10 +1470,27 @@ private struct Prefix {
     let prefix: Int
 }
 
+/// 【APP-11B 任务1.2】剔除 \u2060 等隐形零宽字符：仅保留 IP/CIDR 合法字符
+/// （数字、hex 字母、`.`、`:`、`/`）。iOS 剪贴板从微信/网页复制时会在末尾
+/// 塞入 U+2060 Word Joiner，trim 无法去除，会导致内核
+/// `netip.ParsePrefix("10.195.0.2/32\u{2060}")` 报 bad bits after slash。
+private func cleanCIDR(_ raw: String) -> String {
+    let allowed = Set("0123456789abcdefABCDEF.:/")
+    return String(raw.unicodeScalars.filter { allowed.contains(Character($0)) })
+}
+
+/// 【APP-11B】通用可见 ASCII 提纯：仅保留 0x21...0x7E，剔除空格、
+/// \u2060、\u200B-\u200F、\uFEFF、换行等一切不可见/非 ASCII 字符。
+/// 用于 server 域名等字段（cleanCIDR 仅适用 IP/CIDR，会误伤域名字母）。
+private func cleanVisibleASCII(_ raw: String) -> String {
+    String(raw.unicodeScalars.filter { $0.value >= 0x21 && $0.value <= 0x7E })
+}
+
 /// 【APP-11 任务1.1】给无前缀的地址补默认子网前缀（IPv4 → /24，IPv6 → /64），
 /// 内核按 netip.Prefix 解析 local_address，缺前缀会直接失败。
+/// 【APP-11B】先经 cleanCIDR 剔除隐形字符再补前缀。
 private func normalizePrefixString(_ raw: String) -> String {
-    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let s = cleanCIDR(raw)
     if s.isEmpty { return "10.0.0.2/24" }
     if s.contains("/") { return s }
     return s.contains(":") ? "\(s)/64" : "\(s)/24"
@@ -1517,6 +1558,25 @@ private func prismProtectSocket(_ fd: Int32) -> Int32 {
     let ipBoundIf: Int32 = 25    // IP_BOUND_IF
     let ipv6BoundIf: Int32 = 125 // IPV6_BOUND_IF
 
+    // 【APP-11B 任务2】按 Socket 真实协议族精准绑定：
+    // 先 getsockname 读 sa_family——AF_INET 只调 IP_BOUND_IF；AF_INET6 只调
+    // IPV6_BOUND_IF 且忽略失败（iOS NECP 对未开 IPv6 隧道的 AF_INET6 Socket
+    // 绑定会返回 EPERM，盲目对 IPv6 Socket 调 IP_BOUND_IF 也会触发
+    // "operation not permitted"，绝不能破坏 Socket 状态）。
+    var addr = sockaddr()
+    var len = socklen_t(MemoryLayout<sockaddr>.size)
+    if getsockname(fd, &addr, &len) == 0 {
+        switch Int32(addr.sa_family) {
+        case AF_INET:
+            _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+        case AF_INET6:
+            _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+        default:
+            break
+        }
+        return 0
+    }
+    // getsockname 失败（未绑定 Socket）：按旧逻辑先 IPv4 后 IPv6 兜底
     if setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
         _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
     }

@@ -432,7 +432,25 @@ export default function Settings() {
     }
   };
 
-  const patchGoLan = (p: Partial<GoLanForm>) => setGoLan((f) => ({ ...f, ...p }));
+  // 【APP-11B 任务1.3】输入即净化：从微信/网页粘贴时常带入 \u2060 等
+  // 零宽隐形字符，直接导致内核 netip.ParsePrefix 崩溃。在 onChange 瞬间
+  // 物理滤除所有不可见字符，用户无感知。
+  const INVISIBLE_CHARS = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\s]/g;
+  const patchGoLan = (p: Partial<GoLanForm>) =>
+    setGoLan((f) => {
+      const next = { ...f, ...p };
+      // 对所有字符串字段统一净化（多行网段列表保留换行分隔）
+      for (const k of Object.keys(next) as (keyof GoLanForm)[]) {
+        const v = next[k];
+        if (typeof v === "string" && k !== "lanCidrs" && k !== "lanDomains") {
+          (next as Record<string, unknown>)[k] = cleanInput(v);
+        }
+      }
+      return next;
+    });
+
+  // 净化函数定义（引用上方的 INVISIBLE_CHARS 常量）
+  const cleanInput = (s: string): string => s.replace(INVISIBLE_CHARS, "");
 
   /// 本地表单 → 后端设置（多行文本按行拆分并过滤空行；保留 cachedManagedOutbound 等未编辑字段）
   const buildGoLanPayload = (): GoLanSettings => {
@@ -446,12 +464,12 @@ export default function Settings() {
     const wgConfig: WgManualConfig | null =
       goLan.mode === "manual" && goLan.method === "wg" && wgAnyFilled
         ? {
-            server: goLan.wgServer.trim(),
+            server: cleanInput(goLan.wgServer),
             serverPort: goLan.wgServerPort || 0,
-            privateKey: goLan.wgPrivateKey.trim(),
-            peerPublicKey: goLan.wgPeerPublicKey.trim(),
-            preSharedKey: goLan.wgPreSharedKey.trim() || null,
-            localIp: goLan.wgLocalIp.trim() || WG_DEFAULTS.localIp,
+            privateKey: cleanInput(goLan.wgPrivateKey),
+            peerPublicKey: cleanInput(goLan.wgPeerPublicKey),
+            preSharedKey: cleanInput(goLan.wgPreSharedKey) || null,
+            localIp: cleanInput(goLan.wgLocalIp) || WG_DEFAULTS.localIp,
             mtu: goLan.wgMtu || WG_DEFAULTS.mtu,
           }
         : null;
@@ -459,19 +477,20 @@ export default function Settings() {
       ...base,
       enabled: goLan.enabled,
       mode: goLan.mode,
-      nodeUri: goLan.nodeUri.trim(),
+      nodeUri: cleanInput(goLan.nodeUri),
       wgConfig,
+      // 【APP-11B】多行字段逐行净化隐形字符（保留换行分隔符本身）
       lanCidrs: goLan.lanCidrs
         .split("\n")
-        .map((l) => l.trim())
+        .map((l) => cleanInput(l))
         .filter(Boolean),
-      lanDns: goLan.lanDns.trim() || null,
+      lanDns: cleanInput(goLan.lanDns) || null,
       lanDomains: goLan.lanDomains
         .split("\n")
-        .map((l) => l.trim())
+        .map((l) => cleanInput(l))
         .filter(Boolean),
-      managedServer: goLan.managedServer.trim() || MANAGED_SERVER_DEFAULT,
-      deviceCode: goLan.deviceCode.trim(),
+      managedServer: cleanInput(goLan.managedServer) || MANAGED_SERVER_DEFAULT,
+      deviceCode: cleanInput(goLan.deviceCode),
     };
   };
 

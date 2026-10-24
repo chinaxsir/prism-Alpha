@@ -466,7 +466,8 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     // 对 wireguard 出站必须同步解析 server 域名，若 dns-direct(-bak) 解析
     // 被 RST 会中断整个 VPN 启动。提前把 server 换成 IP，post-start 零 DNS
     // 请求、瞬时启动；解析失败则原样保留域名（扩展侧还有兜底重试）。
-    let server = resolve_endpoint_host_to_ip(wg.server.trim());
+    // 【APP-11B】先剔除 \u2060 等隐形字符再解析
+    let server = resolve_endpoint_host_to_ip(&strip_invisible_and_non_ascii(&wg.server));
     let local_address = normalize_local_address(&wg.local_ip);
     // 【APP-11 任务1.1】严禁在 wireguard 出站**顶层**写入 "allowed_ips"！
     // sing-box v1.11.3 的 Legacy WireGuard 单节点结构顶层不存在该字段，
@@ -526,8 +527,10 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
     }
     // 2. 手动分享链接：wireguard:// / wg:// / wg-quick .conf 走专用解析器
     //    （密钥先 URL 解码 + normalize_wg_key 规范化），其余协议交给通用 uri_parser
-    if !lan.node_uri.is_empty() {
-        let uri = lan.node_uri.trim();
+    //    【APP-11B】先剔除 \u2060 等隐形字符再解析
+    let cleaned_uri = strip_invisible_and_non_ascii(&lan.node_uri);
+    if !cleaned_uri.is_empty() {
+        let uri = cleaned_uri.as_str();
         if uri.starts_with("wireguard://") || uri.starts_with("wg://") {
             match parse_wireguard_uri(uri) {
                 Ok(wg) => {
@@ -547,7 +550,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
                 Err(e) => warnings.push(format!(".conf 解析失败: {e}")),
             }
         } else {
-            match uri_parser::parse_line(&lan.node_uri) {
+            match uri_parser::parse_line(&cleaned_uri) {
                 Ok(Some(node_value)) => match serde_json::from_value::<ClashNode>(node_value) {
                     Ok(node) => match node_to_outbound(&node) {
                         Some((mut outbound, warn)) => {
@@ -599,22 +602,54 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
 
 // ---------------------------------------------------------------- 规则合成
 
-/// 【APP-11 任务1.1】规范化 local_address：内核按 `netip.Prefix` 解析，
-/// 缺少 `/子网前缀` 会直接失败。无前缀的 IPv4 补 `/24`（同网段设备可达），
-/// 无前缀 IPv6 补 `/64`。
+/// 【APP-11B 任务1.1】通用可见 ASCII 提纯：仅保留 0x21..=0x7E 可见字符，
+/// 物理剔除空格、`\u2060` Word Joiner、`\u200B..\u200F` 零宽字符、`\uFEFF`
+/// BOM、换行符及一切非 ASCII 字符。从微信/网页长按复制配置时 iOS 剪贴板
+/// 常塞入零宽字符，`.trim()` 只清理 Whitespace 无法去除它们。
+pub fn strip_invisible_and_non_ascii(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii() && (*c as u8) >= 0x21 && (*c as u8) <= 0x7E)
+        .collect()
+}
+
+/// 【APP-11B 任务1.1】IP/CIDR 前缀提纯与严格校验。
+///
+/// 第一步仅保留合法 IP 字符（hex + `.` `:` `/`），100% 物理剥离 `\u2060`
+/// 等隐藏符号——`"10.195.0.2/32\u{2060}"` → `"10.195.0.2/32"`；
+/// 第二步不含 `/` 时自动补默认前缀（IPv6 恒 /64）；
+/// 第三步用 `IpAddr` + 位数范围（v4 0..=32 / v6 0..=128）严格解析后
+/// 重新格式化返回标准字符串。解析失败返回 None（调用方应忽略并告警）。
+pub fn sanitize_ip_prefix(raw: &str, default_prefix_v4: u8) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit() || *c == '.' || *c == ':' || *c == '/')
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let (addr_s, bits) = match cleaned.split_once('/') {
+        Some((a, b)) => (a.to_string(), b.parse::<u8>().ok()?),
+        None => {
+            if cleaned.contains(':') {
+                (cleaned.clone(), 64u8)
+            } else {
+                (cleaned.clone(), default_prefix_v4.min(32))
+            }
+        }
+    };
+    let addr = addr_s.parse::<std::net::IpAddr>().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    if bits > max {
+        return None;
+    }
+    Some(format!("{addr}/{bits}"))
+}
+
+/// 【APP-11B 任务1.1】规范化 local_address：先经 `sanitize_ip_prefix` 剔除
+/// 隐形字符并补默认前缀（IPv4 /32、IPv6 /64）；解析失败时回退安全默认，
+/// 绝不让脏字符串进入内核配置导致 `netip.ParsePrefix` 崩溃。
 fn normalize_local_address(raw: &str) -> String {
-    let s = raw.trim();
-    if s.is_empty() {
-        return "10.0.0.2/24".into();
-    }
-    if s.contains('/') {
-        return s.to_string();
-    }
-    if s.contains(':') {
-        format!("{s}/64")
-    } else {
-        format!("{s}/24")
-    }
+    sanitize_ip_prefix(raw, 32).unwrap_or_else(|| "10.0.0.2/32".into())
 }
 
 /// 【APP-11 任务1.1】规范化回家内网网段列表。
@@ -635,37 +670,29 @@ pub(crate) fn normalize_cidr_list(cidrs: &[String], local_addr: &str) -> Vec<Str
         }
     };
     for raw in cidrs {
-        let c = raw.trim();
-        if c.is_empty() {
+        // 【APP-11B 任务1.1】先经 sanitize_ip_prefix 剔除 \u2060 等隐形字符、
+        // 无掩码自动补 /24、严格校验；清洗后无法解析的条目直接丢弃
+        let Some(clean) = sanitize_ip_prefix(raw, 24) else {
             continue;
-        }
-        match c.split_once('/') {
-            None => {
-                // 单个 IP：若合法则补 /32 与同网段 /24
-                if let Ok(ip) = c.parse::<std::net::Ipv4Addr>() {
+        };
+        let (ip_s, mask_s) = clean.split_once('/').unwrap_or((clean.as_str(), ""));
+        if let (Ok(ip), Ok(mask)) =
+            (ip_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>())
+        {
+            if mask >= 32 {
+                // 精确主机路由原样保留
+                push(clean.clone());
+            } else {
+                // 主机位非零：保留精确 /32 并归一化为网络前缀
+                let net = network_of_v4(ip, mask);
+                if net != format!("{ip}/{mask}") {
                     push(format!("{ip}/32"));
-                    push(network_of_v4(ip, 24));
-                } else if let Ok(ip) = c.parse::<std::net::Ipv6Addr>() {
-                    push(format!("{ip}/128"));
                 }
+                push(net);
             }
-            Some((ip_s, mask_s)) => {
-                if !is_valid_cidr(c) {
-                    continue;
-                }
-                if let (Ok(ip), Ok(mask)) =
-                    (ip_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>())
-                {
-                    // 主机位非零：保留精确 /32 并归一化为网络前缀
-                    let net = network_of_v4(ip, mask);
-                    if net != format!("{ip}/{mask}") {
-                        push(format!("{ip}/32"));
-                    }
-                    push(net);
-                } else {
-                    push(c.to_string());
-                }
-            }
+        } else {
+            // IPv6 或其他已校验格式原样保留
+            push(clean);
         }
     }
     if let Some(virtual_cidr) = extract_virtual_subnet(local_addr) {
@@ -714,7 +741,8 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
     let domains: Vec<String> = lan
         .lan_domains
         .iter()
-        .map(|d| d.trim().trim_start_matches("*.").to_lowercase())
+        // 【APP-11B】剔除 \u2060 等隐形字符
+        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
         .filter(|d| !d.is_empty())
         .collect();
     if !domains.is_empty() {
@@ -728,13 +756,10 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
         .map(|wg| wg.local_ip.as_str())
         .unwrap_or("");
     for raw in &lan.lan_cidrs {
-        let c = raw.trim();
-        if c.is_empty() {
-            continue;
-        }
-        // 无掩码的纯 IP 视为合法用户输入（会自动补全），带掩码才做严格校验
-        if c.contains('/') && !is_valid_cidr(c) {
-            warnings.push(format!("无效网段「{c}」已忽略"));
+        // 【APP-11B】清洗后仍无法解析才告警（隐形字符会被自动剔除，不误报）
+        if sanitize_ip_prefix(raw, 24).is_none() && !strip_invisible_and_non_ascii(raw).is_empty()
+        {
+            warnings.push(format!("无效网段「{}」已忽略", raw.trim()));
         }
     }
     let cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
@@ -762,13 +787,20 @@ pub(crate) fn go_lan_dns(lan: &GoLanSettings) -> (Option<Value>, Option<Value>) 
     if !lan.enabled {
         return (None, None);
     }
-    let Some(dns) = lan.lan_dns.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+    // 【APP-11B】剔除 \u2060 等隐形字符
+    let cleaned_dns = lan
+        .lan_dns
+        .as_deref()
+        .map(strip_invisible_and_non_ascii)
+        .filter(|s| !s.is_empty());
+    let Some(dns) = cleaned_dns.as_deref() else {
         return (None, None);
     };
     let domains: Vec<String> = lan
         .lan_domains
         .iter()
-        .map(|d| d.trim().trim_start_matches("*.").to_lowercase())
+        // 【APP-11B】剔除 \u2060 等隐形字符
+        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
         .filter(|d| !d.is_empty())
         .collect();
     if domains.is_empty() {
@@ -1127,5 +1159,94 @@ mod tests {
         assert!(outbound.is_none());
         let (rules, _) = go_lan_route_rules(&lan);
         assert!(rules.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // APP-11B 任务1.4：\u2060（U+2060 Word Joiner）等隐形字符清洗回归测试
+    //
+    // 真机日志（erro-2.txt Build 211）：
+    //   decode config: outbounds[3].local_address:
+    //   netip.ParsePrefix("10.195.0.2/32\u2060"): bad bits after slash
+    // iOS 剪贴板从微信/网页长按复制时自动塞入 \u2060，`.trim()` /
+    // `.trimmingCharacters(.whitespacesAndNewlines)` 均无法去除
+    // （U+2060 不属于 Unicode Whitespace）。必须物理剔除所有
+    // 非可见 ASCII 字符。
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_strip_invisible_removes_word_joiner() {
+        // U+2060 Word Joiner（真机报错元凶）
+        let s = "10.195.0.2/32\u{2060}";
+        assert_eq!(strip_invisible_and_non_ascii(s), "10.195.0.2/32");
+    }
+
+    #[test]
+    fn test_strip_invisible_removes_zero_width_family() {
+        // U+200B Zero Width Space / U+200C ZWNJ / U+200D ZWJ / U+FEFF BOM
+        assert_eq!(strip_invisible_and_non_ascii("abc\u{200B}def"), "abcdef");
+        assert_eq!(strip_invisible_and_non_ascii("abc\u{200C}def"), "abcdef");
+        assert_eq!(strip_invisible_and_non_ascii("abc\u{200D}def"), "abcdef");
+        assert_eq!(strip_invisible_and_non_ascii("\u{FEFF}10.0.0.1"), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_strip_invisible_removes_whitespace_and_non_ascii() {
+        // 空格、Tab、换行、中文全被剔除
+        assert_eq!(strip_invisible_and_non_ascii(" 10.0.0.1 "), "10.0.0.1");
+        assert_eq!(strip_invisible_and_non_ascii("10.0.0.1\n"), "10.0.0.1");
+        assert_eq!(strip_invisible_and_non_ascii("10.0.0.1中"), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_strip_invisible_preserves_visible_ascii() {
+        // 所有可见 ASCII 原样保留
+        assert_eq!(strip_invisible_and_non_ascii("abc123!@#"), "abc123!@#");
+        assert_eq!(
+            strip_invisible_and_non_ascii("example.com:51820"),
+            "example.com:51820"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_ip_prefix_word_joiner_real_world() {
+        // 真机日志原文："10.195.0.2/32\u{2060}"
+        let raw = "10.195.0.2/32\u{2060}";
+        assert_eq!(
+            sanitize_ip_prefix(raw, 32),
+            Some("10.195.0.2/32".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_ip_prefix_no_slash_appends_default() {
+        // 无斜杠时补默认前缀
+        assert_eq!(
+            sanitize_ip_prefix("10.195.0.2", 32),
+            Some("10.195.0.2/32".to_string())
+        );
+        assert_eq!(
+            sanitize_ip_prefix("192.168.1.0", 24),
+            Some("192.168.1.0/24".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_ip_prefix_strips_quotes_and_spaces() {
+        // 复制粘贴常带引号、空格
+        assert_eq!(
+            sanitize_ip_prefix("\"10.0.0.1/32\"", 32),
+            Some("10.0.0.1/32".to_string())
+        );
+        assert_eq!(
+            sanitize_ip_prefix("  10.0.0.1/32  ", 32),
+            Some("10.0.0.1/32".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_ip_prefix_invalid_falls_back_to_none() {
+        // 完全非法的输入返回 None（由调用方决定 fallback）
+        assert_eq!(sanitize_ip_prefix("not-an-ip", 32), None);
+        assert_eq!(sanitize_ip_prefix("", 32), None);
     }
 }

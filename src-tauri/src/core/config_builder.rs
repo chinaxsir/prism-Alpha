@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::state::{OutboundMode, RunMode, UserSettings};
 
-const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+const DEFAULT_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
 const TUN_TAG: &str = "tun-in";
 const MIXED_TAG: &str = "mixed-in";
 
@@ -338,8 +338,17 @@ pub fn build(
     let mut seen_tags: HashSet<String> =
         ["direct", "block", "dns-out"].map(str::to_string).into_iter().collect();
 
+    // 【APP-11B 任务2】未开启 IPv6 时 direct 出站强制 ipv4_only：
+    // iOS 扩展沙盒中 Go 的 net.ListenPacket("udp", ":0") 默认创建 AF_INET6
+    // 双栈 Socket，未开 IPv6 隧道时绑定会被 NECP 拒绝返回 EPERM
+    // （operation not permitted），导致 WireGuard 握手包与 UDP 53 DNS 全灭。
+    let direct_outbound = if settings.ipv6 {
+        json!({ "type": "direct", "tag": "direct" })
+    } else {
+        json!({ "type": "direct", "tag": "direct", "domain_strategy": "ipv4_only" })
+    };
     let mut outbounds = vec![
-        json!({ "type": "direct", "tag": "direct" }),
+        direct_outbound,
         json!({ "type": "block", "tag": "block" }),
         json!({ "type": "dns", "tag": "dns-out" }),
     ];
@@ -772,7 +781,7 @@ pub fn build(
             "type": "urltest",
             "tag": FALLBACK_TAG,
             "outbounds": [crate::core::go_cus::SIDECAR_TAG, proxy_target],
-            "url": "http://www.gstatic.com/generate_204",
+            "url": "http://cp.cloudflare.com/generate_204",
             "interval": "1m",
             "tolerance": 50,
         }));
@@ -950,21 +959,44 @@ pub fn build(
     }
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
-    // 【APP-11 任务2】默认改用阿里云加密 DoT：其 WAF 已拦截 Host 为纯 IP 的
-    // https://223.5.5.5/dns-query（返回 403 Forbidden），DoT（853）走加密
-    // 通道且原生支持 IP 证书校验，不会再 403，也不会被运营商明文 RST。
-    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "tls://223.5.5.5".to_string());
+    // 【APP-11B 任务3】默认锁定纯 UDP/TCP 53 的 223.5.5.5：
+    // APP-11 的 DoT（tls://223.5.5.5:853）在部分运营商网络仍会被 SNI 嗅探
+    // 拦截；erro-2.txt 显示 https://223.5.5.5/dns-query 仍被阿里云 WAF
+    // 拦截返回 403。纯 223.5.5.5（53 端口）零加密零 Host 头，配合
+    // direct 出站 ipv4_only，彻底告别 403 与 EPERM。
+    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
-        // DoH 地址是域名，需 address_resolver 经 dns-local（223.5.5.5）自举解析，
-        // 否则 sing-box 报 missing address_resolver
-        json!({ "tag": "dns-remote", "address": "https://dns.alidns.com/dns-query", "address_resolver": "dns-local", "detour": "direct" }),
-        json!({ "tag": "dns-local", "address": dns_local_addr, "detour": "direct" }),
+        // 【APP-11B 任务3】dns-remote 锁定 tcp://8.8.8.8 经主选择器出境：
+        // 原先 https://dns.alidns.com/dns-query detour direct 走国内直连，
+        // 在被墙/污染环境下会被 RST；tcp://8.8.8.8 经主代理出境更稳，
+        // 且 ipv4_only 避免 iOS NECP 沙盒拒绝 AF_INET6 UDP Socket。
+        // 无代理组时回落 direct（桌面端无订阅场景兜底）。
+        if let Some(main_tag) = &main_group_tag {
+            json!({
+                "tag": "dns-remote",
+                "address": "tcp://8.8.8.8",
+                "detour": main_tag,
+                "strategy": "ipv4_only",
+            })
+        } else {
+            json!({
+                "tag": "dns-remote",
+                "address": "tcp://8.8.8.8",
+                "detour": "direct",
+                "strategy": "ipv4_only",
+            })
+        },
+        json!({
+            "tag": "dns-local",
+            "address": dns_local_addr,
+            "detour": "direct",
+            "strategy": "ipv4_only",
+        }),
     ];
 
-    // Android DNS 清洗（APP-2 断层二修复）：
-    // Android 被墙环境下阿里 DoH（dns.alidns.com）本身也可能因域名污染/阻断
-    // 不可达，改用 tcp://8.8.8.8 并经主组出境更稳（绕过国内 DNS 封锁）。
-    // 本地直连 DNS（dns-local）仍用 223.5.5.5 兜底国内域名。
+    // Android DNS 清洗（APP-2 断层二修复 + APP-11B 任务3 统一）：
+    // 上方 dns-remote 已统一为 tcp://8.8.8.8 经主组出境，本分支仅作
+    // 双保险——保留原有覆盖逻辑，防止未来回归。
     #[cfg(target_os = "android")]
     {
         if let Some(main_tag) = &main_group_tag {
@@ -972,6 +1004,7 @@ pub fn build(
                 "tag": "dns-remote",
                 "address": "tcp://8.8.8.8",
                 "detour": main_tag,
+                "strategy": "ipv4_only",
             });
         }
     }
@@ -1018,9 +1051,10 @@ pub fn build(
     #[cfg(not(target_os = "android"))]
     let final_route_rules: Vec<serde_json::Value> = route_rules;
 
-    // 【APP-11 任务2】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
-    // 非法域名，导致内核后台疯狂报错刷屏耗电），统一强制 gstatic 204 且
-    // interval 固定 10m。
+    // 【APP-11B 任务3】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
+    // 非法域名，导致内核后台疯狂报错刷屏耗电），统一强制 Cloudflare 204 且
+    // interval 固定 10m。cp.cloudflare.com 国内可达性与稳定性优于 gstatic，
+    // 且响应体极小、无 TLS 指纹风险。
     for ob in outbounds.iter_mut() {
         if ob.get("type").and_then(Value::as_str) != Some("urltest") {
             continue;
@@ -1032,7 +1066,7 @@ pub fn build(
                 .unwrap_or("")
                 .replace(char::is_whitespace, "");
             if !url.to_ascii_lowercase().starts_with("http") {
-                obj.insert("url".into(), json!("https://www.gstatic.com/generate_204"));
+                obj.insert("url".into(), json!("http://cp.cloudflare.com/generate_204"));
             } else {
                 obj.insert("url".into(), json!(url));
             }
@@ -2198,8 +2232,8 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("https://dns.alidns.com/dns-query"),
-            "dns-remote must be a domestically reachable DoH"
+            Some("tcp://8.8.8.8"),
+            "dns-remote 锁定 tcp://8.8.8.8 经主选择器出境（APP-11B 任务3）"
         );
 
         let outbound_rule = dns["rules"]
@@ -2627,8 +2661,8 @@ rules:
         );
         assert_eq!(
             wg["local_address"][0].as_str(),
-            Some("10.8.0.2/24"),
-            "local_address 必须补全子网前缀"
+            Some("10.8.0.2/32"),
+            "local_address 必须补全子网前缀（APP-11B 默认 /32）"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         let rules = built.config["route"]["rules"].as_array().unwrap();
