@@ -22,6 +22,37 @@ const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 const TUN_TAG: &str = "tun-in";
 const MIXED_TAG: &str = "mixed-in";
 
+/// APP-10 任务2：判断 tag 是否为内置非代理出站（direct/block/dns-out 等）。
+///
+/// 这些 tag 是 sing-box 内置或框架生成的功能性出站，绝不可作为"代理节点"
+/// 出现在：主选择器候选、节点列表 UI、自动测速选点、Go AIM 选点池中。
+/// 匹配大小写不敏感，并兼容中文"直连"与 urltest 遗留 tag。
+pub fn is_builtin_non_proxy_tag(tag: &str) -> bool {
+    let t = tag.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t == "直连" {
+        return true;
+    }
+    matches!(
+        t.to_ascii_uppercase().as_str(),
+        "DIRECT"
+            | "BLOCK"
+            | "REJECT"
+            | "REJECT-DROP"
+            | "PASS"
+            | "COMPATIBLE"
+            | "DNS-OUT"
+            | "GLOBAL"
+            | "AUTO"
+            | "URLTEST"
+            | "FALLBACK"
+            | "LOADBALANCE"
+            | "SELECTOR"
+    ) || t.to_ascii_uppercase().starts_with("GO-AIM-PROBE")
+}
+
 pub struct BuiltConfig {
     pub config: Value,
     /// 转换过程中的降级/跳过提示（不致命）
@@ -589,9 +620,10 @@ pub fn build(
     // 出站模式：规则=按订阅 MATCH 分流；全局=所有流量进 GLOBAL 选择组；直连=全部 direct。
     // GLOBAL 组常驻生成（节点存在时）：sing-box 的 mode 不是内置路由开关，
     // 热切换依赖 clash_mode 规则 + 运行中的 GLOBAL 组，见下方规则注入
+    // 【APP-10 任务2b】GLOBAL 选择器只包含真实代理节点，绝不塞入 "direct"/"block"——
+    // 防止 UI 节点列表出现 direct 条目、自动测速把 direct 选为当前节点
     if !node_tags.is_empty() {
-        let mut members = node_tags.clone();
-        members.push("direct".to_string());
+        let members = node_tags.clone();
         let default = node_tags[0].clone();
         outbounds.push(json!({
             "type": "selector",
@@ -774,6 +806,9 @@ pub fn build(
                         merged.push(t.clone());
                     }
                 }
+                // 【APP-10 任务2】主选择器候选池绝不保留内置非代理出站
+                // （订阅可能自带 direct/block，导致 UI 列表出现"直连"并被选中）
+                merged.retain(|t| !is_builtin_non_proxy_tag(t));
                 group["outbounds"] = json!(merged);
                 // default 失效（指向 direct/block 或不在成员列表中）时
                 // 修正为首个真实节点
@@ -782,19 +817,7 @@ pub fn build(
                     .and_then(Value::as_str)
                     .map(|d| {
                         // 订阅里 direct 可能因为延迟最低被设为 default——必须过滤
-                        // REJECT/PASS/COMPATIBLE/block/dns-out 这类内置出站绝不生效
-                        let is_builtin = matches!(
-                            d.to_ascii_uppercase().as_str(),
-                            "DIRECT"
-                                | "BLOCK"
-                                | "REJECT"
-                                | "REJECT-DROP"
-                                | "PASS"
-                                | "COMPATIBLE"
-                                | "DNS-OUT"
-                                | "GLOBAL"
-                        );
-                        !is_builtin && merged.iter().any(|m| m == d)
+                        !is_builtin_non_proxy_tag(d) && merged.iter().any(|m| m == d)
                     })
                     .unwrap_or(false);
                 if !default_valid {

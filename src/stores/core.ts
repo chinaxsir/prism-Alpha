@@ -5,6 +5,7 @@ import type {
   GoAimStatus,
   GoCusSettings,
   GoLanSettings,
+  SubscriptionRecord,
 } from "@/api/ipc";
 
 export type CoreStatus = "stopped" | "starting" | "running" | "stopping" | "error";
@@ -137,9 +138,13 @@ interface CoreState {
   goLanSettings: GoLanSettings | null;
   /** Go Cus 设置缓存；null = 尚未加载 */
   goCusSettings: GoCusSettings | null;
+  /** 【APP-10 任务4】订阅列表缓存；null = 尚未加载（订阅页首帧直出，
+      消除 Switch 启用态切页闪烁） */
+  subscriptions: SubscriptionRecord[] | null;
   setGoAimStatus: (s: GoAimStatus | null) => void;
   setGoLanSettings: (s: GoLanSettings | null) => void;
   setGoCusSettings: (s: GoCusSettings | null) => void;
+  setSubscriptions: (s: SubscriptionRecord[] | null) => void;
 }
 
 // 环形缓冲：仅保留最近 60 个采样点（1 分钟）
@@ -243,7 +248,9 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   goAimStatus: null,
   goLanSettings: null,
   goCusSettings: null,
+  subscriptions: null,
   setGoAimStatus: (goAimStatus) => set({ goAimStatus }),
   setGoLanSettings: (goLanSettings) => set({ goLanSettings }),
   setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
+  setSubscriptions: (subscriptions) => set({ subscriptions }),
 }));

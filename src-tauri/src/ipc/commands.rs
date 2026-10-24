@@ -517,7 +517,6 @@ fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group
 /// direct 延迟最低但无法翻墙，嵌套策略组也不可作为目标，均需排除。
 async fn auto_select_fastest(api: &KernelApi, group: &str) -> anyhow::Result<Option<String>> {
     const GROUP_TYPES: [&str; 4] = ["Selector", "URLTest", "Fallback", "LoadBalance"];
-    const BUILTIN_TAGS: [&str; 4] = ["direct", "block", "dns-out", "GLOBAL"];
 
     let delays = api.group_url_test(group, None, Some(2000), None).await?;
     let proxies = api.get_proxies().await?;
@@ -531,7 +530,10 @@ async fn auto_select_fastest(api: &KernelApi, group: &str) -> anyhow::Result<Opt
         .as_object()
         .into_iter()
         .flatten()
-        .filter(|(name, _)| !BUILTIN_TAGS.contains(&name.as_str()))
+        // 【APP-10 任务2】大小写不敏感 + 中文"直连"统一过滤内置非代理出站
+        .filter(|(name, _)| {
+            !crate::core::config_builder::is_builtin_non_proxy_tag(name.as_str())
+        })
         .filter(|(name, _)| {
             let kind = map
                 .get(*name)
@@ -790,6 +792,10 @@ pub async fn select_proxy(
     name: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // 【APP-10 任务2】任何链路都严禁选中内置非代理出站（direct/block/直连 等）
+    if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
+        return Err(format!("「{name}」是内置功能出站，不能作为代理节点选中"));
+    }
     state
         .kernel_api()
         .select_proxy(&group, &name)
@@ -1312,6 +1318,10 @@ pub async fn get_cached_proxies(
                     if name.is_empty() || server.is_empty() {
                         continue;
                     }
+                    // 【APP-10 任务2】名为 direct/block/直连 的节点绝不进 UI 列表
+                    if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
+                        continue;
+                    }
                     // 跳过机场提示节点（127.x / localhost）
                     if server.starts_with("127.") || server == "localhost" {
                         continue;
@@ -1338,6 +1348,10 @@ pub async fn get_cached_proxies(
                 let server = node.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let port = node.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                 if name.is_empty() || server.is_empty() {
+                    continue;
+                }
+                // 【APP-10 任务2】名为 direct/block/直连 的节点绝不进 UI 列表
+                if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
                     continue;
                 }
                 if server.starts_with("127.") || server == "localhost" {

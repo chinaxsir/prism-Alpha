@@ -278,7 +278,16 @@ pub struct AppState {
 impl AppState {
     /// 创建状态并从 data_dir/settings.json 恢复用户设置（含运行模式）
     pub fn new(data_dir: PathBuf, app_handle: AppHandle) -> Self {
-        let settings = super::store::load_settings(&data_dir);
+        let mut settings = super::store::load_settings(&data_dir);
+        // 【APP-10 任务2】启动清洗：历史版本可能把 direct/block 等内置出站
+        // 持久化为 Go AIM 手动指定节点——一旦发现立即清空，回退自动选点
+        if let Some(pinned) = settings.go_aim_pinned_node.clone()
+            && super::config_builder::is_builtin_non_proxy_tag(&pinned)
+        {
+            tracing::warn!("[startup] 清洗历史遗留的非法 go_aim_pinned_node={pinned}");
+            settings.go_aim_pinned_node = None;
+            let _ = super::store::save_settings(&data_dir, &settings);
+        }
         // iOS 强制归一 TUN 模式：settings.json 里可能存有历史 systemProxy
         //（build 149 方案第 2 步第 1 点）
         #[cfg(target_os = "ios")]

@@ -28,6 +28,7 @@ import EmptyState from "@/components/ui/EmptyState";
 import { toast } from "@/components/ui/Toast";
 import { Feature } from "@/pro/gating";
 import { useTranslation } from "@/i18n";
+import { useCoreStore } from "@/stores/core";
 
 // ============================== 本地解析（仅展示用） ==============================
 
@@ -208,8 +209,14 @@ type SubTabKey = (typeof SUB_TABS)[number]["key"];
 /** Go Cus 引擎：覆写 / 改写 / MitM / 脚本（Pro 功能） */
 export default function GoCus() {
   const { t } = useTranslation();
-  const [settings, setSettings] = useState<GoCusSettings | null>(null);
-  const [loading, setLoading] = useState(true);
+  // 【APP-10 任务4】首帧直出全局 store 缓存（App 启动已水合），
+  // 消除引擎/MitM 开关切页闪烁；无缓存时回落 null 走原加载路径
+  const [settings, setSettings] = useState<GoCusSettings | null>(
+    () => useCoreStore.getState().goCusSettings,
+  );
+  const [loading, setLoading] = useState(
+    () => useCoreStore.getState().goCusSettings == null,
+  );
   const [subTab, setSubTab] = useState<SubTabKey>("modules");
 
   // 模块导入
@@ -225,6 +232,8 @@ export default function GoCus() {
     getGoCusSettings()
       .then((s) => {
         if (!cancelled) setSettings(s);
+        // 回写全局 store，保持后续切页首帧为最新值
+        useCoreStore.getState().setGoCusSettings(s);
       })
       .catch((e) => toast.error(String(e)))
       .finally(() => {
@@ -242,6 +251,8 @@ export default function GoCus() {
     setSettings(next);
     try {
       await saveGoCusSettings(next);
+      // 保存成功即写回全局 store
+      useCoreStore.getState().setGoCusSettings(next);
     } catch (e) {
       toast.error(String(e));
       setSettings(prev);
@@ -250,7 +261,9 @@ export default function GoCus() {
 
   const reload = async () => {
     try {
-      setSettings(await getGoCusSettings());
+      const s = await getGoCusSettings();
+      setSettings(s);
+      useCoreStore.getState().setGoCusSettings(s);
     } catch (e) {
       toast.error(String(e));
     }

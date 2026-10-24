@@ -16,6 +16,7 @@ import Switch from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 import { useProStore } from "@/stores/pro";
+import { useCoreStore } from "@/stores/core";
 import { formatRelativeTime } from "@/utils/time";
 import { formatBytes } from "@/utils/format";
 
@@ -30,8 +31,14 @@ function displayName(record: SubscriptionRecord): string {
 
 export default function Subscription() {
   const { t } = useTranslation();
-  const [subs, setSubs] = useState<SubscriptionRecord[]>([]);
-  const [loading, setLoading] = useState(true);
+  // 【APP-10 任务4】首帧直出全局 store 缓存（App 启动已水合），
+  // 消除订阅启用开关切页闪烁；无缓存时回落空列表走原加载路径
+  const [subs, setSubs] = useState<SubscriptionRecord[]>(
+    () => useCoreStore.getState().subscriptions ?? [],
+  );
+  const [loading, setLoading] = useState(
+    () => useCoreStore.getState().subscriptions == null,
+  );
   const [url, setUrl] = useState("");
   const [adding, setAdding] = useState(false);
   const [updatingUrl, setUpdatingUrl] = useState<string | null>(null);
@@ -43,6 +50,8 @@ export default function Subscription() {
     try {
       const records = await listSubscriptions();
       setSubs(records ?? []);
+      // 回写全局 store，保持后续切页首帧为最新值
+      useCoreStore.getState().setSubscriptions(records ?? []);
     } catch (e) {
       console.error("load subscriptions failed:", e);
       toast.error(t("sub.loadFailed", { error: String(e) }));

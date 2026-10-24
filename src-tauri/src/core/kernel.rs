@@ -1140,16 +1140,11 @@ async fn auto_select_best_proxy(
 ) -> Result<()> {
     const TEST_URL: &str = "http://www.gstatic.com/generate_204";
     const TEST_TIMEOUT_MS: u32 = 3000;
-    /// 内置出站与不可选择项（不做真实测速）。
-    /// 订阅里 direct 可能被当成最低延迟节点（延迟 1ms），若主组 default 漏设或
-    /// 订阅把 direct 加进组里，这里就会选到 direct 变成"假翻墙真直连"。
-    /// 同时 REJECT/COMPATIBLE/PASS 等内置出站也必须排除——它们有特殊语义（拦截、
-    /// 内嵌 DNS、规则直通），绝不能当代理节点测速。
-    const EXCLUDED: [&str; 12] = [
-        "direct", "DIRECT", "block", "BLOCK",
-        "REJECT", "REJECT-DROP", "COMPATIBLE", "GLOBAL", "PASS",
-        "dns-out", "DNS-OUT", "Dns-UDP",
-    ];
+    // 【APP-10 任务2】内置出站与不可选择项统一由
+    // config_builder::is_builtin_non_proxy_tag 判定（大小写不敏感 +
+    // 中文"直连" + GO-AIM-PROBE 探测组），替代局部 EXCLUDED 名单——
+    // 订阅里 direct 可能被当成最低延迟节点（延迟 1ms），一旦漏过滤
+    // 就会选到 direct 变成"假翻墙真直连"。
 
     let proxies = api.get_proxies().await?;
     let map = proxies
@@ -1197,7 +1192,7 @@ async fn auto_select_best_proxy(
     // 只对真实节点测速：排除内置出站 + 嵌套策略组（含 all 成员列表的项）
     let nodes: Vec<String> = members
         .into_iter()
-        .filter(|m| !EXCLUDED.iter().any(|e| m.eq_ignore_ascii_case(e)))
+        .filter(|m| !crate::core::config_builder::is_builtin_non_proxy_tag(m))
         .filter(|m| {
             map.get(m)
                 .map(|info| info.get("all").is_none())

@@ -475,6 +475,10 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
         "private_key": private_key,
         "peer_public_key": peer_public_key,
         "local_address": [wg.local_ip.trim()],
+        // 【APP-10 任务1.2】WireGuard Cryptokey Routing 默认只允许 /32 单 IP，
+        // 必须显式放行 0.0.0.0/0 + ::/0，否则发往家庭内网 192.168.x.0/24 的
+        // 加密数据包被底层路由表直接丢弃，表现为「能连 Google 但打不开家里 NAS」
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
     });
     if let Some(psk) = &wg.pre_shared_key {
         match normalize_wg_key(psk) {
@@ -485,9 +489,10 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    if wg.mtu > 0 {
-        outbound["mtu"] = json!(wg.mtu);
-    }
+    // 【APP-10 任务1.2】MTU 上限 1380：外层 TUN 1400 套内层 WireGuard
+    // 封装（60 字节头）后不分片；用户配置 > 1380 时强制压到 1380
+    let mtu = if wg.mtu > 0 { wg.mtu.min(1380) } else { 1280 };
+    outbound["mtu"] = json!(mtu);
     Some(outbound)
 }
 
@@ -606,6 +611,8 @@ pub(crate) fn is_valid_cidr(cidr: &str) -> bool {
 
 /// 合成回家路由规则（domain_suffix + ip_cidr → go-lan-home）。
 /// 这些规则必须插在 `geosite: private` / `ip_is_private -> direct` 之前。
+/// 【APP-10 任务1.2】自动将 WireGuard 虚拟子网（从 local_ip 推导 /24）
+/// 并入 ip_cidr 规则，确保用户能直接访问虚拟网关（如 10.8.0.1）。
 pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String>) {
     let mut rules = Vec::new();
     let mut warnings = Vec::new();
@@ -621,7 +628,7 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
     if !domains.is_empty() {
         rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
     }
-    let cidrs: Vec<String> = lan
+    let mut cidrs: Vec<String> = lan
         .lan_cidrs
         .iter()
         .map(|c| c.trim().to_string())
@@ -633,10 +640,32 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
             ok
         })
         .collect();
+    // 【APP-10 任务1.2】自动并入 WireGuard 虚拟子网：
+    // 从 local_ip（如 10.8.0.2/24 或 10.0.0.2/32）提取前三段生成 /24 网段，
+    // 使用户能直接访问虚拟网关（10.8.0.1）与同网段设备
+    if let Some(wg) = &lan.wg_config {
+        if let Some(virtual_cidr) = extract_virtual_subnet(&wg.local_ip) {
+            if !cidrs.contains(&virtual_cidr) {
+                cidrs.push(virtual_cidr);
+            }
+        }
+    }
     if !cidrs.is_empty() {
         rules.push(json!({ "ip_cidr": cidrs, "outbound": GO_LAN_TAG }));
     }
     (rules, warnings)
+}
+
+/// 从 WireGuard local_ip（如 "10.8.0.2/24" 或 "10.0.0.2/32"）提取虚拟子网 /24。
+/// 仅处理 IPv4；返回 None 表示无法提取。
+fn extract_virtual_subnet(local_ip: &str) -> Option<String> {
+    let ip_str = local_ip.trim().split('/').next()?;
+    let parts: Vec<&str> = ip_str.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
 }
 
 /// 合成家庭 DNS 服务器与域名解析规则（lan_dns + lan_domains）。

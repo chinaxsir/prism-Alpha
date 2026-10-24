@@ -237,6 +237,11 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
         return nodes;
     };
     for (name, p) in map {
+        // 【APP-10 任务2】名称级兜底：即使 type 显示为真实协议（订阅恶意/
+        // 误命名），名为 direct/block/直连 的条目也绝不进 Go AIM 选点池
+        if crate::core::config_builder::is_builtin_non_proxy_tag(name) {
+            continue;
+        }
         let type_ = p.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
         if GROUP_TYPES.contains(&type_) {
             continue;
@@ -321,11 +326,20 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     return 0usize;
                 }
             };
+            // Gemini 判定只看首跳 Location，必须独立的无重定向客户端
+            let nr_client = match build_probe_client_no_redirect(slot) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("[go-aim] 槽位 {slot} 无重定向客户端构建失败: {e}");
+                    return 0usize;
+                }
+            };
             let mut done = 0usize;
             loop {
                 let next = queue.lock().await.pop_front();
                 let Some((name, history_delay)) = next else { break };
-                let result = probe_node(&api, &client, slot, &name, history_delay).await;
+                let result =
+                    probe_node(&api, &client, &nr_client, slot, &name, history_delay).await;
                 done += 1;
                 // 实时缓存 + 推送前端徽章
                 let app_state = app.state::<AppState>();
@@ -367,11 +381,33 @@ fn build_probe_client(slot: usize) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// 【APP-10 任务3】Gemini 专用无重定向客户端。
+///
+/// Google 对不支持地区的拦截机制：请求 https://gemini.google.com/app 首跳
+/// 直接返回 302，Location 指向 /faq 封锁页。而放行地区（含未登录）首跳为
+/// 200 或跳登录/首页。此前跟随 5 次重定向后用 `!body.contains("isn't
+/// currently supported")` 判定——Google 前端 JS 多语言包内嵌了全部错误
+/// 文案（含该字符串），纯正美国原生 IP 也会被误判封锁，Gemini 标识
+/// 全军覆没。根治：只看首跳响应头 Location 是否含 /faq + 出口地区 loc。
+fn build_probe_client_no_redirect(slot: usize) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
+        .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        )
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// 单节点探测：基线测速确认存活 → 探针选择器切到该节点 → 7 个平台
 /// 并发真实请求判定。死节点生成 probed=true 的空结果。
 async fn probe_node(
     api: &crate::core::kernel::KernelApi,
     client: &reqwest::Client,
+    nr_client: &reqwest::Client,
     slot: usize,
     name: &str,
     history_delay: Option<u64>,
@@ -400,7 +436,7 @@ async fn probe_node(
     let mut checks = Vec::with_capacity(PROBES.len());
     for probe in PROBES {
         let loc = exit_loc.clone();
-        checks.push(check_platform(client, probe, loc));
+        checks.push(check_platform(client, nr_client, probe, loc));
     }
     let outcomes = futures_util::future::join_all(checks).await;
 
@@ -446,13 +482,14 @@ fn dead_result(name: &str) -> AimNodeResult {
 /// 单平台探测：请求 + 按平台规则判定（超时/传输错误自动补测 1 次）
 async fn check_platform(
     client: &reqwest::Client,
+    nr_client: &reqwest::Client,
     probe: &Probe,
     exit_loc: Option<String>,
 ) -> bool {
     let loc = exit_loc.as_deref();
-    match check_once(client, probe, loc).await {
+    match check_once(client, nr_client, probe, loc).await {
         Some(ok) => ok,
-        None => match check_once(client, probe, loc).await {
+        None => match check_once(client, nr_client, probe, loc).await {
             Some(ok) => ok,
             None => false,
         },
@@ -462,9 +499,15 @@ async fn check_platform(
 /// 发起单次请求并按平台规则判定；None = 传输失败/超时（区别于「封锁」）
 async fn check_once(
     client: &reqwest::Client,
+    nr_client: &reqwest::Client,
     probe: &Probe,
     exit_loc: Option<&str>,
 ) -> Option<bool> {
+    // 【APP-10 任务3】Gemini 提前分支：只看首跳 Location 是否含 /faq，
+    // 绝不跟随重定向读正文（Google JS 多语言包内嵌错误文案会误伤）。
+    if probe.tag == "Gemini" {
+        return check_gemini_first_hop(nr_client, probe.url, exit_loc).await;
+    }
     let resp = match client
         .get(probe.url)
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -542,17 +585,8 @@ async fn check_once(
             }
             Some(if status == 403 { loc.is_some() } else { status < 500 })
         }
-        // Gemini：最终页不是 FAQ 封锁页、正文无「不支持该地区」、出口非受限
-        "Gemini" => {
-            if !region_allowed(AI_BLOCKLIST) {
-                return Some(false);
-            }
-            let blocked = final_url.contains("/faq")
-                || body_lc.contains("isn't currently supported")
-                || body_lc.contains("is not currently supported")
-                || body_lc.contains("not available in your country");
-            Some(status == 200 && !blocked)
-        }
+        // Gemini：已在 check_once 入口提前分支（首跳 Location 判定），此处不可达
+        "Gemini" => Some(false),
         // NF：区域锁片源 81280792——跟随重定向后 200 即解锁，404 判封锁
         "NF" => Some(status == 200),
         // Disney+：200 且未跳到不可用提示页
@@ -564,6 +598,46 @@ async fn check_once(
         _ => Some(false),
     };
     verdict
+}
+
+/// 【APP-10 任务3】Gemini 首跳判定（无重定向客户端）：
+/// - 出口地区命中 AI 受限名单 → 封锁；
+/// - 首跳 3xx 且 Location 含 `/faq` → 地区封锁页，判封锁；
+/// - 首跳 200（已进 App）或其他 3xx（跳登录/首页）→ 放行；
+/// - 传输失败/超时 → None，交由上层补测一次。
+async fn check_gemini_first_hop(
+    nr_client: &reqwest::Client,
+    url: &str,
+    exit_loc: Option<&str>,
+) -> Option<bool> {
+    if let Some(l) = exit_loc
+        && AI_BLOCKLIST.contains(&l)
+    {
+        return Some(false);
+    }
+    let resp = match nr_client
+        .get(url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    let status = resp.status().as_u16();
+    if status == 200 {
+        return Some(true);
+    }
+    if (300..400).contains(&status) {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        return Some(!location.contains("/faq"));
+    }
+    Some(false)
 }
 
 fn now_secs() -> u64 {

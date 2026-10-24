@@ -21,6 +21,7 @@ import {
   getGoAimStatus,
   getGoLanSettings,
   getGoCusSettings,
+  listSubscriptions,
   setAppForeground,
   type Entitlement,
 } from "@/api/ipc";
@@ -65,6 +66,8 @@ export default function App() {
     getGoAimStatus().then(store.setGoAimStatus).catch(() => undefined);
     getGoLanSettings().then(store.setGoLanSettings).catch(() => undefined);
     getGoCusSettings().then(store.setGoCusSettings).catch(() => undefined);
+    // 【APP-10 任务4】订阅列表同步入 store：订阅页启用开关首帧直出真实状态
+    listSubscriptions().then(store.setSubscriptions).catch(() => undefined);
   }, []);
 
   // 启动时恢复语言与外观偏好（持久化于后端 settings.json）
@@ -73,6 +76,9 @@ export default function App() {
       .then((s) => {
         if (s.language) setLanguage(s.language);
         if (s.theme) setTheme(s.theme);
+        // 【APP-10 任务4】settings 写入全局 store：设置页各开关
+        // （allowLan/ipv6/blockQuic 等）首帧直接读取真实状态，零闪烁
+        useCoreStore.getState().setSettings(s);
       })
       .catch(() => undefined);
   }, [setLanguage, setTheme]);

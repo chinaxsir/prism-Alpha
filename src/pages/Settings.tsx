@@ -173,19 +173,20 @@ export default function Settings() {
   const { t } = useTranslation();
   const [mode, setRunMode] = useState<RunMode>("systemProxy");
   const [modeBusy, setModeBusy] = useState(false);
-  const [form, setForm] = useState<UserSettings>({
-    mixedPort: 2080,
-    allowLan: false,
-    systemProxy: true,
-    mode: "systemProxy",
-    autoStart: false,
+  const [form, setForm] = useState<UserSettings>(() => ({
+    // 【APP-10 任务4】首帧直出全局 store 中的真实设置（App 启动已水合），
+    // 杜绝 useState(默认 false) → 异步 true 的开关闪烁；store 未水合时
+    // 回落默认值，由 Switch 挂载帧动画锁兜底。
+    // store.settings 必含 mixedPort/allowLan/systemProxy/mode/autoStart
+    // 必填字段，展开在后覆盖下方可选字段默认值
     outboundMode: "rule",
     ipv6: false,
     blockQuic: false,
     closeConnectionsOnSwitch: false,
     language: "system",
     theme: "system",
-  });
+    ...useCoreStore.getState().settings,
+  }));
   const [saved, setSaved] = useState(false);
   const mobile = isMobile();
   const [showActivate, setShowActivate] = useState(false);
@@ -228,8 +229,14 @@ export default function Settings() {
   const [lanIp, setLanIp] = useState<string | null>(null);
 
   // Go Lan · 回家网络（Pro）：拷贝后端设置到本地表单编辑
-  const [goLan, setGoLan] = useState<GoLanForm>(EMPTY_GO_LAN);
-  const [goLanLoaded, setGoLanLoaded] = useState<GoLanSettings | null>(null);
+  // 【APP-10 任务4】首帧直出全局 store 缓存（App 启动已水合），消除开关闪烁
+  const [goLan, setGoLan] = useState<GoLanForm>(() => {
+    const cached = useCoreStore.getState().goLanSettings;
+    return cached ? applyGoLanLoaded(cached) : EMPTY_GO_LAN;
+  });
+  const [goLanLoaded, setGoLanLoaded] = useState<GoLanSettings | null>(
+    () => useCoreStore.getState().goLanSettings,
+  );
   const [goLanBusy, setGoLanBusy] = useState(false);
   const [goLanSyncing, setGoLanSyncing] = useState(false);
   // ipa-9：Go Lan 开关关闭时表单默认收起，点击「展开配置」后再显示
@@ -246,6 +253,8 @@ export default function Settings() {
       .then((s) => {
         setGoLanLoaded(s);
         setGoLan(applyGoLanLoaded(s));
+        // 回写全局 store，保持后续切页首帧为最新值
+        useCoreStore.getState().setGoLanSettings(s);
       })
       .catch((e) => console.error("get go lan settings failed:", e));
   }, []);
@@ -324,7 +333,11 @@ export default function Settings() {
 
   useEffect(() => {
     getSettings()
-      .then((s) => setForm(s))
+      .then((s) => {
+        setForm(s);
+        // 回写全局 store，保持后续切页首帧为最新值
+        useCoreStore.getState().setSettings(s);
+      })
       .catch((e) => console.error(e));
     getCoreStatus()
       .then((data) => {
@@ -398,6 +411,8 @@ export default function Settings() {
   const handleSave = async () => {
     try {
       await saveSettings(form);
+      // 保存成功即写回全局 store：切页后首帧直出最新设置
+      useCoreStore.getState().setSettings(form);
       setSaved(true);
     } catch (e) {
       console.error("save settings failed:", e);
@@ -468,10 +483,13 @@ export default function Settings() {
     }
     setGoLanBusy(true);
     try {
-      const warnings = await saveGoLanSettings(buildGoLanPayload());
+      const payload = buildGoLanPayload();
+      const warnings = await saveGoLanSettings(payload);
       if (warnings && warnings.length > 0) {
         warnings.forEach((w) => toast.info(w));
       }
+      // 保存成功即写回全局 store：切页后 Go Lan 开关首帧直出最新状态
+      useCoreStore.getState().setGoLanSettings(payload);
       toast.success(t("settings.goLan.saveToast"));
     } catch (e) {
       toast.error(String(e));
@@ -486,6 +504,7 @@ export default function Settings() {
       const s = await syncGoLanManaged();
       setGoLanLoaded(s);
       setGoLan(applyGoLanLoaded(s));
+      useCoreStore.getState().setGoLanSettings(s);
       toast.success(t("settings.goLan.syncToast"));
     } catch (e) {
       toast.error(String(e));

@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 interface SwitchProps {
   checked: boolean;
   onChange?: (checked: boolean) => void;
@@ -11,6 +13,12 @@ interface SwitchProps {
  * 不依赖任何 CSS translate-x 或盒模型计算——滑块 x=3/23、宽 18，
  * 永远锁定在 43x23 轨道内部，物理机制上不可能冲出轨道。
  * 内置 ✓/− 状态图标。
+ *
+ * 【APP-10 任务4】挂载帧动画锁：挂载后的第一帧禁用全部过渡动画，
+ * 待 requestAnimationFrame 完成（真实状态已落位）后才启用 transition。
+ * 这样即使页面 useState(默认值) 首帧渲染与异步加载的真实值不同，
+ * 滑块也瞬时落位、绝不播放「先关后开」的滑动动画；用户后续点击
+ * 交互时动画照常生效。从物理机制上消灭全 APP 所有开关的切页闪烁。
  */
 export default function Switch({
   checked,
@@ -18,6 +26,20 @@ export default function Switch({
   title,
   disabled = false,
 }: SwitchProps) {
+  // 挂载帧动画锁：false = 挂载首帧（禁用过渡），true = 已稳定（启用过渡）
+  const [animReady, setAnimReady] = useState(false);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setAnimReady(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  const trackTransition = animReady
+    ? "fill 180ms ease, stroke 180ms ease"
+    : "none";
+  const thumbTransition = animReady
+    ? "x 180ms cubic-bezier(0.4, 0, 0.2, 1)"
+    : "none";
+
   return (
     <button
       type="button"
@@ -49,7 +71,7 @@ export default function Switch({
           fill={checked ? "#6366F1" : "rgb(var(--glass) / 0.12)"}
           stroke={checked ? "#818CF8" : "rgb(var(--glass) / 0.2)"}
           strokeWidth="1"
-          style={{ transition: "fill 180ms ease, stroke 180ms ease" }}
+          style={{ transition: trackTransition }}
         />
         {/* 内部滑块：开启 x=23（23+18=41 <= 43），关闭 x=3 */}
         <rect
@@ -59,7 +81,7 @@ export default function Switch({
           height="18"
           rx="5"
           fill="#FFFFFF"
-          style={{ transition: "x 180ms cubic-bezier(0.4, 0, 0.2, 1)" }}
+          style={{ transition: thumbTransition }}
         />
         {/* 滑块中心状态图标：开启 ✓，关闭 − */}
         {checked ? (
@@ -76,6 +98,7 @@ export default function Switch({
             stroke="#94A3B8"
             strokeWidth="2"
             strokeLinecap="round"
+            strokeLinejoin="round"
           />
         )}
       </svg>
