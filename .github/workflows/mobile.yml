@@ -398,6 +398,38 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -switch /Applications/Xcode.app
 
+      # 【APP-13 任务2】3 秒 Fail-Fast 预检：对扩展源码先做 swiftc -typecheck，
+      # 避免 PacketTunnelProvider.swift 的作用域/未定义变量错误拖到 xcodebuild
+      # 末期才暴露（build 145 的 cannot find 'bindIPv4' in scope 即此类问题）。
+      # 扩展依赖 Go 内核的 C 桥接符号，这里用等价的临时 stub 头文件代替。
+      - name: Pre-check iOS Swift sources (fail-fast)
+        shell: bash
+        run: |
+          set -e
+          node scripts/verify-ios-ready.mjs
+
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos swiftc -typecheck \
+            -target arm64-apple-ios15.0 -sdk "$SDK" \
+            src-tauri/mobile-src/ios/App/PrismTunnelController.swift
+          echo "✅ PrismTunnelController.swift typecheck passed"
+
+          STUB=/tmp/prism_vpn_bridge_stub.h
+          printf '%s\n' \
+            '#include <stdlib.h>' \
+            'typedef struct prism_vpn_cbs { int (*open_tun)(const char* options_json); int (*protect_socket)(int fd); int (*under_extension)(void); } prism_vpn_cbs;' \
+            'static inline char* PrismVPNStart(char* configContent, char* workDir) { (void)configContent; (void)workDir; return NULL; }' \
+            'static inline void PrismVPNStop(void) {}' \
+            'static inline void PrismVPNSetCallbacks(prism_vpn_cbs cbs) { (void)cbs; }' \
+            > "$STUB"
+
+          xcrun -sdk iphoneos swiftc -typecheck \
+            -target arm64-apple-ios15.0 -sdk "$SDK" \
+            -application-extension -parse-as-library \
+            -import-objc-header "$STUB" \
+            src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift
+          echo "✅ PacketTunnelProvider.swift typecheck passed"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:

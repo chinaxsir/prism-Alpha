@@ -2,7 +2,7 @@
 /**
  * verify-ios-ready.mjs —— iOS / Android 构建本地硬性预检（1 秒跑完）
  *
- * 6 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
+ * 7 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
  *   1. UTF-8 BOM 头扫描
  *   2. Rust ios.rs ↔ build.rs ↔ Swift @_cdecl 三方 C ABI 符号对齐
  *   3. Swift 缺失 import 框架自动检测
@@ -10,6 +10,7 @@
  *   5. Swift 括号与引号平衡校验
  *   6. vpn.go Go 内核双端预检（本地小写函数"调用 vs 定义"配对 +
  *      import "C" 块完整性 + 可用时的 gofmt -e 语法校验）
+ *   7. 扩展源码作用域预检（关键标识符先声明后使用 + gen 副本一致性）
  */
 
 import { readFileSync } from 'node:fs';
@@ -244,6 +245,77 @@ try {
 }
 
 // ============================================================
+// 检查 7：扩展源码作用域预检
+// build 145 实证：`bindIPv4` 定义在出站清洗块内，而「允许局域网连接」
+// 路由在 openTun 里引用它 → cannot find 'bindIPv4' in scope。
+// 这里对关键标识符做「先声明后使用」检查，本地 1 秒拦截同类错误。
+// ============================================================
+console.log('\n--- 检查 7：扩展源码作用域预检 ---');
+const EXT_SWIFT = resolve(ROOT, 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift');
+const GEN_SWIFT = resolve(ROOT, 'src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift');
+try {
+  const rawExt = readFileSync(EXT_SWIFT, 'utf8');
+  // 剥除注释，避免文档注释里出现的标识符被误判为使用
+  const stripSwiftComments = (src) =>
+    src
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+  const ext = stripSwiftComments(rawExt);
+  const lineOf = (idx) => ext.slice(0, idx).split('\n').length;
+
+  // 局部变量：使用点必须晚于声明点（Swift 不允许先使用后声明）
+  const LOCAL_VARS = ['bindIPv4', 'bindInterface', 'lanEnabled', 'activePhy'];
+  // 全局函数：Swift 允许先调用后定义（模块级符号），只要求全文有定义
+  const GLOBAL_FUNCS = ['ipv4ToUInt32', 'uint32ToIPv4', 'isValidIPv4Literal'];
+  let scopeOk = true;
+  for (const name of [...LOCAL_VARS, ...GLOBAL_FUNCS]) {
+    const useRe = new RegExp(`\\b${name}\\b`);
+    const useMatch = ext.match(useRe);
+    if (!useMatch) continue; // 未使用，跳过
+    const isFunc = GLOBAL_FUNCS.includes(name);
+    const declRe = new RegExp(
+      isFunc
+        ? `\\b(?:func|private\\s+func)\\s+${name}\\s*[(<]`
+        : `\\b(?:let|var)\\s+${name}\\s*[:=]`
+    );
+    const declIndex = ext.search(declRe);
+    if (declIndex < 0) {
+      fail(
+        `PacketTunnelProvider.swift 使用 \`${name}\` 但全文件无 ` +
+          `${isFunc ? 'func' : 'let/var'} 声明`
+      );
+      scopeOk = false;
+      continue;
+    }
+    // 只有局部变量要求「声明在首次使用之前」
+    if (!isFunc && declIndex > useMatch.index) {
+      fail(
+        `PacketTunnelProvider.swift 第 ${lineOf(useMatch.index)} 行使用 \`${name}\`，` +
+          `但声明在第 ${lineOf(declIndex)} 行（先使用后声明 → cannot find '${name}' in scope）`
+      );
+      scopeOk = false;
+    }
+  }
+  if (scopeOk) {
+    pass('PacketTunnelProvider.swift 关键标识符均先声明后使用 ✓');
+  }
+
+  // gen 副本一致性：CI 会重新 init，本地若存在则必须与规范源完全一致
+  try {
+    const genRaw = readFileSync(GEN_SWIFT, 'utf8');
+    if (genRaw !== rawExt) {
+      fail('src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift 与规范源不一致，请同步');
+    } else {
+      pass('gen/apple 扩展副本与规范源一致 ✓');
+    }
+  } catch {
+    pass('无 gen/apple 本地副本（CI 每次 init 现生成）✓');
+  }
+} catch (e) {
+  fail(`读取 PacketTunnelProvider.swift 失败：${e.message}`);
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
@@ -251,5 +323,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 6 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 7 项检查绿灯通过，iOS / Android 构建就绪！');
 }

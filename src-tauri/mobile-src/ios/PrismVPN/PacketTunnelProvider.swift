@@ -574,7 +574,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     fileprivate func openTun(optionsJSON: String) -> Int32 {
         NSLog("[PrismVPN] openTun options: \(optionsJSON)")
         writeHeartbeat("openTun")
-        _ = findActivePhysicalInterface()
+        // 【APP-13 任务6】物理网卡 IPv4 在 openTun 顶层解析并固定，
+        // 供下方「允许局域网连接」回包路由使用。严禁在使用点再定义，
+        // 避免出现 cannot find 'bindIPv4' in scope 的作用域错误。
+        let activePhy = findActivePhysicalInterface()
+        let bindIPv4: String = isValidIPv4Literal(activePhy.ipv4) ? activePhy.ipv4 : ""
 
         guard let data = optionsJSON.data(using: .utf8),
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
