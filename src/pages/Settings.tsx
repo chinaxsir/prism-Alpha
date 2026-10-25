@@ -83,6 +83,17 @@ export default function Settings() {
   const proUnlocked = useProStore((s) => s.unlocked);
   const proReady = useProStore((s) => s.ready);
   const entitlement = useProStore((s) => s.entitlement);
+  // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
+  // 订阅版显示剩余天数，日期本身作为可点击入口打开授权管理弹窗
+  const permanent =
+    entitlement.plan === "team" ||
+    (entitlement.kind === "lifetime" && !entitlement.expiresAt);
+  const remainDays = (() => {
+    if (permanent || !entitlement.expiresAt) return null;
+    const ms = new Date(entitlement.expiresAt).getTime() - Date.now();
+    if (Number.isNaN(ms)) return null;
+    return Math.max(0, Math.ceil(ms / 86_400_000));
+  })();
   const tunGated = !proUnlocked;
   // ipa-9：Go Lan 是否渲染完整配置区（启动瞬间 ready=false 先渲染完整表单，避免闪烁）
   const goLanUnlocked = proUnlocked || !proReady;
@@ -439,7 +450,13 @@ export default function Settings() {
           GoLanModal，这里只保留与普通设置行一致的紧凑单行卡；
           id 供仪表盘「配置」按钮跳转定位 */}
       {!goLanUnlocked ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5">
+        /* 【APP-13 任务3】未激活：与已激活行同构，仅整体置灰 + Switch 禁用，
+           点击整行弹激活授权弹窗（不再额外渲染醒目「激活 Pro」横幅按钮） */
+        <div
+          onClick={() => setShowActivate(true)}
+          role="button"
+          className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5 opacity-60"
+        >
           <div className="flex min-w-0 items-center gap-3">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
               <Home size={15} className="text-accent" />
@@ -447,7 +464,7 @@ export default function Settings() {
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                  {t("settings.goLan.lockedTitle")}
+                  Go Lan · 回家内网
                 </span>
                 <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
                   PRO
@@ -458,12 +475,12 @@ export default function Settings() {
               </p>
             </div>
           </div>
-          <button
-            onClick={() => setShowActivate(true)}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+          <div
+            className="flex shrink-0 items-center gap-3"
+            onClick={(e) => e.stopPropagation()}
           >
-            {t("pro.activatePro")}
-          </button>
+            <Switch checked={false} disabled onChange={() => {}} />
+          </div>
         </div>
       ) : (
         <div
@@ -578,6 +595,9 @@ export default function Settings() {
           </button>
         </div>
       ) : (
+        /* 【APP-13 任务4】已激活：极简单行——左侧方案+绿点+剩余天数，
+           右侧到期时间胶囊（可点击，直接打开授权管理弹窗）。
+           设备名额等细节全部收进弹窗，这一行只回答「我还有效吗、到哪天」。 */
         <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5">
           <div className="flex min-w-0 items-center gap-3">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
@@ -587,24 +607,23 @@ export default function Settings() {
               <div className="flex items-center gap-1.5 whitespace-nowrap text-sm font-semibold text-gray-100">
                 ✨ Prism Pro
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-latency-good" />
-                {planTextT(entitlement.plan, entitlement.kind, t)} · 已激活
+                {planTextT(entitlement.plan, entitlement.kind, t)} · {t("pro.status.active")}
               </div>
               <p className="mt-0.5 truncate text-xs text-gray-500">
-                到期:{" "}
-                {entitlement.plan === "team" ||
-                (entitlement.kind === "lifetime" && !entitlement.expiresAt)
+                {permanent
                   ? t("pro.permanent")
-                  : fmtDateTime(entitlement.expiresAt)}
-                {" · "}设备名额 {entitlement.usedSeats ?? "?"}/
-                {entitlement.maxSeats ?? "?"}
+                  : remainDays !== null
+                    ? t("pro.remainDays", { days: remainDays })
+                    : "—"}
               </p>
             </div>
           </div>
           <button
             onClick={() => setProManageOpen(true)}
-            className="shrink-0 rounded-lg bg-surface-hover px-3 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:bg-glass-strong"
+            className="flex shrink-0 items-center gap-1 rounded-lg bg-surface-hover px-3 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:bg-glass-strong"
           >
-            授权管理
+            {permanent ? t("pro.permanent") : fmtDateTime(entitlement.expiresAt)}
+            <ChevronRight size={12} className="opacity-60" />
           </button>
         </div>
       )}

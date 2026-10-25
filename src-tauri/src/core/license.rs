@@ -1028,6 +1028,42 @@ pub async fn submit_store_receipt(
     bail!("商店内购激活暂未开放，请使用授权码 + 邮箱激活");
 }
 
+/// 【APP-13 任务4】通知服务端解绑当前设备（POST /api/license/deactivate），
+/// 释放设备名额，让用户可在其他设备直接激活而不占座。
+///
+/// best-effort 语义：必须在清理本地缓存 **之前** 调用（依赖缓存中的
+/// license_key / email）；断网、404、服务端未实现该接口均静默返回 false，
+/// 绝不阻断本地移除授权（本地移除永远 100% 成功）。
+pub async fn release_device(data_dir: &Path, settings: &UserSettings) -> bool {
+    let Some((license_key, email)) = cached_credentials(data_dir) else {
+        return false;
+    };
+    let Ok(dev) = device_id(data_dir) else {
+        return false;
+    };
+    let base = server_base(settings);
+    let result = post_with_fallback(
+        &format!("{base}{}", crate::obf!("/api/license/deactivate")),
+        &serde_json::json!({
+            "license_key": license_key,
+            "email": email,
+            "device_id": dev,
+        }),
+    )
+    .await;
+    match result {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            tracing::info!("license deactivate notify: http={} ok={ok}", resp.status().as_u16());
+            ok
+        }
+        Err(e) => {
+            tracing::warn!("license deactivate notify failed (ignored): {e}");
+            false
+        }
+    }
+}
+
 /// 移除本机授权（切换账号/退款后）：删除本地所有授权与同步缓存文件——
 /// 加密缓存 license.dat、旧版 license_cache.json 与订阅同步基线 sync_links.json。
 /// 文件不存在均忽略；本函数纯本地操作，绝不因远端接口 404 或断网而失败，

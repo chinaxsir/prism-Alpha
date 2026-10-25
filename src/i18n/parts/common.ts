@@ -146,6 +146,8 @@ const zh: Record<string, string> = {
   "pro.status.expired": "已过期",
   "pro.status.revoked": "已吊销",
   "pro.status.inactive": "未激活",
+  "pro.lockedTap": "未激活 · 点击卡片激活授权",
+  "pro.remainDays": "剩余 {days} 天",
   "pro.unboundBanner":
     "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
   "pro.expiredBanner":
@@ -324,6 +326,8 @@ const en: Record<string, string> = {
   "pro.status.expired": "Expired",
   "pro.status.revoked": "Revoked",
   "pro.status.inactive": "Inactive",
+  "pro.lockedTap": "Inactive · Tap card to activate",
+  "pro.remainDays": "{days} days left",
   "pro.unboundBanner":
     "This device has been unbound from your account. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Re-activate in Settings → Prism Pro.",
   "pro.expiredBanner":

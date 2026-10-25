@@ -50,6 +50,23 @@ private struct PhysicalInterface {
     /// 短暂无网场景下兜底候选（pdp_ip0/en0 盲猜）标记为 false，
     /// 热重载检测据此保持待机，不切到死网卡
     let hasRoutableIP: Bool
+    /// 【APP-13 任务5】该网卡当前的真实 IPv4 地址（无则空串）。
+    /// 注入到出站 `inet4_bind_address`，让 UDP/TCP 从物理网卡地址发出，
+    /// 规避 iOS 16.5 NECP 沙盒下双栈 Socket 绑定被 EPERM 拒绝。
+    var ipv4: String = ""
+}
+
+/// 【APP-13 任务5】严格校验 IPv4 字面量（a.b.c.d 且每段 0-255）。
+/// `inet4_bind_address` 若写入非法值会让内核 FATAL 退出，必须先校验。
+private func isValidIPv4Literal(_ s: String) -> Bool {
+    let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4 else { return false }
+    for p in parts {
+        guard !p.isEmpty, p.count <= 3, p.allSatisfy({ $0.isNumber }),
+              let v = Int(p), v >= 0, v <= 255
+        else { return false }
+    }
+    return true
 }
 
 /// 严格判断网卡上的地址是否为真正可路由的 IP（排除 127.0.0.1、169.254.x.x 以及 iOS Wi-Fi 断开后残留的 fe80:: 链路本地地址）
@@ -109,10 +126,27 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     var otherCandidate: PhysicalInterface?
 
     var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+    // 网卡名 → 真实 IPv4 地址（同一网卡可能同时挂 IPv4/IPv6 两条记录，
+    // 只取 AF_INET 那条，IPv6 记录不参与）
+    var ipv4ByName: [String: String] = [:]
     while let current = ptr {
         let flags = Int32(current.pointee.ifa_flags)
         let isUp = (flags & IFF_UP) != 0 && (flags & IFF_RUNNING) != 0
         let isLoopback = (flags & IFF_LOOPBACK) != 0
+
+        if let addr = current.pointee.ifa_addr, Int32(addr.pointee.sa_family) == AF_INET {
+            let name = String(cString: current.pointee.ifa_name)
+            if ipv4ByName[name] == nil, isRoutableAddress(addr) {
+                ipv4ByName[name] = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sinPtr in
+                    var raw = sinPtr.pointee.sin_addr
+                    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    if inet_ntop(AF_INET, &raw, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                        return String(cString: buf)
+                    }
+                    return ""
+                }
+            }
+        }
 
         if isUp && !isLoopback, let addr = current.pointee.ifa_addr, isRoutableAddress(addr) {
             let name = String(cString: current.pointee.ifa_name)
@@ -141,6 +175,13 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
         ptr = current.pointee.ifa_next
     }
 
+    // 把已采集的 IPv4 附加到最终选中的网卡上
+    func attached(_ iface: PhysicalInterface) -> PhysicalInterface {
+        var out = iface
+        out.ipv4 = ipv4ByName[iface.name] ?? ""
+        return out
+    }
+
     // 最优蜂窝候选：系统默认路由同名 > 有可路由 IPv4 > 仅 IPv6（IMS 专网）
     let bestCell = cellNamedCandidate ?? cellV4Candidate ?? cellV6Candidate
 
@@ -149,34 +190,34 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     if systemDefaultIsCellular, let cell = bestCell {
         cachedPhysicalIfIndex = cell.index
         cachedPhysicalIfName = cell.name
-        return cell
+        return attached(cell)
     }
     if let wifi = wifiCandidate {
         cachedPhysicalIfIndex = wifi.index
         cachedPhysicalIfName = wifi.name
-        return wifi
+        return attached(wifi)
     }
     if let cell = bestCell {
         cachedPhysicalIfIndex = cell.index
         cachedPhysicalIfName = cell.name
-        return cell
+        return attached(cell)
     }
     if let other = otherCandidate {
         cachedPhysicalIfIndex = other.index
         cachedPhysicalIfName = other.name
-        return other
+        return attached(other)
     }
     // 兜底：若 getifaddrs 均未匹配，优先尝试 pdp_ip0 再尝试 en0
     let pdpIdx = if_nametoindex("pdp_ip0")
     if pdpIdx > 0 {
         cachedPhysicalIfIndex = pdpIdx
         cachedPhysicalIfName = "pdp_ip0"
-        return PhysicalInterface(name: "pdp_ip0", index: pdpIdx, hasRoutableIP: false)
+        return attached(PhysicalInterface(name: "pdp_ip0", index: pdpIdx, hasRoutableIP: false))
     }
     let enIdx = if_nametoindex("en0")
     cachedPhysicalIfIndex = enIdx
     cachedPhysicalIfName = "en0"
-    return PhysicalInterface(name: "en0", index: enIdx, hasRoutableIP: false)
+    return attached(PhysicalInterface(name: "en0", index: enIdx, hasRoutableIP: false))
 }
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -339,7 +380,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
                 let currentPhy = findActivePhysicalInterface()
                 self.activeBoundInterface = currentPhy.name
-                let sanitizedConfig = self.sanitizeConfigForExtension(configText, workDir: workDir, phyName: currentPhy.name)
+                let sanitizedConfig = self.sanitizeConfigForExtension(
+                    configText,
+                    workDir: workDir,
+                    phyName: currentPhy.name,
+                    phyIPv4: currentPhy.ipv4
+                )
+                // 预解析与网卡取值都在 PrismVPNStart（内部才 setTunnelNetworkSettings）
+                // 之前完成，保证 WireGuard 服务器 IP 落地时 UDP 会话仍绑定物理网卡
 
                 let callbacks = prism_vpn_cbs(
                     open_tun: prismOpenTun,
@@ -417,7 +465,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             if let rawConfig = try? self.loadRawConfigText() {
-                let updatedConfig = self.sanitizeConfigForExtension(rawConfig, workDir: workDir, phyName: newIf)
+                let updatedConfig = self.sanitizeConfigForExtension(
+                    rawConfig,
+                    workDir: workDir,
+                    phyName: newIf,
+                    phyIPv4: latestPhy.ipv4
+                )
                 PrismVPNStop()
                 let errPtr = updatedConfig.withCString { configPtr in
                     workDir.path.withCString { dirPtr in
@@ -642,6 +695,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+        // 【APP-13 任务6】「允许局域网连接」回包闭环：
+        // mixed 入站监听 0.0.0.0 后，局域网设备（192.168.x.x）连本机代理端口，
+        // 其回包若被 utun 默认路由接管会发出不去，表现为「连上了但一直转圈」。
+        // 把本机物理网卡所在 /24 加入 excludedRoutes，回包固定走物理网卡。
+        let lanEnabled = ((json["inbounds"] as? [[String: Any]]) ?? []).contains {
+            ($0["type"] as? String) == "mixed" && ($0["listen"] as? String) == "0.0.0.0"
+        }
+        if lanEnabled, !bindIPv4.isEmpty, let selfIp = ipv4ToUInt32(bindIPv4) {
+            let lanMask: UInt32 = 0xFFFF_FF00
+            if let net = uint32ToIPv4(selfIp & lanMask) {
+                excludedV4.append(
+                    NEIPv4Route(destinationAddress: net, subnetMask: "255.255.255.0")
+                )
+            }
+        }
+
         // 直连 DNS 223.5.5.5 / 114.114.114.114 直出物理网卡（零 403 / 零 EPERM）
         excludedV4.append(
             NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
@@ -912,7 +981,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return str
     }
 
-    private func sanitizeConfigForExtension(_ rawJSON: String, workDir: URL, phyName: String) -> String {
+    /// - Parameters:
+    ///   - phyName: 当前活跃物理网卡名（en0 / pdp_ip0），注入 `bind_interface`
+    ///   - phyIPv4: 该网卡的真实 IPv4，注入 `inet4_bind_address`。
+    ///     仅注入合法 IPv4 字面量；网络切换时扩展会整体重启并重新取值。
+    private func sanitizeConfigForExtension(
+        _ rawJSON: String,
+        workDir: URL,
+        phyName: String,
+        phyIPv4: String = ""
+    ) -> String {
         guard let data = rawJSON.data(using: .utf8),
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else {
@@ -958,6 +1036,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
+        // 【APP-13 任务5】物理网卡绑定统一入口：
+        // bind_interface 让内核 Socket 走物理网卡；inet4_bind_address 再把
+        // 源地址固定为该网卡真实 IPv4，避免 iOS 16.5 NECP 沙盒下双栈
+        // Socket 绑定被 EPERM 拒绝（listen outbound packet connection:
+        // operation not permitted）。
+        let bindIPv4 = isValidIPv4Literal(phyIPv4) ? phyIPv4 : ""
+        func applyPhysicalBind(_ obj: inout [String: Any]) {
+            if !phyName.isEmpty {
+                obj["bind_interface"] = phyName
+            }
+            if !bindIPv4.isEmpty {
+                obj["inet4_bind_address"] = bindIPv4
+            }
+        }
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
             let tag = (outbounds[i]["tag"] as? String) ?? ""
@@ -972,9 +1064,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 锁定 ipv4_only 强制使用纯 IPv4 udp4 Socket，根治
                 // `listen outbound packet connection: operation not permitted`
                 outbounds[i]["domain_strategy"] = "ipv4_only"
-                if !phyName.isEmpty {
-                    outbounds[i]["bind_interface"] = phyName
-                }
+                applyPhysicalBind(&outbounds[i])
             } else if t == "selector" && !tag.isEmpty {
                 if firstSelectorTag == nil {
                     firstSelectorTag = tag
@@ -1067,16 +1157,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     outbounds[i]["peers"] = peers
                 }
-                if !phyName.isEmpty {
-                    outbounds[i]["bind_interface"] = phyName
-                }
+                applyPhysicalBind(&outbounds[i])
             } else if proxyOutboundTypes.contains(t) {
                 if !tag.isEmpty {
                     allRealProxyTags.append(tag)
                 }
-                if !phyName.isEmpty {
-                    outbounds[i]["bind_interface"] = phyName
-                }
+                applyPhysicalBind(&outbounds[i])
             }
         }
 

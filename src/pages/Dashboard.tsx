@@ -87,8 +87,7 @@ export default function Dashboard() {
   const mobile = isMobile();
   const navigate = useNavigate();
 
-  // Pro 授权状态（ipa-9：未激活时引擎矩阵折叠为单张横幅卡）
-  const proReady = useProStore((s) => s.ready);
+  // Pro 授权状态（APP-13 任务3：入口常驻，未激活时卡片整体置灰）
   const proUnlocked = useProStore((s) => s.unlocked);
   const [showActivate, setShowActivate] = useState(false);
   // 【APP-12 任务2.2】Go Lan 配置弹窗：仪表盘「配置」按钮页内直开，不再跳设置页
@@ -534,96 +533,76 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus，Pro 门控）
-          ipa-9：未激活时不渲染三张带遮罩的卡片，折叠为一张紧凑协调的横幅卡；
-          已激活时渲染三张功能卡（移动端单列通栏横向卡片，桌面端三列网格） */}
-      {proUnlocked ? (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
-          <EngineCard
-            icon={<Crosshair size={14} className="text-accent" />}
-            name={t("engine.goAim")}
-            tag={t("engine.goAimTag")}
-            status={aimStatus}
-            enabled={aim?.enabled ?? false}
-            onToggle={toggleAim}
-            action={
-              aim?.enabled ? (
-                // 【APP-9 任务4.2】只保留「重测」按钮——恢复自动选点通过
-                // 关闭再打开 Go AIM 开关实现（后端 set_go_aim_enabled 已
-                // 清空 go_aim_pinned_node），不再单独提供「恢复自动」按钮
-                <button
-                  onClick={runAimProbe}
-                  disabled={aim.probing}
-                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
-                >
-                  {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
-                </button>
-              ) : undefined
-            }
-          />
-          <EngineCard
-            icon={<Home size={14} className="text-accent" />}
-            name={t("engine.goLan")}
-            tag={t("engine.goLanTag")}
-            status={lanStatus}
-            enabled={lan?.enabled ?? false}
-            onToggle={toggleLan}
-            action={
+      {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus）
+          【APP-13 任务3】未激活时不再整体折叠为横幅：三张功能卡原位展示并
+          置灰，点击卡片弹出激活授权弹窗。功能入口位置固定，避免激活前后
+          布局跳变，也让用户一眼看清 Pro 到底解锁了什么。 */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+        <EngineCard
+          icon={<Crosshair size={14} className="text-accent" />}
+          name={t("engine.goAim")}
+          tag={t("engine.goAimTag")}
+          status={proUnlocked ? aimStatus : t("pro.lockedTap")}
+          enabled={proUnlocked && (aim?.enabled ?? false)}
+          locked={!proUnlocked}
+          onLockedClick={() => setShowActivate(true)}
+          onToggle={toggleAim}
+          action={
+            proUnlocked && aim?.enabled ? (
+              // 【APP-9 任务4.2】只保留「重测」按钮——恢复自动选点通过
+              // 关闭再打开 Go AIM 开关实现（后端 set_go_aim_enabled 已
+              // 清空 go_aim_pinned_node），不再单独提供「恢复自动」按钮
+              <button
+                onClick={runAimProbe}
+                disabled={aim.probing}
+                className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
+              >
+                {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
+              </button>
+            ) : undefined
+          }
+        />
+        <EngineCard
+          icon={<Home size={14} className="text-accent" />}
+          name={t("engine.goLan")}
+          tag={t("engine.goLanTag")}
+          status={proUnlocked ? lanStatus : t("pro.lockedTap")}
+          enabled={proUnlocked && (lan?.enabled ?? false)}
+          locked={!proUnlocked}
+          onLockedClick={() => setShowActivate(true)}
+          onToggle={toggleLan}
+          action={
+            proUnlocked ? (
               <button
                 onClick={() => setGoLanModalOpen(true)}
                 className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
               >
                 {t("common.configure")}
               </button>
-            }
-          />
-          <EngineCard
-            icon={<Wand2 size={14} className="text-accent" />}
-            name={t("engine.goCus")}
-            tag={t("engine.goCusTag")}
-            status={cusStatus}
-            enabled={cus?.enabled ?? false}
-            onToggle={toggleCus}
-            action={
+            ) : undefined
+          }
+        />
+        <EngineCard
+          icon={<Wand2 size={14} className="text-accent" />}
+          name={t("engine.goCus")}
+          tag={t("engine.goCusTag")}
+          status={proUnlocked ? cusStatus : t("pro.lockedTap")}
+          enabled={proUnlocked && (cus?.enabled ?? false)}
+          locked={!proUnlocked}
+          onLockedClick={() => setShowActivate(true)}
+          onToggle={toggleCus}
+          action={
+            proUnlocked ? (
               <button
                 onClick={() => navigate("/proxies?tab=goCus")}
                 className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
               >
                 {t("common.configure")}
               </button>
-            }
-          />
-        </div>
-      ) : proReady ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3">
-          <div className="min-w-0 flex-1">
-            {/* APP-5 任务2：标题 + 三个胶囊强制一行，不再折行 */}
-            <div className="flex flex-nowrap items-center gap-1.5 overflow-hidden">
-              <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                ✨ {t("dashboard.proEngines")}
-              </span>
-              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
-                Go AIM
-              </span>
-              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
-                Go Lan
-              </span>
-              <span className="whitespace-nowrap rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-text-muted">
-                Go Cus
-              </span>
-            </div>
-            <p className="mt-1 truncate text-[11px] text-gray-400">
-              {t("dashboard.proBannerDesc")}
-            </p>
-          </div>
-          <button
-            onClick={() => setShowActivate(true)}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90"
-          >
-            {t("pro.activatePro")}
-          </button>
-        </div>
-      ) : null}
+            ) : undefined
+          }
+        />
+      </div>
 
       {/* 实时速率（合并卡片，左右分布） */}
       <div className="bg-surface-card rounded-2xl p-5 border border-border">
@@ -845,6 +824,8 @@ function StatChip({
 
 /// Pro 引擎卡（ipa-8）：横向通栏布局——左侧图标+完整标题+功能标签胶囊+一行状态
 /// 副标题，右侧「配置/重测」轻按钮 + Switch；移动端不再因 grid-cols-3 窄卡片截断文字
+/// 【APP-13 任务3】locked=true 时整卡置灰、Switch 禁用，点击卡片触发
+/// onLockedClick（弹激活授权弹窗），功能入口位置保持固定。
 function EngineCard({
   icon,
   name,
@@ -853,6 +834,8 @@ function EngineCard({
   enabled,
   onToggle,
   action,
+  locked = false,
+  onLockedClick,
 }: {
   icon: ReactNode;
   name: string;
@@ -861,9 +844,17 @@ function EngineCard({
   enabled: boolean;
   onToggle: (v: boolean) => void;
   action?: ReactNode;
+  locked?: boolean;
+  onLockedClick?: () => void;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border">
+    <div
+      onClick={locked ? onLockedClick : undefined}
+      role={locked ? "button" : undefined}
+      className={`flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border ${
+        locked ? "opacity-60 cursor-pointer" : ""
+      }`}
+    >
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           {icon}
@@ -883,9 +874,12 @@ function EngineCard({
           {status}
         </div>
       </div>
-      <div className="flex items-center gap-2.5 shrink-0">
+      <div
+        className="flex items-center gap-2.5 shrink-0"
+        onClick={locked ? (e) => e.stopPropagation() : undefined}
+      >
         {action}
-        <Switch checked={enabled} onChange={onToggle} />
+        <Switch checked={enabled} disabled={locked} onChange={onToggle} />
       </div>
     </div>
   );

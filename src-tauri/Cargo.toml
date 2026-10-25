@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.3.28"
+version = "0.3.29"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"
@@ -41,6 +41,8 @@ tokio-tungstenite = "0.21"
 futures-util = "0.3"
 # 移动端必须用 rustls：native-tls 在 Android 上依赖 OpenSSL，交叉编译受阻
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls"] }
+# 订阅下载：面板无视 Accept-Encoding: identity 强制返回 gzip 时手动解压
+flate2 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

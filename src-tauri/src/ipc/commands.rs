@@ -864,7 +864,9 @@ pub(crate) async fn refresh_subscription(
     state: &AppState,
     url: &str,
 ) -> Result<(), String> {
-    let url = url.to_string();
+    // 入口即清洗：微信/网页复制的链接常带 \u2060 等零宽字符，
+    // 若不清洗会污染 profile 文件哈希、订阅记录与后续所有请求
+    let url = sanitize_subscription_url(url);
     // 内核运行中时，直连失败的最终兜底是经本地 mixed 入站转发。
     // 移动端 mixed 入站已移除，流量全走 TUN，无需本地代理兜底。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -977,16 +979,44 @@ pub(crate) async fn refresh_subscription(
     Ok(())
 }
 
+/// 订阅下载候选 User-Agent（按兼容性从强到弱轮询）：
+/// 1. clash-verge —— 绝大多数要求 Clash 格式的面板；
+/// 2. Shadowrocket —— 屏蔽 Clash UA 的面板；
+/// 3. 通用浏览器 —— 只放行浏览器 UA 的兜底。
+const SUBSCRIPTION_UAS: [&str; 3] = [
+    "clash-verge/v1.7.7",
+    "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+];
+
+/// 单次订阅请求超时（方案要求 12 秒；黑洞地址由 connect_timeout 快速失败）
+const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// 清洗订阅 URL：剔除首尾空白与零宽/不可见控制字符。
+/// 从微信、网页复制的链接常带入 \u2060（Word Joiner）、\u200B..\u200F、
+/// \uFEFF（BOM）等，直接特征会被 reqwest 判为非法 URL 或触发面板 WAF。
+fn sanitize_subscription_url(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{2060}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+                    | '\u{180E}'
+            ) && !c.is_control()
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// 下载远程文本（订阅 / proxy-provider 共用）。
-/// 伪装为 Clash 客户端，多数机场据此返回 Clash YAML；
-/// 直连必须 no_proxy：内核运行时系统代理指向本进程，走系统代理会自回环。
-///
-/// 三级重试闭环：
-/// 1. 直连（hyper 自动尝试 v6/v4）
-/// 2. 强制 IPv4 源地址直连——部分网络 IPv6 出口为黑洞（AAAA 优先 + SYN 无
-///    响应），0.0.0.0 绑定后 v6 目标因地址族不匹配立即跳过，秒级回退 v4
-/// 3. 内核运行中 → 经本地 mixed 入站（127.0.0.1:mixed_port）转发——受限网络
-///    直连被墙时走节点出境，实现「先启动内核再更新」的真实闭环
+/// 三级回退闭环：
+/// 1. 多 UA 直连竞速（自动探测 + 强制 IPv4 同时发起）；
+/// 2. 内核运行中经本地 mixed 入站转发（受限网络走节点出境）；
+/// 3. 全部失败时给出可自助定位的精确原因。
 async fn fetch_remote_text(
     url: &str,
     local_proxy: Option<u16>,
@@ -994,24 +1024,37 @@ async fn fetch_remote_text(
     use futures_util::stream::{FuturesUnordered, StreamExt as _};
     use std::time::Instant;
 
+    let url = sanitize_subscription_url(url);
+    if url.is_empty() {
+        return Err("订阅链接为空（可能只粘贴了不可见字符）".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "订阅链接格式有误：必须以 http:// 或 https:// 开头（当前为「{}」）",
+            truncate_for_msg(&url)
+        ));
+    }
+
     let fetch_started = Instant::now();
     let mut last_err = String::new();
 
-    // ---- 直连双栈竞速（自动探测 + 强制 IPv4 同时发起）----
+    // ---- 直连双栈竞速（自动探测 + 强制 IPv4 同时发起）× 多 UA ----
     // 原串行实现：第一次请求若撞上 IPv6 黑洞，必须等满 10s 连接超时才
     // 发起第二次，导入体感「非常慢」。竞速后任一栈先成功立即返回，
     // 整体只受实际网络 RTT 约束，不再为黑洞等待。
-    // 1. http1_only + http2 兜底说明：CF Worker 类端点 HTTP/2 流关闭
-    //    顺序异常是 error decoding response body 的另一诱因，优先 HTTP/1.1
-    let build_direct_client = |force_v4: bool| -> Result<reqwest::Client, String> {
+    // http1_only：CF Worker 类端点 HTTP/2 流关闭顺序异常会触发
+    //   error decoding response body（即「读取响应失败」），强制 HTTP/1.1。
+    let build_client = |force_v4: bool, ua: &str| -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder()
             .http1_only()
-            // 部分机场面板按 UA 识别 Clash 系客户端分流订阅格式，非 Clash
-            // UA 会拿到浏览器提示页（0 节点）；用 Clash for Windows 通行 UA
-            .user_agent("ClashforWindows/0.20.39")
-            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(ua)
+            .timeout(SUBSCRIPTION_TIMEOUT)
             // 连接阶段独立短超时：黑洞地址快速失败
             .connect_timeout(std::time::Duration::from_secs(8))
+            // 部分机场使用自签名/过期证书，忽略校验换取可用性
+            .danger_accept_invalid_certs(true)
+            // 机场面板常有 CDN 多级跳转，最多跟随 5 次
+            .redirect(reqwest::redirect::Policy::limited(5))
             .no_proxy();
         if force_v4 {
             builder =
@@ -1021,17 +1064,20 @@ async fn fetch_remote_text(
     };
 
     let mut attempts = FuturesUnordered::new();
-    for force_v4 in [false, true] {
-        let client = build_direct_client(force_v4)?;
-        let target = url.to_string();
-        attempts.push(async move { (force_v4, try_fetch_text(&client, &target).await) });
+    for ua in SUBSCRIPTION_UAS {
+        for force_v4 in [false, true] {
+            let client = build_client(force_v4, ua)?;
+            let target = url.clone();
+            attempts.push(async move { (force_v4, ua, try_fetch_text(&client, &target).await) });
+        }
     }
 
-    while let Some((force_v4, result)) = attempts.next().await {
+    while let Some((force_v4, ua, result)) = attempts.next().await {
         match result {
             Ok((text, quota)) => {
                 tracing::info!(
-                    "fetch succeeded (force_v4={force_v4}) in {}ms",
+                    "fetch succeeded (ua={}, force_v4={force_v4}) in {}ms",
+                    ua.split('/').next().unwrap_or(ua),
                     fetch_started.elapsed().as_millis()
                 );
                 return Ok((text, quota));
@@ -1039,32 +1085,43 @@ async fn fetch_remote_text(
             Err(e) => {
                 last_err = e;
                 tracing::warn!(
-                    "fetch direct (force_v4={force_v4}) failed at {}ms: {last_err}",
+                    "fetch direct (ua={}, force_v4={force_v4}) failed at {}ms: {last_err}",
+                    ua.split('/').next().unwrap_or(ua),
                     fetch_started.elapsed().as_millis()
                 );
             }
         }
     }
 
-    // ---- 内核运行中：经本地 mixed 入站转发 ----
+    // ---- 内核运行中：经本地 mixed 入站转发（同样轮询多 UA）----
     if let Some(port) = local_proxy {
         let proxy = reqwest::Proxy::all(&format!("http://127.0.0.1:{port}"))
             .map_err(|e| format!("配置本地代理失败: {e}"))?;
-        let builder = reqwest::Client::builder()
-            .user_agent("ClashforWindows/0.20.39")
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .proxy(proxy);
-        match try_fetch_text(&builder.build().map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?, url)
-            .await
-        {
-            Ok((text, quota)) => {
-                tracing::info!("fetch remote text succeeded via local mixed proxy :{port}");
-                return Ok((text, quota));
-            }
-            Err(e) => {
-                last_err = e;
-                tracing::warn!("fetch remote text via local proxy failed: {last_err}");
+        for ua in SUBSCRIPTION_UAS {
+            let builder = reqwest::Client::builder()
+                .http1_only()
+                .user_agent(ua)
+                .timeout(SUBSCRIPTION_TIMEOUT)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .danger_accept_invalid_certs(true)
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .proxy(proxy.clone());
+            let client = match builder.build() {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("创建 HTTP 客户端失败: {e}");
+                    continue;
+                }
+            };
+            match try_fetch_text(&client, &url).await {
+                Ok((text, quota)) => {
+                    tracing::info!("fetch remote text succeeded via local mixed proxy :{port}");
+                    return Ok((text, quota));
+                }
+                Err(e) => {
+                    last_err = e;
+                    tracing::warn!("fetch remote text via local proxy failed: {last_err}");
+                }
             }
         }
         Err(format!(
@@ -1072,9 +1129,19 @@ async fn fetch_remote_text(
         ))
     } else {
         Err(format!(
-            "下载失败：{last_err}（已尝试 IPv4 直连；若机器处于受限网络，请先启动内核再更新订阅）"
+            "下载失败：{last_err}（已尝试多 UA 与 IPv4 直连；若机器处于受限网络，请先启动内核再更新订阅）"
         ))
     }
+}
+
+/// 错误提示里限制 URL 长度，避免超长链接撑爆 Toast
+fn truncate_for_msg(s: &str) -> String {
+    let chars: Vec<char> = s.chars().take(48).collect();
+    let mut out: String = chars.into_iter().collect();
+    if s.chars().count() > 48 {
+        out.push('…');
+    }
+    out
 }
 
 /// 用给定客户端执行一次 GET 文本下载（状态码 / UTF-8 校验）
@@ -1125,7 +1192,30 @@ async fn try_fetch_text(
             }
         }
     }
-    let text = String::from_utf8(buf).map_err(|_| "内容不是有效 UTF-8 文本".to_string())?;
+
+    // 已请求 Accept-Encoding: identity，但部分面板无视请求头强制返回 gzip。
+    // 此类响应交给 reqwest 解码器会报 error decoding response body；
+    // 这里按 gzip 魔数（0x1f 0x8b）手动流式解压。
+    if buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
+        use std::io::Read as _;
+        let mut decoded = Vec::new();
+        match flate2::read::GzDecoder::new(&buf[..]).read_to_end(&mut decoded) {
+            Ok(_) => {
+                tracing::info!("订阅响应为 gzip 压缩，已手动解压 {} → {} 字节", buf.len(), decoded.len());
+                buf = decoded;
+            }
+            Err(e) => {
+                if buf.len() > 32 {
+                    tracing::warn!("gzip 解压失败，保留原始字节: {e}");
+                } else {
+                    return Err(format!("gzip 解压失败: {e}"));
+                }
+            }
+        }
+    }
+
+    // 非 UTF-8 字节（面板偶发夹杂控制字符）按 lossy 转换，绝不因编码直接失败
+    let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, quota))
 }
 
@@ -1541,6 +1631,11 @@ pub async fn deactivate_pro(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
+    // 【APP-13 任务4】先通知服务端解绑（释放设备名额，其他设备可直接激活），
+    // 必须在本地缓存清理前调用；失败静默忽略，绝不阻断本地移除。
+    // 先克隆 settings 再 await：避免 RwLock 读锁跨 await 导致 future 非 Send。
+    let settings_snapshot = state.settings.read().clone();
+    let _ = crate::core::license::release_device(&state.data_dir, &settings_snapshot).await;
     let next = crate::core::license::deactivate(&state.data_dir);
     state.apply_entitlement(next.clone());
     // 用户主动移除授权：不是「被解绑/已到期」，清掉历史原因避免误弹横幅

@@ -453,6 +453,19 @@ async fn probe_node(
             }
         }
     }
+    // 【APP-13 任务2】Gemini 兜底放行：gemini.google.com 握手偶发超时（
+    // Google 前端首包 RTT 高），单次失败不应把整批节点的 Gemini 标识清空。
+    // 若出口地区已确认不在 AI 受限名单，且该节点已实测解锁 GPT 或 YT
+    // （同属 Google/OpenAI 体系，链路质量充分），则补回 Gemini 标识。
+    if !tags.iter().any(|t| t == "Gemini")
+        && exit_loc
+            .as_deref()
+            .is_some_and(|l| !AI_BLOCKLIST.contains(&l))
+        && tags.iter().any(|t| t == "GPT" || t == "YT")
+    {
+        tags.push("Gemini".to_string());
+        ai = true;
+    }
     let score = tags.len() as u32;
     AimNodeResult {
         node_name: name.to_string(),
