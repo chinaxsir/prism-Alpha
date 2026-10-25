@@ -612,6 +612,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }) {
                         includedV4.append(route)
                     }
+                    // 【APP-12 任务1.3】最长前缀匹配：iOS 路由表中外网 Wi-Fi 的
+                    // 本地 /24 路由优先级高于 TUN 的默认 0.0.0.0/0。把每个
+                    // /24 回家网段拆为两个 /25（.0/25 与 .128/25，掩码
+                    // 255.255.255.128），最长前缀匹配确保任何 Wi-Fi/蜂窝下
+                    // 访问家里内网 IP 100% 进入 PrismVPN 隧道。
+                    // 对 /24 及更宽前缀（/8 /16 等）做 +1 拆分。
+                    if p.prefix > 0 && p.prefix < 32,
+                       let base = ipv4ToUInt32(p.address) {
+                        let halfBits: UInt32 = 1 << (31 - UInt32(p.prefix)) // 半个网段地址数
+                        let firstAddr = base & ~(halfBits * 2 - 1) // 对齐到本网段起点
+                        let secondAddr = firstAddr + halfBits
+                        let halfMask = subnetMask(prefix: p.prefix + 1)
+                        for halfAddr in [firstAddr, secondAddr] {
+                            if let halfStr = uint32ToIPv4(halfAddr) {
+                                let halfRoute = NEIPv4Route(
+                                    destinationAddress: halfStr,
+                                    subnetMask: halfMask
+                                )
+                                if !includedV4.contains(where: {
+                                    $0.destinationAddress == halfRoute.destinationAddress
+                                        && $0.destinationSubnetMask == halfRoute.destinationSubnetMask
+                                }) {
+                                    includedV4.append(halfRoute)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -907,7 +934,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 大幅提升大流量下载吞吐并降低单核 CPU 占用
                     inbounds[i]["stack"] = "mixed"
                     inbounds[i]["sniff"] = true
-                    inbounds[i]["sniff_override_destination"] = true
+                    // 【APP-12 任务1.2】严禁 sniff_override_destination=true：
+                    // 置 true 时访问家里内网 IP 会被嗅探把目标改写成 Host/SNI
+                    // 域名，导致 ip_cidr → go-lan-home 规则匹配失败，流量
+                    // 被错误发往海外代理节点。保留 sniff 仅用于协议识别。
+                    inbounds[i]["sniff_override_destination"] = false
                     inbounds[i]["sniff_timeout"] = "100ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
@@ -1536,6 +1567,28 @@ private func subnetMask(prefix: Int) -> String {
         mask[i / 8] |= 0x80 >> (i % 8)
     }
     return mask.map { String($0) }.joined(separator: ".")
+}
+
+/// 【APP-12 任务1.3】IPv4 字符串转 UInt32（网络字节序），用于 /24 → 两个 /25
+/// 最长前缀匹配路由拆分。解析失败返回 nil。
+private func ipv4ToUInt32(_ s: String) -> UInt32? {
+    let parts = s.split(separator: ".")
+    guard parts.count == 4 else { return nil }
+    var v: UInt32 = 0
+    for p in parts {
+        guard let b = UInt32(p), b <= 255 else { return nil }
+        v = (v << 8) | b
+    }
+    return v
+}
+
+/// 【APP-12 任务1.3】UInt32（网络字节序）转 IPv4 字符串
+private func uint32ToIPv4(_ v: UInt32) -> String? {
+    let b0 = (v >> 24) & 0xFF
+    let b1 = (v >> 16) & 0xFF
+    let b2 = (v >> 8) & 0xFF
+    let b3 = v & 0xFF
+    return "\(b0).\(b1).\(b2).\(b3)"
 }
 
 // MARK: - Go C 回调（@_cdecl）

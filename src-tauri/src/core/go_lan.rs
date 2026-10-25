@@ -648,8 +648,25 @@ pub fn sanitize_ip_prefix(raw: &str, default_prefix_v4: u8) -> Option<String> {
 /// 【APP-11B 任务1.1】规范化 local_address：先经 `sanitize_ip_prefix` 剔除
 /// 隐形字符并补默认前缀（IPv4 /32、IPv6 /64）；解析失败时回退安全默认，
 /// 绝不让脏字符串进入内核配置导致 `netip.ParsePrefix` 崩溃。
+///
+/// 【APP-12 任务1.2】IPv4 统一扩为 /24：wireguard-go 内部路由表需识别
+/// 同网段网关（如 10.195.0.1），/32 会让内核认为同网段只有本机一个 IP，
+/// 直接访问 10.195.0.1 会被判为"非本机网段"而路由失败。扩为 /24 后
+/// 内核把整个 10.195.0.0/24 视为本地链路可达。
 fn normalize_local_address(raw: &str) -> String {
-    sanitize_ip_prefix(raw, 32).unwrap_or_else(|| "10.0.0.2/32".into())
+    let sanitized = sanitize_ip_prefix(raw, 32).unwrap_or_else(|| "10.0.0.2/32".into());
+    // 仅对 IPv4 /32 做扩 /24；已是 /24 或更宽直接保留，IPv6 原样保留
+    if let Some((ip_s, mask_s)) = sanitized.split_once('/') {
+        if let (Ok(_ip), Ok(mask)) = (
+            ip_s.parse::<std::net::Ipv4Addr>(),
+            mask_s.parse::<u8>(),
+        ) {
+            if mask == 32 {
+                return format!("{ip_s}/24");
+            }
+        }
+    }
+    sanitized
 }
 
 /// 【APP-11 任务1.1】规范化回家内网网段列表。
@@ -947,7 +964,9 @@ mod tests {
         assert_eq!(ob["type"], "wireguard");
         assert_eq!(ob["tag"], GO_LAN_TAG);
         assert_eq!(ob["server_port"], 51820);
-        assert_eq!(ob["local_address"][0], "10.0.0.2/32");
+        // 【APP-12 任务1.2】/32 自动扩为 /24，wireguard-go 内部路由表
+        // 可识别同网段网关（10.0.0.1）
+        assert_eq!(ob["local_address"][0], "10.0.0.2/24");
         // 密钥必须是重编码后的标准 44 位 Base64
         assert_eq!(ob["private_key"].as_str(), Some(test_key(1).as_str()));
         assert_eq!(

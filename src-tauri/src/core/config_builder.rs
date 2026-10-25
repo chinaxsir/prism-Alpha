@@ -892,8 +892,13 @@ pub fn build(
                 "gvisor"
             },
             // 首包嗅探：100ms 内取不到域名即按目标 IP 直连，避免固定等待
+            // 【APP-12 任务1.2】sniff_override_destination 必须为 false：
+            // 置 true 时访问家里内网 IP（http://10.195.0.1 等）会被嗅探
+            // 改写目标为 Host/SNI 域名，导致 ip_cidr → go-lan-home 规则
+            // 匹配失败，流量被错误发往海外代理节点。仅保留 sniff 用于
+            // 协议识别，绝不篡改目标地址。
             "sniff": true,
-            "sniff_override_destination": true,
+            "sniff_override_destination": false,
             "sniff_timeout": "100ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
@@ -2661,8 +2666,8 @@ rules:
         );
         assert_eq!(
             wg["local_address"][0].as_str(),
-            Some("10.8.0.2/32"),
-            "local_address 必须补全子网前缀（APP-11B 默认 /32）"
+            Some("10.8.0.2/24"),
+            "local_address 必须扩为 /24 以便识别同网段网关（APP-12 任务1.2）"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         let rules = built.config["route"]["rules"].as_array().unwrap();

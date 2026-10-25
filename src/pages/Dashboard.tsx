@@ -52,6 +52,7 @@ import { isMobile } from "@/pro/gating";
 import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
 import { ActivateProModal } from "@/components/ProGate";
+import GoLanModal from "@/components/GoLanModal";
 import Switch from "@/components/ui/Switch";
 
 /// 与节点页一致的组类型过滤：只保留真实节点
@@ -90,6 +91,8 @@ export default function Dashboard() {
   const proReady = useProStore((s) => s.ready);
   const proUnlocked = useProStore((s) => s.unlocked);
   const [showActivate, setShowActivate] = useState(false);
+  // 【APP-12 任务2.2】Go Lan 配置弹窗：仪表盘「配置」按钮页内直开，不再跳设置页
+  const [goLanModalOpen, setGoLanModalOpen] = useState(false);
 
   // 当前节点状态：主选择组、当前选中节点名、可选节点列表、选择器弹窗
   const [mainSelector, setMainSelector] = useState("");
@@ -567,7 +570,7 @@ export default function Dashboard() {
             onToggle={toggleLan}
             action={
               <button
-                onClick={() => navigate("/settings?focus=goLan")}
+                onClick={() => setGoLanModalOpen(true)}
                 className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
               >
                 {t("common.configure")}
@@ -784,6 +787,10 @@ export default function Dashboard() {
       <ActivateProModal
         open={showActivate}
         onClose={() => setShowActivate(false)}
+      />
+      <GoLanModal
+        open={goLanModalOpen}
+        onClose={() => setGoLanModalOpen(false)}
       />
     </div>
   );

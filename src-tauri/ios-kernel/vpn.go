@@ -182,9 +182,17 @@ func (p *prismPlatform) UsePlatformAutoDetectInterfaceControl() bool {
 }
 
 func (p *prismPlatform) AutoDetectInterfaceControl(fd int32) error {
+	// 【APP-12 任务1.1】protect_socket 永不返回 error：
+	// sing-box 的 wireguard 出站底层 wireguard-go 的 StdNetBind.Open() 会
+	// 同时尝试打开 udp4(AF_INET) 与 udp6(AF_INET6) 两个 Socket。在 iOS
+	// 纯 IPv4 网络下，对 udp6 setsockopt(IP_BOUND_IF) 会返回 EPERM。
+	// 若此处返回 error，wireguard-go 会把已成功的 udp4 一并关闭退出，
+	// 导致 WireGuard 握手包 100% 发不出、家里服务端无任何连接记录！
+	// 必须只记录日志、永远返回 nil——绑定失败最多影响该 socket 自身，
+	// 不会连坐其他 socket。
 	rc := C.prism_call_protect(vpnCbs, C.int(fd))
 	if rc != 0 {
-		return errVpn("protect socket failed")
+		vpnLogf("protect_socket fd=%d returned %d (ignored)", fd, rc)
 	}
 	return nil
 }
