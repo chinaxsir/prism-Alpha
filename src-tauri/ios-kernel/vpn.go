@@ -172,6 +172,13 @@ func vpnWriteLog(message string) {
 	}
 }
 
+// vpnLogf：与 vpnWriteLog 同源，支持 Printf 风格格式化。
+// 必须保持轻量无阻塞：内核热路径（protect_socket / Control 回调）也会调用，
+// 写日志绝不允许 panic 或长时间持锁；写入失败仅静默丢弃。
+func vpnLogf(format string, args ...interface{}) {
+	vpnWriteLog(fmt.Sprintf(format, args...))
+}
+
 // ---------------- PlatformInterface ----------------
 
 type prismPlatform struct{}
