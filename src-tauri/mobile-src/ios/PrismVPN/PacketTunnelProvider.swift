@@ -1158,14 +1158,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 outbounds[i]["interval"] = "10m"
             } else if t == "wireguard" {
                 // 【APP-11 任务1.1】Legacy WireGuard 单节点顶层**没有**
-                // allowed_ips 字段，写入会触发内核
-                // "decode config: outbounds[n].allowed_ips: json: unknown field"，
+                // allowed_ips / persistent_keepalive_interval 字段，
+                // 写入会触发内核 "decode config: ... json: unknown field"
                 // 直接拒绝启动。必须无条件剥离。
-                // 【APP-4 任务5】go-lan-home 已改用 sing-box 标准 peers 数组结构
-                // （allowed_ips / persistent_keepalive_interval: 15 写在 peers[0]
-                // 内部，启动即主动握手 + 15s 心跳，wg-easy 面板实时在线/流量），
-                // 严禁再剥离 peers——peers 是唯一合法承载结构。
+                // 【APP-5 任务1】sing-box v1.11.3 LegacyWireGuardPeer 结构体
+                // 仅支持 server/server_port/public_key/pre_shared_key/
+                // allowed_ips/reserved 六个字段，persistent_keepalive_interval
+                // 只存在于 1.11+ 新增的 endpoints 结构中——即使是磁盘缓存里
+                // 有 APP4 写入的 keepalive 也必须在此处显式剥离，零报错启动。
                 outbounds[i].removeValue(forKey: "allowed_ips")
+                outbounds[i].removeValue(forKey: "persistent_keepalive_interval")
                 // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
                 if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
                     outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }
@@ -1194,6 +1196,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 if var peers = outbounds[i]["peers"] as? [[String: Any]] {
                     for j in peers.indices {
+                        // 【APP-5 任务1】peers[].persistent_keepalive_interval
+                        // 也是 sing-box v1.11.3 LegacyWireGuardPeer 不支持的字段，
+                        // 磁盘缓存可能有 APP4 写入残留，显式剥离确保零报错
+                        peers[j].removeValue(forKey: "persistent_keepalive_interval")
                         if let fixed = sanitizeWireGuardKey(peers[j]["public_key"]) {
                             peers[j]["public_key"] = fixed
                         }

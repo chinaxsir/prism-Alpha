@@ -277,6 +277,7 @@ pub fn run() {
             ipc::commands::get_go_lan_settings,
             ipc::commands::save_go_lan_settings,
             ipc::commands::sync_go_lan_managed,
+            ipc::commands::test_go_lan_ip,
             ipc::commands::get_go_cus_settings,
             ipc::commands::save_go_cus_settings,
             ipc::commands::import_go_cus_module,

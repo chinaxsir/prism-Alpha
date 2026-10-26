@@ -624,6 +624,21 @@ pub fn build(
     route_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
     route_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
 
+    // 【APP-5 任务1.2】海外公共 DNS IP（Google DoT/DoH 853/443）强制走代理，
+    // 防止 iOS 系统或应用发起的 8.8.8.8:853 / 8.8.4.4:443 / 1.1.1.1 等请求
+    // 漏到 direct 出站在国内网络下直连超时卡顿。
+    // 规则模式下指向首个策略组，全局模式下指向 GLOBAL，直连模式下跳过（本来就直连）
+    if settings.outbound_mode != OutboundMode::Direct {
+        let main_tag = match settings.outbound_mode {
+            OutboundMode::Global if !node_tags.is_empty() => "GLOBAL".to_string(),
+            _ => rule_final.clone(),
+        };
+        route_rules.push(json!({
+            "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
+            "outbound": main_tag,
+        }));
+    }
+
     // 未显式 MATCH：优先全部订阅中的首个策略组，否则 direct（上方已算）
 
     // 出站模式：规则=按订阅 MATCH 分流；全局=所有流量进 GLOBAL 选择组；直连=全部 direct。
@@ -2664,12 +2679,11 @@ rules:
             wg.get("allowed_ips").is_none(),
             "顶层 allowed_ips 会触发内核 unknown field 报错"
         );
-        // 【APP-4 任务5】peers[0] 标准结构：keepalive=15 启动即握手，
-        // allowed_ips 写在 peers[0] 内部（wg-easy 面板才能显示连接与流量）
-        assert_eq!(
-            wg["peers"][0]["persistent_keepalive_interval"].as_u64(),
-            Some(15),
-            "peers[0] 必须带 persistent_keepalive_interval=15 才会主动握手"
+        // 【APP-5 任务1】peers[0] 严格 LegacyWireGuardPeer 结构，严禁 persistent_keepalive_interval
+        // （sing-box v1.11.3 LegacyWireGuardPeer 不支持该字段，写入会导致 FATAL 启动错误）
+        assert!(
+            wg["peers"][0]["persistent_keepalive_interval"].is_null(),
+            "peers[0] 严禁 persistent_keepalive_interval（sing-box v1.11.3 LegacyWireGuardPeer 不支持）"
         );
         assert_eq!(
             wg["peers"][0]["allowed_ips"][0].as_str(),

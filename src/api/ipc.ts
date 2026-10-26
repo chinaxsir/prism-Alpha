@@ -234,6 +234,16 @@ export const saveGoLanSettings = (settings: GoLanSettings) =>
   invoke<string[]>("save_go_lan_settings", { settings });
 export const syncGoLanManaged = () => invoke<GoLanSettings>("sync_go_lan_managed");
 
+/** 【APP-5 任务2】穿过 go-lan-home 隧道检测指定内网 IP 可达性 */
+export interface GoLanProbeResult {
+  reachable: boolean;
+  targetIp: string;
+  latencyMs: number | null;
+  message: string;
+}
+export const testGoLanIp = (targetIp: string) =>
+  invoke<GoLanProbeResult>("test_go_lan_ip", { targetIp });
+
 /** APP 任务5：Go Lan 配置完整性检查（未配置时前端拦截开启操作）
  *  - manual：lanCidrs 非空，且（nodeUri 非空，或 wgConfig 的
  *    server/privateKey/peerPublicKey 均非空）

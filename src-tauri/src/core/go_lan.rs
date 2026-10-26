@@ -478,6 +478,176 @@ pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), 
     std::fs::write(&path, text).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------- 内网 IP 连通性检测（APP-5 任务2）
+
+/// 内网 IP 连通性检测结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoLanProbeResult {
+    pub reachable: bool,
+    pub target_ip: String,
+    pub latency_ms: Option<u64>,
+    pub message: String,
+}
+
+/// 【APP-5 任务2】穿过 go-lan-home 隧道检测是否能到达指定内网 IP。
+///
+/// 探测策略：
+/// 1) 输入净化：剥离零宽隐形字符 / 空格，提取纯 IP（若含 :port 或 /cidr 则剥离）；
+/// 2) 运行前置校验：内核必须 running 且 Go Lan enabled 才可能成功；
+/// 3) 并发多路探测：
+///    - 直接 tokio::net::TcpStream::connect 目标 IP 的常用端口集合
+///      （80/443/22/53/8080/445）。
+///      TUN 全局路由下直接进入 utun → go-lan-home 出站。
+///    - 额外若 api_addr/api_secret 可用：额外并发一次 Clash API 隧道探针
+///      （GET /proxies/go-lan-home/delay?url=http://{ip}&timeout=2500），
+///      兜底桌面端 direct 模式下不走 TUN 的场景。
+/// 4) 关键判定：
+///    - ConnectionRefused (ECONNREFUSED) 直接判定 reachable=true——
+///      说明 WG 隧道已通，对端主机存在且主动回了 RST；
+///    - 任一端口连接成功（Ok(_)）也判定 reachable=true；
+///    - Clash API 隧道探针返回有效 delay → reachable=true。
+///
+/// 任何成功都会瞬间激活 wg-easy 的连接状态（wireguard-go 在收到
+/// 首包时立即向服务端回 Handshake Response），无需 persistent_keepalive_interval。
+pub async fn probe_intranet_ip(
+    target_ip_raw: &str,
+    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+    is_running: bool,
+    go_lan_enabled: bool,
+) -> GoLanProbeResult {
+    let _ = mixed_port; // 预留：SOCKS5 HTTP CONNECT 路径，当前版本走 Clash API 即可覆盖
+    // 1. 净化输入
+    let cleaned = strip_invisible_and_non_ascii(target_ip_raw)
+        .replace(|c: char| c.is_whitespace(), "");
+    let ip_only = cleaned
+        .split(';').next().unwrap_or("")
+        .split(':').next().unwrap_or("")
+        .split('/').next().unwrap_or("")
+        .to_string();
+    let ip_only = strip_invisible_and_non_ascii(&ip_only);
+    let target_ip = ip_only.trim().to_string();
+    if target_ip.is_empty() {
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.1.1）".into(),
+        };
+    }
+    let ip: std::net::IpAddr = match target_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
+            return GoLanProbeResult {
+                reachable: false,
+                target_ip: target_ip.clone(),
+                latency_ms: None,
+                message: format!("IP 地址格式无效: {target_ip}"),
+            };
+        }
+    };
+
+    // 2. 运行前置
+    if !is_running {
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: "VPN 尚未启动，请先在仪表盘启动代理后再检测".into(),
+        };
+    }
+    if !go_lan_enabled {
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: "Go Lan 尚未开启，请先打开 Go Lan 开关".into(),
+        };
+    }
+
+    let start = std::time::Instant::now();
+    // 3. 并发探测
+    let known_ports: [u16; 6] = [80, 443, 22, 53, 8080, 445];
+    let mut tasks = Vec::with_capacity(known_ports.len() + 1);
+
+    for port in known_ports {
+        let ip_copy = ip;
+        tasks.push(tokio::spawn(async move {
+            let addr = std::net::SocketAddr::new(ip_copy, port);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(3000),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Some(true),
+                Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
+                    Some(true) // ECONNREFUSED = WG 隧道通了
+                }
+                _ => None,
+            }
+        }));
+    }
+
+    // 方式 B：Clash API 隧道探针（兜底桌面端 direct 模式）
+    if !api_addr.is_empty() {
+        let secret = api_secret.to_string();
+        let addr_base = api_addr.to_string();
+        let ip_str = target_ip.clone();
+        tasks.push(tokio::spawn(async move {
+            let base = addr_base.trim_start_matches("http://").trim_start_matches("https://");
+            let url = format!(
+                "http://{base}/proxies/go-lan-home/delay?url=http://{}&timeout=2500",
+                ip_str
+            );
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(3500))
+                .build()
+                .ok()?;
+            let mut req = client.get(&url);
+            if !secret.is_empty() {
+                req = req.bearer_auth(&secret);
+            }
+            let resp = req.send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let body = resp.text().await.ok()?;
+            let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+            v.get("delay")?.as_u64().map(|d| d > 0)
+        }));
+    }
+
+    let mut reachable = false;
+    for t in tasks {
+        if let Ok(Some(true)) = t.await {
+            reachable = true;
+            // 不立即 break，多探测让 wg-easy 多发几个包触发计数
+        }
+    }
+
+    let ms = start.elapsed().as_millis().max(1) as u64;
+    if reachable {
+        GoLanProbeResult {
+            reachable: true,
+            target_ip: target_ip.clone(),
+            latency_ms: Some(ms),
+            message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
+        }
+    } else {
+        GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: format!(
+                "❌ 未能到达 {target_ip}（请求超时），请检查内网网段配置及对端设备是否在线"
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 出站构建
 
 /// 将 WgManualConfig 构建为 sing-box WireGuard 出站（APP-6 任务2）。
@@ -486,12 +656,13 @@ pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), 
 /// 生成的 prism_config.json，防止内核 decode base64 失败导致启动崩溃。
 /// 可选 pre_shared_key 仅在通过校验时写入；无效 PSK 忽略并给出警告。
 ///
-/// 【APP-4 任务5】改用 sing-box 标准 `peers` 数组结构：
-/// - `allowed_ips` / `persistent_keepalive_interval` 是 peers[0] 的合法字段
-///   （顶层写 allowed_ips 会触发 `json: unknown field` 内核拒绝启动）；
-/// - `persistent_keepalive_interval: 15` 让 wireguard-go 启动第 0 秒主动向
-///   服务端发送 Handshake 握手包并每 15 秒心跳——wg-easy 面板由此才能
-///   立即显示在线状态与实时流量（Legacy 顶层单节点结构不会主动握手）。
+/// 【APP-5 任务1】改用 sing-box v1.11.3 兼容的 `peers` 数组结构（LegacyWireGuardPeer）：
+/// - `allowed_ips` 是 peers[0] 的合法字段（顶层写 allowed_ips 会触发 `json: unknown field` 内核拒绝启动）；
+/// - 严禁在 peers[0] 写 `persistent_keepalive_interval`——sing-box v1.11.3 的
+///   `LegacyWireGuardPeer` 不支持该字段，写入会直接导致内核启动报错
+///   `decode config: ... json: unknown field "persistent_keepalive_interval"`。
+///   保活握手改由 Rust 应用层 20 秒周期探测 + 前端手动「检测连通」触发，
+///   既 100% 兼容 sing-box v1.11.3 启动，又能让 wg-easy 面板实时在线。
 fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
@@ -502,15 +673,14 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     // 【APP-11B】先剔除 \u2060 等隐形字符再解析
     let server = resolve_endpoint_host_to_ip(&strip_invisible_and_non_ascii(&wg.server));
     let local_address = normalize_local_address(&wg.local_ip);
-    // 【APP-4 任务5】peers[0] 标准结构：allowed_ips 与 keepalive 只能写在
-    // peers 数组元素内部；allowed_ips=0.0.0.0/0 宣告全量放行，
-    // persistent_keepalive_interval=15 触发启动即握手 + 15s 心跳。
+    // 【APP-5 任务1】peers[0] 严格 LegacyWireGuardPeer 结构，仅写允许的六个字段
+    // （server/server_port/public_key/pre_shared_key/allowed_ips/reserved）；
+    // allowed_ips 宣告全量放行（IPv4 + IPv6 双栈）。
     let mut peer = json!({
         "server": server,
         "server_port": wg.server_port,
         "public_key": peer_public_key,
-        "allowed_ips": ["0.0.0.0/0"],
-        "persistent_keepalive_interval": 15,
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
     });
     if let Some(psk) = &wg.pre_shared_key {
         match normalize_wg_key(psk) {
@@ -999,11 +1169,12 @@ mod tests {
         let ob = outbound.expect("应构建出 WireGuard 出站");
         assert_eq!(ob["type"], "wireguard");
         assert_eq!(ob["tag"], GO_LAN_TAG);
-        // 【APP-4 任务5】peers[0] 标准结构：server/port/public_key/keepalive
-        // 全部在 peers 数组元素内部，顶层严禁出现
+        // 【APP-5 任务1】peers[0] LegacyWireGuardPeer 结构：server/port/public_key/allowed_ips
+        // 全部在 peers 数组元素内部，顶层严禁出现；严禁 persistent_keepalive_interval
         assert_eq!(ob["peers"][0]["server_port"], 51820);
-        assert_eq!(ob["peers"][0]["persistent_keepalive_interval"], 15);
+        assert!(ob["peers"][0]["persistent_keepalive_interval"].is_null(), "peers[0] 严禁 persistent_keepalive_interval");
         assert_eq!(ob["peers"][0]["allowed_ips"][0], "0.0.0.0/0");
+        assert_eq!(ob["peers"][0]["allowed_ips"][1], "::/0");
         assert!(ob.get("server").is_none(), "顶层严禁保留 server 字段");
         assert!(ob.get("peer_public_key").is_none(), "顶层严禁保留 peer_public_key");
         assert!(ob.get("allowed_ips").is_none(), "顶层严禁出现 allowed_ips");
@@ -1189,10 +1360,10 @@ mod tests {
         let ob = outbound.expect("wireguard:// 链接应构建出出站");
         assert_eq!(ob["tag"], GO_LAN_TAG);
         assert_eq!(ob["private_key"].as_str(), Some(priv_key.as_str()));
-        // 【APP-4 任务5】peers[0] 标准结构
+        // 【APP-5 任务1】peers[0] LegacyWireGuardPeer 结构，严禁 persistent_keepalive_interval
         assert_eq!(ob["peers"][0]["public_key"].as_str(), Some(peer.as_str()));
         assert_eq!(ob["peers"][0]["server"], "10.1.2.3");
-        assert_eq!(ob["peers"][0]["persistent_keepalive_interval"], 15);
+        assert!(ob["peers"][0]["persistent_keepalive_interval"].is_null(), "peers[0] 严禁 persistent_keepalive_interval");
     }
 
     #[test]

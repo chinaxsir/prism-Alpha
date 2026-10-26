@@ -78,7 +78,6 @@ export default function Settings() {
   const [goLanModalOpen, setGoLanModalOpen] = useState(false);
   const [proManageOpen, setProManageOpen] = useState(false);
   const proUnlocked = useProStore((s) => s.unlocked);
-  const proReady = useProStore((s) => s.ready);
   const entitlement = useProStore((s) => s.entitlement);
   // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
   // 订阅版显示到期时间，日期本身作为可点击入口打开授权信息弹窗
@@ -86,8 +85,6 @@ export default function Settings() {
     entitlement.plan === "team" ||
     (entitlement.kind === "lifetime" && !entitlement.expiresAt);
   const tunGated = !proUnlocked;
-  // ipa-9：Go Lan 是否渲染完整配置区（启动瞬间 ready=false 先渲染完整表单，避免闪烁）
-  const goLanUnlocked = proUnlocked || !proReady;
 
   // 语言与外观偏好（全局 store，改动即时生效；同时持久化到后端 settings.json）
   const language = usePrefsStore((s) => s.language);
@@ -116,11 +113,6 @@ export default function Settings() {
   // 设置页只读全局 store 渲染紧凑卡片（首帧直出缓存，消除开关闪烁）
   const goLanCfg = useCoreStore((s) => s.goLanSettings);
   const goLanConfigured = goLanCfg ? isGoLanConfigured(goLanCfg) : false;
-  const goLanSubtitle = goLanConfigured
-    ? goLanCfg?.wgConfig?.server
-      ? `已配置: ${goLanCfg.wgConfig.server}:${goLanCfg.wgConfig.serverPort} · 网段 ${(goLanCfg.lanCidrs ?? []).join(", ")}`
-      : `已配置 · 网段 ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
-    : "未配置回家网络 · 点击右侧配置参数";
 
   useEffect(() => {
     getGoLanSettings()
@@ -441,74 +433,46 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Go Lan · 回家网络（Pro 门控）：【APP-12 任务2.2】内嵌大表单收进
-          GoLanModal，这里只保留与普通设置行一致的紧凑单行卡；
-          id 供仪表盘「配置」按钮跳转定位 */}
-      {!goLanUnlocked ? (
-        /* 【APP-4 任务3】未激活：整行静默置灰禁用（opacity-50 + 无任何点击响应），
-           不再弹激活弹窗 */
-        <div
-          className="flex cursor-not-allowed select-none items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5 opacity-50"
-        >
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
-              <Home size={15} className="text-accent" />
+      {/* Go Lan · 回家网络（Pro 门控）：【APP-5 任务3】与 Dashboard 引擎卡 100% 一致 */}
+      <div
+        id="go-lan-card"
+        className={`rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3 ${
+          !proUnlocked ? "opacity-50 select-none" : ""
+        }`}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <Home className="w-4 h-4 text-accent shrink-0" />
+            <span className="font-semibold text-sm text-text">{t("engine.goLan")}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-hover text-text-muted">
+              {t("engine.goLanTag")}
             </span>
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                  Go Lan · 回家内网
-                </span>
-                <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
-                  PRO
-                </span>
-              </div>
-              <p className="mt-0.5 truncate text-xs text-gray-500">
-                {t("settings.goLan.lockedDesc")}
-              </p>
-            </div>
           </div>
-          <div
-            className="flex shrink-0 items-center gap-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <Switch checked={false} disabled onChange={() => {}} />
+          <div className="text-xs text-text-muted mt-1 leading-relaxed break-words">
+            {!proUnlocked
+              ? t("pro.lockedTap")
+              : goLanConfigured
+              ? `${t("pro.configured")}: ${goLanCfg?.wgConfig?.server}:${goLanCfg?.wgConfig?.serverPort} · ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
+              : t("pro.notConfigured")}
           </div>
         </div>
-      ) : (
-        <div
-          id="go-lan-card"
-          className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5"
-        >
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
-              <Home size={15} className="text-accent" />
-            </span>
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                  Go Lan · 回家内网
-                </span>
-              </div>
-              <p className="mt-0.5 truncate text-xs text-gray-500">
-                {goLanSubtitle}
-              </p>
-            </div>
-          </div>
-          <div className="flex shrink-0 items-center gap-3">
+        <div className="flex items-center gap-2.5 shrink-0">
+          {proUnlocked && (
             <button
+              type="button"
               onClick={() => setGoLanModalOpen(true)}
-              className="rounded-lg bg-surface-hover px-3 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:bg-glass-strong"
+              className="text-xs text-accent hover:underline font-medium"
             >
               {t("common.configure")}
             </button>
-            <Switch
-              checked={goLanCfg?.enabled ?? false}
-              onChange={handleGoLanToggle}
-            />
-          </div>
+          )}
+          <Switch
+            checked={proUnlocked ? Boolean(goLanCfg?.enabled) : false}
+            disabled={!proUnlocked}
+            onChange={handleGoLanToggle}
+          />
         </div>
-      )}
+      </div>
 
       {/* 高级 */}
       <SettingsGroup
@@ -564,50 +528,71 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Prism Pro：【APP-12 任务2.3】紧凑卡片，授权详情与操作收进 ProManageModal */}
+      {/* Prism Pro：【APP-5 任务4】未激活展示 5 大模块引导，已激活极简单行 */}
       {!proUnlocked ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
-              <Sparkles size={15} className="text-accent" />
-            </span>
-            <div className="min-w-0">
-              <div className="whitespace-nowrap text-sm font-semibold text-gray-100">
-                Prism Pro
+        <div className="rounded-xl bg-surface border border-border p-4 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-accent/15 flex items-center justify-center shrink-0">
+                <Sparkles className="w-4 h-4 text-accent" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-sm text-text">Prism Pro</div>
+                <div className="text-[11px] text-text-muted truncate">
+                  {t("pro.activateDesc")}
+                </div>
               </div>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowActivate(true)}
+              className="px-3.5 py-1.5 rounded-lg bg-accent hover:bg-accent/90 text-white text-xs font-medium shrink-0 transition-colors"
+            >
+              {t("pro.activatePro")}
+            </button>
           </div>
-          <button
-            onClick={() => setShowActivate(true)}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
-          >
-            {t("pro.activatePro")}
-          </button>
-        </div>
-      ) : (
-        /* 【APP-4 任务2】已激活极简单行：左侧仅「✨ Prism Pro」，右侧仅到期时间
-           胶囊（emerald 样式），点击整行或按钮均弹出「授权信息」窗口。
-           删除中间方案文案与下方剩余天数，彻底杜绝小屏重叠。 */
-        <div
-          onClick={() => setProManageOpen(true)}
-          className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5"
-        >
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
-              <Sparkles size={15} className="text-accent" />
-            </span>
-            <div className="whitespace-nowrap text-sm font-semibold text-gray-100">
-              ✨ Prism Pro
+          {/* 激活后可解锁的 Pro 功能模块（2-col grid） */}
+          <div className="pt-2.5 border-t border-border/60 grid grid-cols-2 gap-2 text-xs text-text-muted">
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
+              <span className="truncate">{t("pro.modules.goAim")}</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
+              <span className="truncate">{t("pro.modules.goLan")}</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
+              <span className="truncate">{t("pro.modules.goCus")}</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
+              <span className="truncate">{t("pro.modules.proxySuite")}</span>
+            </div>
+            <div className="flex items-center gap-1.5 col-span-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
+              <span className="truncate">{t("pro.modules.cloudSync")}</span>
             </div>
           </div>
+        </div>
+      ) : (
+        /* 已激活：仅单行，左侧 ✨ Prism Pro，右侧订阅到期时间点击弹授权信息 */
+        <div
+          onClick={() => setProManageOpen(true)}
+          className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-border bg-surface px-4 py-3"
+        >
+          <div className="whitespace-nowrap text-sm font-semibold text-text">
+            ✨ Prism Pro
+          </div>
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               setProManageOpen(true);
             }}
             className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-500/20"
           >
-            {permanent ? t("pro.permanent") : fmtDateTime(entitlement.expiresAt)}
+            {t("pro.subscribeExpiry")}: {permanent ? t("pro.permanent") : fmtDateTime(entitlement.expiresAt)}
             <ChevronRight size={12} className="opacity-60" />
           </button>
         </div>
