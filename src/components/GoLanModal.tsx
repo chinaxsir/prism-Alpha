@@ -1,19 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, Download, Eraser, Home, Radar, X } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ClipboardPaste, Home, X } from "lucide-react";
 import { toast } from "@/components/ui/Toast";
 import Switch from "@/components/ui/Switch";
 import { useCoreStore } from "@/stores/core";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 import {
-  clearAppLogs,
-  exportAppLogs,
-  getAppLogs,
   getGoLanSettings,
   saveGoLanSettings,
   syncGoLanManaged,
   testGoLanIp,
-  type AppLogEntry,
   type GoLanSettings,
   type WgManualConfig,
 } from "@/api/ipc";
@@ -59,132 +55,6 @@ function deriveGateway(localIp: string): string {
   const parts = m[1].split(".");
   parts[3] = "1";
   return parts.join(".");
-}
-
-/** 【APP6 任务1.3】Go Lan 实时日志内嵌面板：
- *  过滤 module === "GoLan" 及含 go-lan-home / wireguard 的内核日志，
- *  头部自带导出 / 清空小按钮；refreshSignal 变化或用户操作后自动刷新并
- *  滚动到底部，方便当场排错。 */
-function GoLanLogPanel({ refreshSignal }: { refreshSignal: number }) {
-  const { t } = useTranslation();
-  const [entries, setEntries] = useState<AppLogEntry[]>([]);
-  const [logBusy, setLogBusy] = useState(false);
-  const listRef = useRef<HTMLDivElement>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const payload = await getAppLogs("GoLan");
-      setEntries(payload.entries ?? []);
-    } catch {
-      /* 日志读取失败不打断主流程 */
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => void load(), 2000);
-    return () => window.clearInterval(timer);
-  }, [load, refreshSignal]);
-
-  useEffect(() => {
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [entries.length]);
-
-  const handleExport = async () => {
-    try {
-      const text = await exportAppLogs("GoLan");
-      try {
-        await navigator.clipboard.writeText(text);
-        toast.success(t("logs.exportCopied"));
-      } catch {
-        /* 剪贴板受限时仅下载 */
-      }
-      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `prism-golan-${Date.now()}.log`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  const handleClear = async () => {
-    setLogBusy(true);
-    try {
-      await clearAppLogs();
-      await load();
-      toast.success(t("logs.cleared"));
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      setLogBusy(false);
-    }
-  };
-
-  return (
-    <div className="rounded-lg border border-border bg-black/30 p-2">
-      <div className="mb-1 flex items-center justify-between">
-        <span className="text-[11px] font-medium text-gray-400">
-          {t("logs.goLanPanel")}
-        </span>
-        <div className="flex gap-1">
-          <button
-            onClick={() => void load()}
-            className="rounded p-1 text-gray-500 hover:bg-surface-hover hover:text-gray-300"
-            aria-label={t("logs.refresh")}
-          >
-            <Radar size={12} />
-          </button>
-          <button
-            onClick={() => void handleExport()}
-            className="rounded p-1 text-gray-500 hover:bg-surface-hover hover:text-gray-300"
-            aria-label={t("logs.export")}
-          >
-            <Download size={12} />
-          </button>
-          <button
-            onClick={() => void handleClear()}
-            disabled={logBusy}
-            className="rounded p-1 text-gray-500 hover:bg-surface-hover hover:text-red-300 disabled:opacity-40"
-            aria-label={t("logs.clear")}
-          >
-            <Eraser size={12} />
-          </button>
-        </div>
-      </div>
-      <div
-        ref={listRef}
-        className="max-h-40 overflow-y-auto font-mono text-[10px] leading-relaxed"
-      >
-        {entries.length === 0 ? (
-          <div className="py-4 text-center text-gray-600">{t("logs.empty")}</div>
-        ) : (
-          entries.map((e) => (
-            <div key={e.id} className="flex gap-1.5 py-0.5">
-              <span className="shrink-0 text-gray-600">{e.timestamp.slice(11)}</span>
-              <span
-                className={clsx(
-                  "shrink-0 font-semibold",
-                  e.level === "ERROR"
-                    ? "text-red-400"
-                    : e.level === "WARN"
-                      ? "text-amber-400"
-                      : "text-emerald-400",
-                )}
-              >
-                {e.level}
-              </span>
-              <span className="break-all text-gray-300">{e.message}</span>
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  );
 }
 
 const EMPTY_GO_LAN: GoLanForm = {
@@ -354,18 +224,38 @@ export default function GoLanModal({ open, onClose }: Props) {
   // 【APP-4 任务4】内联黄色提示（替代遮挡状态栏的顶部 Toast 报错）
   const [pasteHint, setPasteHint] = useState("");
   // 【APP6 任务2.3】内网连通性检测：默认目标=local_address 推导的网关
-  const [probeTarget, setProbeTarget] = useState("");
+  // 【IPA9 任务3】用户输入的检测 IP 持久化到 localStorage，下次直接使用
+  const [probeTarget, setProbeTarget] = useState(() => {
+    try {
+      return localStorage.getItem("prism.golan.probe_ip") ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [probing, setProbing] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
   const [probeOk, setProbeOk] = useState<boolean | null>(null);
-  // 【APP6 任务1.3】日志面板刷新信号：保存/检测后触发实时滚动
-  const [logRefresh, setLogRefresh] = useState(0);
 
-  // 打开时用 local_address 推导的网关初始化检测目标
+  // 打开时：若用户从未输入过检测 IP，用 local_address 推导的网关初始化
   useEffect(() => {
-    if (open && !probeTarget) setProbeTarget(deriveGateway(form.wgLocalIp));
+    if (open) {
+      setProbeTarget((prev) => {
+        if (prev) return prev; // 尊重用户已保存的输入
+        const derived = deriveGateway(form.wgLocalIp);
+        return derived;
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // 持久化用户输入的检测 IP
+  useEffect(() => {
+    try {
+      if (probeTarget) localStorage.setItem("prism.golan.probe_ip", probeTarget);
+    } catch {
+      /* localStorage 不可用时静默忽略 */
+    }
+  }, [probeTarget]);
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）
   useEffect(() => {
@@ -378,6 +268,23 @@ export default function GoLanModal({ open, onClose }: Props) {
       })
       .catch((e) => console.error("load go lan failed:", e));
   }, [open, setGoLanSettings]);
+
+  // 【IPA9 任务2】锁屏唤醒 / 切后台回来时复位视口并重置 saving 状态，
+  // 修复 iOS 锁屏解锁后键盘收起导致 WKWebView 视口触摸坐标偏移、
+  // 以及 IPC 挂起导致 saving 卡死的问题。
+  useEffect(() => {
+    const handleWake = () => {
+      window.scrollTo(0, 0);
+      document.body.scrollTop = 0;
+      setBusy(false);
+    };
+    document.addEventListener("visibilitychange", handleWake);
+    window.addEventListener("focus", handleWake);
+    return () => {
+      document.removeEventListener("visibilitychange", handleWake);
+      window.removeEventListener("focus", handleWake);
+    };
+  }, []);
 
   const patch = (p: Partial<GoLanForm>) => setForm((f) => ({ ...f, ...p }));
 
@@ -438,7 +345,7 @@ export default function GoLanModal({ open, onClose }: Props) {
   };
 
   // 【APP6 任务2.3】内网连通性检测：经 go-lan-home 隧道三路并发穿透探测；
-  // 结果就地展示并触发日志面板实时滚动
+  // 结果就地展示在输入框正下方（无需顶部 Toast 遮挡页面）
   const handleProbe = async () => {
     const target = probeTarget.trim();
     if (!target) return;
@@ -455,7 +362,6 @@ export default function GoLanModal({ open, onClose }: Props) {
       setProbeMsg(String(e));
     } finally {
       setProbing(false);
-      setLogRefresh((v) => v + 1);
     }
   };
 
@@ -492,25 +398,36 @@ export default function GoLanModal({ open, onClose }: Props) {
               mtu: form.wgMtu || WG_DEFAULTS.mtu,
             }
           : null;
+      // 【IPA9 任务4.1】lanCidrs 解析：先按 /[\r\n,;，；\s]+/ 拆分（支持
+      // 换行、逗号、分号、空格混输），再对每个子串 cleanInput。严禁在
+      // split 之前整体 .replace(/\s/g,"")，否则会把两行拼成
+      // "10.1.8.0/24192.168.10.0/24" 导致第二行网段丢失。
+      const splitCidrs = (raw: string) =>
+        raw
+          .split(/[\r\n,;，；\s]+/)
+          .map((l) => cleanInput(l))
+          .filter(Boolean);
       const payload: GoLanSettings = {
         ...base,
         enabled: form.enabled,
         mode: form.mode,
         nodeUri: cleanInput(form.nodeUri),
         wgConfig,
-        lanCidrs: form.lanCidrs
-          .split("\n")
-          .map((l) => cleanInput(l))
-          .filter(Boolean),
+        lanCidrs: splitCidrs(form.lanCidrs),
         lanDns: cleanInput(form.lanDns) || null,
-        lanDomains: form.lanDomains
-          .split("\n")
-          .map((l) => cleanInput(l))
-          .filter(Boolean),
+        lanDomains: splitCidrs(form.lanDomains),
         managedServer: cleanInput(form.managedServer) || MANAGED_SERVER_DEFAULT,
         deviceCode: cleanInput(form.deviceCode),
       };
-      const warnings = await saveGoLanSettings(payload);
+      // 【IPA9 任务2】Promise.race 2500ms 超时保底：saveGoLanSettings 后端
+      // 已改为后台异步重启，这里再兜底一层，确保 saving 状态最多 2.5s
+      // 就释放，绝不让弹窗卡死。
+      const warnings = await Promise.race([
+        saveGoLanSettings(payload),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("保存超时，请稍后重试")), 2500),
+        ),
+      ]);
       // 回读最新设置到全局 store（含 enabled 状态）
       const fresh = await getGoLanSettings();
       setGoLanSettings(fresh);
@@ -519,7 +436,6 @@ export default function GoLanModal({ open, onClose }: Props) {
       } else {
         toast.success(t("goLan.saved") || "Go Lan 配置已保存");
       }
-      setLogRefresh((v) => v + 1);
       onClose();
     } catch (e) {
       toast.error(String(e));
@@ -532,7 +448,7 @@ export default function GoLanModal({ open, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 pb-[calc(env(safe-area-inset-bottom,16px)+16px)]"
       onClick={onClose}
     >
       {/* 【APP-4 任务4.2】三段式布局：固定头部 / 可滚动中部 / 固定底部，
@@ -547,6 +463,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             <Home size={16} className="text-accent" />
             <h3 className="text-sm font-semibold">Go Lan · 回家内网配置</h3>
           </div>
+          {/* 【IPA9 任务2】× 关闭按钮永不禁用：任何时候点击都立即关闭弹窗 */}
           <button
             onClick={onClose}
             className="rounded p-1 text-gray-400 hover:bg-surface-hover hover:text-gray-200"
@@ -808,14 +725,12 @@ export default function GoLanModal({ open, onClose }: Props) {
             </div>
           )}
         </div>
-
-        {/* 【APP6 任务1.3】Go Lan 实时日志面板（Endpoint 解析 / 路由注入 /
-            WireGuard 握手 / 内网检测详情，支持导出与清空） */}
-        <GoLanLogPanel refreshSignal={logRefresh} />
         </div>
 
         {/* 底部操作栏（固定，永不被屏幕底部截断） */}
         <div className="flex shrink-0 gap-2 border-t border-border bg-surface px-4 py-3">
+          {/* 【IPA9 任务2】取消按钮永不禁用：任何时候点击都立即关闭弹窗，
+              防止 saving 状态卡死时用户无法退出 */}
           <button
             onClick={onClose}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"

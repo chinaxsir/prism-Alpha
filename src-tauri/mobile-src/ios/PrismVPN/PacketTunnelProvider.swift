@@ -50,14 +50,13 @@ private struct PhysicalInterface {
     /// 短暂无网场景下兜底候选（pdp_ip0/en0 盲猜）标记为 false，
     /// 热重载检测据此保持待机，不切到死网卡
     let hasRoutableIP: Bool
-    /// 【APP-13 任务5】该网卡当前的真实 IPv4 地址（无则空串）。
-    /// 注入到出站 `inet4_bind_address`，让 UDP/TCP 从物理网卡地址发出，
-    /// 规避 iOS 16.5 NECP 沙盒下双栈 Socket 绑定被 EPERM 拒绝。
+    /// 【IPA9 任务4.3】该网卡当前的真实 IPv4 地址（无则空串）。
+    /// 仅供 excludedRoutes（如「允许局域网连接」回包路由）使用，
+    /// 不再注入出站 inet4_bind_address（5G 蜂窝下引发 i/o timeout）。
     var ipv4: String = ""
 }
 
-/// 【APP-13 任务5】严格校验 IPv4 字面量（a.b.c.d 且每段 0-255）。
-/// `inet4_bind_address` 若写入非法值会让内核 FATAL 退出，必须先校验。
+/// 严格校验 IPv4 字面量（a.b.c.d 且每段 0-255）。
 private func isValidIPv4Literal(_ s: String) -> Bool {
     let parts = s.split(separator: ".", omittingEmptySubsequences: false)
     guard parts.count == 4 else { return false }
@@ -1055,9 +1054,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// - Parameters:
-    ///   - phyName: 当前活跃物理网卡名（en0 / pdp_ip0），注入 `bind_interface`
-    ///   - phyIPv4: 该网卡的真实 IPv4，注入 `inet4_bind_address`。
-    ///     仅注入合法 IPv4 字面量；网络切换时扩展会整体重启并重新取值。
+    ///   - phyName: 当前活跃物理网卡名（en0 / pdp_ip0），供
+    ///     prism_protect_socket 动态设置 IP_BOUND_IF 使用
+    ///   - phyIPv4: 该网卡的真实 IPv4，仅用于 excludedRoutes 回包路由，
+    ///     不再注入出站 inet4_bind_address（IPA9 任务4.3）
     private func sanitizeConfigForExtension(
         _ rawJSON: String,
         workDir: URL,
@@ -1109,19 +1109,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【APP-13 任务5】物理网卡绑定统一入口：
-        // bind_interface 让内核 Socket 走物理网卡；inet4_bind_address 再把
-        // 源地址固定为该网卡真实 IPv4，避免 iOS 16.5 NECP 沙盒下双栈
-        // Socket 绑定被 EPERM 拒绝（listen outbound packet connection:
-        // operation not permitted）。
+        // 【IPA9 任务4.3】移除 bind_interface 与 inet4_bind_address：
+        // 5G 蜂窝下写死物理网卡 IP（如 10.66.92.229）会导致
+        // dial tcp 10.66.92.229:0->8.8.4.4:853: i/o timeout。
+        // 物理网卡绑定统一由 prism_protect_socket(fd) 在 Socket 创建时
+        // 动态设置 IP_BOUND_IF 完成，无需在配置 JSON 中写死。
         let bindIPv4 = isValidIPv4Literal(phyIPv4) ? phyIPv4 : ""
         func applyPhysicalBind(_ obj: inout [String: Any]) {
-            if !phyName.isEmpty {
-                obj["bind_interface"] = phyName
-            }
-            if !bindIPv4.isEmpty {
-                obj["inet4_bind_address"] = bindIPv4
-            }
+            // 仅保留 domain_strategy: ipv4_only 强制纯 IPv4 Socket，
+            // 不再注入 bind_interface / inet4_bind_address
+            _ = bindIPv4
+            _ = phyName
         }
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
@@ -1166,7 +1164,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 //   元素均不支持的非法字段（APP4/APP5 历史残留），
                 //   写入触发 "decode config: ... json: unknown field" 直接
                 //   拒绝启动，必须无条件剥离；
-                // - inet4_bind_address 强制纯 IPv4 Socket，根治 EPERM。
+                // - domain_strategy: ipv4_only 强制纯 IPv4 Socket，根治
+                //   NECP 对双栈 Socket 的 EPERM 拦截（IPA9 任务4.2）。
                 // 【APP6 任务2】peers 数组模式在 sing-box v1.11.3 走
                 // ListenPacket("udp","") 双栈非连接 Socket，iOS NECP 沙盒
                 // 直接拦截报 listen outbound packet connection: operation
@@ -1199,10 +1198,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 必须无条件剥离。
                 outbounds[i].removeValue(forKey: "allowed_ips")
                 outbounds[i].removeValue(forKey: "persistent_keepalive_interval")
-                // 【APP6 任务2】强制 DefaultDialer 使用纯 IPv4 (udp4/AF_INET)
-                // 连接型 Socket，配合 domain_strategy ipv4_only 根治
-                // listen outbound packet connection: operation not permitted
-                outbounds[i]["inet4_bind_address"] = "0.0.0.0"
+                // 【IPA9 任务4.3】不再注入 inet4_bind_address（5G 蜂窝下引发
+                // i/o timeout）；domain_strategy: ipv4_only 已保证纯 IPv4
+                // Socket，物理网卡绑定由 prism_protect_socket 动态完成。
                 // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
                 if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
                     outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }
@@ -1298,7 +1296,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         if !hasDirectOutbound {
             var directObj: [String: Any] = ["type": "direct", "tag": "direct"]
-            if !phyName.isEmpty { directObj["bind_interface"] = phyName }
             outbounds.append(directObj)
         }
         if dnsOutboundTag == nil {
@@ -1785,27 +1782,44 @@ private func prismProtectSocket(_ fd: Int32) -> Int32 {
     let ipBoundIf: Int32 = 25    // IP_BOUND_IF
     let ipv6BoundIf: Int32 = 125 // IPV6_BOUND_IF
 
-    // 【APP-11B 任务2】按 Socket 真实协议族精准绑定：
-    // 先 getsockname 读 sa_family——AF_INET 只调 IP_BOUND_IF；AF_INET6 只调
-    // IPV6_BOUND_IF 且忽略失败（iOS NECP 对未开 IPv6 隧道的 AF_INET6 Socket
-    // 绑定会返回 EPERM，盲目对 IPv6 Socket 调 IP_BOUND_IF 也会触发
-    // "operation not permitted"，绝不能破坏 Socket 状态）。
+    // 【IPA9 任务4.2】区分 Socket 类型：
+    // - TCP（SOCK_STREAM）走 connect()，IP_BOUND_IF 在 connect 前设置
+    //   不会触发 EPERM，正常绑定物理网卡，防止代理流量回环进 VPN。
+    // - UDP（SOCK_DGRAM）可能走 ListenPacket("udp", ":0") → bind(0.0.0.0:0)。
+    //   iOS XNU 下对已设置 IP_BOUND_IF 的未绑定 Socket 调用 bind 会返回
+    //   EPERM（listen outbound packet connection: operation not permitted），
+    //   导致 WireGuard 握手包与 UDP DNS 全灭。因此 UDP Socket 一律跳过
+    //   IP_BOUND_IF，改由 excludedRoutes 把 WireGuard 对端 / DNS 服务器
+    //   路由到物理网卡直出。
+    var sockType: Int32 = 0
+    var typeLen = socklen_t(MemoryLayout<Int32>.size)
+    guard getsockopt(fd, SOL_SOCKET, SO_TYPE, &sockType, &typeLen) == 0 else {
+        return 0
+    }
+    let isUDP = sockType == SOCK_DGRAM
+
     var addr = sockaddr()
     var len = socklen_t(MemoryLayout<sockaddr>.size)
     if getsockname(fd, &addr, &len) == 0 {
         switch Int32(addr.sa_family) {
         case AF_INET:
-            _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+            if !isUDP {
+                _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+            }
         case AF_INET6:
-            _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+            if !isUDP {
+                _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+            }
         default:
             break
         }
         return 0
     }
-    // getsockname 失败（未绑定 Socket）：按旧逻辑先 IPv4 后 IPv6 兜底
-    if setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
-        _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+    // getsockname 失败：仅 TCP 兜底绑定
+    if !isUDP {
+        if setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+            _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
+        }
     }
     return 0
 }

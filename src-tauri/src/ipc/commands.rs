@@ -2288,6 +2288,11 @@ fn spawn_go_lan_warmup(
 }
 
 /// 保存回家网络配置；内核运行中时重建配置生效
+///
+/// 【IPA9 任务2】保存与重启解耦：持久化写入 + state 更新 + 事件广播后
+/// 立即返回 Ok，内核/隧道重启（iOS 会同步停止并重载扩展）放入后台
+/// `tauri::async_runtime::spawn` 异步执行，避免前端 saveGoLanSettings IPC
+/// 卡在等待 iOS 扩展重启上导致弹窗 saving 状态永久卡死。
 #[tauri::command]
 pub async fn save_go_lan_settings(
     settings: serde_json::Value,
@@ -2305,24 +2310,37 @@ pub async fn save_go_lan_settings(
     }
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
-    // 运行中 → 重建内核配置立即生效（iOS 会重启扩展加载 go-lan-home）
-    if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
-        // 【APP-11 任务1.3】开启后主动打一个回家探测包：WireGuard 只在
-        // 首个数据包进入隧道时才发起 Handshake Initiation，若不主动探测，
-        // 家里路由器在用户访问 NAS 前永远看不到连接记录。
-        if lan.enabled {
-            spawn_go_lan_warmup(
-                state.api_addr.read().clone(),
-                state.api_secret.read().clone(),
-                &lan,
-            );
-        }
-    }
-    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
-    let _ = app.emit("settings://updated", serde_json::to_value(state.settings.read().clone()).unwrap_or_default());
-    // 返回构建警告（无效网段等）
+
     let (_, warnings) = crate::core::go_lan::go_lan_route_rules(&lan);
+
+    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
+    let _ = app.emit(
+        "settings://updated",
+        serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
+    );
+
+    // 运行中 → 后台异步重建内核配置生效（iOS 会重启扩展加载 go-lan-home），
+    // 不阻塞前端保存响应
+    if *state.status.read() == CoreStatus::Running {
+        let app_clone = app.clone();
+        let lan_clone = lan.clone();
+        tauri::async_runtime::spawn(async move {
+            // 在 spawn 内部通过 app.state() 获取 'static 生命周期的 AppState，
+            // 避免命令参数 State<'_, AppState> 的非 'static 借用逃逸
+            let state_static = app_clone.state::<AppState>();
+            if let Err(e) = restart_core(&app_clone, &state_static).await {
+                tracing::warn!("[go-lan] 保存后后台重启内核失败: {e}");
+            }
+            // 【APP-11 任务1.3】开启后主动打一个回家探测包
+            if lan_clone.enabled {
+                spawn_go_lan_warmup(
+                    state_static.api_addr.read().clone(),
+                    state_static.api_secret.read().clone(),
+                    &lan_clone,
+                );
+            }
+        });
+    }
     Ok(warnings)
 }
 

@@ -343,12 +343,13 @@ pub fn build(
     // iOS 扩展沙盒中 Go 的 net.ListenPacket("udp", ":0") 默认创建 AF_INET6
     // 双栈 Socket，未开 IPv6 隧道时绑定会被 NECP 拒绝返回 EPERM
     // （operation not permitted），导致 WireGuard 握手包与 UDP 53 DNS 全灭。
-    // 【APP6 任务2】direct 出站统一加 inet4_bind_address 强制 DefaultDialer
-    // 使用纯 IPv4 (udp4/AF_INET) 连接型 Socket，根治 iOS EPERM。
+    // 【IPA9 任务4.3】移除 inet4_bind_address：5G 蜂窝下写死物理网卡 IP
+    // 会导致 dial tcp 超时，物理网卡绑定改由扩展侧 prism_protect_socket
+    // 动态完成，仅保留 domain_strategy 强制纯 IPv4 Socket。
     let direct_outbound = if settings.ipv6 {
-        json!({ "type": "direct", "tag": "direct", "inet4_bind_address": "0.0.0.0" })
+        json!({ "type": "direct", "tag": "direct" })
     } else {
-        json!({ "type": "direct", "tag": "direct", "domain_strategy": "ipv4_only", "inet4_bind_address": "0.0.0.0" })
+        json!({ "type": "direct", "tag": "direct", "domain_strategy": "ipv4_only" })
     };
     let mut outbounds = vec![
         direct_outbound,
@@ -2712,16 +2713,16 @@ rules:
             "顶层单节点模式必须写 peer_public_key"
         );
         assert_eq!(
-            wg["inet4_bind_address"].as_str(),
-            Some("0.0.0.0"),
-            "go-lan-home 必须强制 inet4_bind_address 纯 IPv4 Socket"
-        );
-        assert_eq!(
             wg["local_address"][0].as_str(),
             Some("10.8.0.2/24"),
             "local_address 必须扩为 /24 以便识别同网段网关（APP-12 任务1.2）"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
+        // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
+        assert!(
+            wg.get("inet4_bind_address").is_none(),
+            "go-lan-home 严禁 inet4_bind_address（5G 蜂窝下 i/o timeout）"
+        );
         let rules = built.config["route"]["rules"].as_array().unwrap();
         let cidrs: Vec<String> = rules
             .iter()

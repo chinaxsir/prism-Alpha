@@ -672,9 +672,16 @@ pub async fn probe_intranet_ip(
                 .proxy(proxy)
                 .build()
                 .ok()?;
-            // 对端任何 HTTP 回包（含 4xx/5xx）都证明数据包已穿过隧道
+            // 【IPA9 任务3】必须排除本地混合代理返回的 502/504：
+            // 当内网目标不可达时，本地代理 127.0.0.1:2080 会在 2500ms
+            // 超时后返回 HTTP/1.1 502 Bad Gateway；旧代码只要收到 HTTP
+            // 响应就误判为"已成功到达内网（2503 ms）"。只有对端真实回包
+            // （2xx/3xx/4xx）才能证明数据包已穿过隧道到达目标内网。
             let resp = client.get(format!("http://{ip_str}/")).send().await.ok()?;
             let code = resp.status().as_u16();
+            if code == 502 || code == 504 {
+                return None;
+            }
             Some(format!("混合代理:HTTP{code}"))
         }));
     }
@@ -751,8 +758,10 @@ pub async fn probe_intranet_ip(
 /// - **严禁 `allowed_ips` / `persistent_keepalive_interval`**——顶层
 ///   LegacyWireGuardOutbound 与 peers 元素均不支持这些字段，写入直接
 ///   `json: unknown field` 拒绝启动；
-/// - `inet4_bind_address: "0.0.0.0"` 强制 DefaultDialer 使用纯 IPv4
-///   (AF_INET) Socket，配合 domain_strategy: ipv4_only 根治 iOS EPERM。
+/// - 【IPA9 任务4.3】移除 `inet4_bind_address`：5G 蜂窝网络下写入物理
+///   网卡 IP（如 10.66.92.229）会导致 `dial tcp 10.66.92.229:0->8.8.4.4:853:
+///   i/o timeout`；改用 `domain_strategy: ipv4_only` + 扩展侧
+///   prism_protect_socket 绑定物理网卡即可保证纯 IPv4 Socket 不被 EPERM。
 fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
@@ -772,9 +781,10 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
         "private_key": private_key,
         "local_address": [local_address],
         // iOS 关闭 IPv6 时双栈 Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
-        // 强制 ipv4_only + inet4_bind_address 保证 UDP（WireGuard）可正常发握手包
+        // 强制 ipv4_only 保证 UDP（WireGuard）可正常发握手包；
+        // 物理网卡绑定由扩展侧 prism_protect_socket 动态完成，
+        // 不再写死 inet4_bind_address（5G 蜂窝下会引发 i/o timeout）。
         "domain_strategy": "ipv4_only",
-        "inet4_bind_address": "0.0.0.0",
     });
     if let Some(psk) = &wg.pre_shared_key {
         match normalize_wg_key(psk) {
@@ -1318,7 +1328,12 @@ mod tests {
             "严禁 persistent_keepalive_interval（sing-box v1.11.3 不支持）"
         );
         assert_eq!(ob["peer_public_key"].as_str(), Some(test_key(2).as_str()));
-        assert_eq!(ob["inet4_bind_address"], "0.0.0.0", "必须强制纯 IPv4 Socket");
+        // 【IPA9 任务4.3】不再写死 inet4_bind_address（5G 蜂窝下引发 i/o
+        // timeout），改由扩展侧 prism_protect_socket 动态绑定物理网卡
+        assert!(
+            ob.get("inet4_bind_address").is_none(),
+            "严禁 inet4_bind_address（5G 蜂窝下导致 i/o timeout）"
+        );
         assert_eq!(ob["domain_strategy"], "ipv4_only");
         // 【APP-12 任务1.2】/32 自动扩为 /24，wireguard-go 内部路由表
         // 可识别同网段网关（10.0.0.1）
@@ -1538,6 +1553,39 @@ mod tests {
         let (rules, warnings) = go_lan_route_rules(&lan);
         assert_eq!(rules.len(), 1);
         assert_eq!(warnings.len(), 2);
+    }
+
+    /// 【IPA9 任务4.1】多行内网网段解析回归：用户分两行输入
+    /// `10.1.8.0/24` 与 `192.168.10.0/24`，前端按 `/[\r\n,;，；\s]+/`
+    /// 拆分后传入后端。normalize_cidr_list 必须完整保留两个网段，
+    /// 绝不能因隐形字符清洗把换行吞掉拼成 `10.1.8.0/24192.168.10.0/24`。
+    #[test]
+    fn test_multi_line_cidrs_preserved() {
+        let cidrs = vec![
+            "10.1.8.0/24".to_string(),
+            "192.168.10.0/24".to_string(),
+        ];
+        let normalized = normalize_cidr_list(&cidrs, "");
+        assert!(
+            normalized.contains(&"10.1.8.0/24".to_string()),
+            "第一行网段 10.1.8.0/24 必须保留: {normalized:?}"
+        );
+        assert!(
+            normalized.contains(&"192.168.10.0/24".to_string()),
+            "第二行网段 192.168.10.0/24 必须保留: {normalized:?}"
+        );
+    }
+
+    /// 【IPA9 任务4.1】主机位非零的 CIDR（如 192.168.10.253/24）必须按掩码
+    /// 与运算规范化为网络前缀 192.168.10.0/24，避免内核路由匹配失败。
+    #[test]
+    fn test_host_bits_normalized_to_network() {
+        let cidrs = vec!["192.168.10.253/24".to_string()];
+        let normalized = normalize_cidr_list(&cidrs, "");
+        assert!(
+            normalized.contains(&"192.168.10.0/24".to_string()),
+            "主机位非零必须归一化为网络前缀: {normalized:?}"
+        );
     }
 
     #[test]

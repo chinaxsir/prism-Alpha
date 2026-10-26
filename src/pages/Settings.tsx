@@ -32,7 +32,6 @@ import {
   saveGoLanSettings,
   isGoLanConfigured,
   clearAppLogs,
-  testGoLanIp,
   type KernelInfo,
   type GoLanSettings,
 } from "@/api/ipc";
@@ -266,18 +265,6 @@ export default function Settings() {
     }
   };
 
-  // 【APP6 任务2.3】Go Lan 卡片「检测」：无需输入目标，后端自动从
-  // local_address 推导家庭网关；结果即时 toast，详细过程看 Go Lan 日志
-  const handleGoLanProbe = async () => {
-    try {
-      const r = await testGoLanIp();
-      if (r.reachable) toast.success(r.message);
-      else toast.error(r.message);
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
   // 【APP6 任务1.2】清空全部运行日志
   const handleClearLogs = async () => {
     try {
@@ -486,28 +473,13 @@ export default function Settings() {
         </div>
         <div className="flex items-center gap-2.5 shrink-0">
           {proUnlocked && (
-            <>
-              <button
-                type="button"
-                disabled={!goLanCfg?.enabled}
-                onClick={handleGoLanProbe}
-                className={clsx(
-                  "text-xs font-medium",
-                  goLanCfg?.enabled
-                    ? "text-accent hover:underline"
-                    : "text-gray-500 cursor-not-allowed",
-                )}
-              >
-                {t("engine.goLanProbe")}
-              </button>
-              <button
-                type="button"
-                onClick={() => setGoLanModalOpen(true)}
-                className="text-xs text-accent hover:underline font-medium"
-              >
-                {t("common.configure")}
-              </button>
-            </>
+            <button
+              type="button"
+              onClick={() => setGoLanModalOpen(true)}
+              className="text-xs text-accent hover:underline font-medium"
+            >
+              {t("common.configure")}
+            </button>
           )}
           <Switch
             checked={proUnlocked ? Boolean(goLanCfg?.enabled) : false}

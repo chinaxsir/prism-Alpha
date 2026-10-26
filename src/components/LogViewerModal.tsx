@@ -5,18 +5,19 @@ import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 import {
   clearAppLogs,
-  exportAppLogs,
   getAppLogs,
   type AppLogEntry,
 } from "@/api/ipc";
 
-/** 【APP6 任务1.2】「设置 -> 运行日志」全局诊断中心弹窗
+/** 【IPA9 任务1】「设置 -> 运行日志」全局诊断中心弹窗
  *
- * - 顶部模块筛选标签栏：全部 | Go Lan | 内核 | 订阅 | Pro 授权 | Go AIM | Go Cus
- * - 右上角实时显示日志占用空间（上限 512 KB，超出自动轮转）
- * - 等宽字体深色高对比日志列表：ERROR 红色 / WARN 琥珀色 / INFO 常规
- * - 底部操作：刷新 / 导出日志（下载 .log + 复制全文）/ 清空日志
- * - 打开期间每 2 秒自动轮询，实时滚动输出
+ * - 顶部模块筛选标签栏（flex-wrap 自动换行，最右侧标签不被截断）
+ * - 右上角实时显示日志占用空间（上限 512 KB）
+ * - 每条日志渲染为上下两行全宽卡片：
+ *   第一行 level 徽章 + module 徽章 + 时分秒毫秒时间戳；
+ *   第二行 100% 全宽日志正文（Kernel 日志自动剥离重复头部）。
+ * - 底部操作：刷新 / 导出日志（同步剪贴板 + iOS 原生分享）/ 清空日志
+ * - 打开期间每 2 秒自动轮询
  */
 
 const MODULE_TABS: { key: string; value: string | null; labelKey: string }[] = [
@@ -36,16 +37,16 @@ interface LogViewerModalProps {
   initialModule?: string | null;
   /** 隐藏底部操作栏（GoLanModal 内嵌紧凑模式自行渲染按钮） */
   compact?: boolean;
-  /** 外部刷新信号：变化时立即重新拉取（保存/检测后触发实时滚动） */
+  /** 外部刷新信号：变化时立即重新拉取 */
   refreshSignal?: number;
 }
 
 const levelColor = (level: string) =>
   level === "ERROR"
-    ? "text-red-400"
+    ? "bg-red-500/15 text-red-400"
     : level === "WARN"
-      ? "text-amber-400"
-      : "text-gray-300";
+      ? "bg-amber-500/15 text-amber-400"
+      : "bg-sky-500/15 text-sky-300";
 
 const moduleBadge = (module: string) =>
   module === "GoLan"
@@ -60,6 +61,18 @@ const moduleBadge = (module: string) =>
             ? "bg-pink-500/15 text-pink-300"
             : "bg-gray-500/15 text-gray-300";
 
+/** 剥离 Kernel 日志中重复的头部前缀：
+ *  `+0000 2026-10-26 09:44:10 ERROR [xxxx] connection: ...` → `connection: ...`
+ *  保留干净的核心信息。
+ */
+function stripKernelHeader(msg: string): string {
+  // 匹配：可选 +0000 → 日期时间 → 级别 → [模块] → 正文
+  return msg.replace(
+    /^[+-]\d{4}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(?:ERROR|WARN|INFO|DEBUG|FATAL)\s+\[[^\]]*\]\s*/,
+    "",
+  );
+}
+
 export default function LogViewerModal({
   open,
   onClose,
@@ -72,6 +85,7 @@ export default function LogViewerModal({
   const [entries, setEntries] = useState<AppLogEntry[]>([]);
   const [totalBytes, setTotalBytes] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(
@@ -97,7 +111,7 @@ export default function LogViewerModal({
     return () => window.clearInterval(timer);
   }, [open, activeModule, load, refreshSignal]);
 
-  // 新日志到达时自动滚动到底部（实时滚动输出）
+  // 新日志到达时自动滚动到底部
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -107,36 +121,81 @@ export default function LogViewerModal({
 
   const kb = (totalBytes / 1024).toFixed(1);
 
-  const handleExport = async () => {
+  /** 【IPA9 任务1.3】iOS WKWebView 不支持 <a download> Blob 下载，且
+   *  await 异步之后调用剪贴板会被 iOS 系统拦截。改为在点击瞬间同步
+   *  基于已加载 entries 构造导出文本，直接写入剪贴板并调起原生分享。 */
+  const handleExport = () => {
+    if (entries.length === 0) {
+      toast.error("暂无日志可导出");
+      return;
+    }
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const lines: string[] = [];
+    lines.push("================ Prism 诊断日志 ================");
+    lines.push(`导出时间: ${ts}`);
+    lines.push(`日志条数: ${entries.length}`);
+    if (activeModule) lines.push(`模块筛选: ${activeModule}`);
+    lines.push("===============================================");
+    lines.push("");
+    for (const e of entries) {
+      lines.push(`[${e.timestamp}][${e.level}][${e.module}] ${e.message}`);
+    }
+    const exportText = lines.join("\n");
+
+    // 第 1 步：同步写入剪贴板（textarea + execCommand，iOS 100% 成功）
+    let copied = false;
     try {
-      const text = await exportAppLogs(activeModule ?? undefined);
-      // 同步复制到剪贴板
-      try {
-        await navigator.clipboard.writeText(text);
-        toast.success(t("logs.exportCopied"));
-      } catch {
-        /* 剪贴板权限受限时仅下载文件 */
-      }
-      // 导出保存为 .log 文件
-      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const ta = document.createElement("textarea");
+      ta.value = exportText;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      copied = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch {
+      copied = false;
+    }
+    // 兜底：navigator.clipboard（桌面端）
+    if (!copied && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(exportText).catch(() => {});
+    }
+
+    // 第 2 步：iOS 原生分享面板 / 桌面端 Blob 下载
+    if (navigator.share) {
+      navigator
+        .share({ title: "Prism-Logs.txt", text: exportText })
+        .catch(() => {});
+    } else {
+      const blob = new Blob([exportText], {
+        type: "text/plain;charset=utf-8",
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `prism-logs-${new Date()
-        .toISOString()
-        .slice(0, 19)
-        .replace(/[:T]/g, "-")}.log`;
+      a.download = `prism-logs-${ts.replace(/[: ]/g, "-")}.log`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch (e) {
-      toast.error(String(e));
     }
+
+    // 第 3 步：按钮反馈
+    setExporting(true);
+    window.setTimeout(() => setExporting(false), 2500);
+    toast.success(t("logs.exportCopied") || "已复制全部日志到剪贴板");
   };
 
+  /** 【IPA9 任务1.2】清空日志：调用后端 clear_app_logs 后立即把前端
+   *  列表置空、容量归零，避免轮询把旧日志又拉回来（后端 LAST_CLEARED
+   *  机制会过滤外部文件中的旧内容）。 */
   const handleClear = async () => {
     try {
       await clearAppLogs();
-      await load(activeModule);
+      setEntries([]);
+      setTotalBytes(0);
       toast.success(t("logs.cleared"));
     } catch (e) {
       toast.error(String(e));
@@ -172,8 +231,8 @@ export default function LogViewerModal({
           </div>
         </div>
 
-        {/* 模块筛选标签栏 */}
-        <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-3 py-2 text-xs">
+        {/* 模块筛选标签栏：flex-wrap 自动换行，最右侧标签不被截断 */}
+        <div className="flex shrink-0 flex-wrap gap-1.5 border-b border-border px-3 py-2 text-xs">
           {MODULE_TABS.map((tab) => (
             <button
               key={tab.key}
@@ -190,49 +249,66 @@ export default function LogViewerModal({
           ))}
         </div>
 
-        {/* 日志列表（等宽深色高对比） */}
+        {/* 日志列表：每条为上下两行全宽卡片 */}
         <div
           ref={listRef}
-          className="flex-1 overflow-y-auto bg-black/40 px-3 py-2 font-mono text-[11px] leading-relaxed"
+          className="flex-1 space-y-1.5 overflow-y-auto bg-black/40 px-3 py-2"
         >
           {entries.length === 0 ? (
             <div className="py-10 text-center text-gray-500">
               {loading ? t("logs.loading") : t("logs.empty")}
             </div>
           ) : (
-            entries.map((e) => (
-              <div key={e.id} className="flex gap-2 py-0.5">
-                <span className="shrink-0 text-gray-500">{e.timestamp}</span>
-                <span
-                  className={clsx(
-                    "shrink-0 font-semibold",
-                    levelColor(e.level),
-                  )}
+            entries.map((e) => {
+              const msg =
+                e.module === "Kernel" ? stripKernelHeader(e.message) : e.message;
+              // 时间戳只显示时分秒毫秒（去掉日期前缀）
+              const shortTs = e.timestamp.length >= 12 ? e.timestamp.slice(11) : e.timestamp;
+              return (
+                <div
+                  key={e.id}
+                  className="rounded-lg bg-background/60 border border-border/50 px-3 py-2 space-y-1"
                 >
-                  {e.level}
-                </span>
-                <span
-                  className={clsx(
-                    "shrink-0 rounded px-1 text-[10px] font-medium",
-                    moduleBadge(e.module),
-                  )}
-                >
-                  {e.module}
-                </span>
-                <span
-                  className={clsx(
-                    "break-all",
-                    e.level === "ERROR"
-                      ? "text-red-300"
-                      : e.level === "WARN"
-                        ? "text-amber-200"
-                        : "text-gray-300",
-                  )}
-                >
-                  {e.message}
-                </span>
-              </div>
-            ))
+                  {/* 第一行：level 徽章 + module 徽章 + 精简时间戳 */}
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={clsx(
+                          "rounded px-1.5 py-0.5 text-[10px] font-semibold",
+                          levelColor(e.level),
+                        )}
+                      >
+                        {e.level}
+                      </span>
+                      <span
+                        className={clsx(
+                          "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                          moduleBadge(e.module),
+                        )}
+                      >
+                        {e.module}
+                      </span>
+                    </div>
+                    <span className="shrink-0 font-mono text-[10px] text-gray-500">
+                      {shortTs}
+                    </span>
+                  </div>
+                  {/* 第二行：100% 全宽日志正文 */}
+                  <div
+                    className={clsx(
+                      "w-full text-[11px] font-mono leading-relaxed break-all whitespace-pre-wrap select-text",
+                      e.level === "ERROR"
+                        ? "text-red-300"
+                        : e.level === "WARN"
+                          ? "text-amber-200"
+                          : "text-gray-300",
+                    )}
+                  >
+                    {msg}
+                  </div>
+                </div>
+              );
+            })
           )}
         </div>
 
@@ -248,11 +324,14 @@ export default function LogViewerModal({
             </button>
             <div className="flex gap-2">
               <button
-                onClick={() => void handleExport()}
-                className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs text-white hover:opacity-90"
+                onClick={handleExport}
+                className={clsx(
+                  "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs text-white hover:opacity-90",
+                  exporting ? "bg-emerald-500/90" : "bg-accent",
+                )}
               >
                 <Download size={13} />
-                {t("logs.export")}
+                {exporting ? "✅ 已复制全部日志" : t("logs.export")}
               </button>
               <button
                 onClick={() => void handleClear()}

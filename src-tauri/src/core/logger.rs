@@ -65,6 +65,13 @@ struct LogState {
 
 static STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
 
+/// 【IPA9 任务1.2】最近一次「清空日志」的 Unix 毫秒时间戳。
+/// 外部日志文件（kernel.log / iOS App Group box.log 等）由内核或网络扩展
+/// 进程持有写入，主进程 truncate/remove_file 后扩展仍可能继续向旧 fd
+/// 写入导致旧内容回弹。collect_kernel_and_extension_logs 读取外部文件时
+/// 只采纳 mtime >= LAST_CLEARED 的内容，确保清空后历史日志不再复活。
+static LAST_CLEARED_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
 fn state() -> Option<&'static Mutex<LogState>> {
     STATE.get()
 }
@@ -207,6 +214,27 @@ fn ios_app_group_dir() -> Option<PathBuf> {
     crate::platform::ios::app_group_dir().map(PathBuf::from)
 }
 
+/// 判断外部日志文件是否在「最近一次清空」之后被修改过。
+/// 外部进程（内核 / iOS 网络扩展）持有文件 fd，主进程 truncate 后扩展仍
+/// 可能向旧 fd 写入旧内容；只采纳 mtime 晚于清空时刻的文件，避免旧日志回弹。
+fn file_modified_after_clear(path: &std::path::Path) -> bool {
+    let cleared = LAST_CLEARED_UNIX_MS.load(Ordering::Relaxed);
+    if cleared == 0 {
+        return true; // 从未清空过，正常读取
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    mtime_ms >= cleared
+}
+
 /// 收集 sing-box 内核日志 + iOS 扩展诊断日志（合并进内存条目列表）
 fn collect_kernel_and_extension_logs(
     data_dir: &std::path::Path,
@@ -216,27 +244,35 @@ fn collect_kernel_and_extension_logs(
     // 1. 桌面端（含 Android）：sing-box 子进程日志 kernel.log
     {
         let kernel_log = data_dir.join("kernel").join("kernel.log");
-        if let Ok(text) = std::fs::read_to_string(&kernel_log) {
-            // 只取末尾 200 行（前面是历史，环形日志只关心近期现场）
-            let tail: Vec<&str> = text.lines().collect();
-            let start = tail.len().saturating_sub(200);
-            let joined = tail[start..].join("\n");
-            merge_external_text(&joined, entries, seq, 200);
+        if file_modified_after_clear(&kernel_log) {
+            if let Ok(text) = std::fs::read_to_string(&kernel_log) {
+                // 只取末尾 200 行（前面是历史，环形日志只关心近期现场）
+                let tail: Vec<&str> = text.lines().collect();
+                let start = tail.len().saturating_sub(200);
+                let joined = tail[start..].join("\n");
+                merge_external_text(&joined, entries, seq, 200);
+            }
         }
     }
     // 2. iOS：App Group 共享目录下的扩展诊断日志
     #[cfg(target_os = "ios")]
     if let Some(group) = ios_app_group_dir() {
         for name in ["prism_error.txt", "vpn_trace.log"] {
-            if let Ok(text) = std::fs::read_to_string(group.join(name)) {
-                merge_external_text(&text, entries, seq, 100);
+            let p = group.join(name);
+            if file_modified_after_clear(&p) {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    merge_external_text(&text, entries, seq, 100);
+                }
             }
         }
-        if let Ok(text) = std::fs::read_to_string(group.join("prism_work").join("box.log")) {
-            let tail: Vec<&str> = text.lines().collect();
-            let start = tail.len().saturating_sub(200);
-            let joined = tail[start..].join("\n");
-            merge_external_text(&joined, entries, seq, 200);
+        let box_log = group.join("prism_work").join("box.log");
+        if file_modified_after_clear(&box_log) {
+            if let Ok(text) = std::fs::read_to_string(&box_log) {
+                let tail: Vec<&str> = text.lines().collect();
+                let start = tail.len().saturating_sub(200);
+                let joined = tail[start..].join("\n");
+                merge_external_text(&joined, entries, seq, 200);
+            }
         }
     }
 }
@@ -286,7 +322,19 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
 
 /// 清空全部日志：内存环形缓冲 + 删除本地 prism_app.log +
 /// 清空内核 kernel.log + iOS 共享容器中的旧日志缓存
+///
+/// 【IPA9 任务1.2】同步设置 LAST_CLEARED_UNIX_MS，collect_kernel_and_extension_logs
+/// 会据此过滤外部文件中清空时刻之前的旧内容，防止内核/扩展进程持有的旧 fd
+/// 继续写入导致历史日志回弹。
 pub fn clear_logs(data_dir: &std::path::Path) {
+    // 先记录清空时刻（早于文件 truncate，确保 truncate 后产生的新内容
+    // 的 mtime >= 此刻，能被正常读取）
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    LAST_CLEARED_UNIX_MS.store(now_ms, Ordering::Relaxed);
+
     if let Some(mutex) = state()
         && let Ok(mut st) = mutex.lock()
     {

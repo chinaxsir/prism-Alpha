@@ -42,7 +42,6 @@ import {
   getGoCusSettings,
   saveGoCusSettings,
   isGoLanConfigured,
-  testGoLanIp,
 } from "@/api/ipc";
 import { useCoreStore, type RunMode } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
@@ -293,18 +292,6 @@ export default function Dashboard() {
       s.enabled = v;
       await saveGoLanSettings(s);
       useCoreStore.getState().setGoLanSettings(s);
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  // 【APP6 任务2.3】Go Lan 卡片轻量「检测」：自动推导网关三路穿透探测，
-  // 结果 toast 展示；详细过程写 [GoLan] 日志（GoLanModal 内可查看）
-  const handleLanProbe = async () => {
-    try {
-      const r = await testGoLanIp();
-      if (r.reachable) toast.success(r.message);
-      else toast.error(r.message);
     } catch (e) {
       toast.error(String(e));
     }
@@ -580,23 +567,12 @@ export default function Dashboard() {
           onToggle={toggleLan}
           action={
             proUnlocked ? (
-              <>
-                {/* 【APP6 任务2.3】轻量「检测」：已激活且开启时可用，
-                    自动推导网关三路穿透探测；未开启时静默禁用 */}
-                <button
-                  onClick={handleLanProbe}
-                  disabled={!running || !(lan?.enabled ?? false)}
-                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
-                >
-                  {t("engine.goLanProbe")}
-                </button>
-                <button
-                  onClick={() => setGoLanModalOpen(true)}
-                  className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
-                >
-                  {t("common.configure")}
-                </button>
-              </>
+              <button
+                onClick={() => setGoLanModalOpen(true)}
+                className="text-xs text-accent hover:underline px-1.5 py-1 whitespace-nowrap"
+              >
+                {t("common.configure")}
+              </button>
             ) : undefined
           }
         />
