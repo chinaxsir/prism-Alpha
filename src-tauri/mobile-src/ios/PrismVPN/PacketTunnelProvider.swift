@@ -305,6 +305,45 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// 【APP10 任务2.2】向 App Group vpn_trace.log 追加一行 GoLan-Ext 实况
+    /// 日志：扩展进程内真实生效的 go-lan-home 顶层字段与回家路由网段。
+    /// 主 App 运行日志（logger.rs collect_kernel_and_extension_logs）会
+    /// 读取该文件并按 go-lan-home 关键字归类到 GoLan 模块。
+    private func writeGoLanExtLog(_ sanitizedConfig: String) {
+        guard let data = sanitizedConfig.data(using: .utf8),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let outbounds = root["outbounds"] as? [[String: Any]],
+              let golan = outbounds.first(where: {
+                  ($0["tag"] as? String) == "go-lan-home"
+              })
+        else { return }
+        let server = golan["server"] as? String ?? "?"
+        let port = (golan["server_port"] as? NSNumber)?.intValue
+            ?? (golan["server_port"] as? Int) ?? 0
+        let local = (golan["local_address"] as? [String])?.joined(separator: ",")
+            ?? (golan["local_address"] as? String) ?? "?"
+        var cidrs: [String] = []
+        if let rules = (root["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
+            for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
+                for c in (rule["ip_cidr"] as? [String]) ?? [] where !cidrs.contains(c) {
+                    cidrs.append(c)
+                }
+            }
+        }
+        let ts = Int(Date().timeIntervalSince1970)
+        let line = "\(ts) INFO [GoLan-Ext] 扩展已加载 go-lan-home -> server=\(server):\(port), local=\(local), 路由网段=[\(cidrs.joined(separator: ", "))]\n"
+        for dir in sharedDirURLs() {
+            let url = dir.appendingPathComponent("vpn_trace.log")
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile()
+                h.write(line.data(using: .utf8) ?? Data())
+                try? h.close()
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+
     private func loadRawConfigText() throws -> String {
         if let configPath = (protocolConfiguration as? NETunnelProviderProtocol)?
             .providerConfiguration?["config_path"] as? String,
@@ -387,6 +426,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 )
                 // 预解析与网卡取值都在 PrismVPNStart（内部才 setTunnelNetworkSettings）
                 // 之前完成，保证 WireGuard 服务器 IP 落地时 UDP 会话仍绑定物理网卡
+
+                // 【APP10 任务2.2】GoLan-Ext 实况日志：把扩展进程内真实生效的
+                // go-lan-home 参数（server/local/路由网段）写入 App Group
+                // vpn_trace.log，用户可在运行日志界面直接确认扩展侧配置。
+                self.writeGoLanExtLog(sanitizedConfig)
 
                 let callbacks = prism_vpn_cbs(
                     open_tun: prismOpenTun,
@@ -636,20 +680,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //    而不是走当前 Wi-Fi 本地局域网丢包。
         var excludedV4: [NEIPv4Route] = []
         var includedV4: [NEIPv4Route] = ipv4.includedRoutes ?? []
+        var excludedIPs: Set<String> = []
+        func addExcludedIP(_ ip: String) {
+            guard isIPLiteral(ip), !excludedIPs.contains(ip) else { return }
+            excludedIPs.insert(ip)
+            excludedV4.append(
+                NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255")
+            )
+        }
         if let outs = json["outbounds"] as? [[String: Any]] {
-            for ob in outs
-            where (ob["tag"] as? String) == "go-lan-home" && (ob["type"] as? String) == "wireguard" {
-                if let srv = ob["server"] as? String, isIPLiteral(srv) {
-                    excludedV4.append(
-                        NEIPv4Route(destinationAddress: srv, subnetMask: "255.255.255.255")
-                    )
+            // 【APP10 任务1.3】所有出站的公网服务器 IP（go-lan-home 的
+            // WireGuard 对端 + 各代理节点 server）一律加入 excludedRoutes
+            // /32 直出物理网卡：扩展自身流量本由 NECP 自动走物理网卡，
+            // excludedRoutes 再兜一层底，双保险杜绝回环进 utun。
+            for ob in outs {
+                if let srv = ob["server"] as? String {
+                    addExcludedIP(srv)
                 }
-                if let peers = ob["peers"] as? [[String: Any]] {
+                if (ob["tag"] as? String) == "go-lan-home",
+                   let peers = ob["peers"] as? [[String: Any]] {
                     for peer in peers {
-                        if let srv = peer["server"] as? String, isIPLiteral(srv) {
-                            excludedV4.append(
-                                NEIPv4Route(destinationAddress: srv, subnetMask: "255.255.255.255")
-                            )
+                        if let srv = peer["server"] as? String {
+                            addExcludedIP(srv)
                         }
                     }
                 }
@@ -1054,10 +1106,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// - Parameters:
-    ///   - phyName: 当前活跃物理网卡名（en0 / pdp_ip0），供
-    ///     prism_protect_socket 动态设置 IP_BOUND_IF 使用
+    ///   - phyName: 当前活跃物理网卡名（en0 / pdp_ip0），仅记录日志
     ///   - phyIPv4: 该网卡的真实 IPv4，仅用于 excludedRoutes 回包路由，
-    ///     不再注入出站 inet4_bind_address（IPA9 任务4.3）
+    ///     不再注入出站 inet4_bind_address（APP10 任务1）
     private func sanitizeConfigForExtension(
         _ rawJSON: String,
         workDir: URL,
@@ -1084,13 +1135,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // mixed 栈：TCP 走系统原生栈、UDP 走 gvisor（sing-box 默认），
                     // 大幅提升大流量下载吞吐并降低单核 CPU 占用
                     inbounds[i]["stack"] = "mixed"
-                    inbounds[i]["sniff"] = true
-                    // 【APP-12 任务1.2】严禁 sniff_override_destination=true：
-                    // 置 true 时访问家里内网 IP 会被嗅探把目标改写成 Host/SNI
-                    // 域名，导致 ip_cidr → go-lan-home 规则匹配失败，流量
-                    // 被错误发往海外代理节点。保留 sniff 仅用于协议识别。
+                    // 【APP10 任务2.1】tun-in 严禁 sniff=true：
+                    // sniff 开启时 sing-box 会在 tun-in 收到发往
+                    // 192.168.10.253:80 的包时先在本地伪造 TCP 握手
+                    // （SYN-ACK 代答）并等待客户端发 HTTP 头，造成
+                    // "TUN直连:80 延迟 2502 ms" 假阳性检测，还会干扰
+                    // SMB/SSH/WebSocket 等非 HTTP 内网协议。本 App DNS
+                    // 采用 dns-remote/dns-local 标准解析（非 FakeIP），
+                    // IP 与域名规则直接匹配，关闭 sniff 后访问
+                    // 10.1.8.0/24、192.168.10.0/24 的包零延迟直入
+                    // go-lan-home WireGuard 隧道。
+                    inbounds[i]["sniff"] = false
                     inbounds[i]["sniff_override_destination"] = false
-                    inbounds[i]["sniff_timeout"] = "100ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }
@@ -1109,11 +1165,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【IPA9 任务4.3】移除 bind_interface 与 inet4_bind_address：
-        // 5G 蜂窝下写死物理网卡 IP（如 10.66.92.229）会导致
-        // dial tcp 10.66.92.229:0->8.8.4.4:853: i/o timeout。
-        // 物理网卡绑定统一由 prism_protect_socket(fd) 在 Socket 创建时
-        // 动态设置 IP_BOUND_IF 完成，无需在配置 JSON 中写死。
+        // 【APP10 任务1】不注入 bind_interface / inet4_bind_address，也不做
+        // Socket 级 IP_BOUND_IF（prism_protect_socket 已为空操作）：
+        // 扩展进程自身流量由系统 NECP 自动走主物理网卡（5G pdp_ip0 /
+        // Wi-Fi en0），服务器 IP 另由 excludedRoutes /32 兜底直出。
         let bindIPv4 = isValidIPv4Literal(phyIPv4) ? phyIPv4 : ""
         func applyPhysicalBind(_ obj: inout [String: Any]) {
             // 仅保留 domain_strategy: ipv4_only 强制纯 IPv4 Socket，
@@ -1198,9 +1253,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 必须无条件剥离。
                 outbounds[i].removeValue(forKey: "allowed_ips")
                 outbounds[i].removeValue(forKey: "persistent_keepalive_interval")
-                // 【IPA9 任务4.3】不再注入 inet4_bind_address（5G 蜂窝下引发
-                // i/o timeout）；domain_strategy: ipv4_only 已保证纯 IPv4
-                // Socket，物理网卡绑定由 prism_protect_socket 动态完成。
+                // 【APP10 任务1】不注入 inet4_bind_address（5G 蜂窝下引发
+                // i/o timeout）；domain_strategy: ipv4_only 保证纯 IPv4
+                // Socket，物理网卡路由由系统 NECP + excludedRoutes 兜底。
                 // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
                 if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
                     outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }
@@ -1772,55 +1827,17 @@ private func prismOpenTun(_ json: UnsafePointer<CChar>?) -> Int32 {
 
 @_cdecl("prism_protect_socket")
 private func prismProtectSocket(_ fd: Int32) -> Int32 {
-    guard fd >= 0 else { return 0 }
-    var idx = cachedPhysicalIfIndex
-    if idx == 0 {
-        idx = findActivePhysicalInterface().index
-    }
-    guard idx > 0 else { return 0 }
-
-    let ipBoundIf: Int32 = 25    // IP_BOUND_IF
-    let ipv6BoundIf: Int32 = 125 // IPV6_BOUND_IF
-
-    // 【IPA9 任务4.2】区分 Socket 类型：
-    // - TCP（SOCK_STREAM）走 connect()，IP_BOUND_IF 在 connect 前设置
-    //   不会触发 EPERM，正常绑定物理网卡，防止代理流量回环进 VPN。
-    // - UDP（SOCK_DGRAM）可能走 ListenPacket("udp", ":0") → bind(0.0.0.0:0)。
-    //   iOS XNU 下对已设置 IP_BOUND_IF 的未绑定 Socket 调用 bind 会返回
-    //   EPERM（listen outbound packet connection: operation not permitted），
-    //   导致 WireGuard 握手包与 UDP DNS 全灭。因此 UDP Socket 一律跳过
-    //   IP_BOUND_IF，改由 excludedRoutes 把 WireGuard 对端 / DNS 服务器
-    //   路由到物理网卡直出。
-    var sockType: Int32 = 0
-    var typeLen = socklen_t(MemoryLayout<Int32>.size)
-    guard getsockopt(fd, SOL_SOCKET, SO_TYPE, &sockType, &typeLen) == 0 else {
-        return 0
-    }
-    let isUDP = sockType == SOCK_DGRAM
-
-    var addr = sockaddr()
-    var len = socklen_t(MemoryLayout<sockaddr>.size)
-    if getsockname(fd, &addr, &len) == 0 {
-        switch Int32(addr.sa_family) {
-        case AF_INET:
-            if !isUDP {
-                _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
-            }
-        case AF_INET6:
-            if !isUDP {
-                _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
-            }
-        default:
-            break
-        }
-        return 0
-    }
-    // getsockname 失败：仅 TCP 兜底绑定
-    if !isUDP {
-        if setsockopt(fd, IPPROTO_IP, ipBoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
-            _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &idx, socklen_t(MemoryLayout<UInt32>.size))
-        }
-    }
+    // 【APP10 任务1】安全空操作：iOS NEPacketTunnelProvider 架构下
+    // （includeAllNetworks = false），系统 NECP 策略天然将扩展进程自身
+    // 发起的所有 Socket 绑定到当前系统主物理网络（5G pdp_ip0 /
+    // Wi-Fi en0），绝不回环进 utun。
+    // 过去手动 setsockopt(IP_BOUND_IF) 强绑静态网卡索引，一旦 5G 下
+    // 拿到未联网的 en0 索引，全部出站 TCP/UDP Socket（含 WireGuard
+    // 握手包 14.105.65.122:51820 与 DNS 8.8.8.8:53）报
+    // connect: network is unreachable / operation not permitted。
+    // 移除强绑后交由系统 NECP + excludedRoutes（服务器 IP /32 直出）
+    // 双重保障，5G/Wi-Fi 切换零干预。
+    _ = fd
     return 0
 }
 

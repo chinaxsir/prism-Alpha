@@ -530,25 +530,143 @@ pub fn resolve_probe_target(target_ip_raw: Option<&str>, lan: &GoLanSettings) ->
     derive_gateway_from_local_address(local)
 }
 
-/// 【APP-5 任务2 / APP6 任务2】穿过 go-lan-home 隧道检测是否能到达指定内网 IP。
+/// 【APP10 任务3】经 go-lan-home 出站的真实连通性探测（单目标单端口）。
 ///
-/// 探测策略（三路并发穿透，超时 3 秒）：
-/// 0) 输入净化 + 目标推导：显式 target_ip 优先，未传则从 local_address
-///    自动推导对端网关（10.1.8.2/24 → 10.1.8.1）；
-/// 1) 运行前置校验：内核必须 running 且 Go Lan enabled 才可能成功；
-/// 2) 通道 1（Clash API 出站测速）：GET /proxies/go-lan-home/delay?url=
-///    http://{ip}&timeout=2500 强制 sing-box 直接经 go-lan-home 隧道发包，
-///    瞬间完成 WireGuard 首次握手（桌面 direct 模式兜底）；
-/// 3) 通道 2（本地混合代理）：经 127.0.0.1:{mixed_port} HTTP/SOCKS5 连接
-///    目标内网 IP 的 80/51821/443/22/53/8080 端口；
-/// 4) 通道 3（系统 TUN 直连）：直接 TcpStream::connect 目标内网 IP 的
-///    上述端口，TUN 全局路由下直接进入 utun → go-lan-home 出站。
-/// 5) 可达性判定：任一通道连接成功（Ok），或收到对端协议栈返回的
-///    ConnectionRefused (TCP RST)——证明数据包已穿过 WireGuard 隧道
-///    抵达对端内网主机并收到回包——即判定 reachable=true。
+/// 双通道全部强制穿越 WireGuard 隧道，绝不使用裸 TcpStream::connect
+/// （tun-in 会在本地伪造 SYN-ACK 假握手，造成 2502ms 假阳性）：
 ///
-/// 任何成功都会瞬间激活 wg-easy 的连接状态（wireguard-go 在收到
-/// 首包时立即向服务端回 Handshake Response），无需 persistent_keepalive_interval。
+/// 方法 1（Clash API 直接驱动 go-lan-home 出站）：
+///   GET http://{api}/proxies/go-lan-home/delay?url=http://{ip}:{port}&timeout=2500
+///   - HTTP 200 且 JSON delay > 0 && delay < 2450 → Ok(delay)
+///   - HTTP 503/504/400 → 读取 JSON message（sing-box go-lan-home 出站返回的
+///     最真实底层错误，如 i/o timeout / handshake initiation failed）；
+///     message 含 "connection refused" 说明数据包已穿过隧道到达对端
+///     （对端协议栈回了 RST，只是没开 HTTP 端口）→ 同样判定可达
+/// 方法 2（经本地 mixed 入站 SOCKS5 发真实 HTTP 请求）：
+///   reqwest Proxy::all(socks5://127.0.0.1:{mixed_port}) GET http://{ip}:{port}/
+///   - 收到真实非 502/504 状态码 → Ok(耗时)
+///   - 底层错误为 Connection refused 且耗时 < 2300ms → Ok(耗时)
+///   - 任何耗时 >= 2400ms 的超时 → Err("连接超时")，杜绝 2502ms 假阳性
+async fn probe_via_go_lan_outbound(
+    ip: &str,
+    port: u16,
+    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+) -> Result<u64, String> {
+    let mut last_err = String::from("无可用探测通道");
+
+    // ---- 方法 1：Clash API /proxies/go-lan-home/delay ----
+    if !api_addr.is_empty() {
+        let base = api_addr
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let url = format!(
+            "http://{base}/proxies/go-lan-home/delay?url=http://{ip}:{port}&timeout=2500"
+        );
+        if let Ok(client) = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(3500))
+            .build()
+        {
+            let mut req = client.get(&url);
+            if !api_secret.is_empty() {
+                req = req.bearer_auth(api_secret);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status == 200 {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
+                                // delay 必须 >0 且明显小于 2500ms 超时阈值，
+                                // 卡满阈值的伪延迟一律不可信
+                                if d > 0 && d < 2450 {
+                                    return Ok(d);
+                                }
+                                last_err = format!("Clash API 延迟 {d}ms 不可信（卡超时阈值）");
+                            }
+                        }
+                    } else if status == 503 || status == 504 || status == 400 {
+                        let msg = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("message").and_then(|m| m.as_str()).map(String::from)
+                            })
+                            .unwrap_or_else(|| format!("HTTP {status}"));
+                        let lower = msg.to_lowercase();
+                        if lower.contains("connection refused") || lower.contains("refused") {
+                            // RST 回包 = 数据包已穿隧道抵达对端主机
+                            return Ok(1);
+                        }
+                        last_err = format!("go-lan-home 出站: {msg}");
+                    } else {
+                        last_err = format!("Clash API HTTP {status}");
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("Clash API 请求失败: {e}");
+                }
+            }
+        }
+    }
+
+    // ---- 方法 2：经本地 mixed 入站 SOCKS5 真实 HTTP 探测 ----
+    if mixed_port > 0 {
+        let proxy = reqwest::Proxy::all(format!("socks5://127.0.0.1:{mixed_port}"))
+            .map_err(|e| format!("SOCKS5 代理构建失败: {e}"))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(2500))
+            .proxy(proxy)
+            .build()
+            .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        let start = std::time::Instant::now();
+        match client
+            .get(format!("http://{ip}:{port}/"))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                let ms = start.elapsed().as_millis().max(1) as u64;
+                // 本地 mixed 入站在对端不可达时会代答 502/504，必须排除；
+                // 仅 2xx/3xx/4xx/5xx(非 502/504) 才是对端真实回包
+                if code == 502 || code == 504 {
+                    last_err = format!("本地代理代答 HTTP {code}（对端不可达）");
+                } else {
+                    return Ok(ms);
+                }
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_millis().max(1) as u64;
+                let text = format!("{e:?}").to_lowercase();
+                // ECONNREFUSED：包已穿隧道到对端，对端协议栈回 RST
+                if text.contains("connection refused") && ms < 2300 {
+                    return Ok(ms);
+                }
+                if ms >= 2400 {
+                    last_err = "连接超时".into();
+                } else {
+                    last_err = format!("{e}");
+                }
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+/// 【APP10 任务3】穿过 go-lan-home 隧道检测内网 IP，实现
+/// 「WireGuard 网关 + 目标设备」双级真实诊断：
+///
+/// 1. 从 local_address（10.1.8.2/24）推导 WG 服务端虚拟网关（10.1.8.1）；
+/// 2. 目标 IP ≠ 网关时并发探测两者：
+///    - 目标通 → ✅ 已成功到达内网 {ip} · 延迟 {ms} ms
+///    - 网关通/目标超时 → ⚠️ 隧道已连通但目标不可达（检查 NAT/IP 转发/在线）
+///    - 网关也超时 → ❌ 隧道未握手成功（检查端口/密钥）
+///
+/// 彻底废除会被 tun-in 假握手欺骗的裸 TcpStream::connect 通道。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
     mixed_port: u16,
@@ -572,18 +690,15 @@ pub async fn probe_intranet_ip(
             message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.1.1）".into(),
         };
     };
-    let ip: std::net::IpAddr = match target_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => {
-            crate::core::logger::warn(log, &format!("IP 地址格式无效: {target_ip}"));
-            return GoLanProbeResult {
-                reachable: false,
-                target_ip: target_ip.clone(),
-                latency_ms: None,
-                message: format!("IP 地址格式无效: {target_ip}"),
-            };
-        }
-    };
+    if target_ip.parse::<std::net::IpAddr>().is_err() {
+        crate::core::logger::warn(log, &format!("IP 地址格式无效: {target_ip}"));
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: format!("IP 地址格式无效: {target_ip}"),
+        };
+    }
 
     // 2. 运行前置
     if !is_running {
@@ -604,139 +719,107 @@ pub async fn probe_intranet_ip(
             message: "Go Lan 尚未开启，请先打开 Go Lan 开关".into(),
         };
     }
+
+    // 3. 推导 WG 网关（local_address 同网段 .1）与服务器端口
+    let local_addr = lan
+        .wg_config
+        .as_ref()
+        .map(|wg| wg.local_ip.as_str())
+        .unwrap_or("");
+    let wg_gateway = derive_gateway_from_local_address(local_addr);
+    let server_port = lan
+        .wg_config
+        .as_ref()
+        .map(|wg| wg.server_port)
+        .unwrap_or(51820);
+
     crate::core::logger::info(
         log,
         &format!("正在通过 go-lan-home 隧道检测内网目标: {target_ip} ..."),
     );
 
-    let start = std::time::Instant::now();
-    let known_ports: [u16; 7] = [80, 51821, 443, 22, 53, 8080, 445];
-    let mut tasks = Vec::with_capacity(known_ports.len() + 2);
-
-    // 通道 3：直接经系统 TUN 路由 TcpStream::connect（多端口并发）
-    for port in known_ports {
-        let ip_copy = ip;
-        tasks.push(tokio::spawn(async move {
-            let addr = std::net::SocketAddr::new(ip_copy, port);
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(3000),
-                tokio::net::TcpStream::connect(addr),
-            )
+    // 4. 目标即网关（或无法推导网关，如分享链接/Managed 模式）→ 单级探测
+    if wg_gateway.is_none() || wg_gateway.as_deref() == Some(target_ip.as_str()) {
+        return match probe_via_go_lan_outbound(&target_ip, 80, mixed_port, api_addr, api_secret)
             .await
-            {
-                Ok(Ok(_)) => Some(format!("TUN直连:{port}")),
-                Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
-                    Some(format!("TUN直连:{port}(RST回包)"))
+        {
+            Ok(ms) => {
+                crate::core::logger::info(
+                    log,
+                    &format!(
+                        "✅ 内网检测成功: 已到达 {target_ip}（go-lan-home 出站，延迟 {ms} ms）"
+                    ),
+                );
+                GoLanProbeResult {
+                    reachable: true,
+                    target_ip: target_ip.clone(),
+                    latency_ms: Some(ms),
+                    message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
                 }
-                _ => None,
             }
-        }));
+            Err(e) => {
+                crate::core::logger::warn(
+                    log,
+                    &format!("❌ 内网检测失败: {target_ip} 不可达: {e}"),
+                );
+                GoLanProbeResult {
+                    reachable: false,
+                    target_ip: target_ip.clone(),
+                    latency_ms: None,
+                    message: format!(
+                        "❌ 未能到达 {target_ip}（{e}）。请检查隧道配置与对端设备是否在线"
+                    ),
+                }
+            }
+        };
     }
 
-    // 通道 1：Clash API 直接指定 go-lan-home 出站测速（强制隧道内发包）
-    if !api_addr.is_empty() {
-        let secret = api_secret.to_string();
-        let addr_base = api_addr.to_string();
-        let ip_str = target_ip.clone();
-        tasks.push(tokio::spawn(async move {
-            let base = addr_base.trim_start_matches("http://").trim_start_matches("https://");
-            let url = format!(
-                "http://{base}/proxies/go-lan-home/delay?url=http://{}&timeout=2500",
-                ip_str
+    // 5. 双级诊断：并发探测 网关（10.1.8.1）+ 目标 IP（192.168.10.253）
+    let gw = wg_gateway.clone().unwrap_or_default();
+    let gw_fut = probe_via_go_lan_outbound(&gw, 80, mixed_port, api_addr, api_secret);
+    let target_fut =
+        probe_via_go_lan_outbound(&target_ip, 80, mixed_port, api_addr, api_secret);
+    let (gw_res, target_res) = tokio::join!(gw_fut, target_fut);
+
+    match (gw_res, target_res) {
+        // 情况 1：目标可达（网关通常也通；目标通即最终目的达成）
+        (_, Ok(ms)) => {
+            crate::core::logger::info(
+                log,
+                &format!("✅ 内网检测成功: 已到达 {target_ip}（网关 {gw} 连通，延迟 {ms} ms）"),
             );
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(3500))
-                .build()
-                .ok()?;
-            let mut req = client.get(&url);
-            if !secret.is_empty() {
-                req = req.bearer_auth(&secret);
+            GoLanProbeResult {
+                reachable: true,
+                target_ip: target_ip.clone(),
+                latency_ms: Some(ms),
+                message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
             }
-            let resp = req.send().await.ok()?;
-            if !resp.status().is_success() {
-                return None;
-            }
-            let body = resp.text().await.ok()?;
-            let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-            v.get("delay")?.as_u64().filter(|d| *d > 0).map(|_| "ClashAPI隧道测速".to_string())
-        }));
-    }
-
-    // 通道 2：经本地混合代理（mixed_port）HTTP 连接目标内网 IP
-    if mixed_port > 0 {
-        let ip_str = target_ip.clone();
-        tasks.push(tokio::spawn(async move {
-            let proxy = reqwest::Proxy::http(&format!("http://127.0.0.1:{mixed_port}")).ok()?;
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(3000))
-                .proxy(proxy)
-                .build()
-                .ok()?;
-            // 【IPA9 任务3】必须排除本地混合代理返回的 502/504：
-            // 当内网目标不可达时，本地代理 127.0.0.1:2080 会在 2500ms
-            // 超时后返回 HTTP/1.1 502 Bad Gateway；旧代码只要收到 HTTP
-            // 响应就误判为"已成功到达内网（2503 ms）"。只有对端真实回包
-            // （2xx/3xx/4xx）才能证明数据包已穿过隧道到达目标内网。
-            let resp = client.get(format!("http://{ip_str}/")).send().await.ok()?;
-            let code = resp.status().as_u16();
-            if code == 502 || code == 504 {
-                return None;
-            }
-            Some(format!("混合代理:HTTP{code}"))
-        }));
-    }
-
-    let mut reachable = false;
-    let mut success_via = String::new();
-    for t in tasks {
-        if let Ok(Some(via)) = t.await {
-            reachable = true;
-            if success_via.is_empty() {
-                success_via = via;
-            }
-            // 不立即 break，多探测让 wg-easy 多发几个包触发计数
         }
-    }
-
-    let ms = start.elapsed().as_millis().max(1) as u64;
-    if reachable {
-        crate::core::logger::info(
-            log,
-            &format!("✅ 内网检测成功: 已到达 {target_ip}（{success_via}，延迟 {ms} ms）"),
-        );
-        GoLanProbeResult {
-            reachable: true,
-            target_ip: target_ip.clone(),
-            latency_ms: Some(ms),
-            message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
+        // 情况 2：隧道通（网关可达）但目标不可达 → NAT/IP 转发/设备离线
+        (Ok(gw_ms), Err(e)) => {
+            let msg = format!(
+                "⚠️ WireGuard 隧道已连通 (网关 {gw} 延迟 {gw_ms}ms)，但无法到达 {target_ip} ({e})。请检查家里 WG 服务端是否开启 IP 转发/NAT 或 {target_ip} 是否在线"
+            );
+            crate::core::logger::warn(log, &msg);
+            GoLanProbeResult {
+                reachable: false,
+                target_ip: target_ip.clone(),
+                latency_ms: Some(gw_ms),
+                message: msg,
+            }
         }
-    } else {
-        // 失败诊断：把 Endpoint IP 与当前路由 CIDR 列表写日志供排查
-        let endpoint = lan
-            .wg_config
-            .as_ref()
-            .map(|wg| {
-                format!(
-                    "{}:{}",
-                    resolve_endpoint_host_to_ip(&wg.server),
-                    wg.server_port
-                )
-            })
-            .unwrap_or_else(|| "（未配置 WireGuard，使用分享链接/Managed）".into());
-        let cidrs = normalize_cidr_list(&lan.lan_cidrs, "");
-        crate::core::logger::warn(
-            log,
-            &format!(
-                "❌ 内网检测失败: {target_ip} 不可达（全部通道超时）。Endpoint={endpoint}，当前回家路由网段={cidrs:?}。请检查家庭服务器是否在线、端口是否正确"
-            ),
-        );
-        GoLanProbeResult {
-            reachable: false,
-            target_ip: target_ip.clone(),
-            latency_ms: None,
-            message: format!(
-                "❌ 未能到达 {target_ip}（请求超时），请检查内网网段配置及对端设备是否在线"
-            ),
+        // 情况 3：连网关都不可达 → 隧道未握手成功
+        (Err(gw_err), Err(_)) => {
+            let msg = format!(
+                "❌ WireGuard 隧道未握手成功 (网关 {gw} 超时: {gw_err})，请检查服务器端口 {server_port} 及密钥配置"
+            );
+            crate::core::logger::warn(log, &msg);
+            GoLanProbeResult {
+                reachable: false,
+                target_ip: target_ip.clone(),
+                latency_ms: None,
+                message: msg,
+            }
         }
     }
 }
