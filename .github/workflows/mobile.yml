@@ -489,6 +489,36 @@ jobs:
           gem list xcodeproj -i >/dev/null 2>&1 || sudo gem install xcodeproj --no-document
           ruby scripts/inject-ios-vpn.rb
 
+      # 注入完成后 Xcode 实际编译的是 gen/apple 下的副本（此前 3 秒预检只查
+      # mobile-src，若两目录漂移会在 xcodebuild 末期才暴露）。这里对真正参与
+      # 编译的 gen/apple 两个 Swift 文件再做一次 swiftc -typecheck 兜底。
+      - name: Typecheck injected gen/apple Swift sources (fail-fast)
+        shell: bash
+        run: |
+          set -e
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+
+          xcrun -sdk iphoneos swiftc -typecheck \
+            -target arm64-apple-ios15.0 -sdk "$SDK" \
+            src-tauri/gen/apple/PrismTunnelController.swift
+          echo "✅ gen/apple/PrismTunnelController.swift typecheck passed"
+
+          STUB=/tmp/prism_vpn_bridge_stub.h
+          printf '%s\n' \
+            '#include <stdlib.h>' \
+            'typedef struct prism_vpn_cbs { int (*open_tun)(const char* options_json); int (*protect_socket)(int fd); int (*under_extension)(void); } prism_vpn_cbs;' \
+            'static inline char* PrismVPNStart(char* configContent, char* workDir) { (void)configContent; (void)workDir; return NULL; }' \
+            'static inline void PrismVPNStop(void) {}' \
+            'static inline void PrismVPNSetCallbacks(prism_vpn_cbs cbs) { (void)cbs; }' \
+            > "$STUB"
+
+          xcrun -sdk iphoneos swiftc -typecheck \
+            -target arm64-apple-ios15.0 -sdk "$SDK" \
+            -application-extension -parse-as-library \
+            -import-objc-header "$STUB" \
+            src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift
+          echo "✅ gen/apple/PrismVPN/PacketTunnelProvider.swift typecheck passed"
+
       # 官方未签名路径（CLI 2.12+）：--no-sign 先构建未签名 archive，
       # 再直接从 archive 内的 .app 产出未签名 IPA；
       # 不经过 exportArchive，因此无需任何证书/描述文件

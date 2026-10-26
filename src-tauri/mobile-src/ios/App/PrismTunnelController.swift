@@ -174,12 +174,16 @@ func prismIosVpnIsConnected() -> Int32 {
 /// APP6 任务1：返回 App Group（group.com.prism.proxy）共享容器路径，
 /// 供 Rust 侧运行日志系统读取扩展诊断日志（prism_error.txt /
 /// prism_work/box.log / vpn_trace.log）。拿不到时返回 NULL。
+/// 注意：Darwin.strdup 返回 UnsafeMutablePointer<CChar>!，与 C ABI 声明的
+/// UnsafePointer<CChar>? 不是同一类型，Swift 不允许在 return 处隐式转换，
+/// 必须显式构造（否则报 cannot convert return expression）。
 @_cdecl("prism_ios_app_group_dir")
 func prismIosAppGroupDir() -> UnsafePointer<CChar>? {
     guard let groupURL = FileManager.default.containerURL(
         forSecurityApplicationGroupIdentifier: prismAppGroupID
     ) else { return nil }
-    return strdup(groupURL.path)
+    guard let path = strdup(groupURL.path) else { return nil }
+    return UnsafePointer(path)
 }
 
 /// Rust 启动内核时读取系统级真实连接起始时间戳（IPA-12）：
@@ -2130,7 +2134,7 @@ final class PrismTunnelController {
                 let desc = err.map {
                     PrismTunnelController.describe(error: $0)
                 } ?? generic
-                if let err = err {
+                if err != nil {
                     NSLog("[PrismVPN] fetchLastDisconnectError: \(desc)")
                 }
                 DispatchQueue.main.async { completion(desc, err) }

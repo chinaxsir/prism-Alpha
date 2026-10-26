@@ -472,15 +472,13 @@ export default function Dashboard() {
             <div className="text-2xl font-bold tabular-nums text-gray-100">
               {running ? formatUptime(displayUptimeSecs) : "Prism"}
             </div>
-            {/* 未连接（stopped）时不再显示「点击右侧按钮启动代理」副标题，
-                让左侧仅保留状态圆点与 Prism 标题；启动中仍给出隧道提示 */}
+            {/* 未连接/启动中时左侧仅保留状态圆点与 Prism 标题：不再显示
+                「正在建立 VPN 隧道，请稍候」副标题，避免点击启动瞬间卡片
+                高度跳动（启动反馈由状态点与右侧「启动中」按钮承载）。
+                仅「已连接」显示计时器时，下方才显示运行模式。 */}
             {running ? (
               <div className="text-xs text-gray-500 mt-1">
                 {t("dashboard.runModeLabel", { mode: modeLabel(mode) })}
-              </div>
-            ) : status === "starting" ? (
-              <div className="text-xs text-gray-500 mt-1">
-                {t("status.startingTunnel")}
               </div>
             ) : null}
           </div>

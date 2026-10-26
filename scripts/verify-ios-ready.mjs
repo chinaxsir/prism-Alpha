@@ -250,9 +250,8 @@ try {
 // 路由在 openTun 里引用它 → cannot find 'bindIPv4' in scope。
 // 这里对关键标识符做「先声明后使用」检查，本地 1 秒拦截同类错误。
 // ============================================================
-console.log('\n--- 检查 7：扩展源码作用域预检 ---');
+console.log('\n--- 检查 7：扩展源码作用域预检 + gen 双文件副本一致性 ---');
 const EXT_SWIFT = resolve(ROOT, 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift');
-const GEN_SWIFT = resolve(ROOT, 'src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift');
 try {
   const rawExt = readFileSync(EXT_SWIFT, 'utf8');
   // 剥除注释，避免文档注释里出现的标识符被误判为使用
@@ -300,16 +299,31 @@ try {
     pass('PacketTunnelProvider.swift 关键标识符均先声明后使用 ✓');
   }
 
-  // gen 副本一致性：CI 会重新 init，本地若存在则必须与规范源完全一致
-  try {
-    const genRaw = readFileSync(GEN_SWIFT, 'utf8');
-    if (genRaw !== rawExt) {
-      fail('src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift 与规范源不一致，请同步');
-    } else {
-      pass('gen/apple 扩展副本与规范源一致 ✓');
+  // gen 副本一致性：CI 每次 init 现生成 gen/apple，本地若存在则必须与规范源
+  // 完全一致——Xcode 实际编译的是 gen/apple 下的副本，双目录漂移会导致
+  // 「本地改对了、CI 仍报错」。控制器与扩展两个文件都要逐一比对。
+  const GEN_PAIRS = [
+    [
+      'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift',
+      'src-tauri/gen/apple/PrismVPN/PacketTunnelProvider.swift',
+    ],
+    [
+      'src-tauri/mobile-src/ios/App/PrismTunnelController.swift',
+      'src-tauri/gen/apple/PrismTunnelController.swift',
+    ],
+  ];
+  for (const [specRel, genRel] of GEN_PAIRS) {
+    try {
+      const genRaw = readFileSync(resolve(ROOT, genRel), 'utf8');
+      const specRaw = readFileSync(resolve(ROOT, specRel), 'utf8');
+      if (genRaw !== specRaw) {
+        fail(`${genRel} 与规范源 ${specRel} 不一致，请同步（Xcode 编译的是 gen 副本）`);
+      } else {
+        pass(`${genRel} 与规范源一致 ✓`);
+      }
+    } catch {
+      pass(`无 ${genRel} 本地副本（CI 每次 init 现生成）✓`);
     }
-  } catch {
-    pass('无 gen/apple 本地副本（CI 每次 init 现生成）✓');
   }
 } catch (e) {
   fail(`读取 PacketTunnelProvider.swift 失败：${e.message}`);

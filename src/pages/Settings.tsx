@@ -648,26 +648,32 @@ export default function Settings() {
           </div>
         </div>
       ) : (
-        /* 已激活：仅单行，左侧 ✨ Prism Pro，右侧订阅到期时间点击弹授权信息 */
-        <div
+        /* 已激活：上下两行排版（第一行标题+徽章，第二行订阅到期时间），
+           与上方 Go Lan 卡片视觉层次完全统一；整张卡片含第二行与右侧
+           「授权信息 >」入口，点击任意位置均弹出授权信息窗口 */
+        <button
+          type="button"
           onClick={() => setProManageOpen(true)}
-          className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-border bg-surface px-4 py-3"
+          className="flex w-full items-center justify-between gap-3 rounded-xl border border-border bg-surface px-4 py-3 text-left transition-colors hover:border-emerald-500/30"
         >
-          <div className="whitespace-nowrap text-sm font-semibold text-text">
-            ✨ Prism Pro
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 shrink-0 text-amber-400" />
+              <span className="text-sm font-semibold text-text">Prism Pro</span>
+              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+                {t("pro.status.active")}
+              </span>
+            </div>
+            <div className="mt-1 truncate text-xs text-text-muted">
+              {t("pro.subscribeExpiry")}:{" "}
+              {permanent ? t("pro.permanent") : fmtDateTime(entitlement.expiresAt)}
+            </div>
           </div>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setProManageOpen(true);
-            }}
-            className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-500/20"
-          >
-            {t("pro.subscribeExpiry")}: {permanent ? t("pro.permanent") : fmtDateTime(entitlement.expiresAt)}
-            <ChevronRight size={12} className="opacity-60" />
-          </button>
-        </div>
+          <div className="flex shrink-0 items-center gap-1 text-xs font-medium text-emerald-400">
+            <span>{t("pro.infoTitle")}</span>
+            <ChevronRight className="h-4 w-4" />
+          </div>
+        </button>
       )}
 
       <ActivateProModal
