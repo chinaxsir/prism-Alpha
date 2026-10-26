@@ -43,7 +43,8 @@ export default function ToastViewport() {
   const toasts = useToast((s) => s.toasts);
 
   return (
-    <div className="fixed top-4 inset-x-4 md:inset-x-auto md:right-4 md:w-80 z-50 space-y-2">
+    // 【APP-4 任务4.2】顶部安全区偏移：iPhone 刘海屏/灵动岛下不遮挡状态栏
+    <div className="fixed top-[calc(env(safe-area-inset-top,24px)+12px)] inset-x-4 md:inset-x-auto md:right-4 md:w-80 z-50 space-y-2">
       {toasts.map((t) => (
         <ToastCard key={t.id} item={t} />
       ))}

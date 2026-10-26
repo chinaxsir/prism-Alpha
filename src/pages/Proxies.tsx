@@ -18,7 +18,6 @@ import { useCoreStore } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
-import { ActivateProModal } from "@/components/ProGate";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
@@ -109,7 +108,6 @@ export default function Proxies() {
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
   const proReady = useProStore((s) => s.ready);
   const proUnlocked = useProStore((s) => s.unlocked);
-  const [showActivate, setShowActivate] = useState(false);
   const [mainSelectorName, setMainSelectorName] = useState("");
   const [current, setCurrent] = useState<string>("");
   const [nodes, setNodes] = useState<ProxyEntry[]>([]);
@@ -133,11 +131,7 @@ export default function Proxies() {
   // 授权是否可用（启动瞬间 ready=false 时保持可用，避免闪烁误锁）
   const proActive = proUnlocked || !proReady;
 
-  /// 未激活授权时的统一拦截：提示 + 弹出激活弹窗，绝不执行筛选/探测
-  const guardPro = () => {
-    toast.error(t("proxies.goAim.guard"));
-    setShowActivate(true);
-  };
+  // 【APP-4 任务3】未激活不再拦截提示：Pro 控件一律 disabled 静默禁用
 
   // 用 ref 保存最新值，避免 useEffect([]) 闭包捕获到初始值（stale closure）。
   // loadProxies 由 core://status / proxies://changed 事件触发，必须读到最新状态。
@@ -350,8 +344,8 @@ export default function Proxies() {
 
   /// Go AIM 解锁探测：结果经 go-aim://updated 事件实时刷新到列表徽章
   const handleAimProbe = async () => {
+    // 【APP-4 任务3】未激活静默忽略（按钮本身已 disabled，此处兜底）
     if (!proActive) {
-      guardPro();
       return;
     }
     if (coreStatus !== "running") {
@@ -470,7 +464,7 @@ export default function Proxies() {
   return (
     <div className="space-y-4">
       {/* Go AIM 筛选 pills + AI 检测入口（Go AIM / AI / 流媒体与检测为 Pro 功能：
-          未激活时锁定并弹激活弹窗，ipa-9） */}
+          【APP-4 任务3】未激活时 disabled 静默禁用，不弹 Toast / 激活窗） */}
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1.5 overflow-x-auto">
           {AIM_FILTERS.map((f) => {
@@ -478,12 +472,15 @@ export default function Proxies() {
             return (
               <button
                 key={f.value}
-                onClick={() => (locked ? guardPro() : setFilter(f.value))}
+                disabled={locked}
+                onClick={() => (locked ? undefined : setFilter(f.value))}
                 className={clsx(
                   "shrink-0 flex items-center gap-1 px-3 py-1 rounded-full text-xs transition-colors",
-                  filter === f.value
-                    ? "bg-accent text-white font-medium"
-                    : "bg-glass text-gray-400 hover:text-gray-200"
+                  locked
+                    ? "bg-glass text-gray-500 opacity-50 cursor-not-allowed"
+                    : filter === f.value
+                      ? "bg-accent text-white font-medium"
+                      : "bg-glass text-gray-400 hover:text-gray-200"
                 )}
               >
                 {locked && <Lock size={12} className="opacity-70" />}
@@ -493,8 +490,14 @@ export default function Proxies() {
           })}
         </div>
         <button
-          onClick={proActive ? handleAimProbe : guardPro}
-          className="ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border-strong text-xs text-gray-300 transition-colors hover:border-accent/40 hover:text-accent"
+          disabled={!proActive}
+          onClick={proActive ? handleAimProbe : undefined}
+          className={clsx(
+            "ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border-strong text-xs transition-colors",
+            proActive
+              ? "text-gray-300 hover:border-accent/40 hover:text-accent"
+              : "text-gray-500 opacity-50 cursor-not-allowed"
+          )}
           title={
             !proActive
               ? t("proxies.goAim.lockedTip")
@@ -658,12 +661,6 @@ export default function Proxies() {
         })}
       </div>
       )}
-
-      {/* Pro 激活弹窗（Go AIM 筛选/检测拦截入口共用） */}
-      <ActivateProModal
-        open={showActivate}
-        onClose={() => setShowActivate(false)}
-      />
     </div>
   );
 }

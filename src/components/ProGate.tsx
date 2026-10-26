@@ -339,7 +339,6 @@ export function ActivateProModal({
 export default function ProGate({
   title,
   description,
-  actionLabel,
   children,
 }: {
   /** 门控的功能标识（保留用于埋点/扩展；文案已统一，APP-5 任务4） */
@@ -348,41 +347,28 @@ export default function ProGate({
   title?: string;
   /** 自定义说明文案（缺省用统一说明） */
   description?: string;
-  /** 自定义按钮文案（缺省「激活 Pro」） */
-  actionLabel?: string;
   children: ReactNode;
 }) {
   const { t } = useTranslation();
   const unlocked = useProStore((s) => s.unlocked);
   const ready = useProStore((s) => s.ready);
-  const [showActivate, setShowActivate] = useState(false);
 
   if (unlocked) return <>{children}</>;
 
   // 启动瞬间（授权状态尚未读出）先保持可用，避免闪烁误锁
   if (!ready) return <>{children}</>;
 
+  // 【APP-4 任务3】未激活仅展示静默锁定卡：不提供任何激活按钮/弹窗，
+  // 全 APP 唯一激活入口为「设置 → Prism Pro」
   return (
-    <>
-      <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-border bg-surface-card px-5 py-6 text-center">
-        <Lock size={18} className="text-accent" />
-        <p className="text-sm text-gray-300">
-          {title ?? t("pro.featureLocked")}
-        </p>
-        <p className="max-w-md text-xs leading-relaxed text-gray-500">
-          {description ?? t("pro.gate.desc")}
-        </p>
-        <button
-          onClick={() => setShowActivate(true)}
-          className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
-        >
-          {actionLabel ?? t("pro.activatePro")}
-        </button>
-      </div>
-      <ActivateProModal
-        open={showActivate}
-        onClose={() => setShowActivate(false)}
-      />
-    </>
+    <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-border bg-surface-card px-5 py-6 text-center opacity-60 select-none">
+      <Lock size={18} className="text-accent" />
+      <p className="text-sm text-gray-300">
+        {title ?? t("pro.featureLocked")}
+      </p>
+      <p className="max-w-md text-xs leading-relaxed text-gray-500">
+        {description ?? t("pro.gate.desc")}
+      </p>
+    </div>
   );
 }

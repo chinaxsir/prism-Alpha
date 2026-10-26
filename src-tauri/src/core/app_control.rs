@@ -377,9 +377,10 @@ fn android_device_info() -> (String, String) {
     use std::ffi::CStr;
     unsafe {
         let prop = |key: &[u8]| -> String {
-            // __system_property_get 缓冲区按 c_char（u8）对齐，92 字节为
-            // PROP_VALUE_MAX 的安全冗余
-            let mut buf = [0u8; 92];
+            // __system_property_get 缓冲区按 libc::c_char 对齐，92 字节为
+            // PROP_VALUE_MAX 的安全冗余。注意 c_char 在 i686/x86_64 Android
+            // 目标上为 i8，若写死 [u8; 92] 会在 32 位 x86 端 E0308 编译失败。
+            let mut buf = [0 as libc::c_char; 92];
             let cname = match std::ffi::CString::new(key) {
                 Ok(c) => c,
                 Err(_) => return String::new(),
@@ -387,7 +388,7 @@ fn android_device_info() -> (String, String) {
             if libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr()) == 0 {
                 return String::new();
             }
-            CStr::from_ptr(buf.as_ptr().cast())
+            CStr::from_ptr(buf.as_ptr())
                 .to_string_lossy()
                 .into_owned()
         };

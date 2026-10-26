@@ -116,12 +116,68 @@ fn split_host_port(s: &str) -> Result<(String, u16)> {
     }
 }
 
-/// 解析 URI 尾部 #fragment 为 name（URL 解码）
+/// 解析 URI 尾部 #fragment 为 name（URL 解码 + UTF-8 字节还原）
 fn decode_name(frag: &str) -> String {
-    urlencoding_decode(frag).unwrap_or_else(|| frag.to_string())
+    let decoded = urlencoding_decode(frag).unwrap_or_else(|| frag.to_string());
+    // 【APP-4 任务1】修复 UTF-8 被按 Latin-1/cp1252 逐字节解码导致的乱码：
+    // 例如 `%E5%AE%B6%E5%AE%BD%E4%BC%98%E9%80%895`（家宽优选5）被旧代码
+    // 按 `byte as char` 逐字节展开为 `å®¶å®½ä¼˜é€‰5`。这里把每个字符
+    // 映射回原始字节再按 UTF-8 重组，能还原出正确中文。
+    fix_utf8_mojibake(&decoded)
 }
 
-/// 简易 URL percent-decode（处理 %20、%40 等）
+/// cp1252/Latin-1 高位字符 → 原始字节映射。
+/// 0x00-0xFF 直接对应；0x80-0x9F 区间在 cp1252 里有特殊字符映射。
+fn cp1252_to_byte(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if code <= 0xFF {
+        return Some(code as u8);
+    }
+    match ch {
+        '€' => Some(0x80), '‚' => Some(0x82), 'ƒ' => Some(0x83),
+        '„' => Some(0x84), '…' => Some(0x85), '†' => Some(0x86),
+        '‡' => Some(0x87), 'ˆ' => Some(0x88), '‰' => Some(0x89),
+        'Š' => Some(0x8A), '‹' => Some(0x8B), 'Œ' => Some(0x8C),
+        'Ž' => Some(0x8E), '‘' => Some(0x91), '’' => Some(0x92),
+        '“' => Some(0x93), '”' => Some(0x94), '•' => Some(0x95),
+        '–' => Some(0x96), '—' => Some(0x97), '˜' => Some(0x98),
+        '™' => Some(0x99), 'š' => Some(0x9A), '›' => Some(0x9B),
+        'œ' => Some(0x9C), 'ž' => Some(0x9E), 'Ÿ' => Some(0x9F),
+        _ => None,
+    }
+}
+
+/// 修复 UTF-8 字节被按 Latin-1/cp1252 单字节解码产生的乱码。
+/// 如果字符串中所有字符都能映射回单字节，且这些字节恰好组成合法
+/// UTF-8 多字节文本（含中文或扩展字符），则还原为正确的 UTF-8 字符串。
+/// 纯 ASCII 或包含无法映射字符时原样返回。
+pub fn fix_utf8_mojibake(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_string();
+    }
+    let mut raw_bytes = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        if let Some(b) = cp1252_to_byte(ch) {
+            raw_bytes.push(b);
+        } else {
+            return s.to_string();
+        }
+    }
+    if let Ok(decoded) = String::from_utf8(raw_bytes) {
+        if decoded != s
+            && decoded
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || c > '\u{00FF}')
+        {
+            return decoded;
+        }
+    }
+    s.to_string()
+}
+
+/// 简易 URL percent-decode（处理 %20、%40 等）。
+/// 注意：返回的是按 Latin-1 逐字节展开的字符串，调用方需配合
+/// `fix_utf8_mojibake` 还原真实 UTF-8 内容。
 fn urlencoding_decode(s: &str) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -792,6 +848,51 @@ mod tests {
         assert_eq!(node["port"], 1080);
         assert_eq!(node["username"], "alice");
         assert_eq!(node["password"], "s3cret");
+    }
+
+    // ============================================================
+    // 【APP-4 任务1】fix_utf8_mojibake 单元测试
+    // ============================================================
+    #[test]
+    fn fix_mojibake_restores_chinese_name() {
+        // "UCN优选1" UTF-8 字节被逐字节按 Latin-1 展开后的乱码
+        let garbled = "UCN\u{00e4}\u{00bc}\u{0098}\u{00e9}\u{0080}\u{0089}1";
+        assert_eq!(fix_utf8_mojibake(garbled), "UCN优选1");
+    }
+
+    #[test]
+    fn fix_mojibake_restores_pure_chinese() {
+        // "家宽优选5" UTF-8 乱码
+        let garbled = "\u{00e5}\u{00ae}\u{00b6}\u{00e5}\u{00ae}\u{00bd}\u{00e4}\u{00bc}\u{0098}\u{00e9}\u{0080}\u{0089}5";
+        assert_eq!(fix_utf8_mojibake(garbled), "家宽优选5");
+    }
+
+    #[test]
+    fn fix_mojibake_keeps_ascii_unchanged() {
+        assert_eq!(fix_utf8_mojibake("HK-01"), "HK-01");
+        assert_eq!(fix_utf8_mojibake("US West"), "US West");
+    }
+
+    #[test]
+    fn fix_mojibake_keeps_normal_unicode_unchanged() {
+        // 正常的中文节点名不应被误改
+        let normal = "香港节点01";
+        assert_eq!(fix_utf8_mojibake(normal), normal);
+    }
+
+    #[test]
+    fn fix_mojibake_mixed_ascii_and_garbled() {
+        // 混合 ASCII + 乱码：只有乱码部分被还原
+        let garbled = "JP-\u{00e6}\u{0097}\u{00a5}\u{00e6}\u{009c}\u{00ac}";
+        assert_eq!(fix_utf8_mojibake(garbled), "JP-日本");
+    }
+
+    #[test]
+    fn percent_decode_plus_fix_mojibake() {
+        // 模拟订阅链接中 #fragment 的 %XX 编码 UTF-8 中文
+        let frag = "%E5%AE%B6%E5%AE%BD%E4%BC%98%E9%80%895";
+        let decoded = urlencoding_decode(frag).unwrap();
+        assert_eq!(fix_utf8_mojibake(&decoded), "家宽优选5");
     }
 
     #[test]

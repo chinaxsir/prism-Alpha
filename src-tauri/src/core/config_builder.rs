@@ -2664,6 +2664,19 @@ rules:
             wg.get("allowed_ips").is_none(),
             "顶层 allowed_ips 会触发内核 unknown field 报错"
         );
+        // 【APP-4 任务5】peers[0] 标准结构：keepalive=15 启动即握手，
+        // allowed_ips 写在 peers[0] 内部（wg-easy 面板才能显示连接与流量）
+        assert_eq!(
+            wg["peers"][0]["persistent_keepalive_interval"].as_u64(),
+            Some(15),
+            "peers[0] 必须带 persistent_keepalive_interval=15 才会主动握手"
+        );
+        assert_eq!(
+            wg["peers"][0]["allowed_ips"][0].as_str(),
+            Some("0.0.0.0/0")
+        );
+        assert_eq!(wg["peers"][0]["server_port"].as_u64(), Some(51820));
+        assert!(wg.get("server").is_none(), "顶层严禁保留 server 字段");
         assert_eq!(
             wg["local_address"][0].as_str(),
             Some("10.8.0.2/24"),

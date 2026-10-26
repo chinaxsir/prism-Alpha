@@ -422,6 +422,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.stateLock.unlock()
 
                 self.writeHeartbeat("running(\(currentPhy.name))")
+                // 【APP-4 任务5】隧道启动 1 秒后向内网网关发轻量探测，
+                // 触发 WireGuard 首次握手（wg-easy 面板即时在线/流量）
+                self.scheduleGoLanWarmup(sanitizedConfig: sanitizedConfig)
                 DispatchQueue.main.async {
                     self.startHeartbeatTimer()
                     completionHandler(nil)
@@ -911,6 +914,72 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return false
     }
 
+    // MARK: - Go Lan 主动握手探测（APP-4 任务5）
+
+    /// 隧道启动成功 1 秒后，经 Clash API 对 go-lan-home 出站向内网网关发起
+    /// 轻量延迟探测：网关取 local_address 末段改 .1（如 10.1.8.2/24 → 10.1.8.1）
+    /// 以及 route.rules 中各回家网段的 .1。探测包穿过隧道即触发 WireGuard
+    /// Handshake——配合 peers[0].persistent_keepalive_interval=15 的启动即
+    /// 握手，wg-easy 面板立即显示在线与实时流量（与桌面端
+    /// spawn_go_lan_warmup 对齐；结果不重要，发包即可）。
+    private func scheduleGoLanWarmup(sanitizedConfig: String) {
+        guard let data = sanitizedConfig.data(using: .utf8),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+
+        // 仅当配置里确实存在 go-lan-home WireGuard 出站时才需要探测
+        let outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
+        guard let wg = outbounds.first(where: {
+            ($0["tag"] as? String) == "go-lan-home" && ($0["type"] as? String) == "wireguard"
+        }) else { return }
+
+        var gateways: [String] = []
+        func pushGateway(_ ip: String) {
+            let parts = ip.split(separator: ".")
+            guard parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }) else { return }
+            let gw = "\(parts[0]).\(parts[1]).\(parts[2]).1"
+            if !gateways.contains(gw) { gateways.append(gw) }
+        }
+        let localAddrs = (wg["local_address"] as? [String])
+            ?? (wg["local_address"] as? String).map { [$0] }
+            ?? []
+        for la in localAddrs {
+            pushGateway(la.split(separator: "/").first.map(String.init) ?? "")
+        }
+        let rules = ((root["route"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
+            for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
+                pushGateway(cidr.split(separator: "/").first.map(String.init) ?? "")
+            }
+        }
+        guard !gateways.isEmpty else { return }
+
+        // Clash API 地址与密钥（与桌面端 KernelApi.test_delay 一致）
+        guard let clashAPI = (root["experimental"] as? [String: Any])?["clash_api"] as? [String: Any],
+              let controller = clashAPI["external_controller"] as? String,
+              !controller.isEmpty else { return }
+        let secret = clashAPI["secret"] as? String
+        let base = controller.hasPrefix("http") ? controller : "http://\(controller)"
+
+        vpnQueue.asyncAfter(deadline: .now() + 1.0) {
+            for gw in gateways {
+                var comps = URLComponents(string: "\(base)/proxies/go-lan-home/delay")
+                comps?.queryItems = [
+                    URLQueryItem(name: "url", value: "http://\(gw)"),
+                    URLQueryItem(name: "timeout", value: "1500"),
+                ]
+                guard let url = comps?.url else { continue }
+                var req = URLRequest(url: url, timeoutInterval: 3.5)
+                if let secret = secret, !secret.isEmpty {
+                    req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+                }
+                // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
+                URLSession.shared.dataTask(with: req).resume()
+            }
+            NSLog("[PrismVPN] [go-lan] 主动握手探测已触发 \(gateways)")
+        }
+    }
+
     // MARK: - go-lan-home 剥离兜底（APP-8 任务4）
 
     /// 从配置 JSON 中剥离 go-lan-home WireGuard 出站及其关联引用，
@@ -1091,11 +1160,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 【APP-11 任务1.1】Legacy WireGuard 单节点顶层**没有**
                 // allowed_ips 字段，写入会触发内核
                 // "decode config: outbounds[n].allowed_ips: json: unknown field"，
-                // 直接拒绝启动。必须无条件剥离；peers 也统一收敛为顶层单节点结构。
+                // 直接拒绝启动。必须无条件剥离。
+                // 【APP-4 任务5】go-lan-home 已改用 sing-box 标准 peers 数组结构
+                // （allowed_ips / persistent_keepalive_interval: 15 写在 peers[0]
+                // 内部，启动即主动握手 + 15s 心跳，wg-easy 面板实时在线/流量），
+                // 严禁再剥离 peers——peers 是唯一合法承载结构。
                 outbounds[i].removeValue(forKey: "allowed_ips")
-                if tag == "go-lan-home" {
-                    outbounds[i].removeValue(forKey: "peers")
-                }
                 // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
                 if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
                     outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }

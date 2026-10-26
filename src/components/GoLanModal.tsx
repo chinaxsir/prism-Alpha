@@ -95,74 +95,102 @@ function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
 const INVISIBLE_CHARS = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\s]/g;
 const cleanInput = (s: string): string => s.replace(INVISIBLE_CHARS, "");
 
-/** 解析 WireGuard .conf 全文为 GoLanForm 片段
+/** 零宽隐形字符（保留空白与换行，供逐行解析使用） */
+const INVISIBLE_ONLY = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
+
+const WG_KNOWN_KEYS =
+  /^(PrivateKey|Address|DNS|MTU|ListenPort|Table|PublicKey|PresharedKey|PreSharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=/i;
+
+/** 【APP-4 任务4】解析 WireGuard .conf 全文为 GoLanForm 片段
  *
- * 识别 [Interface] 的 PrivateKey/Address/MTU 与 [Peer] 的
- * PublicKey/PresharedKey/Endpoint/AllowedIPs，自动填充所有字段。
- * 同时剔除所有零宽隐形字符。
+ * 折行合并解析算法：同时兼容 wg-easy 标准配置与微信跨行折行配置——
+ * 只有以标准 WG 关键字开头的行才开启新字段，其余非注释/非节名行自动
+ * 拼接到上一字段末尾（PrivateKey =\noJms...\nkJj...= 场景）。
+ *
+ * 自动提取：
+ * - [Interface] PrivateKey/Address/MTU（MTU > 1380 默认 1280）
+ * - [Peer] PublicKey/PresharedKey/Endpoint（按最后一个 : 拆分 host/port）
+ * - 从 Address 推导 /24 内网网段（10.1.8.2/24 → 10.1.8.0/24）+
+ *   AllowedIPs 中非默认网段，一并填入「回家内网网段」
+ * - 识别成功后自动开启「启用 Go Lan」开关
  */
 function parseWgConf(text: string): Partial<GoLanForm> | null {
-  const cleaned = cleanInput(text);
-  if (!cleaned.includes("[Interface]") && !cleaned.startsWith("wireguard://")) {
-    return null;
-  }
-  const out: Partial<GoLanForm> = {};
-  const lines = cleaned.split(/\r?\n/);
+  const cleaned = text.replace(INVISIBLE_ONLY, "");
+  if (!/\[interface\]/i.test(cleaned)) return null;
+
+  const entries: { section: string; key: string; value: string }[] = [];
   let section = "";
-  let endpointHost = "";
-  let endpointPort = 0;
-  const allowedIps: string[] = [];
-  for (const raw of lines) {
-    const line = raw.trim();
+  for (const rawLine of cleaned.split(/\r?\n/)) {
+    const line = rawLine.trim();
     if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-    if (line.startsWith("[") && line.endsWith("]")) {
-      section = line.slice(1, -1).toLowerCase();
+    if (/^\[interface\]$/i.test(line)) {
+      // 两段 [Interface]（服务端+客户端拼接）且尚无 [Peer] 时重置之前的字段
+      if (!entries.some((e) => e.section === "peer")) entries.length = 0;
+      section = "interface";
       continue;
     }
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim().toLowerCase();
-    const val = line.slice(eq + 1).trim();
-    if (section === "interface") {
-      if (key === "privatekey") out.wgPrivateKey = val;
-      else if (key === "address") out.wgLocalIp = val.split(",")[0].trim();
-      else if (key === "mtu") {
-        const n = parseInt(val, 10);
-        if (!isNaN(n) && n > 0) out.wgMtu = n;
-      }
-    } else if (section === "peer") {
-      if (key === "publickey") out.wgPeerPublicKey = val;
-      else if (key === "presharedkey") out.wgPreSharedKey = val;
-      else if (key === "endpoint") {
-        const idx = val.lastIndexOf(":");
-        if (idx > 0) {
-          endpointHost = val.slice(0, idx).replace(/^\[|\]$/g, "");
-          endpointPort = parseInt(val.slice(idx + 1), 10) || 51820;
-        }
-      } else if (key === "allowedips") {
-        for (const cidr of val.split(",")) {
-          const t = cidr.trim();
-          if (t && t !== "0.0.0.0/0" && t !== "::/0") allowedIps.push(t);
-        }
-      }
+    if (/^\[peer\]$/i.test(line)) {
+      section = "peer";
+      continue;
+    }
+    if (WG_KNOWN_KEYS.test(line)) {
+      const eq = line.indexOf("=");
+      const key = line.slice(0, eq).trim().toLowerCase();
+      const value = line
+        .slice(eq + 1)
+        .replace(/#.*$/, "")
+        .trim();
+      entries.push({ section, key, value });
+    } else if (entries.length > 0) {
+      // 微信折行续行：无缝拼接到上一字段末尾
+      entries[entries.length - 1].value += line.replace(/\s+/g, "");
     }
   }
-  if (endpointHost) {
-    out.wgServer = endpointHost;
-    out.wgServerPort = endpointPort || 51820;
+
+  const get = (sec: string, key: string) =>
+    entries.find((e) => e.section === sec && e.key === key)?.value;
+
+  const out: Partial<GoLanForm> = {};
+  const priv = get("interface", "privatekey");
+  if (priv) out.wgPrivateKey = priv;
+  const addr = get("interface", "address");
+  if (addr) out.wgLocalIp = addr.split(",")[0].trim();
+  const mtuRaw = get("interface", "mtu");
+  if (mtuRaw) {
+    const n = parseInt(mtuRaw, 10);
+    if (!isNaN(n) && n > 0) out.wgMtu = n > 1380 ? WG_DEFAULTS.mtu : n;
   }
-  // AllowedIPs + Address 所在 /24 网段并入回家内网网段
-  const cidrs = new Set<string>(allowedIps);
+  const pub = get("peer", "publickey");
+  if (pub) out.wgPeerPublicKey = pub;
+  const psk = get("peer", "presharedkey");
+  if (psk) out.wgPreSharedKey = psk;
+  const ep = get("peer", "endpoint");
+  if (ep) {
+    const idx = ep.lastIndexOf(":");
+    if (idx > 0) {
+      out.wgServer = ep.slice(0, idx).replace(/^\[|\]$/g, "").trim();
+      out.wgServerPort = parseInt(ep.slice(idx + 1), 10) || 51820;
+    } else {
+      out.wgServer = ep.trim();
+      out.wgServerPort = 51820;
+    }
+  }
+  // 回家内网网段：Address 所在 /24 + AllowedIPs 非默认网段
+  const cidrs = new Set<string>();
   if (out.wgLocalIp) {
-    const ipPart = out.wgLocalIp.split("/")[0];
-    const parts = ipPart.split(".");
-    if (parts.length === 4) {
-      cidrs.add(`${parts[0]}.${parts[1]}.${parts[2]}.0/24`);
+    const parts = out.wgLocalIp.split("/")[0].split(".");
+    if (parts.length === 4) cidrs.add(`${parts[0]}.${parts[1]}.${parts[2]}.0/24`);
+  }
+  const allowed = get("peer", "allowedips");
+  if (allowed) {
+    for (const c of allowed.split(",")) {
+      const seg = c.trim();
+      if (seg && seg !== "0.0.0.0/0" && seg !== "::/0") cidrs.add(seg);
     }
   }
-  if (cidrs.size > 0) {
-    out.lanCidrs = Array.from(cidrs).join("\n");
-  }
+  if (cidrs.size > 0) out.lanCidrs = Array.from(cidrs).join("\n");
+  // 识别成功自动开启「启用 Go Lan」
+  out.enabled = true;
   return out;
 }
 
@@ -182,6 +210,8 @@ export default function GoLanModal({ open, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [pasteBuf, setPasteBuf] = useState("");
+  // 【APP-4 任务4】内联黄色提示（替代遮挡状态栏的顶部 Toast 报错）
+  const [pasteHint, setPasteHint] = useState("");
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）
   useEffect(() => {
@@ -197,25 +227,45 @@ export default function GoLanModal({ open, onClose }: Props) {
 
   const patch = (p: Partial<GoLanForm>) => setForm((f) => ({ ...f, ...p }));
 
-  /** 一键粘贴 .conf 自动识别 */
+  /** 【APP-4 任务4】统一识别入口：严格非空校验——确实解析出
+   *  privateKey / peerPublicKey / server 之一才算成功，严禁假阳性提示 */
+  const recognizeFromText = (
+    text: string,
+    opts?: { silent?: boolean },
+  ): boolean => {
+    const parsed = parseWgConf(text);
+    if (
+      parsed &&
+      (parsed.wgPrivateKey || parsed.wgPeerPublicKey || parsed.wgServer)
+    ) {
+      patch(parsed);
+      setPasteHint("");
+      if (!opts?.silent) {
+        toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
+      }
+      return true;
+    }
+    return false;
+  };
+
+  /** 一键识别按钮：粘贴框优先，为空再读系统剪贴板；都为空给内联黄色提示 */
   const handlePasteRecognize = async () => {
     let text = pasteBuf;
-    if (!text) {
+    if (!text.trim()) {
       try {
         text = await navigator.clipboard.readText();
       } catch {
-        toast.error(t("common.pasteFailed") || "读取剪贴板失败，请手动粘贴到下方文本框");
-        return;
+        text = "";
       }
+      if (text) setPasteBuf(text);
     }
-    const parsed = parseWgConf(text);
-    if (!parsed) {
-      toast.error("未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式");
+    if (!text.trim()) {
+      setPasteHint("请先将 WireGuard 配置文本长按粘贴到上方输入框中");
       return;
     }
-    patch(parsed);
-    setPasteBuf("");
-    toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
+    if (!recognizeFromText(text)) {
+      setPasteHint("未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式");
+    }
   };
 
   const handleSyncManaged = async () => {
@@ -308,12 +358,14 @@ export default function GoLanModal({ open, onClose }: Props) {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
       onClick={onClose}
     >
+      {/* 【APP-4 任务4.2】三段式布局：固定头部 / 可滚动中部 / 固定底部，
+          底部保存按钮永远完整显示不被屏幕截断 */}
       <div
-        className="max-h-[90vh] w-full max-w-md space-y-4 overflow-y-auto rounded-xl bg-surface-card p-5"
+        className="flex max-h-[82vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-border bg-surface"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* 标题栏 */}
-        <div className="flex items-center justify-between">
+        {/* 标题栏（固定） */}
+        <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
           <div className="flex items-center gap-2">
             <Home size={16} className="text-accent" />
             <h3 className="text-sm font-semibold">Go Lan · 回家内网配置</h3>
@@ -326,6 +378,9 @@ export default function GoLanModal({ open, onClose }: Props) {
             <X size={16} />
           </button>
         </div>
+
+        {/* 可滚动表单区 */}
+        <div className="flex-1 space-y-2.5 overflow-y-auto px-4 py-3">
 
         {/* 模式切换 */}
         <div className="flex gap-2 rounded-lg bg-surface-hover p-1 text-xs">
@@ -358,11 +413,32 @@ export default function GoLanModal({ open, onClose }: Props) {
               </button>
               <textarea
                 value={pasteBuf}
-                onChange={(e) => setPasteBuf(e.target.value)}
-                placeholder="或手动粘贴 [Interface] ... [Peer] ... 全文到此处，再点上方按钮"
+                onPaste={(e) => {
+                  // 【APP-4 任务4】粘贴瞬间立即解析填入，无需再点按钮
+                  const txt = e.clipboardData.getData("text");
+                  if (!txt) return;
+                  e.preventDefault();
+                  setPasteBuf(txt);
+                  recognizeFromText(txt);
+                }}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setPasteBuf(v);
+                  setPasteHint("");
+                  // 兜底：部分 WebView onPaste 不触发时，onChange 静默即时解析
+                  if (/\[interface\]/i.test(v)) {
+                    recognizeFromText(v, { silent: true });
+                  }
+                }}
+                placeholder="粘贴 [Interface] ... [Peer] ... 全文到此处，松开即刻自动识别填入"
                 rows={3}
                 className="mt-2 w-full resize-none rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-[11px] text-gray-300 placeholder-gray-600 focus:border-accent focus:outline-none"
               />
+              {pasteHint && (
+                <p className="mt-1.5 text-[11px] leading-snug text-yellow-400">
+                  {pasteHint}
+                </p>
+              )}
             </div>
 
             {/* 回家网段 */}
@@ -518,9 +594,10 @@ export default function GoLanModal({ open, onClose }: Props) {
             onChange={(v) => patch({ enabled: v })}
           />
         </div>
+        </div>
 
-        {/* 底部按钮 */}
-        <div className="flex gap-2 pt-2">
+        {/* 底部操作栏（固定，永不被屏幕底部截断） */}
+        <div className="flex shrink-0 gap-2 border-t border-border bg-surface px-4 py-3">
           <button
             onClick={onClose}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"

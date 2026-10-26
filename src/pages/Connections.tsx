@@ -137,7 +137,6 @@ export default function Connections() {
         feature={Feature.Connections}
         title={t(expired ? "pro.conn.expiredTitle" : "pro.conn.lockedTitle")}
         description={t("pro.conn.lockedDesc")}
-        actionLabel={expired ? t("pro.renew") : undefined}
       >
         {null}
       </ProGate>

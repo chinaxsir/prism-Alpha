@@ -9,7 +9,6 @@ import {
   updateSubscription,
   type SubscriptionRecord,
 } from "@/api/ipc";
-import { ActivateProModal } from "@/components/ProGate";
 import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
 import Switch from "@/components/ui/Switch";
@@ -43,7 +42,6 @@ export default function Subscription() {
   const [adding, setAdding] = useState(false);
   const [updatingUrl, setUpdatingUrl] = useState<string | null>(null);
   const [confirmUrl, setConfirmUrl] = useState<string | null>(null);
-  const [showActivate, setShowActivate] = useState(false);
   const unlocked = useProStore((s) => s.unlocked);
 
   const load = useCallback(async () => {
@@ -77,8 +75,8 @@ export default function Subscription() {
       return;
     }
     // 免费版仅支持单订阅：第二条起需要 Pro（全平台门控）
+    // 【APP-4 任务3】未激活点击静默忽略：不弹 Toast / 激活弹窗
     if (!unlocked && subs.length >= 1) {
-      setShowActivate(true);
       return;
     }
     setAdding(true);
@@ -302,11 +300,6 @@ export default function Subscription() {
           </div>
         )}
       </div>
-
-      <ActivateProModal
-        open={showActivate}
-        onClose={() => setShowActivate(false)}
-      />
     </div>
   );
 }

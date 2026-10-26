@@ -18,11 +18,11 @@ import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 
-/** 【APP-12 任务2.3】Prism Pro 授权详情弹窗
+/** 【APP-12 任务2.3】Prism Pro 授权信息弹窗
  *
  * 承载原 Settings 页 PRISM PRO 大表格的全部内容：
- * 设备 ID（带复制）/ APP 版本 / 当前方案 / 到期时间 / 设备名额 / 上次校验，
- * 底部保留「立即校验」「移除授权」两个操作。
+ * 设备 ID（带复制）/ APP 版本 / 当前方案 / 到期时间（含剩余）/ 设备名额 / 上次校验，
+ * 底部保留「校验授权」「反向激活」两个操作。
  */
 
 /** 授权状态 → 文案 key 与状态点颜色 */
@@ -103,6 +103,17 @@ export default function ProManageModal({ open, onClose }: Props) {
   const [confirmDeactivate, setConfirmDeactivate] = useState(false);
   const [deactivating, setDeactivating] = useState(false);
 
+  // 【APP-4 任务2】剩余天数：订阅版在到期时间旁展示
+  const remainDays = (() => {
+    const permanent =
+      entitlement.plan === "team" ||
+      (entitlement.kind === "lifetime" && !entitlement.expiresAt);
+    if (permanent || !entitlement.expiresAt) return null;
+    const ms = entitlement.expiresAt * 1000 - Date.now();
+    if (Number.isNaN(ms) || ms <= 0) return null;
+    return Math.ceil(ms / 86_400_000);
+  })();
+
   useEffect(() => {
     if (!open) return;
     getDeviceId()
@@ -153,8 +164,8 @@ export default function ProManageModal({ open, onClose }: Props) {
     }
   };
 
-  // ipa-8：移除授权——组件内二次确认替代 window.confirm：
-  // 第一次点击进入红色确认态（3 秒未点击自动恢复），第二次点击才真正执行移除
+  // ipa-8：反向激活——组件内二次确认替代 window.confirm：
+  // 第一次点击进入红色确认态（3 秒未点击自动恢复），第二次点击才真正执行解绑
   const handleDeactivate = async () => {
     if (!confirmDeactivate) {
       setConfirmDeactivate(true);
@@ -189,7 +200,7 @@ export default function ProManageModal({ open, onClose }: Props) {
         <div className="flex items-center justify-between px-5 pb-3 pt-4">
           <div className="flex items-center gap-2">
             <Sparkles size={16} className="text-accent" />
-            <h3 className="text-sm font-semibold">Prism Pro · 授权详情</h3>
+            <h3 className="text-sm font-semibold">{t("pro.infoTitle")}</h3>
           </div>
           <div className="flex items-center gap-2">
             <span className="flex items-center gap-1.5 text-xs text-gray-400">
@@ -273,6 +284,12 @@ export default function ProManageModal({ open, onClose }: Props) {
                 (entitlement.kind === "lifetime" && !entitlement.expiresAt)
                   ? t("pro.permanent")
                   : fmtDateTime(entitlement.expiresAt)}
+                {/* 【APP-4 任务2】到期时间附剩余天数 */}
+                {remainDays !== null && (
+                  <span className="text-[11px] text-gray-500">
+                    ({t("pro.remainDays", { days: remainDays })})
+                  </span>
+                )}
                 {expiringSoon(entitlement.expiresAt) && (
                   <span className="text-[11px] text-yellow-400">
                     {t("pro.expiringSoon")}
@@ -295,7 +312,7 @@ export default function ProManageModal({ open, onClose }: Props) {
           />
         </div>
 
-        {/* 底部操作：立即校验 / 移除授权 */}
+        {/* 底部操作：校验授权 / 反向激活 */}
         <div className="flex gap-2 px-5 py-4">
           <button
             onClick={handleVerifyEntitlement}

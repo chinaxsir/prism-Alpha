@@ -51,7 +51,6 @@ import { delayClass, delayText } from "@/utils/latency";
 import { isMobile } from "@/pro/gating";
 import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
-import { ActivateProModal } from "@/components/ProGate";
 import GoLanModal from "@/components/GoLanModal";
 import Switch from "@/components/ui/Switch";
 
@@ -89,7 +88,6 @@ export default function Dashboard() {
 
   // Pro 授权状态（APP-13 任务3：入口常驻，未激活时卡片整体置灰）
   const proUnlocked = useProStore((s) => s.unlocked);
-  const [showActivate, setShowActivate] = useState(false);
   // 【APP-12 任务2.2】Go Lan 配置弹窗：仪表盘「配置」按钮页内直开，不再跳设置页
   const [goLanModalOpen, setGoLanModalOpen] = useState(false);
 
@@ -545,7 +543,6 @@ export default function Dashboard() {
           status={proUnlocked ? aimStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (aim?.enabled ?? false)}
           locked={!proUnlocked}
-          onLockedClick={() => setShowActivate(true)}
           onToggle={toggleAim}
           action={
             proUnlocked && aim?.enabled ? (
@@ -569,7 +566,6 @@ export default function Dashboard() {
           status={proUnlocked ? lanStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
-          onLockedClick={() => setShowActivate(true)}
           onToggle={toggleLan}
           action={
             proUnlocked ? (
@@ -589,7 +585,6 @@ export default function Dashboard() {
           status={proUnlocked ? cusStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (cus?.enabled ?? false)}
           locked={!proUnlocked}
-          onLockedClick={() => setShowActivate(true)}
           onToggle={toggleCus}
           action={
             proUnlocked ? (
@@ -762,11 +757,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Pro 激活弹窗（未激活横幅卡「激活 Pro」入口共用） */}
-      <ActivateProModal
-        open={showActivate}
-        onClose={() => setShowActivate(false)}
-      />
+      {/* 【APP-4 任务3】未激活不再提供任何激活弹窗入口，Pro 功能一律静默禁用 */}
       <GoLanModal
         open={goLanModalOpen}
         onClose={() => setGoLanModalOpen(false)}
@@ -824,8 +815,8 @@ function StatChip({
 
 /// Pro 引擎卡（ipa-8）：横向通栏布局——左侧图标+完整标题+功能标签胶囊+一行状态
 /// 副标题，右侧「配置/重测」轻按钮 + Switch；移动端不再因 grid-cols-3 窄卡片截断文字
-/// 【APP-13 任务3】locked=true 时整卡置灰、Switch 禁用，点击卡片触发
-/// onLockedClick（弹激活授权弹窗），功能入口位置保持固定。
+/// 【APP-4 任务3】locked=true 时整卡静默置灰禁用（opacity-50 + 无任何点击响应），
+/// 不再弹 Toast 或激活弹窗。
 function EngineCard({
   icon,
   name,
@@ -835,7 +826,6 @@ function EngineCard({
   onToggle,
   action,
   locked = false,
-  onLockedClick,
 }: {
   icon: ReactNode;
   name: string;
@@ -845,14 +835,11 @@ function EngineCard({
   onToggle: (v: boolean) => void;
   action?: ReactNode;
   locked?: boolean;
-  onLockedClick?: () => void;
 }) {
   return (
     <div
-      onClick={locked ? onLockedClick : undefined}
-      role={locked ? "button" : undefined}
       className={`flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border ${
-        locked ? "opacity-60 cursor-pointer" : ""
+        locked ? "opacity-50 select-none cursor-not-allowed" : ""
       }`}
     >
       <div className="min-w-0 flex-1">
@@ -874,10 +861,7 @@ function EngineCard({
           {status}
         </div>
       </div>
-      <div
-        className="flex items-center gap-2.5 shrink-0"
-        onClick={locked ? (e) => e.stopPropagation() : undefined}
-      >
+      <div className="flex items-center gap-2.5 shrink-0">
         {action}
         <Switch checked={enabled} disabled={locked} onChange={onToggle} />
       </div>

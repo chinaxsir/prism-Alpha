@@ -375,13 +375,26 @@ pub fn parse_wireguard_uri(uri: &str) -> Result<WgManualConfig, String> {
 /// 铁律：键值必须用 `split_once('=')` 切割——`split('=').nth(1)` 会把
 /// 密钥末尾的填充 `=` 吃掉，正是 byte 43 报错的来源之一。
 /// 可选 PresharedKey 无效时置 None。
+///
+/// 【APP-4 任务4】折行合并解析（与前端 GoLanModal.parseWgConf 同一算法）：
+/// 只有以已知 WG 关键字开头的行才开启新字段，无 `=` 的非注释/非节名行
+/// 自动拼接到上一字段末尾——兼容微信/IM 把 44 位 Base64 密钥折成两行的场景。
 pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
-    let mut private_key: Option<String> = None;
-    let mut peer_public_key: Option<String> = None;
-    let mut pre_shared_key: Option<String> = None;
-    let mut local_ip = String::new();
-    let mut endpoint: Option<String> = None;
-    let mut mtu = default_mtu();
+    const KNOWN_KEYS: [&str; 11] = [
+        "privatekey",
+        "address",
+        "dns",
+        "mtu",
+        "listenport",
+        "table",
+        "publickey",
+        "presharedkey",
+        "allowedips",
+        "endpoint",
+        "persistentkeepalive",
+    ];
+    // (是否 [Peer] 段, 键, 值)
+    let mut entries: Vec<(bool, String, String)> = Vec::new();
     let mut in_peer = false;
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -396,42 +409,55 @@ pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
             in_peer = true;
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match (in_peer, key.as_str()) {
-            (false, "privatekey") => private_key = Some(value.to_string()),
-            (false, "address") => {
-                if local_ip.is_empty() {
-                    local_ip = value.split(',').next().unwrap_or("").trim().to_string();
-                }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim().to_ascii_lowercase();
+            if KNOWN_KEYS.contains(&key.as_str()) {
+                // 行内注释剔除（# 之后的内容）
+                let value = line[eq + 1..]
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                entries.push((in_peer, key, value));
+                continue;
             }
-            (false, "mtu") => mtu = value.parse().unwrap_or(default_mtu()),
-            (true, "publickey") => peer_public_key = Some(value.to_string()),
-            (true, "presharedkey") => pre_shared_key = Some(value.to_string()),
-            (true, "endpoint") => endpoint = Some(value.to_string()),
-            _ => {}
+            // 含 '=' 但不是已知键 → 视为折行续行（Base64 密钥末尾的 = 填充），
+            // 落入下方续行拼接；与前端 GoLanModal 的 KNOWN_KEYS 正则算法一致。
+        }
+        // 续行：无缝拼接到上一字段末尾（微信折行 / Base64 尾位 = 片段）
+        if let Some(last) = entries.last_mut() {
+            last.2.push_str(&line.split_whitespace().collect::<String>());
         }
     }
-    let private_key = normalize_wg_key(&private_key.ok_or("缺少 PrivateKey")?)
+    let get = |peer: bool, key: &str| {
+        entries
+            .iter()
+            .find(|(p, k, _)| *p == peer && k == key)
+            .map(|(_, _, v)| v.clone())
+    };
+    let private_key = normalize_wg_key(&get(false, "privatekey").ok_or("缺少 PrivateKey")?)
         .ok_or("PrivateKey 不是合法的 32 字节密钥")?;
     let peer_public_key =
-        normalize_wg_key(&peer_public_key.ok_or("缺少 Peer PublicKey")?)
+        normalize_wg_key(&get(true, "publickey").ok_or("缺少 Peer PublicKey")?)
             .ok_or("Peer PublicKey 不是合法的 32 字节密钥")?;
-    let (server, server_port) = split_endpoint(&endpoint.ok_or("缺少 Endpoint")?)?;
+    let pre_shared_key = get(true, "presharedkey").and_then(|k| normalize_wg_key(&k));
+    let local_ip = get(false, "address")
+        .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "10.0.0.2/32".into());
+    let mtu = get(false, "mtu")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(default_mtu);
+    let endpoint = get(true, "endpoint").ok_or("缺少 Endpoint")?;
+    let (server, server_port) = split_endpoint(&endpoint)?;
     Ok(WgManualConfig {
         server,
         server_port,
         private_key,
         peer_public_key,
-        pre_shared_key: pre_shared_key.and_then(|k| normalize_wg_key(&k)),
-        local_ip: if local_ip.is_empty() {
-            "10.0.0.2/32".into()
-        } else {
-            local_ip
-        },
+        pre_shared_key,
+        local_ip,
         mtu,
     })
 }
@@ -459,6 +485,13 @@ pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), 
 /// 否则返回 None——**严禁**把空串、未解码的 `%3D` 或长度不对的密钥写入
 /// 生成的 prism_config.json，防止内核 decode base64 失败导致启动崩溃。
 /// 可选 pre_shared_key 仅在通过校验时写入；无效 PSK 忽略并给出警告。
+///
+/// 【APP-4 任务5】改用 sing-box 标准 `peers` 数组结构：
+/// - `allowed_ips` / `persistent_keepalive_interval` 是 peers[0] 的合法字段
+///   （顶层写 allowed_ips 会触发 `json: unknown field` 内核拒绝启动）；
+/// - `persistent_keepalive_interval: 15` 让 wireguard-go 启动第 0 秒主动向
+///   服务端发送 Handshake 握手包并每 15 秒心跳——wg-easy 面板由此才能
+///   立即显示在线状态与实时流量（Legacy 顶层单节点结构不会主动握手）。
 fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
@@ -469,32 +502,35 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     // 【APP-11B】先剔除 \u2060 等隐形字符再解析
     let server = resolve_endpoint_host_to_ip(&strip_invisible_and_non_ascii(&wg.server));
     let local_address = normalize_local_address(&wg.local_ip);
-    // 【APP-11 任务1.1】严禁在 wireguard 出站**顶层**写入 "allowed_ips"！
-    // sing-box v1.11.3 的 Legacy WireGuard 单节点结构顶层不存在该字段，
-    // 写入会直接触发 `decode config: outbounds[n].allowed_ips: json: unknown
-    // field "allowed_ips"`，内核拒绝启动。单节点顶层模式内核已自动将
-    // AllowedIPs 视为 0.0.0.0/0 + ::/0（全量放行），无需也无法显式声明。
-    let mut outbound = json!({
-        "type": "wireguard",
-        "tag": GO_LAN_TAG,
+    // 【APP-4 任务5】peers[0] 标准结构：allowed_ips 与 keepalive 只能写在
+    // peers 数组元素内部；allowed_ips=0.0.0.0/0 宣告全量放行，
+    // persistent_keepalive_interval=15 触发启动即握手 + 15s 心跳。
+    let mut peer = json!({
         "server": server,
         "server_port": wg.server_port,
-        "private_key": private_key,
-        "peer_public_key": peer_public_key,
-        "local_address": [local_address],
-        // iOS 关闭 IPv6 时双栈 Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
-        // 强制 ipv4_only 保证 UDP（WireGuard）可正常发握手包
-        "domain_strategy": "ipv4_only",
+        "public_key": peer_public_key,
+        "allowed_ips": ["0.0.0.0/0"],
+        "persistent_keepalive_interval": 15,
     });
     if let Some(psk) = &wg.pre_shared_key {
         match normalize_wg_key(psk) {
-            Some(valid) => outbound["pre_shared_key"] = Value::String(valid),
+            Some(valid) => peer["pre_shared_key"] = Value::String(valid),
             None if !psk.trim().is_empty() => {
                 warnings.push("预共享密钥格式无效，已忽略（不影响连接）".into());
             }
             None => {}
         }
     }
+    let mut outbound = json!({
+        "type": "wireguard",
+        "tag": GO_LAN_TAG,
+        "private_key": private_key,
+        "local_address": [local_address],
+        "peers": [peer],
+        // iOS 关闭 IPv6 时双栈 Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
+        // 强制 ipv4_only 保证 UDP（WireGuard）可正常发握手包
+        "domain_strategy": "ipv4_only",
+    });
     // 【APP-10 任务1.2】MTU 上限 1380：外层 TUN 1400 套内层 WireGuard
     // 封装（60 字节头）后不分片；用户配置 > 1380 时强制压到 1380
     let mtu = if wg.mtu > 0 { wg.mtu.min(1380) } else { 1280 };
@@ -963,7 +999,14 @@ mod tests {
         let ob = outbound.expect("应构建出 WireGuard 出站");
         assert_eq!(ob["type"], "wireguard");
         assert_eq!(ob["tag"], GO_LAN_TAG);
-        assert_eq!(ob["server_port"], 51820);
+        // 【APP-4 任务5】peers[0] 标准结构：server/port/public_key/keepalive
+        // 全部在 peers 数组元素内部，顶层严禁出现
+        assert_eq!(ob["peers"][0]["server_port"], 51820);
+        assert_eq!(ob["peers"][0]["persistent_keepalive_interval"], 15);
+        assert_eq!(ob["peers"][0]["allowed_ips"][0], "0.0.0.0/0");
+        assert!(ob.get("server").is_none(), "顶层严禁保留 server 字段");
+        assert!(ob.get("peer_public_key").is_none(), "顶层严禁保留 peer_public_key");
+        assert!(ob.get("allowed_ips").is_none(), "顶层严禁出现 allowed_ips");
         // 【APP-12 任务1.2】/32 自动扩为 /24，wireguard-go 内部路由表
         // 可识别同网段网关（10.0.0.1）
         assert_eq!(ob["local_address"][0], "10.0.0.2/24");
@@ -1110,6 +1153,26 @@ mod tests {
         assert_eq!(wg.mtu, 1400);
     }
 
+    /// 【APP-4 任务4】微信折行 .conf：44 位 Base64 密钥被折成两行
+    /// （PrivateKey =\nxxxx \nyyyy=），折行合并后必须还原完整密钥
+    #[test]
+    fn test_parse_conf_with_wrapped_lines() {
+        let priv_key = test_key(21);
+        let peer = test_key(22);
+        // 把密钥从中间折断成两行（模拟微信自动换行）
+        let (pk_a, pk_b) = priv_key.split_at(20);
+        let (pub_a, pub_b) = peer.split_at(30);
+        let conf = format!(
+            "[Interface]\nPrivateKey =\n{pk_a}\n{pk_b}\nAddress = 10.1.8.2/24\n\n[Peer]\nPublicKey = {pub_a}\n{pub_b}\nEndpoint = ishow.indevs.in:51820\nAllowedIPs = 0.0.0.0/0\n"
+        );
+        let wg = parse_wireguard_conf(&conf).expect("折行 .conf 必须解析成功");
+        assert_eq!(wg.private_key, priv_key, "折行私钥必须完整还原");
+        assert_eq!(wg.peer_public_key, peer, "折行公钥必须完整还原");
+        assert_eq!(wg.server, "ishow.indevs.in");
+        assert_eq!(wg.server_port, 51820);
+        assert_eq!(wg.local_ip, "10.1.8.2/24");
+    }
+
     #[test]
     fn test_build_outbound_via_wireguard_uri() {
         let priv_key = test_key(14);
@@ -1126,8 +1189,10 @@ mod tests {
         let ob = outbound.expect("wireguard:// 链接应构建出出站");
         assert_eq!(ob["tag"], GO_LAN_TAG);
         assert_eq!(ob["private_key"].as_str(), Some(priv_key.as_str()));
-        assert_eq!(ob["peer_public_key"].as_str(), Some(peer.as_str()));
-        assert_eq!(ob["server"], "10.1.2.3");
+        // 【APP-4 任务5】peers[0] 标准结构
+        assert_eq!(ob["peers"][0]["public_key"].as_str(), Some(peer.as_str()));
+        assert_eq!(ob["peers"][0]["server"], "10.1.2.3");
+        assert_eq!(ob["peers"][0]["persistent_keepalive_interval"], 15);
     }
 
     #[test]

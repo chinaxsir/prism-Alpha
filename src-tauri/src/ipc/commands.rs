@@ -907,7 +907,10 @@ pub(crate) async fn refresh_subscription(
         let mut seen = std::collections::HashSet::new();
         let mut proxies = Vec::new();
         for mut node in nodes {
-            let base = node["name"].as_str().unwrap_or_default().to_string();
+            // 【APP-4 任务1】还原被 Latin-1 展开的 UTF-8 乱码节点名
+            let base = crate::core::uri_parser::fix_utf8_mojibake(
+                node["name"].as_str().unwrap_or_default(),
+            );
             let base = if base.is_empty() {
                 format!(
                     "{}:{}",
@@ -1401,7 +1404,9 @@ pub async fn get_cached_proxies(
         if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
             if let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) {
                 for p in proxies {
-                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = crate::core::uri_parser::fix_utf8_mojibake(
+                        p.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
                     let kind = p.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
@@ -1433,7 +1438,9 @@ pub async fn get_cached_proxies(
                 tracing::warn!("cached proxies URI fallback: {}", errors.join("；"));
             }
             for node in nodes {
-                let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = crate::core::uri_parser::fix_utf8_mojibake(
+                    node.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                );
                 let kind = node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let server = node.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let port = node.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
