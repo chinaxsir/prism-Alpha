@@ -211,9 +211,18 @@ pub fn start_probe(app: AppHandle) {
         match probe_all(&app, &state).await {
             Ok(count) => {
                 tracing::info!("[go-aim] 全量真实探测完成，共 {count} 个节点参与评级");
+                // 【APP6 任务1】[GoAim] 模块日志
+                crate::core::logger::info(
+                    crate::core::logger::MOD_GO_AIM,
+                    &format!("AIM 全量探测完成，共 {count} 个节点参与评级"),
+                );
                 if state.settings.read().go_aim_enabled {
                     if let Err(e) = apply_selection(&app, &state).await {
                         tracing::warn!("[go-aim] 锁定选择失败: {e}");
+                        crate::core::logger::warn(
+                            crate::core::logger::MOD_GO_AIM,
+                            &format!("锁定节点选择失败: {e}"),
+                        );
                     }
                 }
             }

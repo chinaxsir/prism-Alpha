@@ -18,6 +18,7 @@ import {
   Home,
   Languages,
   Palette,
+  FileTerminal,
 } from "lucide-react";
 
 import {
@@ -30,6 +31,8 @@ import {
   getGoLanSettings,
   saveGoLanSettings,
   isGoLanConfigured,
+  clearAppLogs,
+  testGoLanIp,
   type KernelInfo,
   type GoLanSettings,
 } from "@/api/ipc";
@@ -38,6 +41,7 @@ import { useCoreStore } from "@/stores/core";
 import { RUN_MODES } from "@/constants/modes";
 import { ActivateProModal } from "@/components/ProGate";
 import GoLanModal from "@/components/GoLanModal";
+import LogViewerModal from "@/components/LogViewerModal";
 import ProManageModal, { fmtDateTime } from "@/components/ProManageModal";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
@@ -77,6 +81,8 @@ export default function Settings() {
   // 【APP-12 任务2.2/2.3】Go Lan 配置弹窗与 Pro 授权详情弹窗开关
   const [goLanModalOpen, setGoLanModalOpen] = useState(false);
   const [proManageOpen, setProManageOpen] = useState(false);
+  // 【APP6 任务1.2】运行日志弹窗
+  const [logViewerOpen, setLogViewerOpen] = useState(false);
   const proUnlocked = useProStore((s) => s.unlocked);
   const entitlement = useProStore((s) => s.entitlement);
   // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
@@ -256,6 +262,28 @@ export default function Settings() {
       warnings?.forEach((w) => toast.info(w));
     } catch (e) {
       useCoreStore.getState().setGoLanSettings(current);
+      toast.error(String(e));
+    }
+  };
+
+  // 【APP6 任务2.3】Go Lan 卡片「检测」：无需输入目标，后端自动从
+  // local_address 推导家庭网关；结果即时 toast，详细过程看 Go Lan 日志
+  const handleGoLanProbe = async () => {
+    try {
+      const r = await testGoLanIp();
+      if (r.reachable) toast.success(r.message);
+      else toast.error(r.message);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // 【APP6 任务1.2】清空全部运行日志
+  const handleClearLogs = async () => {
+    try {
+      await clearAppLogs();
+      toast.success(t("logs.cleared"));
+    } catch (e) {
       toast.error(String(e));
     }
   };
@@ -458,13 +486,28 @@ export default function Settings() {
         </div>
         <div className="flex items-center gap-2.5 shrink-0">
           {proUnlocked && (
-            <button
-              type="button"
-              onClick={() => setGoLanModalOpen(true)}
-              className="text-xs text-accent hover:underline font-medium"
-            >
-              {t("common.configure")}
-            </button>
+            <>
+              <button
+                type="button"
+                disabled={!goLanCfg?.enabled}
+                onClick={handleGoLanProbe}
+                className={clsx(
+                  "text-xs font-medium",
+                  goLanCfg?.enabled
+                    ? "text-accent hover:underline"
+                    : "text-gray-500 cursor-not-allowed",
+                )}
+              >
+                {t("engine.goLanProbe")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setGoLanModalOpen(true)}
+                className="text-xs text-accent hover:underline font-medium"
+              >
+                {t("common.configure")}
+              </button>
+            </>
           )}
           <Switch
             checked={proUnlocked ? Boolean(goLanCfg?.enabled) : false}
@@ -502,6 +545,35 @@ export default function Settings() {
           onChange={(v) => patchSwitch({ closeConnectionsOnSwitch: v })}
         />
       </SettingsGroup>
+
+      {/* 【APP6 任务1.2】诊断与日志：全模块环形日志查看/导出/清空 */}
+      <div className="rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-accent/15 flex items-center justify-center shrink-0">
+            <FileTerminal size={16} className="text-accent" />
+          </div>
+          <div className="min-w-0">
+            <div className="font-semibold text-sm text-text">{t("logs.cardTitle")}</div>
+            <div className="text-[11px] text-text-muted truncate">{t("logs.cardDesc")}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => setLogViewerOpen(true)}
+            className="px-3 py-1.5 rounded-lg bg-surface-hover text-xs text-gray-300 hover:text-white transition-colors"
+          >
+            {t("logs.view")}
+          </button>
+          <button
+            type="button"
+            onClick={handleClearLogs}
+            className="px-3 py-1.5 rounded-lg bg-red-500/90 text-xs text-white hover:opacity-90 transition-colors"
+          >
+            {t("logs.clear")}
+          </button>
+        </div>
+      </div>
 
       {/* 代理内核：仅保留版本状态展示行；启动时后台自动校验，无需手动按钮 */}
       <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={14} />}>
@@ -605,6 +677,10 @@ export default function Settings() {
       <GoLanModal
         open={goLanModalOpen}
         onClose={() => setGoLanModalOpen(false)}
+      />
+      <LogViewerModal
+        open={logViewerOpen}
+        onClose={() => setLogViewerOpen(false)}
       />
       <ProManageModal
         open={proManageOpen}

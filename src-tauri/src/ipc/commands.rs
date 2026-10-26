@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD}, Engine as _};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::core::kernel::{
     KernelApi, KernelConfig, KernelHandle, check_config, generate_secret, probe_version,
@@ -85,6 +85,27 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
             state.api_secret.read().clone(),
             group,
         );
+    }
+    // 【APP6 任务2】iOS 上 VPN 运行在独立 PrismVPN 扩展进程，此前启动后
+    // 从不执行首次内网握手激活；这里无论平台统一在启动成功后对开启的
+    // Go Lan 触发一次 WireGuard 握手（发包即握手，wg-easy 立即显示在线）
+    {
+        crate::core::logger::info(
+            crate::core::logger::MOD_KERNEL,
+            &format!("VPN 内核启动成功（模式切换至 {:?}）", state.mode.read()),
+        );
+        let lan = state.go_lan.read().clone();
+        if lan.enabled && crate::core::go_lan::is_configured(&lan) {
+            crate::core::logger::info(
+                crate::core::logger::MOD_GO_LAN,
+                "VPN 启动完成，自动触发 go-lan-home 首次握手",
+            );
+            spawn_go_lan_warmup(
+                state.api_addr.read().clone(),
+                state.api_secret.read().clone(),
+                &lan,
+            );
+        }
     }
     Ok(())
 }
@@ -618,6 +639,8 @@ pub async fn stop_core(state: State<'_, AppState>) -> Result<(), String> {
 
 /// 停止/退出时统一调用：回收 TUN 守卫 → 停内核 → 清系统代理
 pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
+    // 【APP6 任务1】[Kernel] 模块日志：VPN 停止
+    crate::core::logger::info(crate::core::logger::MOD_KERNEL, "正在停止 VPN 内核...");
     // 1. 关闭 TUN 守卫（手动路由/DNS 回滚，通常为 None）
     // 先在独立语句完成 write()，避免临时写守卫跨越 await（parking_lot 守卫 !Send）
     let tun_taken = state.tun_guard.write().take();
@@ -1562,6 +1585,98 @@ pub async fn delete_subscription(
     Ok(removed)
 }
 
+/// 上次自动全量同步时间戳（Unix 秒）；0 = 从未同步。
+/// 启动循环每小时都会触发对账，全量节点刷新以 24h 节流防重复下载。
+static LAST_AUTO_SYNC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 【APP6 任务3】激活 Pro / 启动校验 Pro 有效后：自动开启云端同步并拉取
+/// 云端订阅列表（云端空而本地有则上传备份），拉取完成后立即自动下载并
+/// 解析所有启用订阅的最新节点，全程零手动干预。
+///
+/// 触发时机：
+/// A. `activate_pro` 激活成功后立即 spawn；
+/// B. APP 启动校验 Pro 有效后（lib.rs 启动循环首轮；内部 24h 节流）；
+/// C. `refresh_entitlement`「立即校验」确认有效后。
+///
+/// 内核运行中时先停机，全部订阅刷新完再一次性重启恢复，避免逐条刷新
+/// 反复重启内核。全程写 [Sub] 模块日志。
+pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
+    use std::sync::atomic::Ordering;
+    let log = crate::core::logger::MOD_SUB;
+    let state = app.state::<AppState>();
+
+    // 资格自校验：未解锁或服务端未允许云同步时静默返回
+    let ent = state.entitlement.read().clone();
+    if !ent.is_unlocked() || !ent.sync_available {
+        return;
+    }
+    if crate::core::license::cached_credentials(&state.data_dir).is_none() {
+        return;
+    }
+    // 24h 全量刷新节流（reconcile 本身幂等且轻量，可重复执行）
+    let now = crate::core::license::now_unix();
+    let last = LAST_AUTO_SYNC.load(Ordering::Relaxed);
+    if last > 0 && now - last < 24 * 3600 {
+        return;
+    }
+    LAST_AUTO_SYNC.store(now, Ordering::Relaxed);
+
+    crate::core::logger::info(log, "Pro 授权有效，自动开启云端订阅同步并更新节点...");
+    let was_running = *state.status.read() == CoreStatus::Running;
+    let before = crate::core::store::load_subscriptions(&state.data_dir);
+    if was_running {
+        let _ = do_stop(&state).await;
+    }
+
+    // 1. 对账云端订阅链接（云端有 → 拉取合并；云端空而本地有 → 上传备份）
+    crate::core::sync_links::reconcile(&app).await;
+    let after = crate::core::store::load_subscriptions(&state.data_dir);
+    let pulled = after.len().saturating_sub(before.len());
+    if pulled > 0 {
+        crate::core::logger::info(
+            log,
+            &format!("已从云端同步 {pulled} 条订阅链接，开始下载最新节点..."),
+        );
+        let _ = app.emit("subscriptions://changed", ());
+    }
+
+    // 2. 立即下载并解析全部启用订阅的最新节点
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for r in after.iter().filter(|r| r.enabled) {
+        let url = r.url.clone();
+        match refresh_subscription(&app, &state, &url).await {
+            Ok(()) => {
+                ok += 1;
+                crate::core::logger::info(log, &format!("订阅节点更新成功: {}", truncate_for_msg(&url)));
+            }
+            Err(e) => {
+                fail += 1;
+                crate::core::logger::warn(log, &format!("订阅节点更新失败（{}）: {}", truncate_for_msg(&url), e));
+            }
+        }
+    }
+    crate::core::logger::info(
+        log,
+        &format!("自动同步完成：{ok} 个订阅成功 / {fail} 个失败"),
+    );
+    if ok > 0 {
+        let _ = app.emit("proxies://changed", ());
+        // 【APP6 任务3】激活同步完成通知（前端 toast 提示用户节点已更新）
+        let _ = app.emit(
+            "subscriptions://auto-synced",
+            serde_json::json!({ "ok": ok, "fail": fail }),
+        );
+    }
+
+    // 3. 恢复内核（若同步前在运行）
+    if was_running {
+        let app2 = app.clone();
+        let state2 = app2.state::<AppState>();
+        let _ = start_core_inner(&app2, &state2).await;
+    }
+}
+
 /// 激活码激活（邮箱+授权码；联网校验；服务端签名后本地缓存授权）
 #[tauri::command]
 pub async fn activate_pro(
@@ -1579,11 +1694,13 @@ pub async fn activate_pro(
     // 激活成功：清除历史剥夺原因，前端横幅随 proUnlocked=true 一并消失
     if next.is_unlocked() {
         crate::core::app_control::clear_revoke_reason(&data_dir);
-    }
-    // Pro/买断：激活成功后立即做一次云端订阅对账（静默）
-    if next.is_unlocked() && next.sync_available {
+        // 【APP6 任务3】激活成功后立即自动同步云端订阅并刷新全部节点
+        crate::core::logger::info(
+            crate::core::logger::MOD_PRO,
+            "Pro 激活成功，已触发云端订阅自动同步",
+        );
         tauri::async_runtime::spawn(async move {
-            super::super::core::sync_links::reconcile(&app).await;
+            auto_sync_and_refresh_subscriptions(app).await;
         });
     }
     Ok(next)
@@ -1620,10 +1737,14 @@ pub async fn refresh_entitlement(
     let (ent, revoke_msg) = crate::core::app_control::force_runtime_check(&app, &state)
         .await
         .map_err(|e| sanitize_err(&e))?;
-    // 校验成功：对账云端订阅链接（reconcile 内部自校验同步资格并幂等去重）
-    tauri::async_runtime::spawn(async move {
-        super::super::core::sync_links::reconcile(&app).await;
-    });
+    // 【APP6 任务3】校验确认 Pro 有效：自动同步云端订阅并刷新节点
+    //（reconcile 内部自校验同步资格并幂等去重；auto_sync 内部 24h 节流）
+    if ent.is_unlocked() {
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            auto_sync_and_refresh_subscriptions(app2).await;
+        });
+    }
     // 如果触发了授权剥夺（解绑/过期），force_runtime_check 内部已经 apply_entitlement
     // 并 emit pro://revoked；这里正常返回 entitlement 给前端显示即可
     let _ = revoke_msg; // force_runtime_check 内部已 emit 事件
@@ -2148,7 +2269,7 @@ fn spawn_go_lan_warmup(
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let api = KernelApi::new(&api_addr, &api_secret);
-        for gw in targets {
+        for gw in targets.clone() {
             // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
             let _ = api
                 .test_delay(
@@ -2158,6 +2279,10 @@ fn spawn_go_lan_warmup(
                 )
                 .await;
         }
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_LAN,
+            &format!("主动握手探测完成，已向家庭网关发包: {targets:?}"),
+        );
         tracing::info!("[go-lan] 主动握手探测已完成");
     });
 }
@@ -2219,32 +2344,53 @@ pub async fn sync_go_lan_managed(
 /// 返回真实延迟毫秒数并瞬间触发 wg-easy 连接状态。
 #[tauri::command]
 pub async fn test_go_lan_ip(
-    target_ip: String,
+    target_ip: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<crate::core::go_lan::GoLanProbeResult, String> {
     // 提前 .clone() 取走锁内值，避免 parking_lot::RwLockReadGuard（非 Send）
     // 跨越 await 边界导致 tauri::command Future + Send 要求失败
-    let (is_running, go_lan_enabled, mixed_port, api_addr, api_secret) = {
+    let (go_lan_enabled, mixed_port, api_addr, api_secret, lan) = {
         let go_lan_cfg = state.go_lan.read();
         let settings = state.settings.read();
         (
-            *state.status.read() == CoreStatus::Running,
             go_lan_cfg.enabled,
             settings.mixed_port,
             state.api_addr.read().clone(),
             state.api_secret.read().clone(),
+            go_lan_cfg.clone(),
         )
     };
+    // 【APP6 任务2】iOS 上 VPN 内核运行在独立 PrismVPN 扩展进程，
+    // 子进程句柄恒为空，必须结合 NEPacketTunnelFlow 的连接状态判断，
+    // 否则 iOS 上启动 VPN 后「检测内网」被误判为未运行
+    let is_running = is_vpn_actually_running(&state);
     let result = crate::core::go_lan::probe_intranet_ip(
-        &target_ip,
+        target_ip.as_deref(),
         mixed_port,
         &api_addr,
         &api_secret,
         is_running,
         go_lan_enabled,
+        &lan,
     )
     .await;
     Ok(result)
+}
+
+/// 【APP6 任务2】VPN 是否真实在运行：
+/// 桌面端看内核子进程状态；iOS 上内核运行在独立 PrismVPN 扩展进程，
+/// `state.is_running()` 恒为 false，必须叠加 `vpn_is_connected()`
+/// （NEVPNManager 连接状态）才能准确识别。
+pub fn is_vpn_actually_running(state: &AppState) -> bool {
+    let core_running = *state.status.read() == CoreStatus::Running;
+    #[cfg(target_os = "ios")]
+    {
+        core_running || crate::platform::ios::vpn_is_connected()
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        core_running
+    }
 }
 
 // ============================== Go Cus（Pro） ==============================
@@ -2308,6 +2454,15 @@ pub async fn import_go_cus_module(
     let module = crate::core::go_cus::upsert_module(&mut cus, trimmed, &raw, name.as_deref())?;
     crate::core::go_cus::save(&state.data_dir, &cus)?;
     *state.go_cus.write() = cus.clone();
+    // 【APP6 任务1】[GoCus] 模块日志：模块加载数量
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_CUS,
+        &format!(
+            "Go Cus 模块已导入: {}（当前共 {} 个模块）",
+            module.name,
+            cus.modules.len()
+        ),
+    );
     // 首个模块导入即自动启用引擎并拉起边车
     let mut cus = state.go_cus.read().clone();
     let mut changed = false;
@@ -2385,4 +2540,38 @@ pub async fn generate_or_get_ca_url(
     }
     let info = crate::core::go_cus::generate_or_get_ca(&state, app)?;
     serde_json::to_value(info).map_err(|e| sanitize_err(&e.to_string()))
+}
+
+// ============================== 全模块运行日志（APP6 任务1） ==============================
+
+/// 读取全模块运行日志（可选按模块过滤），自动合并内核日志与 iOS 扩展诊断日志
+#[tauri::command]
+pub async fn get_app_logs(
+    module_filter: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::core::logger::LogsPayload, String> {
+    Ok(crate::core::logger::get_logs(
+        &state.data_dir,
+        module_filter.as_deref(),
+    ))
+}
+
+/// 清空全部日志（内存 + prism_app.log + 内核 kernel.log + iOS 扩展诊断缓存）
+#[tauri::command]
+pub async fn clear_app_logs(state: State<'_, AppState>) -> Result<(), String> {
+    crate::core::logger::clear_logs(&state.data_dir);
+    crate::core::logger::info(crate::core::logger::MOD_KERNEL, "日志已清空（内存与本地文件）");
+    Ok(())
+}
+
+/// 导出带设备环境头信息的格式化纯文本日志（WireGuard 私钥 / License Key 自动脱敏）
+#[tauri::command]
+pub async fn export_app_logs(
+    module_filter: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    Ok(crate::core::logger::export_logs(
+        &state.data_dir,
+        module_filter.as_deref(),
+    ))
 }

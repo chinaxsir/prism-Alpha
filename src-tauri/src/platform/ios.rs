@@ -28,6 +28,9 @@ unsafe extern "C" {
     /// 返回 Keychain 持久化的 64 字符 hex SHA-256 硬件指纹
     /// （APP-7 任务2.3）；nilptr 表示 Swift 侧拿不到
     fn prism_ios_get_device_id() -> *const std::os::raw::c_char;
+    /// 返回 App Group（group.com.prism.proxy）共享容器路径（APP6 任务1）；
+    /// nilptr 表示 Swift 侧拿不到
+    fn prism_ios_app_group_dir() -> *const std::os::raw::c_char;
 }
 
 pub fn start_tunnel(config_content: &str) -> Result<()> {
@@ -91,6 +94,19 @@ pub fn take_pending_restart() -> bool {
 pub fn get_device_id() -> Option<String> {
     unsafe {
         let p = prism_ios_get_device_id();
+        if p.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(p);
+        Some(cstr.to_string_lossy().into_owned())
+    }
+}
+
+/// App Group（group.com.prism.proxy）共享容器路径（APP6 任务1）：
+/// 运行日志系统据此读取扩展诊断日志。None = Swift 侧拿不到。
+pub fn app_group_dir() -> Option<String> {
+    unsafe {
+        let p = prism_ios_app_group_dir();
         if p.is_null() {
             return None;
         }

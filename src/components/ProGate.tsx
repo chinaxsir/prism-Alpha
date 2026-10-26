@@ -60,12 +60,34 @@ const LICENSE_ERROR_MAP: Record<
     title: "服务器临时异常",
     detail: "稍后重试；若持续出现，请提交工单。",
   },
+  // 【APP6 任务4】服务端具体原因精准映射（license.rs map_activation_error）
+  invalid_key: {
+    code: "invalid_key",
+    title: "授权码 (License Key) 不存在或输入有误",
+    detail: "请核对授权码是否完整、有无多余空格后重试。",
+  },
+  email_mismatch: {
+    code: "email_mismatch",
+    title: "输入的邮箱与该授权码绑定的账户邮箱不一致",
+    detail: "请使用激活该授权码时填写的邮箱。",
+  },
+  license_expired: {
+    code: "license_expired",
+    title: "该授权码已到期",
+    detail: "请续费后再重新激活。",
+  },
+  license_blocked: {
+    code: "license_blocked",
+    title: "该授权码或当前设备已被管理员禁用",
+    detail: "如有疑问请联系客服申诉。",
+  },
 };
 
 /** 从后端错误字符串提取标准错误码并映射到错误卡片文案。
  *  后端约定（见 license.rs）：
  *  - "err_code:{code}"（非 429 失败）
- *  - "rate_limited:{秒数}:{code}"（429 限流） */
+ *  - "rate_limited:{秒数}:{code}"（429 限流）
+ *  - "err_raw:{服务端原文}"（【APP6 任务4】无法归入已知类别时透传原文） */
 function parseLicenseError(
   message: string
 ): { code: string; title: string; detail: string } | null {
@@ -73,8 +95,21 @@ function parseLicenseError(
   const errCode = message.match(/err_code:([a-z_]+)/i);
   const rate = message.match(/rate_limited:\d+:([a-z_]+)/i);
   const code = errCode?.[1] ?? rate?.[1] ?? null;
-  if (!code) return null;
-  return LICENSE_ERROR_MAP[code] ?? null;
+  if (code) {
+    return (
+      LICENSE_ERROR_MAP[code] ?? {
+        code,
+        title: message.replace(/^err_code:/, ""),
+        detail: "",
+      }
+    );
+  }
+  // err_raw 透传：直接展示服务端返回的具体原因（已含 HTTP 状态）
+  const raw = message.match(/^err_raw:(.+)$/s);
+  if (raw?.[1]) {
+    return { code: "err_raw", title: raw[1].trim(), detail: "" };
+  }
+  return null;
 }
 
 /** Unix 秒 → "YYYY-MM-DD HH:mm"（本地时区） */

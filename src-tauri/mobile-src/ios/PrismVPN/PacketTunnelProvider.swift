@@ -1157,17 +1157,52 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 outbounds[i]["url"] = u
                 outbounds[i]["interval"] = "10m"
             } else if t == "wireguard" {
-                // 【APP-11 任务1.1】Legacy WireGuard 单节点顶层**没有**
-                // allowed_ips / persistent_keepalive_interval 字段，
-                // 写入会触发内核 "decode config: ... json: unknown field"
-                // 直接拒绝启动。必须无条件剥离。
-                // 【APP-5 任务1】sing-box v1.11.3 LegacyWireGuardPeer 结构体
-                // 仅支持 server/server_port/public_key/pre_shared_key/
-                // allowed_ips/reserved 六个字段，persistent_keepalive_interval
-                // 只存在于 1.11+ 新增的 endpoints 结构中——即使是磁盘缓存里
-                // 有 APP4 写入的 keepalive 也必须在此处显式剥离，零报错启动。
+                // 【APP6 任务2】统一为 sing-box v1.11.3 **顶层单节点模式**
+                // （connect=true，DialContext("udp4") 连接型 Socket）：
+                // - peers 数组模式走 ListenPacket("udp","") 双栈非连接 Socket，
+                //   在 iOS 扩展沙盒被 NECP 拦截报
+                //   listen outbound packet connection: operation not permitted；
+                // - allowed_ips / persistent_keepalive_interval 是顶层与 peers
+                //   元素均不支持的非法字段（APP4/APP5 历史残留），
+                //   写入触发 "decode config: ... json: unknown field" 直接
+                //   拒绝启动，必须无条件剥离；
+                // - inet4_bind_address 强制纯 IPv4 Socket，根治 EPERM。
+                // 【APP6 任务2】peers 数组模式在 sing-box v1.11.3 走
+                // ListenPacket("udp","") 双栈非连接 Socket，iOS NECP 沙盒
+                // 直接拦截报 listen outbound packet connection: operation
+                // not permitted。把 peers[0] 提升为顶层单节点（connect=true，
+                // DialContext("udp4") 连接型 Socket）后 100% 穿透出去。
+                // 历史磁盘缓存 / 旧版本配置里若有 peers 数组，统一在此兜底。
+                if var peers = outbounds[i]["peers"] as? [[String: Any]], let p0 = peers.first {
+                    if (outbounds[i]["server"] as? String ?? "").isEmpty,
+                       let s = p0["server"] as? String {
+                        outbounds[i]["server"] = s
+                    }
+                    if outbounds[i]["server_port"] == nil,
+                       let sp = p0["server_port"] {
+                        outbounds[i]["server_port"] = sp
+                    }
+                    if (outbounds[i]["peer_public_key"] as? String ?? "").isEmpty,
+                       let pk = p0["public_key"] as? String {
+                        outbounds[i]["peer_public_key"] = pk
+                    }
+                    if outbounds[i]["pre_shared_key"] == nil,
+                       let psk = p0["pre_shared_key"] as? String {
+                        outbounds[i]["pre_shared_key"] = psk
+                    }
+                    peers.removeAll()
+                    outbounds[i].removeValue(forKey: "peers")
+                }
+                // allowed_ips / persistent_keepalive_interval：顶层与 peers 元素
+                // 均不支持（v1.11.3 LegacyWireGuard 结构），写入触发
+                // "decode config: ... json: unknown field" 直接拒绝启动。
+                // 必须无条件剥离。
                 outbounds[i].removeValue(forKey: "allowed_ips")
                 outbounds[i].removeValue(forKey: "persistent_keepalive_interval")
+                // 【APP6 任务2】强制 DefaultDialer 使用纯 IPv4 (udp4/AF_INET)
+                // 连接型 Socket，配合 domain_strategy ipv4_only 根治
+                // listen outbound packet connection: operation not permitted
+                outbounds[i]["inet4_bind_address"] = "0.0.0.0"
                 // local_address 必须带子网前缀，否则内核 netip.Prefix 解析失败
                 if let la = outbounds[i]["local_address"] as? [String], !la.isEmpty {
                     outbounds[i]["local_address"] = la.map { normalizePrefixString($0) }
@@ -1194,28 +1229,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         outbounds[i].removeValue(forKey: "pre_shared_key")
                     }
                 }
-                if var peers = outbounds[i]["peers"] as? [[String: Any]] {
-                    for j in peers.indices {
-                        // 【APP-5 任务1】peers[].persistent_keepalive_interval
-                        // 也是 sing-box v1.11.3 LegacyWireGuardPeer 不支持的字段，
-                        // 磁盘缓存可能有 APP4 写入残留，显式剥离确保零报错
-                        peers[j].removeValue(forKey: "persistent_keepalive_interval")
-                        if let fixed = sanitizeWireGuardKey(peers[j]["public_key"]) {
-                            peers[j]["public_key"] = fixed
-                        }
-                        if peers[j]["pre_shared_key"] != nil {
-                            if let fixed = sanitizeWireGuardKey(peers[j]["pre_shared_key"]) {
-                                peers[j]["pre_shared_key"] = fixed
-                            } else {
-                                peers[j].removeValue(forKey: "pre_shared_key")
-                            }
-                        }
-                    }
-                    outbounds[i]["peers"] = peers
-                }
+                // 【APP6 任务2】peers 数组已在上方整体提升为顶层单节点并删除，
+                // 此处不再有 peers 元素需要清洗。
                 // APP-8 任务3：wireguard 出站在内核 post-start 阶段必须同步
                 // 解析 server 域名，dns-direct 被 RST 会中断整个启动。
-                // 预解析顶层 server 与 peers[].server 为 IP，零 DNS 瞬时启动。
+                // 预解析顶层 server 为 IP，零 DNS 瞬时启动。
                 // 【APP-11B】先剔除 server 中的 \u2060 等隐形字符再判定/解析
                 // （server 可能是域名，必须用 cleanVisibleASCII 而非 cleanCIDR）
                 if let srv = outbounds[i]["server"] as? String {
@@ -1226,16 +1244,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             outbounds[i]["server"] = ip
                         }
                     }
-                }
-                if var peers = outbounds[i]["peers"] as? [[String: Any]] {
-                    for j in peers.indices {
-                        if let srv = peers[j]["server"] as? String, !isIPLiteral(srv) {
-                            if let ip = resolveHostToIP(srv) {
-                                peers[j]["server"] = ip
-                            }
-                        }
-                    }
-                    outbounds[i]["peers"] = peers
                 }
                 applyPhysicalBind(&outbounds[i])
             } else if proxyOutboundTypes.contains(t) {

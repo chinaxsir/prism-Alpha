@@ -171,6 +171,17 @@ func prismIosVpnIsConnected() -> Int32 {
     }
 }
 
+/// APP6 任务1：返回 App Group（group.com.prism.proxy）共享容器路径，
+/// 供 Rust 侧运行日志系统读取扩展诊断日志（prism_error.txt /
+/// prism_work/box.log / vpn_trace.log）。拿不到时返回 NULL。
+@_cdecl("prism_ios_app_group_dir")
+func prismIosAppGroupDir() -> UnsafePointer<CChar>? {
+    guard let groupURL = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: prismAppGroupID
+    ) else { return nil }
+    return strdup(groupURL.path)
+}
+
 /// Rust 启动内核时读取系统级真实连接起始时间戳（IPA-12）：
 /// connectedDate 由系统守护进程 nesessionmanagerd 维护，不受 App 挂起、
 /// 锁屏甚至主 App 重启影响。Rust 在内核进入 Running 时优先采用该值作为

@@ -143,6 +143,23 @@ export default function App() {
     };
   }, []);
 
+  // 【APP6 任务3】Pro 激活/启动校验后的云端订阅自动同步完成通知
+  useEffect(() => {
+    const unlisten = listen<{ ok?: number; fail?: number }>(
+      "subscriptions://auto-synced",
+      (event) => {
+        const ok = event.payload?.ok ?? 0;
+        const fail = event.payload?.fail ?? 0;
+        toast.success(
+          t("toast.autoSynced", { ok, fail: ok + fail }),
+        );
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
   // IPA-3 任务2：授权剥夺广播（设备解绑 / 授权到期）——按 reason 精准提示，
   // 严禁把「设备已解绑」显示成「授权已到期」。payload 由后端统一给出 zh/en。
   useEffect(() => {

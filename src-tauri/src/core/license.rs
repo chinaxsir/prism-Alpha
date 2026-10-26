@@ -630,27 +630,78 @@ async fn error_message(resp: reqwest::Response) -> String {
     }
 }
 
-/// 从非 200 响应提取标准机器错误码（APK-3 任务2）。
-/// 优先取 JSON 的 "error" 字符串字段；解析失败按 HTTP 状态码映射：
+/// 从非 200 响应提取 (机器错误码, 服务端具体描述)（APK-3 任务2 / APP6 任务4）。
+/// 机器码优先取 JSON 的 "error" 字符串字段；解析失败按 HTTP 状态码映射：
 /// 400→invalid_input、403→activation_failed、409→seat_limit_reached、
 /// 429→activation_throttled、5xx→server_error。
-async fn extract_error_code(http: u16, resp: reqwest::Response) -> String {
+/// 描述依次尝试 JSON 的 message / reason / detail / error 字段，
+/// 用于「激活未通过 (HTTP xxx): {服务端原文}」的精准透传。
+async fn extract_error_detail(http: u16, resp: reqwest::Response) -> (String, String) {
     let text = resp.text().await.unwrap_or_default();
     let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    if let Some(c) = parsed.get("error").and_then(|e| e.as_str()) {
-        if !c.is_empty() {
-            return c.to_string();
-        }
+    let machine = parsed
+        .get("error")
+        .and_then(|e| e.as_str())
+        .filter(|c| !c.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            match http {
+                400 => "invalid_input",
+                403 => "activation_failed",
+                409 => "seat_limit_reached",
+                429 => "activation_throttled",
+                s if s >= 500 => "server_error",
+                _ => "activation_failed",
+            }
+            .to_string()
+        });
+    let server_msg = ["message", "reason", "detail"]
+        .iter()
+        .find_map(|k| {
+            parsed
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .or_else(|| {
+            // 兼容 {error:{message}} 结构
+            parsed
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    (machine, server_msg)
+}
+
+/// 【APP6 任务4】把服务端机器码 / HTTP 状态映射为前端精准中文文案的
+/// 标准错误码（前端 LICENSE_ERROR_MAP 1:1 渲染）。返回 None 表示
+/// 无法归入已知类别——调用方应透传服务端原文（err_raw）。
+fn map_activation_error(http: u16, machine: &str, server_msg: &str) -> Option<&'static str> {
+    // 综合机器码与服务端原文关键词做归类（大小写不敏感）
+    let hay = format!("{machine} {server_msg}").to_lowercase();
+    let hit = |words: &[&str]| words.iter().any(|w| hay.contains(w));
+    if hit(&["not_found", "invalid_key", "invalid_license", "no_such"]) || http == 404 {
+        Some("invalid_key")
+    } else if hit(&["email", "mismatch", "account"]) {
+        Some("email_mismatch")
+    } else if hit(&["rate", "too_many", "throttl"]) {
+        // rate/too_many 优先于 seat 判定，避免 "rate limit" 误归为席位限制
+        Some("activation_throttled")
+    } else if hit(&["seat", "limit", "max_devices", "full"]) || http == 409 {
+        Some("seat_limit_reached")
+    } else if hit(&["expired"]) {
+        Some("license_expired")
+    } else if hit(&["blocked", "disabled", "banned", "revoked", "suspended"]) {
+        Some("license_blocked")
+    } else {
+        None
     }
-    match http {
-        400 => "invalid_input",
-        403 => "activation_failed",
-        409 => "seat_limit_reached",
-        429 => "activation_throttled",
-        s if s >= 500 => "server_error",
-        _ => "activation_failed",
-    }
-    .to_string()
 }
 
 /// 从 429 响应体提取 retry_after（秒）；缺失/非法时回退 30
@@ -821,12 +872,26 @@ pub async fn activate(
         let secs = retry_after_secs(resp).await;
         bail!("rate_limited:{secs}:activation_throttled");
     }
-    // 非 200：透传标准机器错误码（"err_code:{code}"），
-    // 前端 LICENSE_ERROR_MAP 按错误码 1:1 逐字渲染提示卡片
+    // 非 200：【APP6 任务4】废除笼统报错——提取机器码 + 服务端具体描述，
+    // 按精准规则映射中文文案（"err_code:{code}" 前端 1:1 渲染）；
+    // 无法归入已知类别时透传服务端原文（"err_raw:{描述}"）。全程写 [Pro] 日志。
     if !resp.status().is_success() {
         let http = resp.status().as_u16();
-        let code = extract_error_code(http, resp).await;
-        bail!("err_code:{code}");
+        let (machine, server_msg) = extract_error_detail(http, resp).await;
+        crate::core::logger::warn(
+            crate::core::logger::MOD_PRO,
+            &format!(
+                "激活请求被拒绝：HTTP {http}，错误码 {machine}{}",
+                if server_msg.is_empty() { String::new() } else { format!("，服务端描述：{server_msg}") }
+            ),
+        );
+        if let Some(mapped) = map_activation_error(http, &machine, &server_msg) {
+            bail!("err_code:{mapped}");
+        }
+        if !server_msg.is_empty() {
+            bail!("err_raw:激活未通过 (HTTP {http}): {server_msg}");
+        }
+        bail!("err_code:{}", machine);
     }
     let data: ActivateResponse = resp.json().await?;
     if !data.ok {

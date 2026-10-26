@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::state::{OutboundMode, RunMode, UserSettings};
+use crate::core::go_lan::normalize_cidr_list;
 
 const DEFAULT_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
 const TUN_TAG: &str = "tun-in";
@@ -342,10 +343,12 @@ pub fn build(
     // iOS 扩展沙盒中 Go 的 net.ListenPacket("udp", ":0") 默认创建 AF_INET6
     // 双栈 Socket，未开 IPv6 隧道时绑定会被 NECP 拒绝返回 EPERM
     // （operation not permitted），导致 WireGuard 握手包与 UDP 53 DNS 全灭。
+    // 【APP6 任务2】direct 出站统一加 inet4_bind_address 强制 DefaultDialer
+    // 使用纯 IPv4 (udp4/AF_INET) 连接型 Socket，根治 iOS EPERM。
     let direct_outbound = if settings.ipv6 {
-        json!({ "type": "direct", "tag": "direct" })
+        json!({ "type": "direct", "tag": "direct", "inet4_bind_address": "0.0.0.0" })
     } else {
-        json!({ "type": "direct", "tag": "direct", "domain_strategy": "ipv4_only" })
+        json!({ "type": "direct", "tag": "direct", "domain_strategy": "ipv4_only", "inet4_bind_address": "0.0.0.0" })
     };
     let mut outbounds = vec![
         direct_outbound,
@@ -464,6 +467,17 @@ pub fn build(
     if let Some(outbound) = lan_outbound {
         outbounds.push(outbound);
         go_lan_rules = lan_rules;
+        // 【APP6 任务1】[GoLan] 模块日志：路由网段注入状态
+        if !go_lan_rules.is_empty() {
+            crate::core::logger::info(
+                crate::core::logger::MOD_GO_LAN,
+                &format!(
+                    "go-lan-home 出站已注入配置，回家路由规则 {} 条（网段 {}）",
+                    go_lan_rules.len(),
+                    normalize_cidr_list(&go_lan_cfg.lan_cidrs, "").join(", ")
+                ),
+            );
+        }
     }
     warnings.extend(lan_warnings);
     warnings.extend(lan_rule_warnings);
@@ -2679,18 +2693,29 @@ rules:
             wg.get("allowed_ips").is_none(),
             "顶层 allowed_ips 会触发内核 unknown field 报错"
         );
-        // 【APP-5 任务1】peers[0] 严格 LegacyWireGuardPeer 结构，严禁 persistent_keepalive_interval
-        // （sing-box v1.11.3 LegacyWireGuardPeer 不支持该字段，写入会导致 FATAL 启动错误）
+        // 【APP6 任务2】顶层单节点模式（connect=true，DialContext("udp4")）：
+        // 顶层写 server/server_port/peer_public_key，严禁 peers / allowed_ips /
+        // persistent_keepalive_interval；peers 数组模式走 ListenPacket("udp","")
+        // 双栈非连接 Socket，在 iOS 扩展被 NECP 拦截报
+        // listen outbound packet connection: operation not permitted
         assert!(
-            wg["peers"][0]["persistent_keepalive_interval"].is_null(),
-            "peers[0] 严禁 persistent_keepalive_interval（sing-box v1.11.3 LegacyWireGuardPeer 不支持）"
+            wg.get("peers").is_none(),
+            "go-lan-home 必须是顶层单节点模式，严禁 peers 数组"
+        );
+        assert!(
+            wg.get("persistent_keepalive_interval").is_none(),
+            "go-lan-home 严禁 persistent_keepalive_interval（sing-box v1.11.3 不支持）"
+        );
+        assert_eq!(wg["server_port"].as_u64(), Some(51820));
+        assert!(
+            wg.get("peer_public_key").is_some(),
+            "顶层单节点模式必须写 peer_public_key"
         );
         assert_eq!(
-            wg["peers"][0]["allowed_ips"][0].as_str(),
-            Some("0.0.0.0/0")
+            wg["inet4_bind_address"].as_str(),
+            Some("0.0.0.0"),
+            "go-lan-home 必须强制 inet4_bind_address 纯 IPv4 Socket"
         );
-        assert_eq!(wg["peers"][0]["server_port"].as_u64(), Some(51820));
-        assert!(wg.get("server").is_none(), "顶层严禁保留 server 字段");
         assert_eq!(
             wg["local_address"][0].as_str(),
             Some("10.8.0.2/24"),

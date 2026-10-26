@@ -65,6 +65,12 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir).ok();
             app.manage(core::state::AppState::new(data_dir.clone(), app.handle().clone()));
+            // APP6 任务1：全模块环形日志系统（内存 800 条 + 512KB 磁盘轮转）
+            core::logger::init(&data_dir);
+            core::logger::info(
+                core::logger::MOD_KERNEL,
+                &format!("Prism 启动，版本 {}（{}）", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+            );
 
             // 移动端平台初始化：Android 注册 libbox/JNI VPN 回调
             #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -94,6 +100,10 @@ pub fn run() {
                         state.apply_entitlement(cache);
                     }
                     core::sync_links::reconcile(&handle).await;
+                    // 【APP6 任务3】启动校验 Pro 有效后：本地订阅为空或距上次
+                    // 全量同步超过 24h 时，自动拉取云端订阅并刷新全部节点
+                    //（auto_sync 内部自校验资格并 24h 节流，此处每轮触发即可）
+                    ipc::commands::auto_sync_and_refresh_subscriptions(handle.clone()).await;
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 }
             });
@@ -286,6 +296,9 @@ pub fn run() {
             ipc::commands::generate_or_get_ca_url,
             ipc::commands::get_kernel_info,
             ipc::commands::ensure_kernel,
+            ipc::commands::get_app_logs,
+            ipc::commands::clear_app_logs,
+            ipc::commands::export_app_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

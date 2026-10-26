@@ -15,6 +15,7 @@ pub mod go_cus;
 pub mod go_lan;
 pub mod kernel;
 pub mod license;
+pub mod logger;
 pub mod obf;
 pub mod security;
 pub mod state;

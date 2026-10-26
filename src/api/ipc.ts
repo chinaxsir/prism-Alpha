@@ -234,15 +234,34 @@ export const saveGoLanSettings = (settings: GoLanSettings) =>
   invoke<string[]>("save_go_lan_settings", { settings });
 export const syncGoLanManaged = () => invoke<GoLanSettings>("sync_go_lan_managed");
 
-/** 【APP-5 任务2】穿过 go-lan-home 隧道检测指定内网 IP 可达性 */
+/** 【APP-5 任务2 / APP6 任务2】穿过 go-lan-home 隧道检测指定内网 IP 可达性。
+ *  targetIp 可省略：后端自动从 WireGuard local_address 推导对端网关 */
 export interface GoLanProbeResult {
   reachable: boolean;
   targetIp: string;
   latencyMs: number | null;
   message: string;
 }
-export const testGoLanIp = (targetIp: string) =>
-  invoke<GoLanProbeResult>("test_go_lan_ip", { targetIp });
+export const testGoLanIp = (targetIp?: string) =>
+  invoke<GoLanProbeResult>("test_go_lan_ip", { targetIp: targetIp ?? null });
+
+/** 【APP6 任务1】全模块环形日志系统 */
+export interface AppLogEntry {
+  id: number;
+  timestamp: string;
+  level: "INFO" | "WARN" | "ERROR" | string;
+  module: string;
+  message: string;
+}
+export interface AppLogsPayload {
+  entries: AppLogEntry[];
+  totalBytes: number;
+}
+export const getAppLogs = (moduleFilter?: string) =>
+  invoke<AppLogsPayload>("get_app_logs", { moduleFilter: moduleFilter ?? null });
+export const clearAppLogs = () => invoke<void>("clear_app_logs");
+export const exportAppLogs = (moduleFilter?: string) =>
+  invoke<string>("export_app_logs", { moduleFilter: moduleFilter ?? null });
 
 /** APP 任务5：Go Lan 配置完整性检查（未配置时前端拦截开启操作）
  *  - manual：lanCidrs 非空，且（nodeUri 非空，或 wgConfig 的

@@ -380,6 +380,15 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
         let _ = app.emit("subscriptions://changed", ());
         let _ = app.emit("proxies://changed", ());
     }
+    // 【APP6 任务1】[Sub] 模块日志：云端对账结果
+    crate::core::logger::info(
+        crate::core::logger::MOD_SUB,
+        if changed {
+            "云端订阅对账完成，本地订阅列表已更新"
+        } else {
+            "云端订阅对账完成，云端与本地一致"
+        },
+    );
     Ok(())
 }
 
