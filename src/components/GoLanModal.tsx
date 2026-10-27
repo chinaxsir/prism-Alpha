@@ -44,7 +44,8 @@ interface GoLanForm {
   deviceCode: string;
 }
 
-const WG_DEFAULTS = { localIp: "10.0.0.2/24", mtu: 1280 };
+// 【APP14 任务1】MTU 默认值改为 WireGuard 标准值 1420，严禁再写死 1280。
+const WG_DEFAULTS = { localIp: "10.0.0.2/24", mtu: 1420 };
 const MANAGED_SERVER_DEFAULT = "https://prism.sarl";
 
 /** 【APP6 任务2.3】从 WireGuard local_address（如 10.1.8.2/24）推导
@@ -119,7 +120,7 @@ const WG_KNOWN_KEYS =
  * 拼接到上一字段末尾（PrivateKey =\noJms...\nkJj...= 场景）。
  *
  * 自动提取：
- * - [Interface] PrivateKey/Address/MTU（MTU > 1380 默认 1280）
+ * - [Interface] PrivateKey/Address/MTU（MTU 原样保留，缺省 1420）
  * - [Peer] PublicKey/PresharedKey/Endpoint（按最后一个 : 拆分 host/port）
  * - 从 Address 推导 /24 内网网段（10.1.8.2/24 → 10.1.8.0/24）+
  *   AllowedIPs 中非默认网段，一并填入「回家内网网段」
@@ -128,6 +129,11 @@ const WG_KNOWN_KEYS =
 function parseWgConf(text: string): Partial<GoLanForm> | null {
   const cleaned = text.replace(INVISIBLE_ONLY, "");
   if (!/\[interface\]/i.test(cleaned)) return null;
+
+  // 【APP14 任务1】只有 Base64 密钥字段才允许跨行续接（微信/网页复制常折行）；
+  // Address / DNS / MTU / ListenPort / Table / PersistentKeepalive / Endpoint /
+  // AllowedIPs 等字段绝不拼接后续未知行，否则会把下一行内容粘到 MTU 后面。
+  const BASE64_KEY = /^(privatekey|publickey|presharedkey)$/;
 
   const entries: { section: string; key: string; value: string }[] = [];
   let section = "";
@@ -153,8 +159,12 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
         .trim();
       entries.push({ section, key, value });
     } else if (entries.length > 0) {
-      // 微信折行续行：无缝拼接到上一字段末尾
-      entries[entries.length - 1].value += line.replace(/\s+/g, "");
+      const last = entries[entries.length - 1];
+      // 仅裸 Base64 续行（无 = 号）且当前字段是密钥字段时才拼接
+      const isBase64Chunk = /^[A-Za-z0-9+/=_-]+$/.test(line);
+      if (last && BASE64_KEY.test(last.key) && last.value.length < 44 && isBase64Chunk) {
+        last.value += line;
+      }
     }
   }
 
@@ -168,8 +178,11 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
   if (addr) out.wgLocalIp = addr.split(",")[0].trim();
   const mtuRaw = get("interface", "mtu");
   if (mtuRaw) {
-    const n = parseInt(mtuRaw, 10);
-    if (!isNaN(n) && n > 0) out.wgMtu = n > 1380 ? WG_DEFAULTS.mtu : n;
+    // 【APP14 任务1】只提取纯数字部分，576..9000 范围内 100% 原样保留
+    // （如配置文件写 1420 就填 1420），严禁再改成 1280 / 1380。
+    const m = mtuRaw.match(/\d+/);
+    const n = m ? parseInt(m[0], 10) : 0;
+    out.wgMtu = n >= 576 && n <= 9000 ? n : WG_DEFAULTS.mtu;
   }
   const pub = get("peer", "publickey");
   if (pub) out.wgPeerPublicKey = pub;
@@ -235,6 +248,8 @@ export default function GoLanModal({ open, onClose }: Props) {
   const [probing, setProbing] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
   const [probeOk, setProbeOk] = useState<boolean | null>(null);
+  // 【APP14 任务1】客户端私钥明文/密文切换，方便核对一键识别是否完整
+  const [showPrivKey, setShowPrivKey] = useState(false);
 
   // 打开时：若用户从未输入过检测 IP，用 local_address 推导的网关初始化
   useEffect(() => {
@@ -301,6 +316,13 @@ export default function GoLanModal({ open, onClose }: Props) {
     ) {
       patch(parsed);
       setPasteHint("");
+      // 【APP14 任务1】识别成功但缺 PrivateKey 时给出明确内联提示，
+      // 而不是让用户面对「只填了 IP 和 Port」的空白表单不知所措。
+      if (!parsed.wgPrivateKey) {
+        setPasteHint(
+          "已识别到服务器地址，但配置里没找到 PrivateKey = 行，请确认完整复制了 [Interface] 段",
+        );
+      }
       if (!opts?.silent) {
         toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
       }
@@ -597,7 +619,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                   onChange={(e) =>
                     patch({ wgMtu: parseInt(e.target.value, 10) || 0 })
                   }
-                  placeholder="1280"
+                  placeholder="1420"
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
               </label>
@@ -605,11 +627,18 @@ export default function GoLanModal({ open, onClose }: Props) {
 
             {/* 私钥 / 公钥 / PSK */}
             <label className="block">
-              <span className="mb-1 block text-xs text-gray-400">
+              <span className="mb-1 flex items-center justify-between text-xs text-gray-400">
                 客户端私钥（PrivateKey）
+                <button
+                  type="button"
+                  onClick={() => setShowPrivKey((v) => !v)}
+                  className="rounded px-1 text-[11px] text-accent hover:underline"
+                >
+                  {showPrivKey ? "隐藏" : "显示"}
+                </button>
               </span>
               <input
-                type="password"
+                type={showPrivKey ? "text" : "password"}
                 value={form.wgPrivateKey}
                 onChange={(e) => patch({ wgPrivateKey: e.target.value })}
                 className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 focus:border-accent focus:outline-none"

@@ -656,29 +656,188 @@ async fn probe_via_go_lan_outbound(
     Err(last_err)
 }
 
-/// 【APP11 任务2 铁律4】对 target_ip 的常用 Web 端口并发发起真实端到端
-/// HTTP 探测（Clash API go-lan-home 出站测速 + 本地 mixed 入站 SOCKS5），
-/// 返回首个成功端口的延迟；全部失败时返回最后一条真实错误原因。
+/// 【APP14 任务3】用户未指定端口时要并发探测的常用内网服务端口。
+const COMMON_PROBE_PORTS: [u16; 11] = [80, 443, 8080, 5000, 51821, 22, 445, 139, 3389, 8000, 9000];
+
+/// 【APP14 任务3】解析用户输入的检测目标，支持纯 IP 与 `IP:Port`。
+///
+/// 返回 (ip 字符串, 显式端口)。IPv4 专用（本项目回家网段均为 IPv4）。
+fn parse_probe_target(raw: &str) -> (String, Option<u16>) {
+    // 先剥离不可见字符（零宽空格/Word Joiner 等）与全部空白，
+    // 再切分分号多目标与 CIDR 掩码 —— 与 probe_intranet_ip 的净化口径一致。
+    let cleaned = strip_invisible_and_non_ascii(raw)
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // IPv6 字面量（[::1]:port 形式）本模块不处理，直接返回原文
+    if cleaned.contains('[') {
+        return (cleaned, None);
+    }
+    match cleaned.rsplit_once(':') {
+        Some((host, port_s)) if !host.is_empty() => match port_s.parse::<u16>() {
+            Ok(p) if p > 0 => (host.to_string(), Some(p)),
+            _ => (cleaned, None),
+        },
+        _ => (cleaned, None),
+    }
+}
+
+/// 【APP14 任务3】经本地 mixed 入站（SOCKS5）对目标做一次真实 TCP 握手探测。
+///
+/// 严格语义（与本地回环彻底解耦）：
+/// - 连 `127.0.0.1:{proxy_port}` 失败 → `本地代理端口未就绪`（绝不算目标可达，
+///   彻底排除旧逻辑里「本地 127.0.0.1 拒绝连接 1ms 假阳性」）；
+/// - SOCKS5 CONNECT 返回 `0x00 Succeeded` → 隧道内已完成三次握手 → 「端口开放」；
+/// - 返回 `0x05 Connection refused` 且 rtt >= 3ms → 数据包已穿过 WireGuard
+///   到达内网主机，对端内核主动回了 TCP RST（隧道没通/主机不存在只会是
+///   0x04/0x06/超时）→ 判定「主机在线」；
+/// - 其余一律 Err，由上层汇总为「连接超时」。
+async fn socks5_probe_port(
+    proxy_port: u16,
+    target_ip: std::net::Ipv4Addr,
+    target_port: u16,
+    timeout_ms: u64,
+) -> Result<(u64, &'static str), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dur = std::time::Duration::from_millis(timeout_ms);
+
+    // ---- 1. 连接本地代理（失败即本地未就绪，绝不判定目标可达）----
+    let mut stream = match tokio::time::timeout(
+        dur,
+        tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return Err("本地代理端口未就绪".into()),
+    };
+    let _ = stream.set_nodelay(true);
+
+    // ---- 2. SOCKS5 握手（无认证）----
+    if tokio::time::timeout(dur, stream.write_all(&[0x05, 0x01, 0x00]))
+        .await
+        .map_err(|_| "本地代理握手超时".to_string())?
+        .is_err()
+    {
+        return Err("本地代理握手写入失败".into());
+    }
+    let mut greet = [0u8; 2];
+    match tokio::time::timeout(dur, stream.read_exact(&mut greet)).await {
+        Ok(Ok(_)) => {}
+        _ => return Err("本地代理握手无响应".into()),
+    }
+    if greet[0] != 0x05 || greet[1] != 0x00 {
+        return Err(format!(
+            "本地代理拒绝 SOCKS5 无认证（method=0x{:02x}）",
+            greet[1]
+        ));
+    }
+
+    // ---- 3. CONNECT 请求（IPv4 目标）----
+    let octets = target_ip.octets();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&octets);
+    req.extend_from_slice(&target_port.to_be_bytes());
+    let t0 = std::time::Instant::now();
+    if tokio::time::timeout(dur, stream.write_all(&req))
+        .await
+        .map_err(|_| "隧道连接超时".to_string())?
+        .is_err()
+    {
+        return Err("隧道连接写入失败".into());
+    }
+
+    // ---- 4. 读取 SOCKS5 应答（4 字节头 + 变长地址 + 2 字节端口）----
+    let mut head = [0u8; 4];
+    match tokio::time::timeout(dur, stream.read_exact(&mut head)).await {
+        Ok(Ok(_)) => {}
+        _ => return Err("隧道连接超时".into()),
+    }
+    if head[0] != 0x05 {
+        return Err(format!("SOCKS5 应答版本异常: 0x{:02x}", head[0]));
+    }
+    let remain = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        0x03 => {
+            let mut l = [0u8; 1];
+            match tokio::time::timeout(dur, stream.read_exact(&mut l)).await {
+                Ok(Ok(_)) => l[0] as usize + 2,
+                _ => return Err("隧道连接超时".into()),
+            }
+        }
+        other => return Err(format!("SOCKS5 应答地址类型异常: 0x{other:02x}")),
+    };
+    let mut tail = vec![0u8; remain];
+    let _ = tokio::time::timeout(dur, stream.read_exact(&mut tail)).await;
+
+    let rtt = t0.elapsed().as_millis().max(1) as u64;
+    match head[1] {
+        // Succeeded：隧道内已完成 TCP 三次握手
+        0x00 => Ok((rtt, "端口开放")),
+        // Connection refused：对端主机回的 RST（隧道确实通了）
+        0x05 if rtt >= 3 => Ok((rtt, "主机在线")),
+        other => Err(format!("SOCKS5 应答 0x{other:02x}（{rtt}ms）")),
+    }
+}
+
+/// 【APP14 任务3】对 target_ip 并发探测（显式端口优先，否则常用端口全试），
+/// 返回首个成功的 (延迟, 端口, 状态)；全部失败返回最后一条真实原因。
 async fn probe_target_ports(
     ip: &str,
+    explicit_port: Option<u16>,
     mixed_port: u16,
     api_addr: &str,
     api_secret: &str,
-) -> Result<u64, String> {
-    let (r80, r443, r8080, r51821) = tokio::join!(
-        probe_via_go_lan_outbound(ip, 80, mixed_port, api_addr, api_secret),
-        probe_via_go_lan_outbound(ip, 443, mixed_port, api_addr, api_secret),
-        probe_via_go_lan_outbound(ip, 8080, mixed_port, api_addr, api_secret),
-        probe_via_go_lan_outbound(ip, 51821, mixed_port, api_addr, api_secret),
-    );
-    let mut last_err = String::from("隧道连接超时");
-    for r in [r80, r443, r8080, r51821] {
-        match r {
-            Ok(ms) => return Ok(ms),
-            Err(e) => last_err = e,
+) -> Result<(u64, u16, &'static str), String> {
+    let target_v4: std::net::Ipv4Addr = ip
+        .parse()
+        .map_err(|_| format!("IP 地址格式无效: {ip}"))?;
+
+    let ports: Vec<u16> = match explicit_port {
+        Some(p) => vec![p],
+        None => COMMON_PROBE_PORTS.to_vec(),
+    };
+
+    // 无本地代理入站（mixed_port == 0）时退回 Clash API 驱动 go-lan-home 出站
+    if mixed_port == 0 {
+        for p in ports {
+            if let Ok(ms) = probe_via_go_lan_outbound(ip, p, mixed_port, api_addr, api_secret).await
+            {
+                return Ok((ms, p, "端口开放"));
+            }
+        }
+        return Err("连接超时".into());
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for p in ports {
+        tasks.spawn(async move { (p, socks5_probe_port(mixed_port, target_v4, p, 2500).await) });
+    }
+    let mut last_err = String::from("连接超时");
+    let mut first_ok: Option<(u64, u16, &'static str)> = None;
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((p, res)) = joined {
+            match res {
+                Ok((ms, status)) => {
+                    if first_ok.is_none() {
+                        first_ok = Some((ms, p, status));
+                    }
+                }
+                Err(e) => {
+                    if last_err == "连接超时" || e != "本地代理端口未就绪" {
+                        last_err = e;
+                    }
+                }
+            }
         }
     }
-    Err(last_err)
+    first_ok.ok_or(last_err)
 }
 
 /// 【APP11 任务2】判断 IPv4 是否落在任一 CIDR 网段内（按掩码位运算）。
@@ -724,18 +883,24 @@ pub async fn probe_intranet_ip(
     lan: &GoLanSettings,
 ) -> GoLanProbeResult {
     let log = crate::core::logger::MOD_GO_LAN;
-    // 1. 净化输入 + 目标推导
-    let Some(target_ip) = resolve_probe_target(target_ip_raw, lan) else {
-        crate::core::logger::warn(
-            log,
-            "未提供检测目标且无法从 local_address 推导网关，请手动输入内网 IP（如 10.1.8.1）",
-        );
-        return GoLanProbeResult {
-            reachable: false,
-            target_ip: String::new(),
-            latency_ms: None,
-            message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.10.253）".into(),
-        };
+    // 1. 净化输入 + 目标推导（【APP14 任务3】支持 IP 与 IP:Port）
+    let (target_ip, explicit_port) = match target_ip_raw.map(parse_probe_target) {
+        Some((ip, p)) if !ip.is_empty() => (ip, p),
+        _ => match resolve_probe_target(None, lan) {
+            Some(gw) => (gw, None),
+            None => {
+                crate::core::logger::warn(
+                    log,
+                    "未提供检测目标且无法从 local_address 推导网关，请手动输入内网 IP（如 10.1.8.1）",
+                );
+                return GoLanProbeResult {
+                    reachable: false,
+                    target_ip: String::new(),
+                    latency_ms: None,
+                    message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.10.253）".into(),
+                };
+            }
+        },
     };
     let target_v4: std::net::Ipv4Addr = match target_ip.parse() {
         Ok(v4) => v4,
@@ -776,11 +941,6 @@ pub async fn probe_intranet_ip(
         .as_ref()
         .map(|wg| wg.local_ip.as_str())
         .unwrap_or("");
-    let server_port = lan
-        .wg_config
-        .as_ref()
-        .map(|wg| wg.server_port)
-        .unwrap_or(51820);
     let wg_gateway = derive_gateway_from_local_address(local_addr);
     let self_ip = local_addr.split('/').next().unwrap_or("").trim().to_string();
     let allow_cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
@@ -814,15 +974,29 @@ pub async fn probe_intranet_ip(
 
     crate::core::logger::info(
         log,
-        &format!("正在通过 go-lan-home 隧道检测内网目标: {target_ip} ..."),
+        &format!(
+            "正在通过 go-lan-home 隧道检测内网目标: {}{} ...",
+            target_ip,
+            explicit_port.map(|p| format!(":{p}")).unwrap_or_default()
+        ),
     );
 
-    // 4. 铁律 3/4：仅以 target_ip 本身的真实端到端响应判定 reachable
-    match probe_target_ports(&target_ip, mixed_port, api_addr, api_secret).await {
-        Ok(ms) => {
+    // 4. 仅以 target_ip 本身的真实 TCP 握手结果判定 reachable。
+    // 【APP14 任务3】提示信息 100% 针对用户输入的 target_ip，
+    // 绝不再用网关（10.1.8.1）的探测结果顶替/冒充目标结果。
+    match probe_target_ports(
+        &target_ip,
+        explicit_port,
+        mixed_port,
+        api_addr,
+        api_secret,
+    )
+    .await
+    {
+        Ok((ms, port, status)) => {
             crate::core::logger::info(
                 log,
-                &format!("✅ 内网检测成功: 已到达 {target_ip}（延迟 {ms} ms）"),
+                &format!("✅ 内网检测成功: 已到达 {target_ip}:{port}（{status}，延迟 {ms} ms）"),
             );
             GoLanProbeResult {
                 reachable: true,
@@ -832,20 +1006,9 @@ pub async fn probe_intranet_ip(
             }
         }
         Err(e) => {
-            // 诊断（绝不影响 reachable）：目标失败时才探测网关，区分
-            // 「隧道未握手成功」与「隧道已通但目标不可达」两种情况。
-            let message = if let Some(gw) = wg_gateway.clone() {
-                match probe_via_go_lan_outbound(&gw, 80, mixed_port, api_addr, api_secret).await {
-                    Ok(gw_ms) => format!(
-                        "⚠️ WireGuard 隧道已连通 (网关 {gw} 延迟 {gw_ms}ms)，但无法到达 {target_ip}（{e}）。请检查家里 WG 服务端是否开启 IP 转发/NAT，或该设备是否在线"
-                    ),
-                    Err(_) => format!(
-                        "❌ WireGuard 隧道未握手成功（网关 {gw} 不可达），请检查服务器端口 {server_port} 及密钥配置"
-                    ),
-                }
-            } else {
-                format!("❌ 未能到达 {target_ip}: {e}")
-            };
+            let message = format!(
+                "❌ 未能到达内网 {target_ip}（{e}），请检查该设备是否在线及 WG 服务端转发配置"
+            );
             crate::core::logger::warn(log, &message);
             GoLanProbeResult {
                 reachable: false,
@@ -911,9 +1074,11 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    // 【APP-10 任务1.2】MTU 上限 1380：外层 TUN 1400 套内层 WireGuard
-    // 封装（60 字节头）后不分片；用户配置 > 1380 时强制压到 1380
-    let mtu = if wg.mtu > 0 { wg.mtu.min(1380) } else { 1280 };
+    // 【APP14 任务1】MTU 原样写入内核：用户保存多少（如配置文件里的 1420）
+    // 就写多少，仅在 mtu == 0 时兜底标准值 1420。
+    // 严禁再做 min(1380) / 改写 1280 —— 外层 TUN MTU 已在扩展侧独立设定，
+    // 内层 WireGuard MTU 由用户配置决定（wg-easy 默认 1420）。
+    let mtu = if wg.mtu > 0 { wg.mtu } else { default_mtu() };
     outbound["mtu"] = json!(mtu);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
@@ -1478,6 +1643,33 @@ mod tests {
         assert!(!ipv4_in_any_cidr("192.168.11.1".parse().unwrap(), &cidrs));
     }
 
+    /// 【APP14 任务3】检测目标支持 `IP` 与 `IP:Port` 两种写法
+    #[test]
+    fn test_parse_probe_target() {
+        assert_eq!(
+            parse_probe_target("10.1.8.1"),
+            ("10.1.8.1".to_string(), None)
+        );
+        assert_eq!(
+            parse_probe_target("192.168.10.100:5000"),
+            ("192.168.10.100".to_string(), Some(5000))
+        );
+        // 带不可见字符 / 前后空白 / 掩码时仍能正确解析
+        assert_eq!(
+            parse_probe_target(" 10.1.8.2\u{200b}/24 "),
+            ("10.1.8.2".to_string(), None)
+        );
+        assert_eq!(
+            parse_probe_target("10.1.8.1:8080/24"),
+            ("10.1.8.1".to_string(), Some(8080))
+        );
+        // 端口非法时降级为纯 IP 检测
+        assert_eq!(
+            parse_probe_target("10.1.8.1:abc"),
+            ("10.1.8.1:abc".to_string(), None)
+        );
+    }
+
     #[test]
     fn test_build_wg_outbound() {
         let lan = GoLanSettings {
@@ -1526,6 +1718,35 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
+        // 【APP14 任务1】配置里的 MTU 1420 必须原样写入，绝不被压成 1280/1380
+        assert_eq!(ob["mtu"].as_u64(), Some(1420), "MTU 必须原样保留 1420");
+    }
+
+    /// 【APP14 任务1】MTU 不能再被人为篡改：>1380 原样保留，缺省兜底 1420。
+    #[test]
+    fn test_wg_mtu_preserved_verbatim() {
+        let make = |mtu: u32| GoLanSettings {
+            enabled: true,
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(10),
+                peer_public_key: test_key(11),
+                pre_shared_key: None,
+                local_ip: "10.0.0.2/32".into(),
+                mtu,
+            }),
+            ..Default::default()
+        };
+        for mtu in [1420_u32, 1400, 1280, 1500] {
+            let (outbound, _) = build_outbound(&make(mtu));
+            let ob = outbound.expect("合法配置应构建出站");
+            assert_eq!(ob["mtu"].as_u64(), Some(mtu as u64), "MTU {mtu} 必须原样保留");
+        }
+        // mtu == 0 时兜底标准值 1420
+        let (outbound, _) = build_outbound(&make(0));
+        let ob = outbound.expect("合法配置应构建出站");
+        assert_eq!(ob["mtu"].as_u64(), Some(1420), "mtu=0 应兜底 1420");
     }
 
     #[test]

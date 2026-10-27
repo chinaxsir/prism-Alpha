@@ -198,11 +198,14 @@ func (p *prismPlatform) AutoDetectInterfaceControl(fd int32) error {
 	// 必须只记录日志、永远返回 nil——绑定失败最多影响该 socket 自身，
 	// 不会连坐其他 socket。
 	//
-	// 【APP11 任务1.5】libbox 的 AutoDetectInterfaceControl 只暴露 fd、
-	// 拿不到目标地址，无法在此判定回环。因此「跳过 127.0.0.1 / ::1 /
-	// 未绑定 Socket」的过滤统一在 Swift 侧 prism_protect_socket 内用
-	// getsockname 完成（见 PacketTunnelProvider.swift），此处只负责
-	// 转发 fd 并吞掉错误。
+	// 【APP14 任务2】iOS 侧已彻底移除自定义网卡绑定：
+	// - 扩展配置不再写 route.default_interface / outbound.bind_interface，
+	//   auto_detect_interface 保持 false，因此 sing-box 根本不会调用本回调；
+	// - Swift 的 prism_protect_socket 已改为完全空操作（不再 setsockopt
+	//   IP_BOUND_IF / IPV6_BOUND_IF），扩展进程 Socket 由 iOS NECP 按当前
+	//   活跃物理网卡自动路由，与 155 个常规代理节点 100% 同一条路径；
+	// - 本回调仍保留 UsePlatformAutoDetectInterfaceControl()=true，
+	//   是为了 Android 端 VpnService.protect 不被破坏（本文件双端共用）。
 	rc := C.prism_call_protect(vpnCbs, C.int(fd))
 	if rc != 0 {
 		vpnLogf("protect_socket fd=%d returned %d (ignored)", fd, rc)

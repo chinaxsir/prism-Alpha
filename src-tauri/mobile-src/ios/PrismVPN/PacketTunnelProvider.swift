@@ -401,6 +401,110 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// 【APP14 任务2】向 App Group vpn_trace.log 追加一行 [GoLan-Ext] 实况，
+    /// 供主 App 运行日志展示扩展进程内的真实探测结果。
+    private func appendGoLanExtTrace(_ message: String) {
+        let ts = Int(Date().timeIntervalSince1970)
+        let line = "\(ts) INFO [GoLan-Ext] \(message)\n"
+        for dir in sharedDirURLs() {
+            let url = dir.appendingPathComponent("vpn_trace.log")
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile()
+                h.write(line.data(using: .utf8) ?? Data())
+                try? h.close()
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+
+    /// 【APP14 任务2】扩展进程内 WireGuard 对端的 UDP 握手可达性探测。
+    ///
+    /// 目的：把「扩展自身 Socket 能否发出 148 字节 UDP 握手包」这件事直接
+    /// 写进日志，一眼区分两类故障：
+    ///   - `result=connect-failed(...)` / `Network is unreachable` /
+    ///     `Operation not permitted` → 扩展进程发不出包（网络层被堵），
+    ///     与内网目标无关，问题在 Socket 绑定/路由策略；
+    ///   - `result=timeout after 600ms` → UDP 已发出（connect 成功即代表
+    ///     内核已选出源地址与出口网卡），只是没收到对端回包（对端
+    ///     正常只会对合法 Noise 握手包回包，故 timeout 属预期）。
+    private func probeGoLanUdpHandshake(server: String, port: UInt16) {
+        let physical = cachedPhysicalIfName.isEmpty ? "?" : cachedPhysicalIfName
+        let physicalIdx = cachedPhysicalIfIndex
+        appendGoLanExtTrace(
+            "path=扩展进程内 udp -> 服务器 \(server):\(port), 物理网卡=\(physical)(index=\(physicalIdx))"
+        )
+
+        // 目标必须是 IP 字面量（WireGuard 出站的 server 已在配置里预解析为 IP）
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        let ipStr = server.hasPrefix("[") ? "" : server
+        guard !ipStr.isEmpty, inet_pton(AF_INET, ipStr, &addr.sin_addr) == 1 else {
+            appendGoLanExtTrace("udp handshake -> 服务器 \(server):\(port) result=skip(非 IPv4 字面量)")
+            return
+        }
+
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            appendGoLanExtTrace("udp handshake -> 服务器 \(server):\(port) result=socket failed(errno=\(errno))")
+            return
+        }
+        defer { close(fd) }
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        let connected = withUnsafePointer(to: &addr) { p -> Int32 in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connected != 0 {
+            appendGoLanExtTrace(
+                "udp handshake -> 服务器 \(server):\(port) result=connect-failed(errno=\(errno): \(String(cString: strerror(errno))))"
+            )
+            return
+        }
+
+        // 148 字节 = WireGuard handshake initiation 的标准长度
+        var payload = [UInt8](repeating: 0, count: 148)
+        let sent = payload.withUnsafeBytes { raw -> Int in
+            send(fd, raw.baseAddress, raw.count, 0)
+        }
+        guard sent > 0 else {
+            appendGoLanExtTrace(
+                "udp handshake -> 服务器 \(server):\(port) result=send-failed(errno=\(errno): \(String(cString: strerror(errno))))"
+            )
+            return
+        }
+
+        var buf = [UInt8](repeating: 0, count: 2048)
+        let deadline = Date().addingTimeInterval(0.6)
+        var got: Int = -1
+        while Date() < deadline {
+            let n = recv(fd, &buf, buf.count, 0)
+            if n > 0 {
+                got = n
+                break
+            }
+            if errno != EAGAIN && errno != EWOULDBLOCK {
+                appendGoLanExtTrace(
+                    "udp handshake -> 服务器 \(server):\(port) result=recv-failed(errno=\(errno): \(String(cString: strerror(errno))))"
+                )
+                return
+            }
+            usleep(20_000)
+        }
+        if got > 0 {
+            appendGoLanExtTrace(
+                "udp handshake -> 服务器 \(server):\(port) result=reply(\(got) bytes)"
+            )
+        } else {
+            appendGoLanExtTrace(
+                "udp handshake -> 服务器 \(server):\(port) result=timeout after 600ms (UDP 已发出，仅无回包)"
+            )
+        }
+    }
+
     private func loadRawConfigText() throws -> String {
         if let configPath = (protocolConfiguration as? NETunnelProviderProtocol)?
             .providerConfiguration?["config_path"] as? String,
@@ -748,33 +852,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //    而不是走当前 Wi-Fi 本地局域网丢包。
         var excludedV4: [NEIPv4Route] = []
         var includedV4: [NEIPv4Route] = ipv4.includedRoutes ?? []
-        var excludedIPs: Set<String> = []
-        func addExcludedIP(_ ip: String) {
-            guard isIPLiteral(ip), !excludedIPs.contains(ip) else { return }
-            excludedIPs.insert(ip)
-            excludedV4.append(
-                NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255")
-            )
-        }
-        if let outs = json["outbounds"] as? [[String: Any]] {
-            // 【APP10 任务1.3】所有出站的公网服务器 IP（go-lan-home 的
-            // WireGuard 对端 + 各代理节点 server）一律加入 excludedRoutes
-            // /32 直出物理网卡：扩展自身流量本由 NECP 自动走物理网卡，
-            // excludedRoutes 再兜一层底，双保险杜绝回环进 utun。
-            for ob in outs {
-                if let srv = ob["server"] as? String {
-                    addExcludedIP(srv)
-                }
-                if (ob["tag"] as? String) == "go-lan-home",
-                   let peers = ob["peers"] as? [[String: Any]] {
-                    for peer in peers {
-                        if let srv = peer["server"] as? String {
-                            addExcludedIP(srv)
-                        }
-                    }
-                }
-            }
-        }
+        // 【APP14 任务2】不再把出站服务器 IP（尤其 go-lan-home 的 WireGuard
+        // 对端 14.105.65.122）加入 excludedRoutes /32。
+        //
+        // 实证（文本(1) 第 41 行）：5G 蜂窝下日志报
+        //   `socks connect tcp 127.0.0.1:2080->14.105.65.122:51820:
+        //    connect: network is unreachable`
+        // 根因正是这条 /32 排除路由——在点对点蜂窝接口上，它会被内核装成
+        // 一条「无 next-hop 的黑洞路由」，导致 connect() 直接 ENETUNREACH，
+        // WireGuard 握手包一个字节都发不出去，家里 wg-easy 面板零连接记录。
+        // 而 155 个常规代理节点因为 server 是域名（未解析成 IP 字面量）从未
+        // 被加入 excludedRoutes，所以全部正常。
+        //
+        // 结论：让 go-lan-home 与常规代理节点使用完全一致的 Socket 路径，
+        // 全部交给 iOS NECP 按当前活跃物理网卡（pdp_ip0 / en0）自动路由。
+        // 仅保留「允许局域网连接」的 /24 回包闭环与直连 DNS 两条排除路由。
         if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
             for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
                 for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
@@ -1062,6 +1154,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ($0["tag"] as? String) == "go-lan-home" && ($0["type"] as? String) == "wireguard"
         }) else { return }
 
+        // 【APP14 任务2】先把「扩展进程能否发出 UDP 握手包」写进日志
+        let wgServer = wg["server"] as? String ?? ""
+        let wgPort = UInt16(
+            (wg["server_port"] as? NSNumber)?.intValue
+                ?? (wg["server_port"] as? Int) ?? 0
+        )
+        if !wgServer.isEmpty && wgPort > 0 {
+            vpnQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.probeGoLanUdpHandshake(server: wgServer, port: wgPort)
+            }
+        }
+
         var gateways: [String] = []
         func pushGateway(_ ip: String) {
             let parts = ip.split(separator: ".")
@@ -1243,16 +1347,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【APP11 任务1.2】把活跃物理网卡名写入出站 bind_interface，由
-        // sing-box 的 darwin binder 为非回环外网 Socket 设置 IP_BOUND_IF，
-        // 从根本上阻断代理/回家流量回环进 utun（5G 蜂窝下
-        // connect: network is unreachable / operation not permitted 的根因）。
-        // 绝不写入 inet4_bind_address（写死源地址在 5G 下会 i/o timeout）。
-        func applyPhysicalBind(_ obj: inout [String: Any]) {
-            if !phyName.isEmpty {
-                obj["bind_interface"] = phyName
-            }
-        }
+        // 【APP14 任务2】不再给出站注入 bind_interface：
+        // 实证（文本(1).txt）——155 个常规代理节点在 5G 下全部正常，而
+        // go-lan-home 握手失败。扩展进程自身 Socket 由 iOS NECP 天然走
+        // 当前活跃物理网卡（pdp_ip0 / en0），额外的 IP_BOUND_IF 强绑反而
+        // 把发往 WireGuard 对端的 UDP 握手包堵死。让 go-lan-home 与常规
+        // 代理节点使用 100% 相同的底层 Socket 创建方式。
         _ = phyIPv4
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
@@ -1268,7 +1368,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 锁定 ipv4_only 强制使用纯 IPv4 udp4 Socket，根治
                 // `listen outbound packet connection: operation not permitted`
                 outbounds[i]["domain_strategy"] = "ipv4_only"
-                applyPhysicalBind(&outbounds[i])
             } else if t == "selector" && !tag.isEmpty {
                 if firstSelectorTag == nil {
                     firstSelectorTag = tag
@@ -1376,12 +1475,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                 }
-                applyPhysicalBind(&outbounds[i])
             } else if proxyOutboundTypes.contains(t) {
                 if !tag.isEmpty {
                     allRealProxyTags.append(tag)
                 }
-                applyPhysicalBind(&outbounds[i])
             }
         }
 
@@ -1561,10 +1658,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var dnsRules: [[String: Any]] = preservedDnsRules
         dnsRules.append(contentsOf: [
             [
-                // 节点域名解析（内核出站侧发起）走备用 DNSPod，
-                // 与国内域名解析的 AliDNS 主用互为主备
+                // 【APP14 任务4】节点域名解析（内核出站侧发起）直接走 dns-direct
+                // （223.5.5.5，UDP/TCP 53 + direct 出站）。dns-remote 是
+                // tcp://8.8.8.8 且 detour=主代理，一旦主代理抖动/未锁定，
+                // 就会出现文本(1) 里 `->8.8.8.8:53 read: connection reset by peer`
+                // 的刷屏；改走国内直连 DNS 后与「解析节点域名」这一用途完全匹配。
                 "outbound": "any",
-                "server": "dns-direct-bak"
+                "server": "dns-direct"
             ],
             [
                 "clash_mode": "direct",
@@ -1587,11 +1687,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // 4. 修正 route
+        // 【APP14 任务2】彻底移除 route.default_interface 与 auto_detect_interface
+        // 的手工干预：
+        // - 不再写 default_interface = 物理网卡（手工指定网卡名在蜂窝/Wi-Fi
+        //   切换瞬间极易指向已消失的接口，导致 network is unreachable）；
+        // - auto_detect_interface 保持 false（关闭），让 sing-box 完全不做
+        //   接口探测/绑定，与常规代理节点走同一条系统 NECP 默认路由。
         var route = (root["route"] as? [String: Any]) ?? [:]
         route["auto_detect_interface"] = false
-        if !phyName.isEmpty {
-            route["default_interface"] = phyName
-        }
+        route.removeValue(forKey: "default_interface")
         route["final"] = mainProxyTag
 
         var rules = (route["rules"] as? [[String: Any]]) ?? []
@@ -1910,19 +2014,21 @@ private func prismOpenTun(_ json: UnsafePointer<CChar>?) -> Int32 {
 
 @_cdecl("prism_protect_socket")
 private func prismProtectSocket(_ fd: Int32) -> Int32 {
-    // 【APP12 任务1】极简修复：删掉对值类型 sockaddr 调用 withMemoryRebound 的
-    // 编译错误；保留双栈 setsockopt 物理网卡绑定。
-    // 注：AutoDetectInterfaceControl 只在 sing-box 出站 Socket 创建时被调用
-    // （wireguard-go 的 UDP、sing-box 的 TCP/UDP outbound），这些 Socket 本身
-    // 就是要发外网包的，绝不会是本地 127.0.0.1 回环——所以无需再 getsockname
-    // 做回环过滤，直接绑定即可。IPv4 Socket 上对 IPV6_BOUND_IF setsockopt
-    // 是 Darwin/kernel 允许的 no-op，安全。
-    guard fd >= 0 else { return 0 }
-    let idx = cachedPhysicalIfIndex
-    guard idx > 0 else { return 0 }
-    var ifIdx = idx
-    _ = setsockopt(fd, IPPROTO_IP, 25 /* IP_BOUND_IF */, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
-    _ = setsockopt(fd, IPPROTO_IPV6, 125 /* IPV6_BOUND_IF */, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
+    // 【APP14 任务2】完全空操作：不再对任何 Socket 做 IP_BOUND_IF / IPV6_BOUND_IF
+    // 强绑物理网卡。
+    //
+    // 实证（文本(1).txt）：5G 蜂窝下，wireguard-go 的 UDP Socket 被
+    // setsockopt(IP_BOUND_IF, 索引=蜂窝网卡) 后，握手包以
+    // `operation not permitted` / `network is unreachable` 收场；而 155 个
+    // 常规代理节点（TCP）在同样代码路径下却全部正常，说明问题出在
+    // 对 UDP 的强制网卡绑定本身，而非路由策略。
+    //
+    // 扩展进程自身发出的 Socket 天然由 iOS NECP 按当前活跃物理网卡
+    // （pdp_ip0 / en0）路由，本函数保持空操作即可让 go-lan-home 的
+    // WireGuard 与常规代理节点使用 100% 相同的底层 Socket 创建方式。
+    // 函数签名保持 `-> Int32` 是因为 C 侧 prism_vpn_cbs 声明为
+    // `int (*protect_socket)(int)`，改为 Void 会造成未定义行为。
+    _ = fd
     return 0
 }
 

@@ -246,12 +246,62 @@ fn parse_leading_epoch(line: &str) -> Option<String> {
 
 /// 把外部文本日志（内核 kernel.log / iOS 扩展诊断文件）按行合并为条目。
 /// 【APP11 任务5.3】对连续完全相同的行去重，避免内核高频报错刷屏。
+/// 【APP14 任务4】iOS NECP 沙盒下的 EPERM 刷屏噪声。
+///
+/// 典型样本（文本(1) 第 37、39 行）：
+///   `listen outbound packet connection: operation not permitted`
+///   `sing-box started (0ms)`
+/// 这类条目每几秒重复一次，把真正有价值的 GoLan/代理日志淹没，且 0ms/1ms
+/// 说明它发生在 Socket 创建阶段、对用户无任何可操作信息。仅当同时命中
+/// 「operation not permitted / eperm」与「0ms|1ms」两个特征时才丢弃，
+/// 避免误伤带真实耗时、可定位问题的 EPERM 报错。
+fn is_noise_eperm_line(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    if !(l.contains("operation not permitted") || l.contains("eperm")) {
+        return false;
+    }
+    has_tiny_ms_duration(&l)
+}
+
+/// 判断日志行里是否出现「恰好 0ms 或 1ms」的耗时（而非 1240ms / 2500ms）。
+///
+/// 直接 `contains("0ms")` 会误伤以 0 结尾的毫秒值（124**0ms**、250**0ms**），
+/// 因此逐字符找出 `Nms` 里的整数 N，只有 N 的十进制字符串正好是 "0"/"1"
+/// 才算命中（且数字前不能紧邻字母，避免误判 "s10ms" 之类）。
+fn has_tiny_ms_duration(l: &str) -> bool {
+    let bytes = l.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'm' && bytes[i + 1] == b's' {
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            let digits = &bytes[j..i];
+            if !digits.is_empty() {
+                let preceded_by_letter = j > 0 && bytes[j - 1].is_ascii_alphabetic();
+                if !preceded_by_letter && (digits == b"0" || digits == b"1") {
+                    return true;
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU64, max_lines: usize) {
     let mut count = 0usize;
     let mut last_key: Option<String> = None;
     for line in lines_text.lines() {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        // 【APP14 任务4】过滤 NECP 沙盒 EPERM 刷屏噪声
+        if is_noise_eperm_line(line) {
             continue;
         }
         let module = classify_kernel_line(line);
@@ -553,4 +603,32 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_noise_eperm_line;
+
+    /// 【APP14 任务4】NECP 沙盒 EPERM 刷屏噪声必须被识别并丢弃
+    #[test]
+    fn test_noise_eperm_detected() {
+        assert!(is_noise_eperm_line(
+            "listen outbound packet connection: operation not permitted (0ms)"
+        ));
+        assert!(is_noise_eperm_line(
+            "sing-box: listen tcp 127.0.0.1:2080: operation not permitted 1ms"
+        ));
+    }
+
+    /// 带真实耗时或与 EPERM 无关的日志绝不能误伤
+    #[test]
+    fn test_noise_eperm_not_overfiltered() {
+        assert!(!is_noise_eperm_line(
+            "go-lan-home: dial udp 14.105.65.122:51820: operation not permitted (1240ms)"
+        ));
+        assert!(!is_noise_eperm_line("sing-box started (0ms)"));
+        assert!(!is_noise_eperm_line(
+            "✅ 内网检测成功: 已到达 10.1.8.1:5000（端口开放，延迟 12 ms）"
+        ));
+    }
 }
