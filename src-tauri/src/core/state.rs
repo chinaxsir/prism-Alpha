@@ -243,6 +243,10 @@ pub struct AppState {
     pub aim_results: RwLock<std::collections::HashMap<String, super::go_aim::AimNodeResult>>,
     /// Go AIM：探测进行中标志
     pub aim_probing: std::sync::atomic::AtomicBool,
+    /// 【APP11 任务4.3】Go AIM：中止本轮探测信号。用户在探测途中手动切换
+    /// 节点时置位，探测工作循环据此立即停止，避免继续用旧选择器/残留
+    /// Socket 探测污染结果与内核日志。
+    pub aim_abort: std::sync::atomic::AtomicBool,
     /// Go AIM：当前锁定的解锁节点
     pub aim_locked_node: RwLock<Option<String>>,
     /// Go AIM：监控任务已启动标志（进程内单例）
@@ -321,6 +325,7 @@ impl AppState {
             proxy_backup: RwLock::new(None),
             aim_results: RwLock::new(std::collections::HashMap::new()),
             aim_probing: std::sync::atomic::AtomicBool::new(false),
+            aim_abort: std::sync::atomic::AtomicBool::new(false),
             aim_locked_node: RwLock::new(None),
             aim_monitor_started: std::sync::atomic::AtomicBool::new(false),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),

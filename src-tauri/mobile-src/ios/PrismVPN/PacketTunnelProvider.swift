@@ -101,6 +101,41 @@ private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
     return false
 }
 
+/// 【APP11 任务1.1】内核路由实测：向公网 DNS 223.5.5.5:53 发一个 UDP connect
+/// （仅 connect 不发数据），让内核按「当前真实默认路由」选出源 IP，再
+/// getsockname 读出。这是"此刻真正在用的物理网卡"最权威的判据——弱 Wi-Fi
+/// 无外网时内核会选蜂窝 IP，彻底避免把出站 Socket 绑到断网的 en0。
+/// 隧道已建立时源 IP 可能是 utun 地址（ipv4ByName 不匹配）→ 返回空串，
+/// 调用方自动回退到既有 NWPathMonitor 逻辑。
+private func probeRoutedSourceIPv4() -> String {
+    let fd = socket(AF_INET, SOCK_DGRAM, 0)
+    guard fd >= 0 else { return "" }
+    defer { close(fd) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = UInt16(53).bigEndian
+    addr.sin_addr.s_addr = inet_addr("223.5.5.5")
+    let connected = withUnsafePointer(to: &addr) { p -> Int32 in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard connected == 0 else { return "" }
+    var local = sockaddr_in()
+    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let got = withUnsafeMutablePointer(to: &local) { p -> Int32 in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            getsockname(fd, $0, &len)
+        }
+    }
+    guard got == 0 else { return "" }
+    var raw = local.sin_addr
+    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    guard inet_ntop(AF_INET, &raw, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { return "" }
+    let ip = String(cString: buf)
+    return isValidIPv4Literal(ip) ? ip : ""
+}
+
 /// 获取当前真正联网的物理网卡（Wi-Fi 在家选 en0，出门断 Wi-Fi 自动选蜂窝流量 pdp_ip0）
 ///
 /// 【APP-2】双卡/VoLTE 与弱 Wi-Fi 增强：
@@ -183,6 +218,22 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
 
     // 最优蜂窝候选：系统默认路由同名 > 有可路由 IPv4 > 仅 IPv6（IMS 专网）
     let bestCell = cellNamedCandidate ?? cellV4Candidate ?? cellV6Candidate
+
+    // 【APP11 任务1.1】内核路由实测最优先：谁能真正连公网就用谁。
+    // 直接向 223.5.5.5:53 connect 后 getsockname 得到内核选定的源 IP，
+    // 再反查承载该 IP 的物理网卡。弱 Wi-Fi（有局域网 IP 但无外网）时
+    // 内核会选蜂窝 IP，从而避免把出站 Socket 绑到断网的 en0。
+    let routedIP = probeRoutedSourceIPv4()
+    if !routedIP.isEmpty,
+       let routedName = ipv4ByName.first(where: { $0.value == routedIP })?.key,
+       !routedName.isEmpty,
+       let routedIdx = if_nametoindex(routedName), routedIdx > 0
+    {
+        let iface = PhysicalInterface(name: routedName, index: routedIdx, hasRoutableIP: true)
+        cachedPhysicalIfIndex = routedIdx
+        cachedPhysicalIfName = routedName
+        return attached(iface)
+    }
 
     // NWPathMonitor 指示系统默认路由已是蜂窝（弱 Wi-Fi 已被 iOS 自动切走）
     // → 忽略有局域网 IP 但无外网连通性的弱 en0，直接选用最优 pdp_ip*
@@ -415,6 +466,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             do {
                 try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
                 try? self.copyGeoDatabases(to: workDir)
+
+                // 【APP11 任务5.1】启动前清空 box.log / vpn_trace.log：
+                // 内核以 append 模式写 box.log，跨会话累积会让运行日志里
+                // 堆满历史内核报错（8.8.8.8:853 i/o timeout 等）；vpn_trace.log
+                // 是本扩展自写的实况日志，同样逐会话累积。启动前截断，
+                // 保证日志只反映本次会话。
+                for logName in ["box.log", "vpn_trace.log"] {
+                    let u = workDir.appendingPathComponent(logName)
+                    try? FileManager.default.removeItem(at: u)
+                    FileManager.default.createFile(atPath: u.path, contents: nil)
+                }
 
                 let currentPhy = findActivePhysicalInterface()
                 self.activeBoundInterface = currentPhy.name
@@ -1165,17 +1227,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【APP10 任务1】不注入 bind_interface / inet4_bind_address，也不做
-        // Socket 级 IP_BOUND_IF（prism_protect_socket 已为空操作）：
-        // 扩展进程自身流量由系统 NECP 自动走主物理网卡（5G pdp_ip0 /
-        // Wi-Fi en0），服务器 IP 另由 excludedRoutes /32 兜底直出。
-        let bindIPv4 = isValidIPv4Literal(phyIPv4) ? phyIPv4 : ""
+        // 【APP11 任务1.2】把活跃物理网卡名写入出站 bind_interface，由
+        // sing-box 的 darwin binder 为非回环外网 Socket 设置 IP_BOUND_IF，
+        // 从根本上阻断代理/回家流量回环进 utun（5G 蜂窝下
+        // connect: network is unreachable / operation not permitted 的根因）。
+        // 绝不写入 inet4_bind_address（写死源地址在 5G 下会 i/o timeout）。
         func applyPhysicalBind(_ obj: inout [String: Any]) {
-            // 仅保留 domain_strategy: ipv4_only 强制纯 IPv4 Socket，
-            // 不再注入 bind_interface / inet4_bind_address
-            _ = bindIPv4
-            _ = phyName
+            if !phyName.isEmpty {
+                obj["bind_interface"] = phyName
+            }
         }
+        _ = phyIPv4
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
             let tag = (outbounds[i]["tag"] as? String) ?? ""
@@ -1563,6 +1625,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let headRules: [[String: Any]] = [
             ["protocol": ["dns"], "outbound": finalDnsTag],
             ["port": [53], "outbound": finalDnsTag],
+            // 【APP11 任务4.1】DNS-over-TLS(853) 顶部拦截：系统在隧道就绪前
+            // 尝试 DoT 直连 8.8.8.8:853 / 8.8.4.4:853 会反复 i/o timeout
+            // 刷屏耗电；直接 block 853，逼使回退到标准 53 端口 DNS。
+            ["port": [853], "outbound": finalBlockTag],
             ["protocol": ["quic"], "outbound": finalBlockTag],
             ["network": ["udp"], "port": [443], "outbound": finalBlockTag]
         ]
@@ -1827,17 +1893,51 @@ private func prismOpenTun(_ json: UnsafePointer<CChar>?) -> Int32 {
 
 @_cdecl("prism_protect_socket")
 private func prismProtectSocket(_ fd: Int32) -> Int32 {
-    // 【APP10 任务1】安全空操作：iOS NEPacketTunnelProvider 架构下
-    // （includeAllNetworks = false），系统 NECP 策略天然将扩展进程自身
-    // 发起的所有 Socket 绑定到当前系统主物理网络（5G pdp_ip0 /
-    // Wi-Fi en0），绝不回环进 utun。
-    // 过去手动 setsockopt(IP_BOUND_IF) 强绑静态网卡索引，一旦 5G 下
-    // 拿到未联网的 en0 索引，全部出站 TCP/UDP Socket（含 WireGuard
-    // 握手包 14.105.65.122:51820 与 DNS 8.8.8.8:53）报
-    // connect: network is unreachable / operation not permitted。
-    // 移除强绑后交由系统 NECP + excludedRoutes（服务器 IP /32 直出）
-    // 双重保障，5G/Wi-Fi 切换零干预。
-    _ = fd
+    // 【APP11 任务1.4】只对「真实外网 Socket」设置 IP_BOUND_IF，跳过回环：
+    // - 服务器 IP /32 已在 openTun 的 excludedRoutes 直出，且各出站已带
+    //   bind_interface，这里是最后一道保险，把仍漏网的出站 Socket 绑到
+    //   当前内核实测选定的物理网卡（cachedPhysicalIfIndex），彻底避免
+    //   流量回环进 utun（operation not permitted / network unreachable 根因）；
+    // - 回环（127.x / ::1）Socket 必须保持不动，否则本机代理/CDN 流量会断。
+    guard fd >= 0 else { return 0 }
+    var idx = cachedPhysicalIfIndex
+    if idx == 0 {
+        idx = findActivePhysicalInterface().index
+    }
+    guard idx > 0 else { return 0 }
+
+    let ipBoundIf: Int32 = 25    // IP_BOUND_IF
+    let ipv6BoundIf: Int32 = 125 // IPV6_BOUND_IF
+
+    var addr = sockaddr()
+    var len = socklen_t(MemoryLayout<sockaddr>.size)
+    guard getsockname(fd, &addr, &len) == 0 else { return 0 }
+
+    switch Int32(addr.sa_family) {
+    case AF_INET:
+        // 回环地址（127.0.0.0/8）不绑定物理网卡
+        let ip = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+            UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+        }
+        if (ip >> 24) == 127 { return 0 }
+        var ifIdx = idx
+        _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
+    case AF_INET6:
+        // 回环地址（::1）不绑定物理网卡
+        let isLoopback = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p -> Bool in
+            var a = p.pointee.sin6_addr
+            return withUnsafeBytes(of: &a) { raw -> Bool in
+                guard raw.count >= 16 else { return true }
+                for i in 0..<15 where raw[i] != 0 { return false }
+                return raw[15] == 1
+            }
+        }
+        if isLoopback { return 0 }
+        var ifIdx = idx
+        _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
+    default:
+        break
+    }
     return 0
 }
 

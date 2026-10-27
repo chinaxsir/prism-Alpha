@@ -197,6 +197,12 @@ func (p *prismPlatform) AutoDetectInterfaceControl(fd int32) error {
 	// 导致 WireGuard 握手包 100% 发不出、家里服务端无任何连接记录！
 	// 必须只记录日志、永远返回 nil——绑定失败最多影响该 socket 自身，
 	// 不会连坐其他 socket。
+	//
+	// 【APP11 任务1.5】libbox 的 AutoDetectInterfaceControl 只暴露 fd、
+	// 拿不到目标地址，无法在此判定回环。因此「跳过 127.0.0.1 / ::1 /
+	// 未绑定 Socket」的过滤统一在 Swift 侧 prism_protect_socket 内用
+	// getsockname 完成（见 PacketTunnelProvider.swift），此处只负责
+	// 转发 fd 并吞掉错误。
 	rc := C.prism_call_protect(vpnCbs, C.int(fd))
 	if rc != 0 {
 		vpnLogf("protect_socket fd=%d returned %d (ignored)", fd, rc)

@@ -199,6 +199,8 @@ pub fn start_probe(app: AppHandle) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         return;
     }
+    // 【APP11 任务4.3】新的一轮探测开始，清除中止信号
+    state.aim_abort.store(false, Ordering::Release);
     if !is_running(&state) {
         state.aim_probing.store(false, Ordering::Release);
         tracing::debug!("[go-aim] 内核未运行，跳过探测");
@@ -210,25 +212,35 @@ pub fn start_probe(app: AppHandle) {
         let state = app.state::<AppState>();
         match probe_all(&app, &state).await {
             Ok(count) => {
-                tracing::info!("[go-aim] 全量真实探测完成，共 {count} 个节点参与评级");
-                // 【APP6 任务1】[GoAim] 模块日志
-                crate::core::logger::info(
-                    crate::core::logger::MOD_GO_AIM,
-                    &format!("AIM 全量探测完成，共 {count} 个节点参与评级"),
-                );
-                if state.settings.read().go_aim_enabled {
-                    if let Err(e) = apply_selection(&app, &state).await {
-                        tracing::warn!("[go-aim] 锁定选择失败: {e}");
-                        crate::core::logger::warn(
-                            crate::core::logger::MOD_GO_AIM,
-                            &format!("锁定节点选择失败: {e}"),
-                        );
+                if state.aim_abort.load(Ordering::Acquire) {
+                    // 【APP11 任务4.3】用户中途切换节点 → 跳过锁定，尊重用户选择
+                    tracing::info!("[go-aim] 探测被用户切换节点中止，跳过分组锁定");
+                    crate::core::logger::info(
+                        crate::core::logger::MOD_GO_AIM,
+                        "AIM 探测被用户手动切换节点中止，跳过分组锁定以尊重用户选择",
+                    );
+                } else {
+                    tracing::info!("[go-aim] 全量真实探测完成，共 {count} 个节点参与评级");
+                    // 【APP6 任务1】[GoAim] 模块日志
+                    crate::core::logger::info(
+                        crate::core::logger::MOD_GO_AIM,
+                        &format!("AIM 全量探测完成，共 {count} 个节点参与评级"),
+                    );
+                    if state.settings.read().go_aim_enabled {
+                        if let Err(e) = apply_selection(&app, &state).await {
+                            tracing::warn!("[go-aim] 锁定选择失败: {e}");
+                            crate::core::logger::warn(
+                                crate::core::logger::MOD_GO_AIM,
+                                &format!("锁定节点选择失败: {e}"),
+                            );
+                        }
                     }
                 }
             }
             Err(e) => tracing::warn!("[go-aim] 探测中止: {e}"),
         }
         state.aim_probing.store(false, Ordering::Release);
+        state.aim_abort.store(false, Ordering::Release);
         let _ = app.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
     });
 }
@@ -345,6 +357,11 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             };
             let mut done = 0usize;
             loop {
+                // 【APP11 任务4.3】用户中途切换节点 → 立即停止本轮探测
+                if app.state::<AppState>().aim_abort.load(Ordering::Acquire) {
+                    tracing::info!("[go-aim] 槽位 {slot} 探测被中止信号停止");
+                    break;
+                }
                 let next = queue.lock().await.pop_front();
                 let Some((name, history_delay)) = next else { break };
                 let result =

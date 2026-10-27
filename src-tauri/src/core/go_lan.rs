@@ -580,12 +580,12 @@ async fn probe_via_go_lan_outbound(
                     if status == 200 {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                             if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
-                                // delay 必须 >0 且明显小于 2500ms 超时阈值，
-                                // 卡满阈值的伪延迟一律不可信
-                                if d > 0 && d < 2450 {
+                                // 【APP11 任务2 铁律2】延迟必须落在 2..2450ms：
+                                // <2ms 是本机回环假成功，>=2450ms 是卡满超时阈值的伪延迟
+                                if d >= 2 && d < 2450 {
                                     return Ok(d);
                                 }
-                                last_err = format!("Clash API 延迟 {d}ms 不可信（卡超时阈值）");
+                                last_err = format!("Clash API 延迟 {d}ms 不可信");
                             }
                         }
                     } else if status == 503 || status == 504 || status == 400 {
@@ -595,11 +595,9 @@ async fn probe_via_go_lan_outbound(
                                 v.get("message").and_then(|m| m.as_str()).map(String::from)
                             })
                             .unwrap_or_else(|| format!("HTTP {status}"));
-                        let lower = msg.to_lowercase();
-                        if lower.contains("connection refused") || lower.contains("refused") {
-                            // RST 回包 = 数据包已穿隧道抵达对端主机
-                            return Ok(1);
-                        }
+                        // 【APP11 任务2 铁律2】绝不把 connection refused 当成功：
+                        // 本机代理端口快速回 RST 会在 1ms 内产生该错误，
+                        // 旧逻辑据此返回 Ok(1) → 编造出"已到达内网，延迟 1ms"假阳性。
                         last_err = format!("go-lan-home 出站: {msg}");
                     } else {
                         last_err = format!("Clash API HTTP {status}");
@@ -634,19 +632,20 @@ async fn probe_via_go_lan_outbound(
                 // 仅 2xx/3xx/4xx/5xx(非 502/504) 才是对端真实回包
                 if code == 502 || code == 504 {
                     last_err = format!("本地代理代答 HTTP {code}（对端不可达）");
-                } else {
+                } else if ms >= 2 && ms < 2450 {
+                    // 【APP11 任务2 铁律4】仅真实端到端响应且耗时 2..2450ms 才判定成功
                     return Ok(ms);
+                } else {
+                    last_err = format!("响应耗时 {ms}ms 不可信");
                 }
             }
             Err(e) => {
                 let ms = start.elapsed().as_millis().max(1) as u64;
-                let text = format!("{e:?}").to_lowercase();
-                // ECONNREFUSED：包已穿隧道到对端，对端协议栈回 RST
-                if text.contains("connection refused") && ms < 2300 {
-                    return Ok(ms);
-                }
+                // 【APP11 任务2 铁律2】严禁把 connection refused 当连通：
+                // 本机 127.0.0.1 代理端口被拒会在 1ms 内返回 refused，
+                // 那是本地回环假成功，绝非对端内网主机回包。
                 if ms >= 2400 {
-                    last_err = "连接超时".into();
+                    last_err = "隧道连接超时".into();
                 } else {
                     last_err = format!("{e}");
                 }
@@ -657,16 +656,64 @@ async fn probe_via_go_lan_outbound(
     Err(last_err)
 }
 
-/// 【APP10 任务3】穿过 go-lan-home 隧道检测内网 IP，实现
-/// 「WireGuard 网关 + 目标设备」双级真实诊断：
+/// 【APP11 任务2 铁律4】对 target_ip 的常用 Web 端口并发发起真实端到端
+/// HTTP 探测（Clash API go-lan-home 出站测速 + 本地 mixed 入站 SOCKS5），
+/// 返回首个成功端口的延迟；全部失败时返回最后一条真实错误原因。
+async fn probe_target_ports(
+    ip: &str,
+    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+) -> Result<u64, String> {
+    let (r80, r443, r8080, r51821) = tokio::join!(
+        probe_via_go_lan_outbound(ip, 80, mixed_port, api_addr, api_secret),
+        probe_via_go_lan_outbound(ip, 443, mixed_port, api_addr, api_secret),
+        probe_via_go_lan_outbound(ip, 8080, mixed_port, api_addr, api_secret),
+        probe_via_go_lan_outbound(ip, 51821, mixed_port, api_addr, api_secret),
+    );
+    let mut last_err = String::from("隧道连接超时");
+    for r in [r80, r443, r8080, r51821] {
+        match r {
+            Ok(ms) => return Ok(ms),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// 【APP11 任务2】判断 IPv4 是否落在任一 CIDR 网段内（按掩码位运算）。
+fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
+    let ipu = u32::from(ip);
+    for c in cidrs {
+        let Some((net_s, mask_s)) = c.split_once('/') else {
+            continue;
+        };
+        if let (Ok(net), Ok(mask)) = (
+            net_s.parse::<std::net::Ipv4Addr>(),
+            mask_s.parse::<u8>(),
+        ) {
+            if mask > 32 {
+                continue;
+            }
+            let m: u32 = if mask == 0 { 0 } else { u32::MAX << (32 - mask) };
+            if (ipu & m) == (u32::from(net) & m) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 【APP11 任务2】穿过 go-lan-home 隧道检测内网 IP，严格执行四大铁律：
 ///
-/// 1. 从 local_address（10.1.8.2/24）推导 WG 服务端虚拟网关（10.1.8.1）；
-/// 2. 目标 IP ≠ 网关时并发探测两者：
-///    - 目标通 → ✅ 已成功到达内网 {ip} · 延迟 {ms} ms
-///    - 网关通/目标超时 → ⚠️ 隧道已连通但目标不可达（检查 NAT/IP 转发/在线）
-///    - 网关也超时 → ❌ 隧道未握手成功（检查端口/密钥）
-///
-/// 彻底废除会被 tun-in 假握手欺骗的裸 TcpStream::connect 通道。
+/// - 铁律 1（网段归属硬校验）：target_ip 必须落在已配置的回家网段
+///   （lan_cidrs ∪ local_address 所在 /24）内，否则直接拒绝、绝不发起探测；
+///   同时拒绝探测本机自身的 WireGuard 虚拟 IP；
+/// - 铁律 2（拒绝 connection refused 假成功）：延迟 <2ms 或 >=2450ms 一律无效；
+/// - 铁律 3（严禁用网关结果顶替目标）：reachable 只由 target_ip 本身是否
+///   收到真实应用层响应决定，网关探测仅用于失败时的原因诊断；
+/// - 铁律 4（仅真实端到端 HTTP 响应判定）：Clash API go-lan-home 出站测速
+///   + 经本地 mixed 入站 SOCKS5 的真实 HTTP 请求，严格排除 502/504 代答。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
     mixed_port: u16,
@@ -687,18 +734,21 @@ pub async fn probe_intranet_ip(
             reachable: false,
             target_ip: String::new(),
             latency_ms: None,
-            message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.1.1）".into(),
+            message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.10.253）".into(),
         };
     };
-    if target_ip.parse::<std::net::IpAddr>().is_err() {
-        crate::core::logger::warn(log, &format!("IP 地址格式无效: {target_ip}"));
-        return GoLanProbeResult {
-            reachable: false,
-            target_ip: target_ip.clone(),
-            latency_ms: None,
-            message: format!("IP 地址格式无效: {target_ip}"),
-        };
-    }
+    let target_v4: std::net::Ipv4Addr = match target_ip.parse() {
+        Ok(v4) => v4,
+        Err(_) => {
+            crate::core::logger::warn(log, &format!("IP 地址格式无效: {target_ip}"));
+            return GoLanProbeResult {
+                reachable: false,
+                target_ip: target_ip.clone(),
+                latency_ms: None,
+                message: format!("IP 地址格式无效: {target_ip}"),
+            };
+        }
+    };
 
     // 2. 运行前置
     if !is_running {
@@ -720,73 +770,59 @@ pub async fn probe_intranet_ip(
         };
     }
 
-    // 3. 推导 WG 网关（local_address 同网段 .1）与服务器端口
+    // 3. 铁律 1：网段归属硬校验（不在回家网段内直接拒绝）
     let local_addr = lan
         .wg_config
         .as_ref()
         .map(|wg| wg.local_ip.as_str())
         .unwrap_or("");
-    let wg_gateway = derive_gateway_from_local_address(local_addr);
     let server_port = lan
         .wg_config
         .as_ref()
         .map(|wg| wg.server_port)
         .unwrap_or(51820);
+    let wg_gateway = derive_gateway_from_local_address(local_addr);
+    let self_ip = local_addr.split('/').next().unwrap_or("").trim().to_string();
+    let allow_cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
+
+    if !self_ip.is_empty() && self_ip == target_ip {
+        let hint = wg_gateway.clone().unwrap_or_else(|| "10.1.8.1".into());
+        let msg = format!(
+            "不能检测本机自身的虚拟 IP ({self_ip})，请输入对端网关 (如 {hint}) 或家里内网设备 IP (如 192.168.10.253)"
+        );
+        crate::core::logger::warn(log, &msg);
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: msg,
+        };
+    }
+    if !ipv4_in_any_cidr(target_v4, &allow_cidrs) {
+        let cidrs_str = allow_cidrs.join(", ");
+        let msg = format!(
+            "❌ 目标 IP {target_ip} 不在已配置的回家网段 [{cidrs_str}] 内，不会经过 Go Lan 隧道"
+        );
+        crate::core::logger::warn(log, &msg);
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: msg,
+        };
+    }
 
     crate::core::logger::info(
         log,
         &format!("正在通过 go-lan-home 隧道检测内网目标: {target_ip} ..."),
     );
 
-    // 4. 目标即网关（或无法推导网关，如分享链接/Managed 模式）→ 单级探测
-    if wg_gateway.is_none() || wg_gateway.as_deref() == Some(target_ip.as_str()) {
-        return match probe_via_go_lan_outbound(&target_ip, 80, mixed_port, api_addr, api_secret)
-            .await
-        {
-            Ok(ms) => {
-                crate::core::logger::info(
-                    log,
-                    &format!(
-                        "✅ 内网检测成功: 已到达 {target_ip}（go-lan-home 出站，延迟 {ms} ms）"
-                    ),
-                );
-                GoLanProbeResult {
-                    reachable: true,
-                    target_ip: target_ip.clone(),
-                    latency_ms: Some(ms),
-                    message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
-                }
-            }
-            Err(e) => {
-                crate::core::logger::warn(
-                    log,
-                    &format!("❌ 内网检测失败: {target_ip} 不可达: {e}"),
-                );
-                GoLanProbeResult {
-                    reachable: false,
-                    target_ip: target_ip.clone(),
-                    latency_ms: None,
-                    message: format!(
-                        "❌ 未能到达 {target_ip}（{e}）。请检查隧道配置与对端设备是否在线"
-                    ),
-                }
-            }
-        };
-    }
-
-    // 5. 双级诊断：并发探测 网关（10.1.8.1）+ 目标 IP（192.168.10.253）
-    let gw = wg_gateway.clone().unwrap_or_default();
-    let gw_fut = probe_via_go_lan_outbound(&gw, 80, mixed_port, api_addr, api_secret);
-    let target_fut =
-        probe_via_go_lan_outbound(&target_ip, 80, mixed_port, api_addr, api_secret);
-    let (gw_res, target_res) = tokio::join!(gw_fut, target_fut);
-
-    match (gw_res, target_res) {
-        // 情况 1：目标可达（网关通常也通；目标通即最终目的达成）
-        (_, Ok(ms)) => {
+    // 4. 铁律 3/4：仅以 target_ip 本身的真实端到端响应判定 reachable
+    match probe_target_ports(&target_ip, mixed_port, api_addr, api_secret).await {
+        Ok(ms) => {
             crate::core::logger::info(
                 log,
-                &format!("✅ 内网检测成功: 已到达 {target_ip}（网关 {gw} 连通，延迟 {ms} ms）"),
+                &format!("✅ 内网检测成功: 已到达 {target_ip}（延迟 {ms} ms）"),
             );
             GoLanProbeResult {
                 reachable: true,
@@ -795,30 +831,27 @@ pub async fn probe_intranet_ip(
                 message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
             }
         }
-        // 情况 2：隧道通（网关可达）但目标不可达 → NAT/IP 转发/设备离线
-        (Ok(gw_ms), Err(e)) => {
-            let msg = format!(
-                "⚠️ WireGuard 隧道已连通 (网关 {gw} 延迟 {gw_ms}ms)，但无法到达 {target_ip} ({e})。请检查家里 WG 服务端是否开启 IP 转发/NAT 或 {target_ip} 是否在线"
-            );
-            crate::core::logger::warn(log, &msg);
-            GoLanProbeResult {
-                reachable: false,
-                target_ip: target_ip.clone(),
-                latency_ms: Some(gw_ms),
-                message: msg,
-            }
-        }
-        // 情况 3：连网关都不可达 → 隧道未握手成功
-        (Err(gw_err), Err(_)) => {
-            let msg = format!(
-                "❌ WireGuard 隧道未握手成功 (网关 {gw} 超时: {gw_err})，请检查服务器端口 {server_port} 及密钥配置"
-            );
-            crate::core::logger::warn(log, &msg);
+        Err(e) => {
+            // 诊断（绝不影响 reachable）：目标失败时才探测网关，区分
+            // 「隧道未握手成功」与「隧道已通但目标不可达」两种情况。
+            let message = if let Some(gw) = wg_gateway.clone() {
+                match probe_via_go_lan_outbound(&gw, 80, mixed_port, api_addr, api_secret).await {
+                    Ok(gw_ms) => format!(
+                        "⚠️ WireGuard 隧道已连通 (网关 {gw} 延迟 {gw_ms}ms)，但无法到达 {target_ip}（{e}）。请检查家里 WG 服务端是否开启 IP 转发/NAT，或该设备是否在线"
+                    ),
+                    Err(_) => format!(
+                        "❌ WireGuard 隧道未握手成功（网关 {gw} 不可达），请检查服务器端口 {server_port} 及密钥配置"
+                    ),
+                }
+            } else {
+                format!("❌ 未能到达 {target_ip}: {e}")
+            };
+            crate::core::logger::warn(log, &message);
             GoLanProbeResult {
                 reachable: false,
                 target_ip: target_ip.clone(),
                 latency_ms: None,
-                message: msg,
+                message,
             }
         }
     }
@@ -1378,6 +1411,71 @@ mod tests {
             .map(|i| i.wrapping_mul(31).wrapping_add(seed) | 1)
             .collect();
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// 【APP11 任务2 铁律1 / 任务5.3】不在回家网段内的 IP 必须 100% 拒绝
+    #[tokio::test]
+    async fn test_probe_rejects_ip_outside_lan_cidrs() {
+        let lan = GoLanSettings {
+            enabled: true,
+            lan_cidrs: vec!["10.1.8.0/24".into(), "192.168.10.0/24".into()],
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(1),
+                peer_public_key: test_key(2),
+                pre_shared_key: None,
+                local_ip: "10.1.8.2/24".into(),
+                mtu: 1420,
+            }),
+            ..Default::default()
+        };
+        // 192.168.0.1 不在 [10.1.8.0/24, 192.168.10.0/24] 内 → 直接拒绝，不发起探测
+        let r = probe_intranet_ip(Some("192.168.0.1"), 0, "", "", true, true, &lan).await;
+        assert!(!r.reachable, "网段外 IP 必须拒绝: {r:?}");
+        assert!(
+            r.message.contains("不在已配置的回家网段"),
+            "错误消息应说明网段不匹配: {}",
+            r.message
+        );
+    }
+
+    /// 【APP11 任务2 铁律1】本机自身 WireGuard 虚拟 IP 必须拒绝
+    #[tokio::test]
+    async fn test_probe_rejects_self_virtual_ip() {
+        let lan = GoLanSettings {
+            enabled: true,
+            lan_cidrs: vec!["10.1.8.0/24".into(), "192.168.10.0/24".into()],
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(3),
+                peer_public_key: test_key(4),
+                pre_shared_key: None,
+                local_ip: "10.1.8.2/24".into(),
+                mtu: 1420,
+            }),
+            ..Default::default()
+        };
+        let r = probe_intranet_ip(Some("10.1.8.2"), 0, "", "", true, true, &lan).await;
+        assert!(!r.reachable, "本机虚拟 IP 必须拒绝: {r:?}");
+        assert!(
+            r.message.contains("本机自身"),
+            "错误消息应提示本机虚拟 IP: {}",
+            r.message
+        );
+    }
+
+    /// 【APP11 任务2 铁律1】CIDR 归属位运算校验
+    #[test]
+    fn test_ipv4_in_any_cidr() {
+        let cidrs = vec!["10.1.8.0/24".to_string(), "192.168.10.0/24".to_string()];
+        assert!(ipv4_in_any_cidr("10.1.8.1".parse().unwrap(), &cidrs));
+        assert!(ipv4_in_any_cidr("10.1.8.253".parse().unwrap(), &cidrs));
+        assert!(ipv4_in_any_cidr("192.168.10.253".parse().unwrap(), &cidrs));
+        assert!(!ipv4_in_any_cidr("192.168.0.1".parse().unwrap(), &cidrs));
+        assert!(!ipv4_in_any_cidr("8.8.8.8".parse().unwrap(), &cidrs));
+        assert!(!ipv4_in_any_cidr("192.168.11.1".parse().unwrap(), &cidrs));
     }
 
     #[test]

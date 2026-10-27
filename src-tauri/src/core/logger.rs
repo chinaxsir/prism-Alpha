@@ -175,32 +175,111 @@ fn classify_kernel_line(line: &str) -> &'static str {
     }
 }
 
-/// 把外部文本日志（内核 kernel.log / iOS 扩展诊断文件）按行合并为条目
+/// 【APP11 任务5.2】解析 sing-box 内核日志行自带的时间戳。
+/// 形如 `+0800 2026-10-27 14:23:11 ERROR [...]`，返回统一格式
+/// `YYYY-MM-DD HH:MM:SS.mmm`（无则 None，调用方回退当前时间）。
+fn parse_kernel_timestamp(line: &str) -> Option<String> {
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    while i + 19 <= n {
+        let d = |k: usize| b[k].is_ascii_digit();
+        if d(i)
+            && d(i + 1)
+            && d(i + 2)
+            && d(i + 3)
+            && b[i + 4] == b'-'
+            && d(i + 5)
+            && d(i + 6)
+            && b[i + 7] == b'-'
+            && d(i + 8)
+            && d(i + 9)
+            && b[i + 10] == b' '
+            && d(i + 11)
+            && d(i + 12)
+            && b[i + 13] == b':'
+            && d(i + 14)
+            && d(i + 15)
+            && b[i + 16] == b':'
+            && d(i + 17)
+            && d(i + 18)
+        {
+            let base = &line[i..i + 19];
+            let mut ms = String::from("000");
+            if i + 20 <= n && b[i + 19] == b'.' {
+                let mut j = i + 20;
+                let mut frac = String::new();
+                while j < n && b[j].is_ascii_digit() && frac.len() < 3 {
+                    frac.push(b[j] as char);
+                    j += 1;
+                }
+                if !frac.is_empty() {
+                    while frac.len() < 3 {
+                        frac.push('0');
+                    }
+                    ms = frac;
+                }
+            }
+            return Some(format!("{base}.{ms}"));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 【APP11 任务5.2】解析扩展自写日志行开头的 10 位 Unix 秒级时间戳
+/// （如 vpn_trace.log `1793015059 INFO [GoLan-Ext] ...`），转为本地
+/// `YYYY-MM-DD HH:MM:SS.mmm`。
+fn parse_leading_epoch(line: &str) -> Option<String> {
+    let (head, _) = line.split_once(' ')?;
+    if head.len() != 10 || !head.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let secs: i64 = head.parse().ok()?;
+    use time::macros::format_description;
+    let fmt =
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
+    let dt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    let off = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    dt.to_offset(off).format(&fmt).ok()
+}
+
+/// 把外部文本日志（内核 kernel.log / iOS 扩展诊断文件）按行合并为条目。
+/// 【APP11 任务5.3】对连续完全相同的行去重，避免内核高频报错刷屏。
 fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU64, max_lines: usize) {
     let mut count = 0usize;
+    let mut last_key: Option<String> = None;
     for line in lines_text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        count += 1;
-        if count > max_lines {
-            break;
-        }
         let module = classify_kernel_line(line);
-        let level = if line.to_lowercase().contains("error")
-            || line.to_lowercase().contains("fatal")
-            || line.to_lowercase().contains("失败")
-        {
+        let lower = line.to_lowercase();
+        let level = if lower.contains("error") || lower.contains("fatal") || lower.contains("失败") {
             "ERROR"
-        } else if line.to_lowercase().contains("warn") {
+        } else if lower.contains("warn") {
             "WARN"
         } else {
             "INFO"
         };
+        // 连续重复行去重
+        let key = format!("{level}|{module}|{line}");
+        if last_key.as_deref() == Some(key.as_str()) {
+            continue;
+        }
+        last_key = Some(key);
+        if count >= max_lines {
+            break;
+        }
+        count += 1;
+        // 【APP11 任务5.2】优先使用日志行自带时间戳（内核 + 扩展 epoch）
+        let timestamp = parse_kernel_timestamp(line)
+            .or_else(|| parse_leading_epoch(line))
+            .unwrap_or_else(now_timestamp);
         out.push(LogEntry {
             id: seq.fetch_add(1, Ordering::Relaxed),
-            timestamp: now_timestamp(),
+            timestamp,
             level: level.into(),
             module: module.into(),
             message: line.chars().take(500).collect(),

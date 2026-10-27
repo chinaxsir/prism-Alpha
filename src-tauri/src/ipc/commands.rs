@@ -819,6 +819,15 @@ pub async fn select_proxy(
     if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
         return Err(format!("「{name}」是内置功能出站，不能作为代理节点选中"));
     }
+    // 【APP11 任务4.3】用户手动切换节点时，若 Go AIM 正在探测，立即发出
+    // 中止信号：避免探测继续消耗探针槽位、干扰内核日志，并被随后的
+    // 自动锁定覆盖掉用户刚选的节点。
+    if state.aim_probing.load(std::sync::atomic::Ordering::Acquire) {
+        state
+            .aim_abort
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracing::info!("[go-aim] 检测到用户手动切换节点，已发出探测中止信号");
+    }
     state
         .kernel_api()
         .select_proxy(&group, &name)

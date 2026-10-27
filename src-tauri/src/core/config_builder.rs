@@ -51,6 +51,9 @@ pub fn is_builtin_non_proxy_tag(tag: &str) -> bool {
             | "FALLBACK"
             | "LOADBALANCE"
             | "SELECTOR"
+            // 【APP11 任务3】go-lan-home 是回家专用出站，绝不允许进入任何
+            // 节点选择器 / GLOBAL 组 / urltest 自动测速组 / 默认兜底路由
+            | "GO-LAN-HOME"
     ) || t.to_ascii_uppercase().starts_with("GO-AIM-PROBE")
 }
 
@@ -1069,6 +1072,12 @@ pub fn build(
             "path": cache_path.to_string_lossy()
         }
     });
+
+    // 【APP11 任务4.1】DNS-over-TLS(853) 顶部拦截：iOS/系统在隧道就绪前
+    // 尝试 DoT 直连 8.8.8.8:853 / 8.8.4.4:853，会反复报 i/o timeout 刷屏；
+    // 在最顶部 block 853，逼使系统立即回退到标准 53 端口 DNS。
+    // （route_rules 自身不用 853，插入 index 0 不影响 DNS 劫持优先级）
+    route_rules.insert(0, json!({ "port": 853, "outbound": "block" }));
 
     // Android DNS 清洗（APP-2 断层二修复）：两条规则放在 route_rules 最顶部
     // （最先匹配），确保所有 UDP/53 和 DNS 协议请求都被劫持到 dns-out，
