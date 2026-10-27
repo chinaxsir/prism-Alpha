@@ -1901,8 +1901,8 @@ pub async fn ensure_kernel(
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         let _ = app;
-        *state.kernel_version.write() =
-            Some(format!("{} （内置）", crate::core::kernel::EMBEDDED_VERSION));
+        // 【APP12 任务2】不再拼 "（内置）" 后缀——前端统一加 v 前缀展示
+        *state.kernel_version.write() = Some(crate::core::kernel::EMBEDDED_VERSION.to_string());
         return Ok(kernel_info(&state));
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -1923,9 +1923,9 @@ pub async fn ensure_kernel(
 fn kernel_info(state: &AppState) -> KernelInfoDto {
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
-        let version = state.kernel_version.read().clone().or_else(|| {
-            Some(format!("{} （内置）", crate::core::kernel::EMBEDDED_VERSION))
-        });
+        // 【APP12 任务2】移动端始终返回纯版本号，不再带 "（内置）" 后缀
+        let version = state.kernel_version.read().clone()
+            .or_else(|| Some(crate::core::kernel::EMBEDDED_VERSION.to_string()));
         KernelInfoDto {
             exists: true,
             path: None,

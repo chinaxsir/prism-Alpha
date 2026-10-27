@@ -325,6 +325,53 @@ try {
       pass(`无 ${genRel} 本地副本（CI 每次 init 现生成）✓`);
     }
   }
+
+  // ---- 7.3 withMemoryRebound 值类型误用扫描（APP12 新增）----
+  // 实证：对值类型 sockaddr() 调用 .withMemoryRebound 导致 Swift 编译炸掉。
+  // 精确扫描：prism_protect_socket 函数体内绝不允许出现 .withMemoryRebound(
+  // （因为 sing-box 的 AutoDetectInterfaceControl 只调出站 Socket，都是要发
+  // 外网包的，不需要再用 withMemoryRebound 做回环过滤——vpn.go 也只传 fd）。
+  let protectSocketWMR = false;
+  const cdeclMatch = rawExt.match(/@_cdecl\("prism_protect_socket"\)[\s\S]*?\{/);
+  if (cdeclMatch) {
+    const after = rawExt.slice(cdeclMatch.index + cdeclMatch[0].length);
+    // 取紧跟的函数体（下一对匹配大括号）
+    let depth = 1, end = 0, i = 0;
+    for (; i < after.length && depth > 0; i++) {
+      if (after[i] === '{') depth++;
+      else if (after[i] === '}') depth--;
+    }
+    const body = after.slice(0, i);
+    if (body.includes('.withMemoryRebound(')) protectSocketWMR = true;
+  }
+  if (protectSocketWMR) {
+    fail(
+      'prism_protect_socket 函数体内仍存在 .withMemoryRebound( 调用——' +
+        'sing-box 的 AutoDetectInterfaceControl 只调出站 Socket，无需做回环过滤；' +
+        '且对值类型 sockaddr 调用 withMemoryRebound 会导致 Swift 编译炸掉。'
+    );
+  } else {
+    pass('prism_protect_socket 无 withMemoryRebound 调用 ✓');
+  }
+
+  // 保守扫描：对所有 .withMemoryRebound( 调用，其前置变量名（剥掉 .pointee. 链后）
+  // 若不在白名单里则 warning 提示开发者手动确认该变量是指针类型。
+  // 白名单 = 已验证的 UnsafePointer 参数名（addrPtr / p / addr 都经 UnsafePointer 传入）
+  const WMR_WHITELIST = new Set(['addrPtr', 'p', 'addr', 'sinPtr', 'sin6Ptr', 'sin']);
+  const wmrRe = /([a-zA-Z_][\w]*)(?:\.pointee(?:\.[a-zA-Z_][\w]*)*)*\.withMemoryRebound\(/g;
+  let wmHit;
+  while ((wmHit = wmrRe.exec(rawExt)) !== null) {
+    const varName = wmHit[1];
+    if (!WMR_WHITELIST.has(varName)) {
+      const line = rawExt.slice(0, wmHit.index).split('\n').length;
+      console.warn(
+        `⚠️  [warning] PacketTunnelProvider.swift 第 ${line} 行 ` +
+          `\`${wmHit[0]}\` 的前置变量名 "${varName}" 不在白名单 ` +
+          `[${[...WMR_WHITELIST].join(', ')}] 里，请手动确认它是 UnsafePointer 类型，` +
+          `否则会触发 Swift 编译错 "value of type 'xxx' has no member 'withMemoryRebound'"`
+      );
+    }
+  }
 } catch (e) {
   fail(`读取 PacketTunnelProvider.swift 失败：${e.message}`);
 }
@@ -337,5 +384,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 7 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 8 项检查绿灯通过，iOS / Android 构建就绪！');
 }

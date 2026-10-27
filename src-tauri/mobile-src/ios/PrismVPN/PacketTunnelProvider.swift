@@ -862,6 +862,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
             settings.ipv6Settings = ipv6
+        } else {
+            // 【APP12 任务3】空壳 ipv6Settings：即使不接管任何 IPv6 流量，
+            // 也要挂一个 includedRoutes=[]、excludedRoutes=[default] 的占位。
+            // 原理：iOS 内核 NECP 只有在隧道配置了 ipv6Settings 时才允许扩展
+            // 进程创建 AF_INET6 双栈 UDP Socket（wireguard-go 会同时尝试
+            // udp4 和 udp6），否则直接 EPERM → WireGuard 握手包发不出。
+            let ipv6 = NEIPv6Settings(addresses: [], networkPrefixLengths: [])
+            ipv6.includedRoutes = []
+            ipv6.excludedRoutes = [NEIPv6Route.default()]
+            settings.ipv6Settings = ipv6
         }
 
         if let err = applyNetworkSettingsSync(settings) {
@@ -1412,7 +1422,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         if !hasDirectOutbound {
-            var directObj: [String: Any] = ["type": "direct", "tag": "direct"]
+            // 【APP12 任务1.2】var→let：Swift 编译器警告"变量从未被修改"
+            let directObj: [String: Any] = ["type": "direct", "tag": "direct", "domain_strategy": "ipv4_only"]
             outbounds.append(directObj)
         }
         if dnsOutboundTag == nil {
@@ -1893,51 +1904,19 @@ private func prismOpenTun(_ json: UnsafePointer<CChar>?) -> Int32 {
 
 @_cdecl("prism_protect_socket")
 private func prismProtectSocket(_ fd: Int32) -> Int32 {
-    // 【APP11 任务1.4】只对「真实外网 Socket」设置 IP_BOUND_IF，跳过回环：
-    // - 服务器 IP /32 已在 openTun 的 excludedRoutes 直出，且各出站已带
-    //   bind_interface，这里是最后一道保险，把仍漏网的出站 Socket 绑到
-    //   当前内核实测选定的物理网卡（cachedPhysicalIfIndex），彻底避免
-    //   流量回环进 utun（operation not permitted / network unreachable 根因）；
-    // - 回环（127.x / ::1）Socket 必须保持不动，否则本机代理/CDN 流量会断。
+    // 【APP12 任务1】极简修复：删掉对值类型 sockaddr 调用 withMemoryRebound 的
+    // 编译错误；保留双栈 setsockopt 物理网卡绑定。
+    // 注：AutoDetectInterfaceControl 只在 sing-box 出站 Socket 创建时被调用
+    // （wireguard-go 的 UDP、sing-box 的 TCP/UDP outbound），这些 Socket 本身
+    // 就是要发外网包的，绝不会是本地 127.0.0.1 回环——所以无需再 getsockname
+    // 做回环过滤，直接绑定即可。IPv4 Socket 上对 IPV6_BOUND_IF setsockopt
+    // 是 Darwin/kernel 允许的 no-op，安全。
     guard fd >= 0 else { return 0 }
-    var idx = cachedPhysicalIfIndex
-    if idx == 0 {
-        idx = findActivePhysicalInterface().index
-    }
+    let idx = cachedPhysicalIfIndex
     guard idx > 0 else { return 0 }
-
-    let ipBoundIf: Int32 = 25    // IP_BOUND_IF
-    let ipv6BoundIf: Int32 = 125 // IPV6_BOUND_IF
-
-    var addr = sockaddr()
-    var len = socklen_t(MemoryLayout<sockaddr>.size)
-    guard getsockname(fd, &addr, &len) == 0 else { return 0 }
-
-    switch Int32(addr.sa_family) {
-    case AF_INET:
-        // 回环地址（127.0.0.0/8）不绑定物理网卡
-        let ip = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
-            UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
-        }
-        if (ip >> 24) == 127 { return 0 }
-        var ifIdx = idx
-        _ = setsockopt(fd, IPPROTO_IP, ipBoundIf, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
-    case AF_INET6:
-        // 回环地址（::1）不绑定物理网卡
-        let isLoopback = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p -> Bool in
-            var a = p.pointee.sin6_addr
-            return withUnsafeBytes(of: &a) { raw -> Bool in
-                guard raw.count >= 16 else { return true }
-                for i in 0..<15 where raw[i] != 0 { return false }
-                return raw[15] == 1
-            }
-        }
-        if isLoopback { return 0 }
-        var ifIdx = idx
-        _ = setsockopt(fd, IPPROTO_IPV6, ipv6BoundIf, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
-    default:
-        break
-    }
+    var ifIdx = idx
+    _ = setsockopt(fd, IPPROTO_IP, 25 /* IP_BOUND_IF */, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
+    _ = setsockopt(fd, IPPROTO_IPV6, 125 /* IPV6_BOUND_IF */, &ifIdx, socklen_t(MemoryLayout<UInt32>.size))
     return 0
 }
 

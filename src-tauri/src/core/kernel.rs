@@ -639,7 +639,8 @@ pub async fn probe_version(binary: &std::path::Path) -> Option<String> {
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         let _ = binary;
-        return Some(format!("{} （内置）", EMBEDDED_VERSION));
+        // 【APP12 任务2】返回纯版本号（前端统一加 v 前缀展示，不再拼 "（内置）"）
+        return Some(EMBEDDED_VERSION.to_string());
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {

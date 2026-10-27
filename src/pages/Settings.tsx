@@ -547,29 +547,26 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 代理内核：仅保留版本状态展示行；启动时后台自动校验，无需手动按钮 */}
+      {/* 【APP12 任务2】代理内核：干净单行展示，仅显示版本号 vX.Y.Z */}
       <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={14} />}>
-        <Row
-          icon={
-            <ShieldCheck
-              size={16}
-              className={kernelInfo?.exists ? "text-latency-good" : "text-latency-bad"}
-            />
-          }
-          iconBg={kernelInfo?.exists ? "bg-latency-good/10" : "bg-latency-bad/10"}
-          title={
-            kernelInfo?.exists
-              ? `${t("settings.kernelInstalled")}${kernelInfo.version ? ` · v${kernelInfo.version}` : ""}`
-              : t("settings.kernelMissing")
-          }
-          value={kernelInfo?.exists ? "" : t("settings.kernelReinstall")}
-          valueClass="text-latency-bad"
-        />
-        {kernelInfo?.path && (
-          <div className="px-3 py-2 text-[11px] font-mono break-all text-gray-500 border-t border-border">
-            {kernelInfo.path}
+        <div className="flex items-center justify-between px-3 py-3">
+          <div className="flex items-center gap-3">
+            <RowIcon>
+              <ShieldCheck
+                size={16}
+                className={kernelInfo?.exists ? "text-latency-good" : "text-latency-bad"}
+              />
+            </RowIcon>
+            <div className="text-sm text-text">内核版本</div>
           </div>
-        )}
+          <div className="text-xs font-mono text-text-muted">
+            {kernelInfo?.exists && kernelInfo.version
+              ? `v${kernelInfo.version.trim().replace(/\s*[（(]内置[）)]/g, "").replace(/^v/i, "")}`
+              : kernelInfo?.exists
+                ? ""
+                : t("settings.kernelMissing")}
+          </div>
+        </div>
       </SettingsGroup>
 
       {/* Prism Pro：【APP-5 任务4】未激活展示 5 大模块引导，已激活极简单行 */}
