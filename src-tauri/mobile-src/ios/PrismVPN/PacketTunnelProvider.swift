@@ -226,13 +226,19 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     let routedIP = probeRoutedSourceIPv4()
     if !routedIP.isEmpty,
        let routedName = ipv4ByName.first(where: { $0.value == routedIP })?.key,
-       !routedName.isEmpty,
-       let routedIdx = if_nametoindex(routedName), routedIdx > 0
+       !routedName.isEmpty
     {
-        let iface = PhysicalInterface(name: routedName, index: routedIdx, hasRoutableIP: true)
-        cachedPhysicalIfIndex = routedIdx
-        cachedPhysicalIfName = routedName
-        return attached(iface)
+        // 【APP13 任务1修复】if_nametoindex 返回非可选 UInt32，
+        // 严禁在 if 条件链里用 `let routedIdx = ...` 绑定（会触发
+        // "initializer for conditional binding must have Optional type"
+        // 编译错误）。拆成独立局部变量后再做 `> 0` 判断。
+        let routedIdx = if_nametoindex(routedName)
+        if routedIdx > 0 {
+            let iface = PhysicalInterface(name: routedName, index: routedIdx, hasRoutableIP: true)
+            cachedPhysicalIfIndex = routedIdx
+            cachedPhysicalIfName = routedName
+            return attached(iface)
+        }
     }
 
     // NWPathMonitor 指示系统默认路由已是蜂窝（弱 Wi-Fi 已被 iOS 自动切走）

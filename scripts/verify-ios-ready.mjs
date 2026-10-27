@@ -372,6 +372,66 @@ try {
       );
     }
   }
+
+  // ---- 7.4 非可选 API 条件绑定扫描（APP13 新增）----
+  // 实证：if_nametoindex 返回 UInt32（非 Optional），在 if 条件链里写
+  // `let routedIdx = if_nametoindex(...), routedIdx > 0` 直接触发 Swift
+  // 编译炸："initializer for conditional binding must have Optional type"。
+  // 这里同时扫 PacketTunnelProvider.swift 和 PrismTunnelController.swift，
+  // 命中任何一处立即 fail 并给出精确行号。
+  // 已知返回非可选类型的 C / Swift API：
+  //   - if_nametoindex(...)          → UInt32
+  //   - socket/connect/getsockname/  → Int32
+  //     getifaddrs/getaddrinfo/
+  //     inet_pton/setsockopt/
+  //     fcntl/ioctl/open/close/dup
+  //   - strlen/strcmp                → Int / Int32
+  //   - String(cString: ...)         → String（非 Optional）
+  const NON_OPTIONAL_CALLS = [
+    'if_nametoindex', 'socket', 'connect', 'getsockname', 'getifaddrs',
+    'getaddrinfo', 'inet_pton', 'setsockopt', 'fcntl', 'ioctl',
+    'open', 'close', 'dup', 'strlen', 'strcmp',
+  ];
+  // 模式 1：if / guard / 逗号 条件链里的 `let name = <非可选API>(...)` 绑定
+  const nonOptRe = new RegExp(
+    `(?:if|guard|,)\\s+let\\s+\\w+\\s*=\\s*(${NON_OPTIONAL_CALLS.join('|')})\\s*\\(`,
+    'g'
+  );
+  // 模式 2：特例 `let routedIdx = if_nametoindex(...),` 后面跟逗号条件链
+  const ifNametoindexCommaRe = /let\s+\w+\s*=\s*if_nametoindex\s*\([^)]*\)\s*,/g;
+
+  const SWIFT_PAIRS = [
+    ['PacketTunnelProvider.swift', rawExt],
+  ];
+  // 同时扫 PrismTunnelController.swift
+  try {
+    const ctrlSrc = readFileSync(resolve(ROOT, 'src-tauri/mobile-src/ios/App/PrismTunnelController.swift'), 'utf8');
+    SWIFT_PAIRS.push(['PrismTunnelController.swift', ctrlSrc]);
+  } catch { /* 文件不存在时跳过 */ }
+
+  for (const [fname, src] of SWIFT_PAIRS) {
+    let m;
+    // 重置 lastIndex，避免上轮 exec 残留
+    nonOptRe.lastIndex = 0;
+    while ((m = nonOptRe.exec(src)) !== null) {
+      const line = src.slice(0, m.index).split('\n').length;
+      fail(
+        `${fname} 第 ${line} 行：if / guard 条件链中对返回非可选类型的 ` +
+          `\`${m[1]}()\` 使用了 \`let\` 条件绑定——Swift 要求条件绑定的右侧 ` +
+          `必须是 Optional 类型。必须拆成独立局部变量后再判断。`
+      );
+    }
+    ifNametoindexCommaRe.lastIndex = 0;
+    while ((m = ifNametoindexCommaRe.exec(src)) !== null) {
+      const line = src.slice(0, m.index).split('\n').length;
+      fail(
+        `${fname} 第 ${line} 行：非法模式 \`${m[0].trim()}\` —— if_nametoindex ` +
+          `返回 UInt32（非可选），严禁在 if 条件链里写 \`, routedIdx > 0\`。`
+      );
+    }
+  }
+  // 全部通过的话给一个 summary pass
+  if (!failed) pass('两 Swift 文件均无非可选 API 条件绑定 ✓');
 } catch (e) {
   fail(`读取 PacketTunnelProvider.swift 失败：${e.message}`);
 }
