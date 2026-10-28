@@ -1024,15 +1024,11 @@ pub fn build(
             "address": tun_addresses,
             "mtu": 9000,
             "auto_route": true,
-            // mixed 栈（仅移动端）：TCP 走系统原生高性能协议栈，UDP 走 gvisor。
-            // 原 gvisor 强制用户态 TCP 实现（拥塞控制/滑动窗口全软件模拟）
-            // 单核吞吐明显低于系统栈，大流量下载/4K 播放时 CPU 占用高。
-            // 桌面端保持 gvisor（随包 sidecar 的编译标签不保证含 gvisor 栈）。
-            "stack": if cfg!(any(target_os = "ios", target_os = "android")) {
-                "mixed"
-            } else {
-                "gvisor"
-            },
+            // 【APP18 任务2】统一 gvisor 栈（移动端原为 mixed）：
+            // 进入 utun 的内网流量在用户态内存中直接调用 go-lan-home
+            // 出站 DialContext，与 Clash API 延迟探测走完全相同的内存路径，
+            // 不再依赖 mixed 栈的 172.19.0.2 <-> 172.19.0.1 内核回环 NAT。
+            "stack": "gvisor",
             // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
             // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
             // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，

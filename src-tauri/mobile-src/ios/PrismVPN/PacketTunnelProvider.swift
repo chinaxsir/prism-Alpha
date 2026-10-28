@@ -68,76 +68,6 @@ private func isValidIPv4Literal(_ s: String) -> Bool {
     return true
 }
 
-// MARK: - 【APP16 任务1】IPv4 前缀解析（零元组、零强制转型）
-
-/// IPv4 网段的标准化表示。全部字段为明确的基础类型，
-/// 严禁任何命名元组 / 强制类型转换，确保 swiftc 类型推导 100% 通过。
-private struct PrismIPv4Prefix {
-    let net: UInt32
-    let prefix: Int
-    let networkAddress: String
-    let subnetMask: String
-}
-
-/// 解析 "a.b.c.d[/prefix]" → PrismIPv4Prefix。解析失败返回 nil。
-private func parseIPv4Prefix(_ raw: String) -> PrismIPv4Prefix? {
-    let allowed = Set("0123456789./")
-    let cleaned = String(raw.unicodeScalars.filter { allowed.contains(Character($0)) })
-    guard !cleaned.isEmpty else { return nil }
-    let parts = cleaned.split(separator: "/", omittingEmptySubsequences: false)
-    let ipPart = String(parts[0])
-    guard !ipPart.isEmpty else { return nil }
-    let prefixVal: Int
-    if parts.count > 1, let p = Int(parts[1]), p >= 0 && p <= 32 {
-        prefixVal = p
-    } else {
-        prefixVal = 24
-    }
-    var addr = in_addr()
-    guard inet_pton(AF_INET, ipPart, &addr) == 1 else { return nil }
-    let ipU32 = UInt32(bigEndian: addr.s_addr)
-    let maskU32: UInt32 = prefixVal == 0 ? 0 : (0xFFFF_FFFF << (32 - prefixVal))
-    let netU32 = ipU32 & maskU32
-
-    func u32ToIP(_ v: UInt32) -> String {
-        let b1 = (v >> 24) & 0xFF
-        let b2 = (v >> 16) & 0xFF
-        let b3 = (v >> 8) & 0xFF
-        let b4 = v & 0xFF
-        return "\(b1).\(b2).\(b3).\(b4)"
-    }
-    return PrismIPv4Prefix(
-        net: netU32,
-        prefix: prefixVal,
-        networkAddress: u32ToIP(netU32),
-        subnetMask: u32ToIP(maskU32)
-    )
-}
-
-/// UInt32 网络字节序数值 → 点分十进制字符串（零元组、零强制转型）
-private func ipv4String(_ v: UInt32) -> String {
-    let b1 = (v >> 24) & 0xFF
-    let b2 = (v >> 16) & 0xFF
-    let b3 = (v >> 8) & 0xFF
-    let b4 = v & 0xFF
-    return "\(b1).\(b2).\(b3).\(b4)"
-}
-
-/// 【APP17 任务5.1】把一个 ≤/24 的网段拆成两条 /25（更细的网段原样返回）。
-/// includedRoutes 只下发 /24 会与物理网卡的 /24 直连路由冲突，拆半后
-/// 按最长前缀精确接管回家流量。
-private func splitPrefixToHalves(_ p: PrismIPv4Prefix) -> [PrismIPv4Prefix] {
-    guard p.prefix < 25 else { return [p] }
-    let half = 25
-    let mask: UInt32 = 0xFFFF_FFFF << (32 - half)
-    let firstNet = p.net & mask
-    let secondNet = firstNet | (UInt32(1) << (32 - half))
-    var out: [PrismIPv4Prefix] = []
-    if let a = parseIPv4Prefix("\(ipv4String(firstNet))/\(half)") { out.append(a) }
-    if let b = parseIPv4Prefix("\(ipv4String(secondNet))/\(half)") { out.append(b) }
-    return out
-}
-
 /// 严格判断网卡上的地址是否为真正可路由的 IP（排除 127.0.0.1、169.254.x.x 以及 iOS Wi-Fi 断开后残留的 fe80:: 链路本地地址）
 private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
     let family = Int32(addrPtr.pointee.sa_family)
@@ -758,11 +688,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     fileprivate func openTun(optionsJSON: String) -> Int32 {
         NSLog("[PrismVPN] openTun options: \(optionsJSON)")
         writeHeartbeat("openTun")
-        // 【APP-13 任务6】物理网卡 IPv4 在 openTun 顶层解析并固定，
-        // 供下方「允许局域网连接」回包路由使用。严禁在使用点再定义，
-        // 避免出现 cannot find 'bindIPv4' in scope 的作用域错误。
-        let activePhy = findActivePhysicalInterface()
-        let bindIPv4: String = isValidIPv4Literal(activePhy.ipv4) ? activePhy.ipv4 : ""
 
         guard let data = optionsJSON.data(using: .utf8),
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -802,116 +727,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        let v4Routes = prefixes(json["inet4_route_address"])
-        if v4Routes.isEmpty {
-            ipv4.includedRoutes = [NEIPv4Route.default()]
-        } else {
-            ipv4.includedRoutes = v4Routes.map {
-                if $0.prefix <= 0 || $0.address == "0.0.0.0" {
-                    return NEIPv4Route.default()
-                }
-                return NEIPv4Route(destinationAddress: $0.address, subnetMask: subnetMask(prefix: $0.prefix))
-            }
-        }
-        // 【APP-11 任务1.2】Go Lan 路由与 Socket 加固：
-        // 1) WireGuard 对端公网 IP 加入 excludedRoutes → 加密 UDP 由系统内核
-        //    直接走物理网卡直出，绝不回环进 utun，彻底消除
-        //    "listen outbound packet connection: operation not permitted"；
-        // 2) 回家内网网段（go-lan-home 规则的 ip_cidr）显式加入 includedRoutes，
-        //    强制系统把访问家庭内网 IP 的流量送入 utun 交给回家隧道，
-        //    而不是走当前 Wi-Fi 本地局域网丢包。
-        var excludedV4: [NEIPv4Route] = []
-        var includedV4: [NEIPv4Route] = ipv4.includedRoutes ?? []
-        // 【APP14 任务2】不再把出站服务器 IP（尤其 go-lan-home 的 WireGuard
-        // 对端 14.105.65.122）加入 excludedRoutes /32。
-        //
-        // 实证（文本(1) 第 41 行）：5G 蜂窝下日志报
-        //   `socks connect tcp 127.0.0.1:2080->14.105.65.122:51820:
-        //    connect: network is unreachable`
-        // 根因正是这条 /32 排除路由——在点对点蜂窝接口上，它会被内核装成
-        // 一条「无 next-hop 的黑洞路由」，导致 connect() 直接 ENETUNREACH，
-        // WireGuard 握手包一个字节都发不出去，家里 wg-easy 面板零连接记录。
-        // 而 155 个常规代理节点因为 server 是域名（未解析成 IP 字面量）从未
-        // 被加入 excludedRoutes，所以全部正常。
-        //
-        // 结论：让 go-lan-home 与常规代理节点使用完全一致的 Socket 路径，
-        // 全部交给 iOS NECP 按当前活跃物理网卡（pdp_ip0 / en0）自动路由。
-        // 仅保留「允许局域网连接」的 /24 回包闭环与直连 DNS 两条排除路由。
-        // 【APP16 任务1】Go Lan 回家网段 → includedRoutes：零元组、零强制转型。
-        var goLanPrefixes: [PrismIPv4Prefix] = []
-        if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
-            for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
-                for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
-                    if let parsed = parseIPv4Prefix(cidr), parsed.prefix > 0 {
-                        goLanPrefixes.append(parsed)
-                    }
-                }
-            }
-        }
-        // 【APP17 任务5.1】回家网段必须拆成两条 /25 再写入 includedRoutes：
-        // iOS NECP 对 /24 整段下发在同网段（家里 Wi-Fi 与回家网段重叠）时
-        // 会与物理网卡的 /24 直接路由冲突，拆半后按最长前缀精确接管。
-        var goLanHalfPrefixes: [PrismIPv4Prefix] = []
-        for parsed in goLanPrefixes {
-            for half in splitPrefixToHalves(parsed) {
-                let dup = goLanHalfPrefixes.contains {
-                    $0.net == half.net && $0.prefix == half.prefix
-                }
-                if !dup { goLanHalfPrefixes.append(half) }
-            }
-        }
-        for parsed in goLanHalfPrefixes {
-            let route = NEIPv4Route(
-                destinationAddress: parsed.networkAddress,
-                subnetMask: parsed.subnetMask
-            )
-            if !includedV4.contains(where: {
-                $0.destinationAddress == route.destinationAddress
-                    && $0.destinationSubnetMask == route.destinationSubnetMask
-            }) {
-                includedV4.append(route)
-            }
-        }
-        // 【APP-13 任务6】「允许局域网连接」回包闭环：
-        // mixed 入站监听 0.0.0.0 后，局域网设备（192.168.x.x）连本机代理端口，
-        // 其回包若被 utun 默认路由接管会发出不去，表现为「连上了但一直转圈」。
-        // 把本机物理网卡所在 /24 加入 excludedRoutes，回包固定走物理网卡。
-        let lanEnabled = ((json["inbounds"] as? [[String: Any]]) ?? []).contains {
-            ($0["type"] as? String) == "mixed" && ($0["listen"] as? String) == "0.0.0.0"
-        }
-        if lanEnabled, !bindIPv4.isEmpty,
-           let selfPrefix = parseIPv4Prefix("\(bindIPv4)/24")
-        {
-            // 【APP15 任务1.2.3】回到家里、本机 Wi-Fi 与回家网段同一 /24 时
-            // （如 192.168.10.x），把整段 /24 排除会把回家路由剔掉，导致
-            // NAS 完全不可达。只有不与任何回家网段重叠时才允许排除。
-            let overlaps = goLanPrefixes.contains { item in
-                let mask: UInt32 = item.prefix == 0
-                    ? 0
-                    : (0xFFFF_FFFF << (32 - item.prefix))
-                return (selfPrefix.net & mask) == (item.net & mask)
-            }
-            if !overlaps {
-                excludedV4.append(
-                    NEIPv4Route(
-                        destinationAddress: selfPrefix.networkAddress,
-                        subnetMask: selfPrefix.subnetMask
-                    )
-                )
-            }
-        }
-
-        // 直连 DNS 223.5.5.5 / 114.114.114.114 直出物理网卡（零 403 / 零 EPERM）
-        excludedV4.append(
-            NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
-        )
-        excludedV4.append(
-            NEIPv4Route(destinationAddress: "114.114.114.114", subnetMask: "255.255.255.255")
-        )
-        if !excludedV4.isEmpty {
-            ipv4.excludedRoutes = excludedV4
-        }
-        ipv4.includedRoutes = includedV4
+        // 【APP18 任务2】includedRoutes 只放系统默认路由，excludedRoutes 保持空：
+        // 无 gatewayAddress 的子网路由在 iOS XNU 上会被装成二层链路克隆路由，
+        // Safari / 远程桌面发往 192.168.10.x 的包在进入 utun 之前就被内核丢弃：
+        // 这正是 log2.txt 里 Clash API 已测出 388/468 ms、而 Safari 与 RDP
+        // 全部超时且内核日志无任何 192.168.10.253 连接记录的原因。
+        // 只保留 default() 后，所有内网网段 100% 由默认路由送入 utun，
+        // 再经 tun-in(gvisor) → route.rules → go-lan-home 直达家中内网。
+        ipv4.includedRoutes = [NEIPv4Route.default()]
+        ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
         let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
@@ -1272,13 +1096,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if (inbounds[i]["type"] as? String) == "tun" {
                     inbounds[i].removeValue(forKey: "interface_name")
                     inbounds[i]["strict_route"] = false
-                    inbounds[i]["auto_route"] = true
+                    // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
+                    // 下发，tun-in 不再自行改路由（auto_route=false）。
+                    inbounds[i]["auto_route"] = false
                     // 【APP15 任务1.2.2】外层 utun MTU 1500（与 NEPacketTunnel-
                     // NetworkSettings 一致），内层 go-lan-home 单独固定 1280
                     inbounds[i]["mtu"] = 1500
-                    // mixed 栈：TCP 走系统原生栈、UDP 走 gvisor（sing-box 默认），
-                    // 大幅提升大流量下载吞吐并降低单核 CPU 占用
-                    inbounds[i]["stack"] = "mixed"
+                    // 【APP18 任务2】gvisor 栈：进入 utun 的 Safari / RDP 流量在用户态
+                    // 内存中直接调用 go-lan-home.DialContext，与 Clash API 延迟
+                                        // 探测（388/468 ms）走 100% 相同的内存路径，彻底规避
+                    // mixed 栈依赖的 172.19.0.2 <-> 172.19.0.1 内核回环 NAT。
+                    inbounds[i]["stack"] = "gvisor"
                     // 【APP10 任务2.1】tun-in 严禁 sniff=true：
                     // sniff 开启时 sing-box 会在 tun-in 收到发往
                     // 192.168.10.253:80 的包时先在本地伪造 TCP 握手

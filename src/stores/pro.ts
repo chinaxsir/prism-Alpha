@@ -62,11 +62,19 @@ export const useProStore = create<ProState>((set, get) => ({
     try {
       const e = await getEntitlement();
       set({ entitlement: e, unlocked: unlockedOf(e), ready: true });
-      // 重启后按落盘原因还原横幅：解绑 ≠ 到期，严禁统一显示成「已到期」
+      // 重启后按落盘原因还原状态：解绑 ≠ 到期，严禁统一显示成「已到期」
       if (!unlockedOf(e)) {
         try {
           const reason = await getRevokeReason();
-          if (reason) set({ revokeReason: reason });
+          // 【APP18 任务1】全新安装（status=inactive）绝不能因残留的
+          // revoke_state.json（reason=expired）被误判为「授权已到期」：
+          // 仅当原因为 unbound，或本地确实已 expired 时才还原。
+          if (
+            reason === "unbound" ||
+            (reason === "expired" && e.status === "expired")
+          ) {
+            set({ revokeReason: reason });
+          }
         } catch {
           /* 读取失败按无横幅处理，不影响主流程 */
         }
