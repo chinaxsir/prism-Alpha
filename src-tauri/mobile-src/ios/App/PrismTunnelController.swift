@@ -333,20 +333,33 @@ final class PrismTunnelController {
         return urls
     }
 
+    /// 【APP16 任务3】最新文本文件候选：用结构体替代命名元组，
+    /// 严禁命名元组类型声明与强制类型转换。
+    private struct LatestTextFile {
+        let text: String
+        let mtime: Date
+    }
+
+    /// 【APP16 任务3】最新崩溃日志候选：用结构体替代命名元组。
+    private struct LatestLogFile {
+        let path: String
+        let mtime: Date
+    }
+
     /// 读取扩展心跳 prism_status.txt 的最后阶段（多目录取最新）。
     /// hb=无 → 扩展没进入 startTunnel()（main() 前崩溃/Jetsam）；
     /// hb=start-gotPath/openTun/tun-ok → 精确定位卡死阶段
     static func diagnoseExtensionHeartbeat() -> String {
         let fm = FileManager.default
-        var best: (text: String, mtime: Date)?
+        var best: LatestTextFile?
         for dir in extensionSharedDirs() {
             let path = dir.appendingPathComponent("prism_status.txt").path
             guard let text = try? String(contentsOfFile: path, encoding: .utf8),
                   let attrs = try? fm.attributesOfItem(atPath: path),
                   let mtime = attrs[.modificationDate] as? Date
             else { continue }
-            if best == nil || mtime > best!.mtime {
-                best = (text, mtime)
+            if best == nil || mtime > (best?.mtime ?? Date.distantPast) {
+                best = LatestTextFile(text: text, mtime: mtime)
             }
         }
         guard let best = best else { return "无" }
@@ -357,15 +370,15 @@ final class PrismTunnelController {
     /// 读取扩展写出的精确错误 prism_error.txt（多目录取最新）
     static func diagnoseExtensionError() -> String {
         let fm = FileManager.default
-        var best: (text: String, mtime: Date)?
+        var best: LatestTextFile?
         for dir in extensionSharedDirs() {
             let path = dir.appendingPathComponent("prism_error.txt").path
             guard let text = try? String(contentsOfFile: path, encoding: .utf8), !text.isEmpty,
                   let attrs = try? fm.attributesOfItem(atPath: path),
                   let mtime = attrs[.modificationDate] as? Date
             else { continue }
-            if best == nil || mtime > best!.mtime {
-                best = (text, mtime)
+            if best == nil || mtime > (best?.mtime ?? Date.distantPast) {
+                best = LatestTextFile(text: text, mtime: mtime)
             }
         }
         guard let best = best else { return "无" }
@@ -380,7 +393,7 @@ final class PrismTunnelController {
             "/private/var/mobile/Library/Logs/CrashReporter/Retired"
         ]
         let fm = FileManager.default
-        var latestFile: (path: String, mtime: Date)?
+        var latestFile: LatestLogFile?
         for dir in dirs {
             guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
             for item in items where item.contains("PrismVPN") || item.contains("JetsamEvent") {
@@ -388,8 +401,8 @@ final class PrismTunnelController {
                 guard let attrs = try? fm.attributesOfItem(atPath: full),
                       let mtime = attrs[.modificationDate] as? Date
                 else { continue }
-                if latestFile == nil || mtime > latestFile!.mtime {
-                    latestFile = (full, mtime)
+                if latestFile == nil || mtime > (latestFile?.mtime ?? Date.distantPast) {
+                    latestFile = LatestLogFile(path: full, mtime: mtime)
                 }
             }
         }
@@ -407,15 +420,15 @@ final class PrismTunnelController {
     /// DNS、握手失败都会写这里；主 App 持 no-sandbox 直接读共享目录）
     static func diagnoseBoxLog() -> String {
         let fm = FileManager.default
-        var best: (text: String, mtime: Date)?
+        var best: LatestTextFile?
         for dir in extensionSharedDirs() {
             let path = dir.appendingPathComponent("prism_work/box.log").path
             guard let text = try? String(contentsOfFile: path, encoding: .utf8),
                   let attrs = try? fm.attributesOfItem(atPath: path),
                   let mtime = attrs[.modificationDate] as? Date
             else { continue }
-            if best == nil || mtime > best!.mtime {
-                best = (text, mtime)
+            if best == nil || mtime > (best?.mtime ?? Date.distantPast) {
+                best = LatestTextFile(text: text, mtime: mtime)
             }
         }
         guard let best = best else { return "无" }
@@ -727,8 +740,8 @@ final class PrismTunnelController {
             let ptr = unsafeBitCast(infoCode, to: OpaquePointer.self)
             var infoDictRef: CFTypeRef?
             if info(ptr, 0, &infoDictRef) == 0, let d = infoDictRef,
-               CFGetTypeID(d) == CFDictionaryGetTypeID() {
-                let nd = d as! NSDictionary
+               CFGetTypeID(d) == CFDictionaryGetTypeID(),
+               let nd = d as? NSDictionary {
                 if let ident = nd["identifier"] { extra += " id=\(ident)" }
                 if let team = nd["teamidentifier"] { extra += " team=\(team)" }
                 if let flags = nd["flags"] { extra += " flags=\(flags)" }
@@ -1116,17 +1129,26 @@ final class PrismTunnelController {
         }
     }
 
+    /// 【APP16 任务3】runSpawnTool 返回值：用结构体替代命名元组，
+    /// 严禁命名元组声明与强制类型转换。
+    private struct SpawnToolResult {
+        let spawn: Int32
+        let exit: Int32
+        let termsig: Int32
+        let output: String
+    }
+
     /// 通过 posix_spawn 运行 pluginkit 子命令。
     /// asRoot 依赖 com.apple.private.persona-mgmt entitlement，用
     /// posix_spawn 运行外部工具（TrollStore TSUtil.m spawnRoot 同款机制）；
     /// captureOutput 时把 stdout 重定向到临时文件并在结束后读回。
-    /// 返回 (spawnErrno, 子进程exitCode, 终止信号(0=正常退出), stdout)
+    /// 返回 SpawnToolResult(spawnErrno, 子进程exitCode, 终止信号(0=正常退出), stdout)
     private static func runSpawnTool(
         path: String,
         args: [String],
         asRoot: Bool,
         captureOutput: Bool
-    ) -> (spawn: Int32, exit: Int32, termsig: Int32, output: String) {
+    ) -> SpawnToolResult {
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path)]
         for a in args { argv.append(strdup(a)) }
         argv.append(nil)
@@ -1184,7 +1206,7 @@ final class PrismTunnelController {
             spawnResult = posix_spawn(&pid, path, nil, &attr, &argv, nil)
         }
         guard spawnResult == 0 else {
-            return (spawnResult, -1, 0, "")
+            return SpawnToolResult(spawn: spawnResult, exit: -1, termsig: 0, output: "")
         }
         var status: Int32 = 0
         waitpid(pid, &status, 0)
@@ -1199,7 +1221,7 @@ final class PrismTunnelController {
             output = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
             unlink(outPath)
         }
-        return (0, exitCode, termsig, output)
+        return SpawnToolResult(spawn: 0, exit: exitCode, termsig: termsig, output: output)
     }
 
     // MARK: - root helper 注册
@@ -1256,18 +1278,18 @@ final class PrismTunnelController {
             return false
         }
         let appPath = Bundle.main.bundlePath
-        let (spawnErr, exitCode, termsig, output) = runSpawnTool(
+        let spawnTool = runSpawnTool(
             path: helperPath, args: ["uicache", appPath],
             asRoot: true, captureOutput: true)
-        if spawnErr != 0 {
-            rootHelperResult = "helper=spawn=\(spawnErr)"
+        if spawnTool.spawn != 0 {
+            rootHelperResult = "helper=spawn=\(spawnTool.spawn)"
             return false
         }
-        let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sigNote = termsig != 0 ? " sig=\(termsig)" : ""
-        rootHelperResult = "helper=u\(exitCode)\(sigNote)\(tail.isEmpty ? "" : " out=\(tail.prefix(100))")"
+        let tail = spawnTool.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sigNote = spawnTool.termsig != 0 ? " sig=\(spawnTool.termsig)" : ""
+        rootHelperResult = "helper=u\(spawnTool.exit)\(sigNote)\(tail.isEmpty ? "" : " out=\(tail.prefix(100))")"
         NSLog("[PrismVPN] rootHelper: \(rootHelperResult)")
-        return exitCode == 0 && termsig == 0
+        return spawnTool.exit == 0 && spawnTool.termsig == 0
     }
 
     // MARK: 旧版扩展进程清理（build 150 方案第 2 步）
@@ -1384,10 +1406,10 @@ final class PrismTunnelController {
             NSLog("[PrismVPN] killext 失败：PrismHelper 不存在")
             return
         }
-        let (spawnErr, exitCode, termsig, _) = runSpawnTool(
+        let spawnTool = runSpawnTool(
             path: helperPath, args: ["killext"],
             asRoot: true, captureOutput: false)
-        NSLog("[PrismVPN] killext spawn=\(spawnErr) exit=\(exitCode) sig=\(termsig)")
+        NSLog("[PrismVPN] killext spawn=\(spawnTool.spawn) exit=\(spawnTool.exit) sig=\(spawnTool.termsig)")
     }
 
     // MARK: - 随包 root helper（PrismHelper）强扭注册
@@ -1437,23 +1459,23 @@ final class PrismTunnelController {
         // fixperm 必须先于 register：Bundle 属主修成 _installd(33:33) 后
         // 再注册，pkd/LaunchServices 读到的就是正确属主（build 141 方案）
         for cmd in ["fixperm", "register"] {
-            let (spawnErr, exitCode, termsig, output) = runSpawnTool(
+            let spawnTool = runSpawnTool(
                 path: helperPath, args: [cmd, mainPath, appexPath],
                 asRoot: true, captureOutput: true)
-            if spawnErr != 0 {
-                all.append("\(cmd):spawn=\(spawnErr)")
+            if spawnTool.spawn != 0 {
+                all.append("\(cmd):spawn=\(spawnTool.spawn)")
                 spawnedOK = false
                 continue
             }
-            let lines = output.split(separator: "\n")
+            let lines = spawnTool.output.split(separator: "\n")
                 .map { String($0).trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
             // sig=N 非零说明 helper 被信号杀死（此时 WEXITSTATUS 恒为 0，
             // 不能只看 exitCode 判定成功——build 138 实证空括号误判）
-            let sigNote = termsig != 0 ? " sig=\(termsig)" : ""
-            all.append("\(cmd):u\(exitCode)\(sigNote)[\(lines.joined(separator: " | ").prefix(220))]")
-            if cmd == "register" { registerText = output }
-            if exitCode != 0 || termsig != 0 { spawnedOK = false }
+            let sigNote = spawnTool.termsig != 0 ? " sig=\(spawnTool.termsig)" : ""
+            all.append("\(cmd):u\(spawnTool.exit)\(sigNote)[\(lines.joined(separator: " | ").prefix(220))]")
+            if cmd == "register" { registerText = spawnTool.output }
+            if spawnTool.exit != 0 || spawnTool.termsig != 0 { spawnedOK = false }
         }
         selfHelperResult = all.joined(separator: " ")
         NSLog("[PrismVPN] selfHelper: \(selfHelperResult)")
@@ -1970,26 +1992,35 @@ final class PrismTunnelController {
         }
     }
 
+    /// 【APP16 任务3】扩展心跳结果：用结构体替代命名元组。
+    struct ExtensionHeartbeat {
+        let alive: Bool
+        let stage: String
+        let age: Int
+    }
+
     /// 读取扩展心跳（prism_status.txt，扩展每 60s 刷新）。
     /// TrollStore 假团队配置下系统可能上报假 connected（扩展进程从未
     /// 被拉起），心跳是扩展存活的唯一可靠证据。
-    static func readExtensionHeartbeat() -> (alive: Bool, stage: String, age: Int) {
+    static func readExtensionHeartbeat() -> ExtensionHeartbeat {
         guard let groupURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: prismAppGroupID
-        ) else { return (false, "appGroup不可用", -1) }
+        ) else { return ExtensionHeartbeat(alive: false, stage: "appGroup不可用", age: -1) }
         guard let text = try? String(
             contentsOf: groupURL.appendingPathComponent("prism_status.txt"),
             encoding: .utf8
-        ), !text.isEmpty else { return (false, "无心跳文件", -1) }
+        ), !text.isEmpty else {
+            return ExtensionHeartbeat(alive: false, stage: "无心跳文件", age: -1)
+        }
         let parts = text.split(separator: " ")
         guard let ts = Double(parts.first ?? "") else {
-            return (false, "心跳格式异常", -1)
+            return ExtensionHeartbeat(alive: false, stage: "心跳格式异常", age: -1)
         }
         let stage = parts.dropFirst().joined(separator: " ")
         let age = Int(Date().timeIntervalSince1970 - ts)
         // 心跳间隔已由 3s 调整为 60s（低功耗）：宽限期取 90s，
         // 允许一次心跳延迟仍判定存活，避免锁屏/后台挂起误判
-        return (age <= 90, stage, age)
+        return ExtensionHeartbeat(alive: age <= 90, stage: stage, age: age)
     }
 
     /// 读取 App Group 共享错误文件（扩展写入的内核错误原文/断开原因）。

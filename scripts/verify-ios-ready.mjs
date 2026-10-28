@@ -2,7 +2,7 @@
 /**
  * verify-ios-ready.mjs —— iOS / Android 构建本地硬性预检（1 秒跑完）
  *
- * 7 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
+ * 8 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
  *   1. UTF-8 BOM 头扫描
  *   2. Rust ios.rs ↔ build.rs ↔ Swift @_cdecl 三方 C ABI 符号对齐
  *   3. Swift 缺失 import 框架自动检测
@@ -11,6 +11,7 @@
  *   6. vpn.go Go 内核双端预检（本地小写函数"调用 vs 定义"配对 +
  *      import "C" 块完整性 + 可用时的 gofmt -e 语法校验）
  *   7. 扩展源码作用域预检（关键标识符先声明后使用 + gen 副本一致性）
+ *   8. Swift 冻结指令（严禁 as! / 命名元组类型声明 + gen 副本字节一致）
  */
 
 import { readFileSync } from 'node:fs';
@@ -434,6 +435,71 @@ try {
   if (!failed) pass('两 Swift 文件均无非可选 API 条件绑定 ✓');
 } catch (e) {
   fail(`读取 PacketTunnelProvider.swift 失败：${e.message}`);
+}
+
+// ============================================================
+// 检查 8：【APP16 任务3】Swift 冻结指令
+//   1. 严禁任何 `as!` 强制类型转换
+//   2. 严禁命名元组类型声明（`-> (`、`(name: Type, ...)`、`(net:`/`(prefix:`）
+//   3. mobile-src 规范源与 gen/apple 编译副本字节完全一致（本地无副本则跳过）
+// ============================================================
+console.log('\n--- 检查 8：Swift 冻结指令（as! / 命名元组 / gen 副本一致） ---');
+const SWIFT_TARGETS = [
+  'src-tauri/mobile-src/ios/App/PrismTunnelController.swift',
+  'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift',
+  'src-tauri/mobile-src/ios/Helper/PrismHelper.swift',
+];
+const SWIFT_BAN_RULES = [
+  { re: /(?<![\w.])as!/, msg: '出现 `as!` 强制类型转换（APP16 硬性禁令）' },
+  { re: /->\s*\(/, msg: '出现 `-> (` 元组返回值声明（APP16 硬性禁令，请改用结构体）' },
+  { re: /:\s*\(\s*[A-Za-z_]\w*\s*:\s*[A-Za-z_][\w\[\]<>?.]*\s*,/, msg: '出现命名元组类型声明 `(name: Type, ...)`（APP16 硬性禁令，请改用结构体）' },
+  // 元组数组/可选的命名元组类型：`[(net: UInt32, prefix: UInt8)]`、
+  // `((net: UInt32, prefix: UInt8))?` 等 ERR6 同款写法（标签函数调用不会命中）
+  { re: /[\[(]\s*\(\s*[A-Za-z_]\w*\s*:\s*[A-Za-z_][\w\[\]<>?.]*\s*,/, msg: '出现 `[(net: Type, ...)]` 命名元组类型（APP16 硬性禁令，请改用结构体）' },
+];
+for (const rel of SWIFT_TARGETS) {
+  let src = '';
+  try {
+    src = readFileSync(resolve(ROOT, rel), 'utf8');
+  } catch {
+    pass(`${rel} 不存在，跳过`);
+    continue;
+  }
+  let hit = false;
+  for (const { re, msg } of SWIFT_BAN_RULES) {
+    const m = src.match(re);
+    if (m) {
+      const line = src.slice(0, m.index).split('\n').length;
+      fail(`${rel} 第 ${line} 行：${msg}`);
+      hit = true;
+    }
+  }
+  if (!hit) pass(`${rel}: 无 as! / 命名元组 ✓`);
+}
+
+// gen 副本字节一致：Xcode 实际编译的是 gen/apple 下的副本，
+// 双目录漂移会导致「本地改对了、CI 仍报同样的编译错」。
+const GEN_BYTE_PAIRS = [
+  'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift',
+  'src-tauri/mobile-src/ios/App/PrismTunnelController.swift',
+];
+for (const specRel of GEN_BYTE_PAIRS) {
+  const genRel = specRel
+    .replace('src-tauri/mobile-src/ios/PrismVPN/', 'src-tauri/gen/apple/PrismVPN/')
+    .replace('src-tauri/mobile-src/ios/App/', 'src-tauri/gen/apple/');
+  let genBuf;
+  try {
+    genBuf = readFileSync(resolve(ROOT, genRel));
+  } catch {
+    pass(`无 ${genRel} 本地副本（CI 每次 init 现生成，跳过字节比对）✓`);
+    continue;
+  }
+  const specBuf = readFileSync(resolve(ROOT, specRel));
+  if (Buffer.compare(genBuf, specBuf) !== 0) {
+    fail(`${genRel} 与规范源 ${specRel} 字节不一致，请完整复制覆盖（Xcode 编译的是 gen 副本）`);
+  } else {
+    pass(`${genRel} 与规范源字节完全一致 ✓`);
+  }
 }
 
 // ============================================================

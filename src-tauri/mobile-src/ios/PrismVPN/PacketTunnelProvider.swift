@@ -68,6 +68,52 @@ private func isValidIPv4Literal(_ s: String) -> Bool {
     return true
 }
 
+// MARK: - 【APP16 任务1】IPv4 前缀解析（零元组、零强制转型）
+
+/// IPv4 网段的标准化表示。全部字段为明确的基础类型，
+/// 严禁任何命名元组 / 强制类型转换，确保 swiftc 类型推导 100% 通过。
+private struct PrismIPv4Prefix {
+    let net: UInt32
+    let prefix: Int
+    let networkAddress: String
+    let subnetMask: String
+}
+
+/// 解析 "a.b.c.d[/prefix]" → PrismIPv4Prefix。解析失败返回 nil。
+private func parseIPv4Prefix(_ raw: String) -> PrismIPv4Prefix? {
+    let allowed = Set("0123456789./")
+    let cleaned = String(raw.unicodeScalars.filter { allowed.contains(Character($0)) })
+    guard !cleaned.isEmpty else { return nil }
+    let parts = cleaned.split(separator: "/", omittingEmptySubsequences: false)
+    let ipPart = String(parts[0])
+    guard !ipPart.isEmpty else { return nil }
+    let prefixVal: Int
+    if parts.count > 1, let p = Int(parts[1]), p >= 0 && p <= 32 {
+        prefixVal = p
+    } else {
+        prefixVal = 24
+    }
+    var addr = in_addr()
+    guard inet_pton(AF_INET, ipPart, &addr) == 1 else { return nil }
+    let ipU32 = UInt32(bigEndian: addr.s_addr)
+    let maskU32: UInt32 = prefixVal == 0 ? 0 : (0xFFFF_FFFF << (32 - prefixVal))
+    let netU32 = ipU32 & maskU32
+
+    func u32ToIP(_ v: UInt32) -> String {
+        let b1 = (v >> 24) & 0xFF
+        let b2 = (v >> 16) & 0xFF
+        let b3 = (v >> 8) & 0xFF
+        let b4 = v & 0xFF
+        return "\(b1).\(b2).\(b3).\(b4)"
+    }
+    return PrismIPv4Prefix(
+        net: netU32,
+        prefix: prefixVal,
+        networkAddress: u32ToIP(netU32),
+        subnetMask: u32ToIP(maskU32)
+    )
+}
+
 /// 严格判断网卡上的地址是否为真正可路由的 IP（排除 127.0.0.1、169.254.x.x 以及 iOS Wi-Fi 断开后残留的 fe80:: 链路本地地址）
 private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
     let family = Int32(addrPtr.pointee.sa_family)
@@ -767,56 +813,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 结论：让 go-lan-home 与常规代理节点使用完全一致的 Socket 路径，
         // 全部交给 iOS NECP 按当前活跃物理网卡（pdp_ip0 / en0）自动路由。
         // 仅保留「允许局域网连接」的 /24 回包闭环与直连 DNS 两条排除路由。
-        // 【APP15 任务1.2.3】记录所有回家网段，供「允许局域网连接」排除判断
-        // 时做重叠保护（本机 Wi-Fi /24 与回家网段相同时绝不能排除）。
-        var goLanNets: [(net: UInt32, prefix: UInt8)] = []
+        // 【APP16 任务1】Go Lan 回家网段 → includedRoutes：零元组、零强制转型。
+        // 仅用 PrismIPv4Prefix 结构体逐个转换，删除原 /25 拆分等复杂运算
+        // （命名元组形式会引发 Swift 编译错误）。
+        var goLanPrefixes: [PrismIPv4Prefix] = []
         if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
             for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
                 for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
-                    guard let p = parseCIDR(cidr), !p.address.isEmpty else { continue }
-                    if p.prefix > 0, let base = ipv4ToUInt32(p.address) {
-                        goLanNets.append((base, p.prefix))
-                    }
-                    let route = p.prefix <= 0
-                        ? NEIPv4Route.default()
-                        : NEIPv4Route(
-                            destinationAddress: p.address,
-                            subnetMask: subnetMask(prefix: p.prefix)
-                        )
-                    if !includedV4.contains(where: {
-                        $0.destinationAddress == route.destinationAddress
-                            && $0.destinationSubnetMask == route.destinationSubnetMask
-                    }) {
-                        includedV4.append(route)
-                    }
-                    // 【APP-12 任务1.3】最长前缀匹配：iOS 路由表中外网 Wi-Fi 的
-                    // 本地 /24 路由优先级高于 TUN 的默认 0.0.0.0/0。把每个
-                    // /24 回家网段拆为两个 /25（.0/25 与 .128/25，掩码
-                    // 255.255.255.128），最长前缀匹配确保任何 Wi-Fi/蜂窝下
-                    // 访问家里内网 IP 100% 进入 PrismVPN 隧道。
-                    // 对 /24 及更宽前缀（/8 /16 等）做 +1 拆分。
-                    if p.prefix > 0 && p.prefix < 32,
-                       let base = ipv4ToUInt32(p.address) {
-                        let halfBits: UInt32 = 1 << (31 - UInt32(p.prefix)) // 半个网段地址数
-                        let firstAddr = base & ~(halfBits * 2 - 1) // 对齐到本网段起点
-                        let secondAddr = firstAddr + halfBits
-                        let halfMask = subnetMask(prefix: p.prefix + 1)
-                        for halfAddr in [firstAddr, secondAddr] {
-                            if let halfStr = uint32ToIPv4(halfAddr) {
-                                let halfRoute = NEIPv4Route(
-                                    destinationAddress: halfStr,
-                                    subnetMask: halfMask
-                                )
-                                if !includedV4.contains(where: {
-                                    $0.destinationAddress == halfRoute.destinationAddress
-                                        && $0.destinationSubnetMask == halfRoute.destinationSubnetMask
-                                }) {
-                                    includedV4.append(halfRoute)
-                                }
-                            }
-                        }
+                    if let parsed = parseIPv4Prefix(cidr), parsed.prefix > 0 {
+                        goLanPrefixes.append(parsed)
                     }
                 }
+            }
+        }
+        for parsed in goLanPrefixes {
+            let route = NEIPv4Route(
+                destinationAddress: parsed.networkAddress,
+                subnetMask: parsed.subnetMask
+            )
+            if !includedV4.contains(where: {
+                $0.destinationAddress == route.destinationAddress
+                    && $0.destinationSubnetMask == route.destinationSubnetMask
+            }) {
+                includedV4.append(route)
             }
         }
         // 【APP-13 任务6】「允许局域网连接」回包闭环：
@@ -826,21 +845,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let lanEnabled = ((json["inbounds"] as? [[String: Any]]) ?? []).contains {
             ($0["type"] as? String) == "mixed" && ($0["listen"] as? String) == "0.0.0.0"
         }
-        if lanEnabled, !bindIPv4.isEmpty, let selfIp = ipv4ToUInt32(bindIPv4) {
-            let lanMask: UInt32 = 0xFFFF_FF00
+        if lanEnabled, !bindIPv4.isEmpty,
+           let selfPrefix = parseIPv4Prefix("\(bindIPv4)/24")
+        {
             // 【APP15 任务1.2.3】回到家里、本机 Wi-Fi 与回家网段同一 /24 时
             // （如 192.168.10.x），把整段 /24 排除会把回家路由剔掉，导致
             // NAS 完全不可达。只有不与任何回家网段重叠时才允许排除。
-            let selfNet = selfIp & lanMask
-            let overlaps = goLanNets.contains { item in
+            let overlaps = goLanPrefixes.contains { item in
                 let mask: UInt32 = item.prefix == 0
                     ? 0
-                    : ~UInt32(0) << (32 - UInt32(min(item.prefix, 32)))
-                return (selfNet & mask) == (item.net & mask)
+                    : (0xFFFF_FFFF << (32 - item.prefix))
+                return (selfPrefix.net & mask) == (item.net & mask)
             }
-            if !overlaps, let net = uint32ToIPv4(selfNet) {
+            if !overlaps {
                 excludedV4.append(
-                    NEIPv4Route(destinationAddress: net, subnetMask: "255.255.255.0")
+                    NEIPv4Route(
+                        destinationAddress: selfPrefix.networkAddress,
+                        subnetMask: selfPrefix.subnetMask
+                    )
                 )
             }
         }
@@ -1354,23 +1376,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 2) 内核侧 mtu 固定 1280（外层 utun 1500）：MSS 1240 +
                 //    60 字节 WG 头 = 1340 < 任何链路 MTU，TLS 大包不再丢失。
                 if tag == "go-lan-home" {
-                    var primaryAddr: [String] = []
-                    for raw in ((outbounds[i]["local_address"] as? [String]) ?? []) {
-                        let tokens = raw.split(whereSeparator: { ch in
-                            ch == "," || ch == ";" || ch == "\u{FF0C}" || ch == "\u{FF1B}"
-                                || ch == "\n" || ch == "\r" || ch == " " || ch == "\t"
-                        })
-                        for tok in tokens {
-                            let ipOnly = tok.split(separator: "/").first.map(String.init) ?? ""
-                            if isValidIPv4Literal(ipOnly) {
-                                primaryAddr = ["\(ipOnly)/32"]
-                                break
-                            }
-                        }
-                        if !primaryAddr.isEmpty { break }
+                    // 【APP16 任务1】极简字符串处理：逗号/分号/空白拆分后仅取
+                    // 第 1 个 IPv4 地址，确保带 "/" 前缀（无则补 /32）。
+                    // 删除一切复杂网段拆分/排除元组运算。
+                    let rawLocal = outbounds[i]["local_address"]
+                    var firstRaw = ""
+                    if let arr = rawLocal as? [String], let f = arr.first {
+                        firstRaw = f
+                    } else if let s = rawLocal as? String {
+                        firstRaw = s
                     }
-                    if !primaryAddr.isEmpty {
-                        outbounds[i]["local_address"] = primaryAddr
+                    let tokens = firstRaw
+                        .components(separatedBy: CharacterSet(charactersIn: ",; \r\n\t"))
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    if let primary = tokens.first {
+                        let allowed = Set("0123456789./")
+                        let clean = String(primary.unicodeScalars.filter { allowed.contains(Character($0)) })
+                        if !clean.isEmpty {
+                            let finalAddr = clean.contains("/") ? clean : "\(clean)/32"
+                            outbounds[i]["local_address"] = [finalAddr]
+                        }
                     }
                     outbounds[i]["mtu"] = 1280
                 }

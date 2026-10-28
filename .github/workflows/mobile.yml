@@ -402,7 +402,7 @@ jobs:
       # 避免 PacketTunnelProvider.swift 的作用域/未定义变量错误拖到 xcodebuild
       # 末期才暴露（build 145 的 cannot find 'bindIPv4' in scope 即此类问题）。
       # 扩展依赖 Go 内核的 C 桥接符号，这里用等价的临时 stub 头文件代替。
-      - name: Pre-check iOS Swift sources (fail-fast)
+      - name: Pre-check ALL Swift sources against iPhoneOS SDK (Fail-Fast in 3s)
         shell: bash
         run: |
           set -e
@@ -421,6 +421,7 @@ jobs:
             'static inline char* PrismVPNStart(char* configContent, char* workDir) { (void)configContent; (void)workDir; return NULL; }' \
             'static inline void PrismVPNStop(void) {}' \
             'static inline void PrismVPNSetCallbacks(prism_vpn_cbs cbs) { (void)cbs; }' \
+            'static inline void PrismKernelFree(char* p) { (void)p; }' \
             > "$STUB"
 
           xcrun -sdk iphoneos swiftc -typecheck \
@@ -510,6 +511,7 @@ jobs:
             'static inline char* PrismVPNStart(char* configContent, char* workDir) { (void)configContent; (void)workDir; return NULL; }' \
             'static inline void PrismVPNStop(void) {}' \
             'static inline void PrismVPNSetCallbacks(prism_vpn_cbs cbs) { (void)cbs; }' \
+            'static inline void PrismKernelFree(char* p) { (void)p; }' \
             > "$STUB"
 
           xcrun -sdk iphoneos swiftc -typecheck \
