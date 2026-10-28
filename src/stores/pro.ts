@@ -133,14 +133,16 @@ export const useProStore = create<ProState>((set, get) => ({
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
       return unlockedOf(e);
     } catch (err) {
-      // 保留完整错误文本（429 限流时含 retry_after，UI 需解析）
+      // 保留完整错误文本（429 限流时含 retry_after，UI 需解析）。
+      // 【APP17 任务4】仅剥掉 Tauri IPC 自带的 "Error: " 前缀，
+      // 其余 100% 原样展示官网返回的错误描述/错误码。
       const message =
         typeof err === "string"
           ? err
           : err instanceof Error
             ? err.message
             : String(err);
-      set({ busy: false, error: message || "激活失败" });
+      set({ busy: false, error: message.replace(/^Error:\s*/, "") });
       return false;
     }
   },

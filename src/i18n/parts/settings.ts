@@ -84,8 +84,24 @@ const zh: Record<string, string> = {
   "settings.goLan.lanDomains": "域名后缀",
   "settings.goLan.lanDomainsHint": "每行一个，如 nas.home",
   "settings.goLan.saveToast": "Go Lan 配置已保存",
+  "settings.goLan.clearToast": "Go Lan 配置已清空",
   "settings.goLan.invalidWg": "WireGuard 手动配置需填写 Server、私钥与 Peer 公钥",
   "settings.goLan.syncToast": "已拉取回家配置",
+  "settings.goLan.clearBtn": "清空配置",
+  "settings.goLan.cancelBtn": "取消",
+  "settings.goLan.saveBtn": "保存配置",
+  "settings.goLan.savingBtn": "保存中...",
+  "settings.goLan.needServer": "请填写服务器地址",
+  "settings.goLan.needPrivateKey": "请填写客户端私钥",
+  "settings.goLan.needPeerKey": "请填写服务端公钥",
+  "settings.goLan.needNodeUri": "请粘贴回家节点分享链接",
+  "settings.goLan.needCidr": "请填写回家内网网段（如 10.195.0.0/24）",
+  "settings.goLan.saveTimeout": "保存超时，请稍后重试",
+  "settings.goLan.recognized": "已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存",
+  "settings.goLan.recognizedMissingKey":
+    "已识别到服务器地址，但配置里没找到 Private Key 行，请确认完整复制了 [Interface] 段",
+  "settings.goLan.needPaste": "请先将 WireGuard 配置文本长按粘贴到上方输入框中",
+  "settings.goLan.notRecognized": "未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式",
 };
 
 const en: Record<string, string> = {
@@ -168,8 +184,26 @@ const en: Record<string, string> = {
   "settings.goLan.lanDomains": "Domain Suffixes",
   "settings.goLan.lanDomainsHint": "One per line, e.g. nas.home",
   "settings.goLan.saveToast": "Go Lan configuration saved",
+  "settings.goLan.clearToast": "Go Lan configuration cleared",
   "settings.goLan.invalidWg": "WireGuard manual config requires Server, private key and peer public key",
   "settings.goLan.syncToast": "Home configuration fetched",
+  "settings.goLan.clearBtn": "Clear",
+  "settings.goLan.cancelBtn": "Cancel",
+  "settings.goLan.saveBtn": "Save",
+  "settings.goLan.savingBtn": "Saving...",
+  "settings.goLan.needServer": "Please enter the server address",
+  "settings.goLan.needPrivateKey": "Please enter the client private key",
+  "settings.goLan.needPeerKey": "Please enter the peer public key",
+  "settings.goLan.needNodeUri": "Please paste the home node share link",
+  "settings.goLan.needCidr": "Please enter the home LAN subnet (e.g. 10.195.0.0/24)",
+  "settings.goLan.saveTimeout": "Save timed out, please try again",
+  "settings.goLan.recognized":
+    "WireGuard configuration recognized and filled in. Please confirm your home LAN subnets and save",
+  "settings.goLan.recognizedMissingKey":
+    "Server detected, but no Private Key line was found. Please make sure the [Interface] section is fully copied",
+  "settings.goLan.needPaste": "Please paste the WireGuard configuration into the box above first",
+  "settings.goLan.notRecognized":
+    "No WireGuard [Interface]/[Peer] configuration found, please check the format",
 };
 
 export default { zh, en };

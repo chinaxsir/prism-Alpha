@@ -114,6 +114,30 @@ private func parseIPv4Prefix(_ raw: String) -> PrismIPv4Prefix? {
     )
 }
 
+/// UInt32 网络字节序数值 → 点分十进制字符串（零元组、零强制转型）
+private func ipv4String(_ v: UInt32) -> String {
+    let b1 = (v >> 24) & 0xFF
+    let b2 = (v >> 16) & 0xFF
+    let b3 = (v >> 8) & 0xFF
+    let b4 = v & 0xFF
+    return "\(b1).\(b2).\(b3).\(b4)"
+}
+
+/// 【APP17 任务5.1】把一个 ≤/24 的网段拆成两条 /25（更细的网段原样返回）。
+/// includedRoutes 只下发 /24 会与物理网卡的 /24 直连路由冲突，拆半后
+/// 按最长前缀精确接管回家流量。
+private func splitPrefixToHalves(_ p: PrismIPv4Prefix) -> [PrismIPv4Prefix] {
+    guard p.prefix < 25 else { return [p] }
+    let half = 25
+    let mask: UInt32 = 0xFFFF_FFFF << (32 - half)
+    let firstNet = p.net & mask
+    let secondNet = firstNet | (UInt32(1) << (32 - half))
+    var out: [PrismIPv4Prefix] = []
+    if let a = parseIPv4Prefix("\(ipv4String(firstNet))/\(half)") { out.append(a) }
+    if let b = parseIPv4Prefix("\(ipv4String(secondNet))/\(half)") { out.append(b) }
+    return out
+}
+
 /// 严格判断网卡上的地址是否为真正可路由的 IP（排除 127.0.0.1、169.254.x.x 以及 iOS Wi-Fi 断开后残留的 fe80:: 链路本地地址）
 private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
     let family = Int32(addrPtr.pointee.sa_family)
@@ -814,8 +838,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 全部交给 iOS NECP 按当前活跃物理网卡（pdp_ip0 / en0）自动路由。
         // 仅保留「允许局域网连接」的 /24 回包闭环与直连 DNS 两条排除路由。
         // 【APP16 任务1】Go Lan 回家网段 → includedRoutes：零元组、零强制转型。
-        // 仅用 PrismIPv4Prefix 结构体逐个转换，删除原 /25 拆分等复杂运算
-        // （命名元组形式会引发 Swift 编译错误）。
         var goLanPrefixes: [PrismIPv4Prefix] = []
         if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
             for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
@@ -826,7 +848,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+        // 【APP17 任务5.1】回家网段必须拆成两条 /25 再写入 includedRoutes：
+        // iOS NECP 对 /24 整段下发在同网段（家里 Wi-Fi 与回家网段重叠）时
+        // 会与物理网卡的 /24 直接路由冲突，拆半后按最长前缀精确接管。
+        var goLanHalfPrefixes: [PrismIPv4Prefix] = []
         for parsed in goLanPrefixes {
+            for half in splitPrefixToHalves(parsed) {
+                let dup = goLanHalfPrefixes.contains {
+                    $0.net == half.net && $0.prefix == half.prefix
+                }
+                if !dup { goLanHalfPrefixes.append(half) }
+            }
+        }
+        for parsed in goLanHalfPrefixes {
             let route = NEIPv4Route(
                 destinationAddress: parsed.networkAddress,
                 subnetMask: parsed.subnetMask
@@ -1376,9 +1410,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 2) 内核侧 mtu 固定 1280（外层 utun 1500）：MSS 1240 +
                 //    60 字节 WG 头 = 1340 < 任何链路 MTU，TLS 大包不再丢失。
                 if tag == "go-lan-home" {
-                    // 【APP16 任务1】极简字符串处理：逗号/分号/空白拆分后仅取
-                    // 第 1 个 IPv4 地址，确保带 "/" 前缀（无则补 /32）。
-                    // 删除一切复杂网段拆分/排除元组运算。
+                    // 【APP17 任务5.1】local_address 仅保留第 1 个地址，且保持
+                    // /24 前缀（无前缀补 /24）：gVisor 需要同子网前缀才认可
+                    // 链路内邻居；逗号分隔的其余地址已由 Rust 转成 /24 并入
+                    // route.rules 的 ip_cidr → go-lan-home。
                     let rawLocal = outbounds[i]["local_address"]
                     var firstRaw = ""
                     if let arr = rawLocal as? [String], let f = arr.first {
@@ -1394,11 +1429,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         let allowed = Set("0123456789./")
                         let clean = String(primary.unicodeScalars.filter { allowed.contains(Character($0)) })
                         if !clean.isEmpty {
-                            let finalAddr = clean.contains("/") ? clean : "\(clean)/32"
+                            let finalAddr = clean.contains("/") ? clean : "\(clean)/24"
                             outbounds[i]["local_address"] = [finalAddr]
                         }
                     }
                     outbounds[i]["mtu"] = 1280
+                    // 【APP17 任务5.1】WireGuard 出站绑定真实物理网卡，
+                    // 避免握手/数据 UDP 被系统默认路由送回隧道自身而死循环。
+                    let bindIfName = findActivePhysicalInterface().name
+                    if !bindIfName.isEmpty {
+                        outbounds[i]["bind_interface"] = bindIfName
+                    }
                 }
                 // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
                 // 强制 ipv4_only 保证 WireGuard 握手包可正常发出
@@ -1754,15 +1795,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 黄金优先级顺序（自上而下）：
-        // 1. DNS 劫持 + QUIC 拦截（headRules）
-        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N）
-        // 3. Go Lan 回家内网直通（ip_cidr → go-lan-home，必须在 clash_mode 之前！）
-        // 4. 私有地址直连（排除已被第 3 优先级命中的家庭网段）
-        // 5. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
-        var finalHead = headRules
-        finalHead.append(contentsOf: aimProbeRules)
+        // 黄金优先级顺序（自上而下，APP17 任务5.1 强制置顶）：
+        // 1. protocol dns + port 53（DNS 劫持）
+        // 2. Go Lan 回家内网直通（ip_cidr → go-lan-home）——必须是第 1 位之后
+        //    的第一条，先于 853/DoH 拦截、QUIC 拦截、GO-AIM 与 clash_mode
+        // 3. 853 / DoH / QUIC / UDP443 拦截
+        // 4. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N）
+        // 5. 私有地址直连（排除已被第 2 优先级命中的家庭网段）
+        // 6. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        var finalHead = Array(headRules.prefix(2))
         finalHead.append(contentsOf: goLanRules)
+        finalHead.append(contentsOf: Array(headRules.dropFirst(2)))
+        finalHead.append(contentsOf: aimProbeRules)
         finalHead.append(["ip_is_private": true, "outbound": "direct"])
         rules.insert(contentsOf: finalHead, at: 0)
         route["rules"] = rules

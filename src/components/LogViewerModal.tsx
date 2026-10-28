@@ -126,7 +126,7 @@ export default function LogViewerModal({
    *  基于已加载 entries 构造导出文本，直接写入剪贴板并调起原生分享。 */
   const handleExport = () => {
     if (entries.length === 0) {
-      toast.error("暂无日志可导出");
+      toast.error(t("logs.nothingToExport"));
       return;
     }
     const now = new Date();

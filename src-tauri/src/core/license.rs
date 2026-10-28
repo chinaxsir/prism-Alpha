@@ -630,77 +630,42 @@ async fn error_message(resp: reqwest::Response) -> String {
     }
 }
 
-/// 从非 200 响应提取 (机器错误码, 服务端具体描述)（APK-3 任务2 / APP6 任务4）。
-/// 机器码优先取 JSON 的 "error" 字符串字段；解析失败按 HTTP 状态码映射：
-/// 400→invalid_input、403→activation_failed、409→seat_limit_reached、
-/// 429→activation_throttled、5xx→server_error。
-/// 描述依次尝试 JSON 的 message / reason / detail / error 字段，
-/// 用于「激活未通过 (HTTP xxx): {服务端原文}」的精准透传。
-async fn extract_error_detail(http: u16, resp: reqwest::Response) -> (String, String) {
-    let text = resp.text().await.unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    let machine = parsed
-        .get("error")
-        .and_then(|e| e.as_str())
-        .filter(|c| !c.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            match http {
-                400 => "invalid_input",
-                403 => "activation_failed",
-                409 => "seat_limit_reached",
-                429 => "activation_throttled",
-                s if s >= 500 => "server_error",
-                _ => "activation_failed",
+/// 【APP17 任务4】把官网返回的错误体整理为「原样展示」的文本：
+/// 描述取 message / detail / reason，错误码取 error / code，
+/// 两者都有且不同时拼成 "{描述} ({错误码})"；只有其一时原样返回；
+/// 响应体不是 JSON 时直接返回非空 body_text。全程不做自定义包装前缀。
+fn official_error_text(v: &Value, body: &str) -> String {
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+    };
+    let msg = pick(&["message", "detail", "reason", "error"]).or_else(|| {
+        // 兼容 {error:{message}} 结构
+        v.get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    });
+    let code = pick(&["error", "code"]);
+    match (msg, code) {
+        (Some(m), Some(c)) if m != c => format!("{m} ({c})"),
+        (Some(m), _) => m,
+        (None, Some(c)) => c,
+        (None, None) => {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "未知错误".to_string()
+            } else {
+                trimmed.to_string()
             }
-            .to_string()
-        });
-    let server_msg = ["message", "reason", "detail"]
-        .iter()
-        .find_map(|k| {
-            parsed
-                .get(k)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .or_else(|| {
-            // 兼容 {error:{message}} 结构
-            parsed
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .unwrap_or_default();
-    (machine, server_msg)
-}
-
-/// 【APP6 任务4】把服务端机器码 / HTTP 状态映射为前端精准中文文案的
-/// 标准错误码（前端 LICENSE_ERROR_MAP 1:1 渲染）。返回 None 表示
-/// 无法归入已知类别——调用方应透传服务端原文（err_raw）。
-fn map_activation_error(http: u16, machine: &str, server_msg: &str) -> Option<&'static str> {
-    // 综合机器码与服务端原文关键词做归类（大小写不敏感）
-    let hay = format!("{machine} {server_msg}").to_lowercase();
-    let hit = |words: &[&str]| words.iter().any(|w| hay.contains(w));
-    if hit(&["not_found", "invalid_key", "invalid_license", "no_such"]) || http == 404 {
-        Some("invalid_key")
-    } else if hit(&["email", "mismatch", "account"]) {
-        Some("email_mismatch")
-    } else if hit(&["rate", "too_many", "throttl"]) {
-        // rate/too_many 优先于 seat 判定，避免 "rate limit" 误归为席位限制
-        Some("activation_throttled")
-    } else if hit(&["seat", "limit", "max_devices", "full"]) || http == 409 {
-        Some("seat_limit_reached")
-    } else if hit(&["expired"]) {
-        Some("license_expired")
-    } else if hit(&["blocked", "disabled", "banned", "revoked", "suspended"]) {
-        Some("license_blocked")
-    } else {
-        None
+        }
     }
 }
 
@@ -872,30 +837,24 @@ pub async fn activate(
         let secs = retry_after_secs(resp).await;
         bail!("rate_limited:{secs}:activation_throttled");
     }
-    // 非 200：【APP6 任务4】废除笼统报错——提取机器码 + 服务端具体描述，
-    // 按精准规则映射中文文案（"err_code:{code}" 前端 1:1 渲染）；
-    // 无法归入已知类别时透传服务端原文（"err_raw:{描述}"）。全程写 [Pro] 日志。
+    // 非 200：【APP17 任务4】废除一切自定义包装前缀，100% 原样透传
+    // 官网返回的错误描述/错误码（"err_raw:{原文}"，前端 1:1 展示）。
     if !resp.status().is_success() {
         let http = resp.status().as_u16();
-        let (machine, server_msg) = extract_error_detail(http, resp).await;
+        let body_text = resp.text().await.unwrap_or_default();
+        let v: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let official = official_error_text(&v, &body_text);
         crate::core::logger::warn(
             crate::core::logger::MOD_PRO,
-            &format!(
-                "激活请求被拒绝：HTTP {http}，错误码 {machine}{}",
-                if server_msg.is_empty() { String::new() } else { format!("，服务端描述：{server_msg}") }
-            ),
+            &format!("激活请求被拒绝：HTTP {http}，官网原文：{official}"),
         );
-        if let Some(mapped) = map_activation_error(http, &machine, &server_msg) {
-            bail!("err_code:{mapped}");
-        }
-        if !server_msg.is_empty() {
-            bail!("err_raw:激活未通过 (HTTP {http}): {server_msg}");
-        }
-        bail!("err_code:{}", machine);
+        bail!("err_raw:{official}");
     }
-    let data: ActivateResponse = resp.json().await?;
+    let body_text = resp.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+    let data: ActivateResponse = serde_json::from_value(v.clone())?;
     if !data.ok {
-        bail!("激活失败：服务端未确认（ok=false）");
+        bail!("err_raw:{}", official_error_text(&v, &body_text));
     }
 
     // 优先用激活响应自带的 expires_at；缺失时 best-effort 拉一次状态补全

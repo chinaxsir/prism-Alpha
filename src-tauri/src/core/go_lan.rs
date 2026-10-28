@@ -666,7 +666,7 @@ async fn probe_via_go_lan_outbound(
 
 /// 【APP15 任务2】用户未指定端口时要并发探测的常用内网服务端口。
 /// 首位是飞牛 NAS 的 8001/8000（用户主要场景），其余按优先级排列。
-const COMMON_PROBE_PORTS: [u16; 10] = [8001, 8000, 80, 443, 8080, 5000, 5001, 51821, 22, 445];
+const COMMON_PROBE_PORTS: [u16; 8] = [8001, 8000, 80, 443, 5000, 5001, 8080, 3000];
 
 /// 【APP15 任务2】解析用户输入的检测目标，支持纯 IP、`IP:Port` 与
 /// `https://IP:Port/path`、`http://IP:Port/path` 三种写法。
@@ -702,218 +702,99 @@ fn parse_probe_target(raw: &str) -> (String, Option<u16>) {
     }
 }
 
-/// 【APP15 任务2 · 通道3】经本地 mixed 入站（SOCKS5）对目标做一次真实
-/// TCP 握手探测（该通道不可用时静默跳过，不影响主判据）。
-///
-/// 严格语义（与本地回环彻底解耦）：
-/// - 连 `127.0.0.1:{proxy_port}` 失败 → 该通道不可用，仅返回 Err；
-/// - SOCKS5 CONNECT 返回 `0x00 Succeeded` → 隧道内已完成三次握手 → 「端口开放」；
-/// - 返回 `0x05 Connection refused` 且 rtt >= 3ms → 数据包已穿过 WireGuard
-///   到达内网主机，对端内核主动回了 TCP RST（隧道没通/主机不存在只会是
-///   0x04/0x06/超时）→ 判定「主机在线」；
-/// - 其余一律 Err，由上层汇总为「隧道探测超时」。
-async fn socks5_probe_port(
-    proxy_port: u16,
-    target_ip: std::net::Ipv4Addr,
-    target_port: u16,
-    timeout_ms: u64,
-) -> Result<(u64, &'static str), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let dur = std::time::Duration::from_millis(timeout_ms);
-
-    // ---- 1. 连接本地代理（未就绪时静默跳过该通道）----
-    let mut stream = match tokio::time::timeout(
-        dur,
-        tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        // 【APP15 任务2】彻底删除「本地代理端口未就绪」文案：
-        // 该通道在当前环境下不可用，仅静默跳过，交由其它通道判定
-        _ => return Err("隧道探测超时".into()),
+/// 【APP17 任务5.2】从用户输入中提取 HTTP 请求路径（默认 "/"）。
+/// 支持 http://IP[:Port]/path、https://... 与直接粘贴的 NAS 页面地址。
+fn probe_request_path(raw: &str) -> String {
+    let no_invisible = strip_invisible_and_non_ascii(raw);
+    let first = no_invisible.split(';').next().unwrap_or("").trim();
+    let rest = match first.split_once("://") {
+        Some((_scheme, r)) => r,
+        None => first.trim_start_matches("//"),
     };
-    let _ = stream.set_nodelay(true);
-
-    // ---- 2. SOCKS5 握手（无认证）----
-    if tokio::time::timeout(dur, stream.write_all(&[0x05, 0x01, 0x00]))
-        .await
-        .map_err(|_| "隧道探测超时".to_string())?
-        .is_err()
-    {
-        return Err("隧道探测写入失败".into());
-    }
-    let mut greet = [0u8; 2];
-    match tokio::time::timeout(dur, stream.read_exact(&mut greet)).await {
-        Ok(Ok(_)) => {}
-        _ => return Err("隧道探测超时".into()),
-    }
-    if greet[0] != 0x05 || greet[1] != 0x00 {
-        return Err(format!(
-            "本地代理拒绝 SOCKS5 无认证（method=0x{:02x}）",
-            greet[1]
-        ));
-    }
-
-    // ---- 3. CONNECT 请求（IPv4 目标）----
-    let octets = target_ip.octets();
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&octets);
-    req.extend_from_slice(&target_port.to_be_bytes());
-    let t0 = std::time::Instant::now();
-    if tokio::time::timeout(dur, stream.write_all(&req))
-        .await
-        .map_err(|_| "隧道连接超时".to_string())?
-        .is_err()
-    {
-        return Err("隧道连接写入失败".into());
-    }
-
-    // ---- 4. 读取 SOCKS5 应答（4 字节头 + 变长地址 + 2 字节端口）----
-    let mut head = [0u8; 4];
-    match tokio::time::timeout(dur, stream.read_exact(&mut head)).await {
-        Ok(Ok(_)) => {}
-        _ => return Err("隧道连接超时".into()),
-    }
-    if head[0] != 0x05 {
-        return Err(format!("SOCKS5 应答版本异常: 0x{:02x}", head[0]));
-    }
-    let remain = match head[3] {
-        0x01 => 4 + 2,
-        0x04 => 16 + 2,
-        0x03 => {
-            let mut l = [0u8; 1];
-            match tokio::time::timeout(dur, stream.read_exact(&mut l)).await {
-                Ok(Ok(_)) => l[0] as usize + 2,
-                _ => return Err("隧道连接超时".into()),
-            }
-        }
-        other => return Err(format!("SOCKS5 应答地址类型异常: 0x{other:02x}")),
-    };
-    let mut tail = vec![0u8; remain];
-    let _ = tokio::time::timeout(dur, stream.read_exact(&mut tail)).await;
-
-    let rtt = t0.elapsed().as_millis().max(1) as u64;
-    match head[1] {
-        // Succeeded：隧道内已完成 TCP 三次握手
-        0x00 => Ok((rtt, "端口开放")),
-        // Connection refused：对端主机回的 RST（隧道确实通了）
-        0x05 if rtt >= 3 => Ok((rtt, "主机在线")),
-        other => Err(format!("SOCKS5 应答 0x{other:02x}（{rtt}ms）")),
+    match rest.split_once('/') {
+        Some((_host, path)) => format!("/{}", path.trim_start_matches('/')),
+        None => "/".to_string(),
     }
 }
 
-/// 【APP15 任务2 · 通道1】直连 TUN 发真实 HTTPS/HTTP 请求。
-///
-/// tun-in 会为所有 TCP 握手伪造 SYN-ACK，但**绝不可能伪造出真实的 TLS
-/// 证书或 HTTP 状态行**——只要收到任意 HTTP 状态码（含 401/403/404/302）
-/// 就证明数据包真实穿过了 WireGuard 到达对端，零假阳性。
-///
-/// `danger_accept_invalid_certs(true)` 用于内网 NAS 自签名证书；
-/// `no_proxy()` 确保不走系统代理；`redirect(Policy::none())` 避免被
-/// 302 跳转到外网后误判。
-async fn direct_tun_probe_port(
-    target_ip: std::net::Ipv4Addr,
-    target_port: u16,
-) -> Result<u64, String> {
+/// 【APP17 任务5.2】经 go-lan-home 隧道对内网目标发起一次真实 HTTP GET。
+/// 成功判据唯一：**实际收到的响应字节数 > 0**——端口连通但零数据、或
+/// 内核伪造的 SYN-ACK，都不算成功（彻底杜绝假阳性）。
+/// 返回 (HTTP 状态码, 应答字节数, 延迟毫秒)。
+async fn http_get_via_lan(
+    ip: &str,
+    port: u16,
+    path: &str,
+) -> Result<(u16, usize, u64), String> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_millis(2000))
-        .timeout(std::time::Duration::from_millis(2500))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("探测客户端构建失败: {e}"))?;
 
-    let mut last_err = String::from("直连探测超时");
-    // 先试 HTTPS（NAS 8001/5001 等默认 HTTPS），失败再试 HTTP（80/8000 等）
+    let mut last_err = String::from("隧道探测超时");
+    // 先试 HTTPS（NAS 8001/5001 默认自签名 HTTPS），失败再试 HTTP
     for scheme in ["https", "http"] {
+        let url = format!("{scheme}://{ip}:{port}{path}");
         let start = std::time::Instant::now();
-        match client
-            .get(format!("{scheme}://{target_ip}:{target_port}/"))
-            .send()
-            .await
-        {
-            Ok(_resp) => {
-                // 收到任意 HTTP 状态码即证明真实到达对端（429/401/404 都算）
-                let ms = start.elapsed().as_millis().max(1) as u64;
-                return Ok(ms);
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => {
+                last_err = format!("{scheme} 请求超时");
+                continue;
             }
-            Err(e) => last_err = format!("{scheme}: {e}"),
+        };
+        let status = resp.status().as_u16();
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = format!("{scheme} 读取应答失败: {e}");
+                continue;
+            }
+        };
+        let ms = start.elapsed().as_millis() as u64;
+        if body.is_empty() {
+            last_err = format!("HTTP {status} 但未收到任何应答数据");
+            continue;
         }
+        return Ok((status, body.len(), ms));
     }
     Err(last_err)
 }
 
-/// 【APP15 任务2】对 target_ip 并发执行三通道探测（显式端口优先，
-/// 否则常用端口全试），返回首个成功的 (延迟, 端口, 状态)。
-///
-/// - 通道1：直连 TUN 的真实 HTTPS/HTTP 请求（主判据，零假阳性）；
-/// - 通道2：Clash API `/proxies/go-lan-home/delay`（仅在 api 可用时）；
-/// - 通道3：本地 mixed 入站 SOCKS5（未就绪时静默跳过，绝不报错）。
+/// 【APP17 任务5.2】按端口优先级并发发起真实 HTTP GET，首个「确有字节返回」
+/// 的结果胜出（显式端口优先，否则遍历常用内网服务端口）。
+/// 返回 (端口, HTTP 状态码, 应答字节数, 延迟毫秒)。
 async fn probe_target_ports(
     ip: &str,
     explicit_port: Option<u16>,
-    mixed_port: u16,
-    api_addr: &str,
-    api_secret: &str,
-) -> Result<(u64, u16, &'static str), String> {
-    let target_v4: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| format!("IP 地址格式无效: {ip}"))?;
-
+    path: &str,
+) -> Result<(u16, u16, usize, u64), String> {
     let ports: Vec<u16> = match explicit_port {
         Some(p) => vec![p],
         None => COMMON_PROBE_PORTS.to_vec(),
     };
-
-    let mut tasks: tokio::task::JoinSet<(u16, Result<(u64, &'static str), String>)> =
+    let mut tasks: tokio::task::JoinSet<(u16, Result<(u16, usize, u64), String>)> =
         tokio::task::JoinSet::new();
-
     for &p in &ports {
-        // 通道1：直连 TUN 真实 HTTPS/HTTP（始终启用）
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
         tasks.spawn(async move {
-            match direct_tun_probe_port(target_v4, p).await {
-                Ok(ms) => (p, Ok((ms, "端口开放"))),
+            match http_get_via_lan(&ip_owned, p, &path_owned).await {
+                Ok((status, bytes, ms)) => (p, Ok((status, bytes, ms))),
                 Err(e) => (p, Err(e)),
             }
         });
-        // 通道3：SOCKS5（mixed 入站未开启时静默跳过）
-        if mixed_port > 0 {
-            tasks.spawn(async move {
-                match socks5_probe_port(mixed_port, target_v4, p, 2500).await {
-                    Ok((ms, status)) => (p, Ok((ms, status))),
-                    Err(e) => (p, Err(e)),
-                }
-            });
-        }
     }
-    // 通道2：Clash API 驱动 go-lan-home 出站（仅在 api 可用时启用）
-    if !api_addr.is_empty() {
-        let api_addr = api_addr.to_string();
-        let api_secret = api_secret.to_string();
-        let ip_owned = ip.to_string();
-        for &p in &ports {
-            let api = api_addr.clone();
-            let sec = api_secret.clone();
-            let target = ip_owned.clone();
-            tasks.spawn(async move {
-                match probe_via_go_lan_outbound(&target, p, 0, &api, &sec).await {
-                    Ok(ms) => (p, Ok((ms, "端口开放"))),
-                    Err(e) => (p, Err(e)),
-                }
-            });
-        }
-    }
-
     let mut last_err = String::from("隧道探测超时");
     while let Some(joined) = tasks.join_next().await {
         if let Ok((p, res)) = joined {
             match res {
-                Ok((ms, status)) => return Ok((ms, p, status)),
+                Ok((status, bytes, ms)) => return Ok((p, status, bytes, ms)),
                 Err(e) => {
-                    // 只记录更有信息量的错误（过滤通道不可用类的通用超时）
                     if e != "隧道探测超时" && e != "隧道连接超时" {
                         last_err = e;
                     }
@@ -947,16 +828,15 @@ fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
     false
 }
 
-/// 【APP11 任务2】穿过 go-lan-home 隧道检测内网 IP，严格执行四大铁律：
+/// 【APP11 任务2 / APP17 任务5.2】穿过 go-lan-home 隧道检测内网 IP：
 ///
-/// - 铁律 1（网段归属硬校验）：target_ip 必须落在已配置的回家网段
+/// - 网段归属硬校验：target_ip 必须落在已配置的回家网段
 ///   （lan_cidrs ∪ local_address 所在 /24）内，否则直接拒绝、绝不发起探测；
 ///   同时拒绝探测本机自身的 WireGuard 虚拟 IP；
-/// - 铁律 2（拒绝 connection refused 假成功）：延迟 <2ms 或 >=2450ms 一律无效；
-/// - 铁律 3（严禁用网关结果顶替目标）：reachable 只由 target_ip 本身是否
-///   收到真实应用层响应决定，网关探测仅用于失败时的原因诊断；
-/// - 铁律 4（仅真实端到端 HTTP 响应判定）：Clash API go-lan-home 出站测速
-///   + 经本地 mixed 入站 SOCKS5 的真实 HTTP 请求，严格排除 502/504 代答。
+/// - 严禁用网关结果顶替目标：reachable 只由 target_ip 本身的真实应答决定；
+/// - **真实字节判据**：走 Clash API / go-lan-home 隧道发一次真实 HTTP GET，
+///   以「实际收到的应答字节数 > 0」为唯一成功标准，彻底杜绝端口连通但
+///   零数据的假成功（此前 SOCKS5/TCP 探测会把伪造 SYN-ACK 当成可达）。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
     mixed_port: u16,
@@ -998,6 +878,11 @@ pub async fn probe_intranet_ip(
             };
         }
     };
+    // 【APP17 任务5.2】提取请求路径（用户可直接粘贴 NAS 页面地址）
+    let req_path = target_ip_raw
+        .map(probe_request_path)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_string());
 
     // 2. 运行前置
     if !is_running {
@@ -1071,33 +956,38 @@ pub async fn probe_intranet_ip(
         ),
     );
 
-    // 4. 仅以 target_ip 本身的真实 TCP 握手结果判定 reachable。
-    // 【APP14 任务3】提示信息 100% 针对用户输入的 target_ip，
-    // 绝不再用网关（10.1.8.1）的探测结果顶替/冒充目标结果。
-    match probe_target_ports(
-        &target_ip,
-        explicit_port,
-        mixed_port,
-        api_addr,
-        api_secret,
-    )
-    .await
-    {
-        Ok((ms, port, status)) => {
+    // 4. 【APP17 任务5.2】以「真实收到的应答字节数 > 0」作为唯一成功判据。
+    // 提示信息 100% 针对用户输入的 target_ip，绝不用网关结果顶替。
+    match probe_target_ports(&target_ip, explicit_port, &req_path).await {
+        Ok((port, status, bytes, ms)) => {
             crate::core::logger::info(
                 log,
-                &format!("✅ 内网检测成功: 已到达 {target_ip}:{port}（{status}，延迟 {ms} ms）"),
+                &format!(
+                    "✅ 内网检测成功: {target_ip}:{port} 返回 HTTP {status}，{bytes} 字节，延迟 {ms} ms"
+                ),
             );
             GoLanProbeResult {
                 reachable: true,
                 target_ip: target_ip.clone(),
                 latency_ms: Some(ms),
-                message: format!("✅ 已成功到达内网 {target_ip} · 延迟 {ms} ms"),
+                message: format!(
+                    "✅ 已成功到达内网 {target_ip}:{port}（HTTP {status} · {bytes} 字节 · {ms} ms）"
+                ),
             }
         }
         Err(e) => {
+            // 失败时用 Clash API 直驱 go-lan-home 出站做一次诊断，给出底层原因
+            let diag_port = explicit_port.unwrap_or(8001);
+            let diag = probe_via_go_lan_outbound(
+                &target_ip, diag_port, mixed_port, api_addr, api_secret,
+            )
+            .await;
+            let hint = match diag {
+                Ok(d) => format!("Clash API 探测延迟 {d} ms，但未取到任何应答数据"),
+                Err(x) => x,
+            };
             let message = format!(
-                "❌ 未能到达内网 {target_ip}（{e}），请检查该设备是否在线及 WG 服务端转发配置"
+                "❌ 未能到达内网 {target_ip}（{e}；{hint}），请检查该设备是否在线及 WG 服务端转发配置"
             );
             crate::core::logger::warn(log, &message);
             GoLanProbeResult {
@@ -1140,9 +1030,9 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     // 请求、瞬时启动；解析失败则原样保留域名（扩展侧还有兜底重试）。
     // 【APP-11B】先剔除 \u2060 等隐形字符再解析
     let server = resolve_endpoint_host_to_ip(&strip_invisible_and_non_ascii(&wg.server));
-    // 【APP15 任务1.1】local_address 只允许写第 1 个主隧道地址（强制 /32）。
-    // 逗号分隔的第 2 个及后续地址（如 192.168.10.222/24）绝不能进
-    // local_address —— gVisor 会按最长前缀匹配选中它作为源 IP，
+    // 【APP15 任务1.1 / APP17 任务5.1】local_address 只允许写第 1 个主隧道
+    // 地址（统一 /24）。逗号分隔的第 2 个及后续地址（如 192.168.10.222/24）
+    // 绝不能进 local_address —— gVisor 会按最长前缀匹配选中它作为源 IP，
     // 导致 NAS 侧只放行隧道地址时全部静默丢包。这些地址的 /24 网段
     // 由 go_lan_route_rules 合并进回家路由。
     let (primary_local_addr, _extra_lan_cidrs) = parse_wg_local_addresses(&wg.local_ip);
@@ -1374,16 +1264,16 @@ pub fn sanitize_ip_prefix(raw: &str, default_prefix_v4: u8) -> Option<String> {
     Some(format!("{addr}/{bits}"))
 }
 
-/// 【APP15 任务1.1】解析 WireGuard Local Address，支持逗号/分号/中文标点/
-/// 换行/空白分隔的多个地址（如 `"10.196.0.2/32,192.168.10.222/24"`）。
+/// 【APP15 任务1.1 / APP17 任务5.1】解析 WireGuard Local Address，支持
+/// 逗号/分号/中文标点/换行/空白分隔的多个地址（如 `"10.196.0.2/24,192.168.10.222/24"`）。
 ///
 /// 返回：
-/// - 第 1 个：主隧道地址，**强制 `/32`**（唯一允许写入 `local_address`
-///   的值，避免 gVisor 最长前缀匹配选错源 IP 被对端丢弃）；
+/// - 第 1 个：主隧道地址，**统一 `/24`**（方便 gVisor 协议栈识别同子网
+///   邻居，单写 `local_address`）；其余地址一律转成 `/24` 回家网段；
 /// - 第 2 个：拆分出的所有 IPv4 地址对应的 `/24` 网段（去重），
 ///   由 `go_lan_route_rules` 合并进 `ip_cidr` 回家路由。
 ///
-/// 解析失败（无任何合法 IPv4）时主地址兜底 `10.0.0.2/32`。
+/// 解析失败（无任何合法 IPv4）时主地址兜底 `10.0.0.2/24`。
 pub fn parse_wg_local_addresses(raw: &str) -> (String, Vec<String>) {
     let mut primary = String::new();
     let mut extra_lan_cidrs: Vec<String> = Vec::new();
@@ -1400,7 +1290,7 @@ pub fn parse_wg_local_addresses(raw: &str) -> (String, Vec<String>) {
             continue;
         };
         if primary.is_empty() {
-            primary = format!("{ip_s}/32");
+            primary = format!("{ip_s}/24");
         }
         let net = network_of_v4(ip, 24);
         if !extra_lan_cidrs.contains(&net) {
@@ -1408,7 +1298,7 @@ pub fn parse_wg_local_addresses(raw: &str) -> (String, Vec<String>) {
         }
     }
     if primary.is_empty() {
-        primary = "10.0.0.2/32".to_string();
+        primary = "10.0.0.2/24".to_string();
     }
     (primary, extra_lan_cidrs)
 }
@@ -1838,9 +1728,9 @@ mod tests {
             "严禁 inet4_bind_address（5G 蜂窝下导致 i/o timeout）"
         );
         assert_eq!(ob["domain_strategy"], "ipv4_only");
-        // 【APP15 任务1.1】local_address 只写第 1 个主隧道地址并强制 /32，
-        // 严禁再扩为 /24（gVisor 最长前缀匹配会选错源 IP 被对端丢弃）
-        assert_eq!(ob["local_address"][0], "10.0.0.2/32");
+        // 【APP17 任务5.1】local_address 只写第 1 个主隧道地址，并保持 /24
+        // 前缀（gVisor 需同子网前缀识别邻居；其余地址转 /24 进 ip_cidr）
+        assert_eq!(ob["local_address"][0], "10.0.0.2/24");
         // 密钥必须是重编码后的标准 44 位 Base64
         assert_eq!(ob["private_key"].as_str(), Some(test_key(1).as_str()));
         assert_eq!(
@@ -1883,13 +1773,13 @@ mod tests {
         }
     }
 
-    /// 【APP15 任务1.1】逗号分隔的 Local Address 必须正确拆分为
-    /// 主隧道地址（强制 /32）+ 各地址对应的 /24 回家网段，
-    /// 绝不能再回退硬编码 10.0.0.2/24。
+    /// 【APP15 任务1.1 / APP17 任务5.1】逗号分隔的 Local Address 必须正确
+    /// 拆分为主隧道地址（统一 /24）+ 各地址对应的 /24 回家网段，
+    /// 绝不能再回退硬编码 10.0.0.2/24 丢地址。
     #[test]
     fn test_parse_wg_local_addresses() {
         let (primary, extras) = parse_wg_local_addresses("10.196.0.2/32,192.168.10.222/24");
-        assert_eq!(primary, "10.196.0.2/32", "主隧道地址必须取第 1 个且强制 /32");
+        assert_eq!(primary, "10.196.0.2/24", "主隧道地址必须取第 1 个并统一 /24");
         assert_eq!(extras, vec!["10.196.0.0/24", "192.168.10.0/24"]);
 
         // 分号 / 中文标点 / 换行 / 空白分隔同样支持
@@ -1900,14 +1790,14 @@ mod tests {
             "10.196.0.2/32 192.168.10.222/24",
         ] {
             let (p, e) = parse_wg_local_addresses(raw);
-            assert_eq!(p, "10.196.0.2/32", "分隔符 {raw:?} 解析失败");
+            assert_eq!(p, "10.196.0.2/24", "分隔符 {raw:?} 解析失败");
             assert_eq!(e, vec!["10.196.0.0/24", "192.168.10.0/24"]);
         }
 
-        // 单个 /24 地址也只取 /32 作为主隧道地址
-        assert_eq!(parse_wg_local_addresses("10.8.0.2/24").0, "10.8.0.2/32");
+        // 单个 /24 地址保持 /24
+        assert_eq!(parse_wg_local_addresses("10.8.0.2/24").0, "10.8.0.2/24");
         // 无有效 IPv4 → 兜底安全默认
-        assert_eq!(parse_wg_local_addresses("").0, "10.0.0.2/32");
+        assert_eq!(parse_wg_local_addresses("").0, "10.0.0.2/24");
     }
 
     /// 【APP15 任务1.1】逗号地址时，第 2 个地址所在网段必须自动并入回家路由

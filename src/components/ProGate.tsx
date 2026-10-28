@@ -203,15 +203,14 @@ export function ActivateProModal({
     } else {
       const wait = parseRetryAfter(error ?? "");
       if (wait > 0) setRetryAfter(wait);
-      // 命中标准错误码 → 弹窗内渲染错误卡片；未命中 → 维持原 toast
-      const mapped = parseLicenseError(error ?? "");
+      // 命中标准错误码 → 弹窗内渲染错误卡片；其余（含官网原文）→ 原样 Toast。
+      // 【APP17 任务4】只剥离 Tauri IPC 的 "Error: " 前缀，绝不拼接
+      // "激活未通过 / 激活失败" 等自定义前缀。
+      const rawError = (error ?? "").replace(/^Error:\s*/, "").trim();
+      const mapped = parseLicenseError(rawError);
       setParsedError(mapped);
       if (!mapped) {
-        toast.error(
-          wait > 0
-            ? t("pro.rateLimited", { secs: wait })
-            : (error ?? t("pro.activateFailed"))
-        );
+        toast.error(wait > 0 ? t("pro.rateLimited", { secs: wait }) : rawError);
       }
     }
   };

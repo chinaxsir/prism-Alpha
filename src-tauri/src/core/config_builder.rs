@@ -829,16 +829,8 @@ pub fn build(
         );
     }
 
-    // 【APP-9 任务2.1a】Go Lan 回家规则插入：在 clash_mode 之前、
-    // block_quic / prism.sarl 之后的位置。此时 route_rules 头部为
-    // [block_quic?] [clash_mode x2] [custom ...]，Go Lan 插入到
-    // clash_mode 组的最前面（索引 = block_quic 占位）。
-    if !go_lan_rules.is_empty() {
-        let insert_at = if settings.block_quic { 1 } else { 0 };
-        for (i, rule) in go_lan_rules.into_iter().enumerate() {
-            route_rules.insert(insert_at + i, rule);
-        }
-    }
+    // 【APP-9 任务2.1a / APP17 任务5.1】Go Lan 回家规则的最终落位在
+    // 下方「Android DNS 清洗」之前统一执行（强制置顶），此处仅先声明。
 
     // 官网域名强制直连（最高优先级）：官方站点用于授权激活/续费与客户端下载，
     // 经节点在部分机场会被 CDN 或上游策略拦截，表现为「开代理后官网打不开」。
@@ -1003,6 +995,9 @@ pub fn build(
         "tag": MIXED_TAG,
         "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
         "listen_port": settings.mixed_port,
+        // 【APP17 任务5.1】关闭入站嗅探：防止嗅探器把内网 IP:8000/8001 的
+        // 目标改写为域名，导致 ip_cidr → go-lan-home 规则匹配失败
+        "sniff": false,
     }));
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
@@ -1038,13 +1033,11 @@ pub fn build(
             } else {
                 "gvisor"
             },
-            // 首包嗅探：100ms 内取不到域名即按目标 IP 直连，避免固定等待
-            // 【APP-12 任务1.2】sniff_override_destination 必须为 false：
-            // 置 true 时访问家里内网 IP（http://10.195.0.1 等）会被嗅探
-            // 改写目标为 Host/SNI 域名，导致 ip_cidr → go-lan-home 规则
-            // 匹配失败，流量被错误发往海外代理节点。仅保留 sniff 用于
-            // 协议识别，绝不篡改目标地址。
-            "sniff": true,
+            // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
+            // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
+            // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，
+            // 流量被送进海外节点。DEST 嗅探对本场景只有负作用。
+            "sniff": false,
             "sniff_override_destination": false,
             "sniff_timeout": "100ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
@@ -1206,6 +1199,18 @@ pub fn build(
         }),
     );
 
+    // 【APP17 任务5.1】Go Lan 回家规则强制置顶：紧随 DNS(53) 之后，
+    // 先于 853/DoH 拦截、官网直连、block_quic 与 clash_mode/ip_is_private/
+    // 订阅规则。家庭内网网段本身是私有 IP，任何更靠前的规则都会把回家
+    // 流量吞进海外节点或普通直连（log1.txt 实证 192.168.10.x 漏走节点）。
+    // Android 上由下方 DNS 清洗在本数组前再插入两条 dns-out，最终顺序
+    // 即「protocol dns → port 53 → go-lan-home → 其余」。
+    if !go_lan_rules.is_empty() {
+        for (i, rule) in go_lan_rules.into_iter().enumerate() {
+            route_rules.insert(i, rule);
+        }
+    }
+
     // Android DNS 清洗（APP-2 断层二修复）：两条规则放在 route_rules 最顶部
     // （最先匹配），确保所有 UDP/53 和 DNS 协议请求都被劫持到 dns-out，
     // 再由 DNS 模块按 detour 走主组出境，防止内核绕过 sing-box DNS 流程
@@ -1293,10 +1298,13 @@ pub fn build(
             }
         }
         if let Some(rules) = config["route"]["rules"].as_array_mut() {
+            // 【APP17 任务5.1】Go Lan 回家规则必须保持最前，探针规则插入到
+            // 「顶部 dns-out + go-lan-home」之后，绝不把回家规则挤下去。
             let insert_at = rules
                 .iter()
                 .take_while(|r| {
-                    r.get("outbound").and_then(|o| o.as_str()) == Some("dns-out")
+                    let out = r.get("outbound").and_then(|o| o.as_str());
+                    out == Some("dns-out") || out == Some("go-lan-home")
                 })
                 .count();
             for slot in 0..4 {
@@ -2885,12 +2893,12 @@ rules:
             wg.get("peer_public_key").is_some(),
             "顶层单节点模式必须写 peer_public_key"
         );
-        // 【APP15 任务1.1】local_address 只写第 1 个主隧道地址并强制 /32，
-        // 严禁扩为 /24（否则 gVisor 最长前缀匹配会选错源 IP 被对端丢弃）
+        // 【APP17 任务5.1】local_address 只写第 1 个主隧道地址并保持 /24
+        // （gVisor 需同子网前缀识别邻居；其余地址转 /24 进 ip_cidr）
         assert_eq!(
             wg["local_address"][0].as_str(),
-            Some("10.8.0.2/32"),
-            "local_address 必须是主隧道地址 /32"
+            Some("10.8.0.2/24"),
+            "local_address 必须是主隧道地址 /24"
         );
         // 【APP15 任务1.2.2】内核侧 MTU 固定 1280
         assert_eq!(wg["mtu"].as_u64(), Some(1280), "go-lan-home 内核 MTU 固定 1280");
@@ -2901,6 +2909,14 @@ rules:
             "go-lan-home 严禁 inet4_bind_address（5G 蜂窝下 i/o timeout）"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
+        // 【APP17 任务5.1】回家规则必须置顶：先于 853/DoH 拦截、官网直连、
+        // block_quic 与 clash_mode/ip_is_private/订阅规则，否则 192.168.10.x
+        // 这类私有网段会被更靠前的规则吞进海外节点或普通直连。
+        let go_lan_first = rules
+            .iter()
+            .position(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
+            .expect("go-lan 回家规则必须存在");
+        assert_eq!(go_lan_first, 0, "go-lan 回家规则必须位于 route.rules 首位");
         let cidrs: Vec<String> = rules
             .iter()
             .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))

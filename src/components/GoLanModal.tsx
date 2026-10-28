@@ -346,12 +346,10 @@ export default function GoLanModal({ open, onClose }: Props) {
       // 【APP14 任务1】识别成功但缺 PrivateKey 时给出明确内联提示，
       // 而不是让用户面对「只填了 IP 和 Port」的空白表单不知所措。
       if (!parsed.wgPrivateKey) {
-        setPasteHint(
-          "已识别到服务器地址，但配置里没找到 PrivateKey = 行，请确认完整复制了 [Interface] 段",
-        );
+        setPasteHint(t("settings.goLan.recognizedMissingKey"));
       }
       if (!opts?.silent) {
-        toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
+        toast.success(t("settings.goLan.recognized"));
       }
       return true;
     }
@@ -370,11 +368,11 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (text) setPasteBuf(text);
     }
     if (!text.trim()) {
-      setPasteHint("请先将 WireGuard 配置文本长按粘贴到上方输入框中");
+      setPasteHint(t("settings.goLan.needPaste"));
       return;
     }
     if (!recognizeFromText(text)) {
-      setPasteHint("未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式");
+      setPasteHint(t("settings.goLan.notRecognized"));
     }
   };
 
@@ -385,7 +383,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       setLoaded(s);
       setForm(applyGoLanLoaded(s));
       setGoLanSettings(s);
-      toast.success(t("goLan.syncSuccess") || "已拉取家庭节点配置");
+      toast.success(t("settings.goLan.syncToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -417,14 +415,14 @@ export default function GoLanModal({ open, onClose }: Props) {
   const handleSave = async () => {
     // 必填校验
     if (form.mode === "manual" && form.method === "wg") {
-      if (!form.wgServer.trim()) return toast.error("请填写服务器地址");
-      if (!form.wgPrivateKey.trim()) return toast.error("请填写客户端私钥");
-      if (!form.wgPeerPublicKey.trim()) return toast.error("请填写服务端公钥");
+      if (!form.wgServer.trim()) return toast.error(t("settings.goLan.needServer"));
+      if (!form.wgPrivateKey.trim()) return toast.error(t("settings.goLan.needPrivateKey"));
+      if (!form.wgPeerPublicKey.trim()) return toast.error(t("settings.goLan.needPeerKey"));
     }
     if (form.mode === "manual" && form.method === "uri") {
-      if (!form.nodeUri.trim()) return toast.error("请粘贴回家节点分享链接");
+      if (!form.nodeUri.trim()) return toast.error(t("settings.goLan.needNodeUri"));
     }
-    if (!form.lanCidrs.trim()) return toast.error("请填写回家内网网段（如 10.195.0.0/24）");
+    if (!form.lanCidrs.trim()) return toast.error(t("settings.goLan.needCidr"));
 
     setBusy(true);
     try {
@@ -481,7 +479,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       const warnings = await Promise.race([
         saveGoLanSettings(payload),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("保存超时，请稍后重试")), 2500),
+          setTimeout(() => reject(new Error(t("settings.goLan.saveTimeout"))), 2500),
         ),
       ]);
       // 回读最新设置到全局 store（含 enabled 状态）
@@ -490,9 +488,50 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (warnings && warnings.length > 0) {
         toast.error(warnings[0]);
       } else {
-        toast.success(t("goLan.saved") || "Go Lan 配置已保存");
+        toast.success(t("settings.goLan.saveToast"));
       }
       onClose();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 【APP17 任务2】一键清空：立即重置弹窗所有表单状态，并把空的默认
+  // GoLanSettings 持久化到后端（VPN 运行中时后端自动热重载移除 go-lan-home）
+  const handleClearConfig = async () => {
+    setForm({ ...EMPTY_GO_LAN, wgLocalIp: "", wgMtu: WG_DEFAULTS.mtu });
+    setPasteBuf("");
+    setPasteHint("");
+    setProbeTarget("");
+    setProbeMsg("");
+    setProbeOk(null);
+    setShowPrivKey(false);
+    try {
+      localStorage.removeItem("prism.golan.probe_ip");
+    } catch {
+      /* localStorage 不可用时静默忽略 */
+    }
+    setBusy(true);
+    try {
+      const payload: GoLanSettings = {
+        ...(loaded ?? ({} as GoLanSettings)),
+        enabled: false,
+        mode: "manual",
+        nodeUri: "",
+        wgConfig: null,
+        lanCidrs: [],
+        lanDns: null,
+        lanDomains: [],
+        managedServer: loaded?.managedServer || MANAGED_SERVER_DEFAULT,
+        deviceCode: "",
+      };
+      await saveGoLanSettings(payload);
+      const fresh = await getGoLanSettings();
+      setLoaded(fresh);
+      setGoLanSettings(fresh);
+      toast.success(t("settings.goLan.clearToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -641,7 +680,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                 <input
                   value={form.wgLocalIp}
                   onChange={(e) => patch({ wgLocalIp: e.target.value })}
-                  placeholder="10.195.0.2/32"
+                  placeholder="10.195.0.2/24"
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
                 <span className="mt-1 block text-[10px] leading-4 text-gray-500">
@@ -765,7 +804,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             <input
               value={probeTarget}
               onChange={(e) => setProbeTarget(e.target.value)}
-              placeholder="如 10.1.8.1 或 192.168.1.1"
+              placeholder="如 192.168.10.253:8001 或 http://192.168.10.253:8000/webman"
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 focus:border-accent focus:outline-none"
             />
             <button
@@ -793,22 +832,30 @@ export default function GoLanModal({ open, onClose }: Props) {
         </div>
         </div>
 
-        {/* 底部操作栏（固定，永不被屏幕底部截断） */}
-        <div className="flex shrink-0 gap-2 border-t border-border bg-surface px-4 py-3">
+        {/* 底部操作栏（固定，永不被屏幕底部截断）：左「清空配置」，右「取消 / 保存配置」 */}
+        <div className="flex shrink-0 items-center gap-2 border-t border-border bg-surface px-4 py-3">
+          <button
+            onClick={handleClearConfig}
+            disabled={busy}
+            className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+          >
+            {t("settings.goLan.clearBtn")}
+          </button>
+          <div className="flex-1" />
           {/* 【IPA9 任务2】取消按钮永不禁用：任何时候点击都立即关闭弹窗，
               防止 saving 状态卡死时用户无法退出 */}
           <button
             onClick={onClose}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
           >
-            取消
+            {t("settings.goLan.cancelBtn")}
           </button>
           <button
             onClick={handleSave}
             disabled={busy}
             className="flex-1 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            {busy ? "保存中..." : "保存配置"}
+            {busy ? t("settings.goLan.savingBtn") : t("settings.goLan.saveBtn")}
           </button>
         </div>
       </div>
