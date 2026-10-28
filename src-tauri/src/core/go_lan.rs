@@ -38,12 +38,11 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP19 任务1】go-lan-home 出站 MTU 下限：比 tun-in(1360) 大 60 字节
-/// 的 WireGuard 头预算。低于该值的用户配置会被钳制回 1420。
-pub const GO_LAN_MTU_FLOOR: u32 = 1280;
-
-/// 【APP19 任务1】go-lan-home 默认 MTU（对齐家庭 WG 服务端 1420）。
-pub const GO_LAN_MTU_DEFAULT: u32 = 1420;
+/// 【APP20 任务2.1】go-lan-home WireGuard 内层 MTU（硬编码 1280）。
+/// 内核层统一宣告 MSS=1240，确保与 tun-in(1280) 和 iOS settings(1280)
+/// 三层对齐，双向零分片、零丢包。前端 settings.json 仍保存用户配置的
+/// 服务端 MTU（通常 1420），内核层在出站 JSON 里强制写 1280。
+pub const GO_LAN_WIRE_MTU: u32 = 1280;
 
 // ---------------------------------------------------------------- 数据模型
 
@@ -1267,20 +1266,17 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    // 【APP19 任务1】严禁再把内核侧 MTU 写死 1280！家庭 WG 服务端 MTU 为
-    // 1420，若隧道缓冲区只有 1280，NAS 发回的 1420 字节满载 TCP 分段会被
-    // gVisor 静默丢弃——表现为 RDP（握手包仅十几字节）能连、飞牛网页与
-    // SMB 文件块全部卡死。用户配置在 [1280, 9000] 内原样采用，否则默认 1420。
-    let mtu = if (GO_LAN_MTU_FLOOR..=9000).contains(&wg.mtu) {
-        wg.mtu
-    } else {
-        GO_LAN_MTU_DEFAULT
-    };
-    outbound["mtu"] = json!(mtu);
+    // 【APP20 任务2.1】go-lan-home 内核侧 MTU 强制 1280（与 tun-in 和
+    // iOS settings.mtu 三层对齐）：WireGuard 出站宣告 MSS=1240，
+    // 内网 NAS（飞牛/群晖/威联通）回包最大 1280 字节；+60 字节 WG 头 = 1340，
+    // 在 5G 蜂窝 pdp_ip0（1500 链路）下 100% 零分片。前端 settings.json
+    // 保存用户配置的服务端 MTU（通常 1420），这里只在出站 JSON 里写 1280，
+    // 不影响用户配置值。
+    outbound["mtu"] = json!(GO_LAN_WIRE_MTU);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(
-            "已构建 go-lan-home 顶层单节点出站: {}:{}（隧道地址 {primary_local_addr}，MTU {mtu}）",
+            "已构建 go-lan-home 顶层单节点出站: {}:{}（隧道地址 {primary_local_addr}，MTU {GO_LAN_WIRE_MTU}）",
             outbound["server"].as_str().unwrap_or("?"),
             wg.server_port
         ),
@@ -1950,17 +1946,19 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
-        // 【APP19 任务1】用户配置 1420 必须原样写入内核，严禁再压成 1280
+        // 【APP20 任务2.1】内核侧 MTU 强制 GO_LAN_WIRE_MTU=1280（与 tun-in
+        // 和 iOS settings.mtu 三层对齐，统一宣告 MSS=1240）
         assert_eq!(
             ob["mtu"].as_u64(),
-            Some(1420),
-            "go-lan-home MTU 必须采用用户配置 1420"
+            Some(GO_LAN_WIRE_MTU as u64),
+            "go-lan-home MTU 必须强制 {GO_LAN_WIRE_MTU}"
         );
     }
 
-    /// 【APP19 任务1】MTU 合法区间 [1280, 9000] 原样采用，其余回落 1420。
+    /// 【APP20 任务2.1】内核层 go-lan-home MTU 强制 1280，
+    /// 与 tun-in 和 iOS settings 三层对齐，无论用户配置值是什么。
     #[test]
-    fn test_wg_mtu_from_user_config() {
+    fn test_wg_mtu_forced_1280() {
         let make = |mtu: u32| GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -1974,22 +1972,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        for mtu in [1420_u32, 1400, 1280, 1500] {
+        // 用户配置值差异大（1420 服务端 / 1500 标准 / 9000 巨型 / 越界值），
+        // 内核出站 JSON 一律强制 GO_LAN_WIRE_MTU=1280
+        for mtu in [0_u32, 1000, 1280, 1420, 1500, 9000, 65535] {
             let (outbound, _) = build_outbound(&make(mtu));
             let ob = outbound.expect("合法配置应构建出站");
             assert_eq!(
                 ob["mtu"].as_u64(),
-                Some(mtu as u64),
-                "用户配置 MTU {mtu} 在 [1280, 9000] 内必须原样写入"
-            );
-        }
-        for mtu in [0_u32, 1000, 9001, 65535] {
-            let (outbound, _) = build_outbound(&make(mtu));
-            let ob = outbound.expect("合法配置应构建出站");
-            assert_eq!(
-                ob["mtu"].as_u64(),
-                Some(GO_LAN_MTU_DEFAULT as u64),
-                "越界 MTU {mtu} 必须回落 1420"
+                Some(GO_LAN_WIRE_MTU as u64),
+                "用户配置 MTU {mtu} 时内核出站必须强制 {GO_LAN_WIRE_MTU}"
             );
         }
     }

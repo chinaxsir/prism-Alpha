@@ -755,12 +755,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP19 任务1】外层 utun MTU 与 tun-in 统一 1360
-        // （= go-lan-home 1420 − 60 字节 WireGuard 头预算）。
-        // 1360 会自动向对端宣告 MSS = 1320，飞牛 NAS 回送的网页 TLS
-        // 证书 / JS 大包 / SMB 文件块最大 1360 字节，可 100% 无损穿过
-        // MTU 1420 的 go-lan-home；历史 1500/1280 倒挂会把满载分段静默丢弃。
-        let mtu: Int32 = 1360
+        // 【APP20 任务2.2】外层 utun MTU 强制 1280，与 tun-in 和 go-lan-home
+        // 三层对齐：go-lan-home 宣告 MSS=1240，tun-in 同步 1280 让 iOS 内核
+        // TCP 栈也宣告 MSS=1240，双向对称；+60 字节 WG 头 = 1340，
+        // 在 5G 蜂窝（pdp_ip0，链路 MTU 1500）下 100% 零分片、零丢包。
+        let mtu: Int32 = 1280
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -785,13 +784,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        // 【APP19 任务2】includedRoutes = 系统默认路由 + 回家网段子网路由。
-        // 每条子网路由必须显式设置 gatewayAddress = "172.19.0.1"：
-        // 无 gatewayAddress 时 iOS XNU 会把子网路由装成「二层链路克隆路由」，
-        // 「文件」App 的 mount_smbfs / NetAuthSysAgent、打印机 cupsd、
-        // Safari WebKit 等系统守护进程发往 192.168.10.x 的包会在进入 utun
-        // 之前就被内核丢弃（APP18 去掉子网路由后 RDP 能通、SMB 与打印机仍不通）。
-        // 带 gatewayAddress 后才是真正的三层隧道路由，系统守护进程全部走隧道。
+        // 【APP20 任务2.2】includedRoutes = 默认路由 + 回家网段子网路由；
+        // 不加 gatewayAddress（保持默认 nil），让 iOS XNU 把子网路由装成
+        // 正常的三层直连路由——流量由系统路由层送入 utun，再经 tun-in(gvisor)
+        // → route.rules → go-lan-home 直达家中内网。
+        // APP19 实测 gatewayAddress="172.19.0.1" 会触发自环黑洞
+        // （系统尝试发到 172.19.0.1 却经 172.19.0.1 路由回自己）。
         var included: [NEIPv4Route] = [NEIPv4Route.default()]
         for cidrStr in loadGoLanRouteCIDRs() {
             guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
@@ -799,25 +797,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 destinationAddress: parsed.networkAddress,
                 subnetMask: parsed.subnetMask
             )
-            subnetRoute.gatewayAddress = "172.19.0.1"
             included.append(subnetRoute)
-            // /24 额外注入两条带 gatewayAddress 的 /25 最长前缀匹配路由：
-            // 设备连着外部 Wi-Fi 时，更具体的 /25 优先于物理网卡的
-            // 同网段链路路由，确保回家流量 100% 进入 Go Lan 隧道。
-            if parsed.prefix == 24 {
-                let lowHalf = NEIPv4Route(
-                    destinationAddress: ipv4String(parsed.net),
-                    subnetMask: "255.255.255.128"
-                )
-                lowHalf.gatewayAddress = "172.19.0.1"
-                let highHalf = NEIPv4Route(
-                    destinationAddress: ipv4String(parsed.net | 128),
-                    subnetMask: "255.255.255.128"
-                )
-                highHalf.gatewayAddress = "172.19.0.1"
-                included.append(lowHalf)
-                included.append(highHalf)
-            }
         }
         ipv4.includedRoutes = included
         ipv4.excludedRoutes = []
@@ -1185,10 +1165,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
-                    // 【APP19 任务1】tun-in MTU 与 NEPacketTunnelNetworkSettings
-                    // 的 settings.mtu 严格一致，统一 1360：向对端宣告
-                    // MSS=1320，go-lan-home(1420) 可完整容纳所有满载回包。
-                    inbounds[i]["mtu"] = 1360
+                    // 【APP20 任务2.2】tun-in MTU 强制 1280（与 NEPacketTunnel-
+                    // NetworkSettings 的 settings.mtu 和 go-lan-home 三层对齐），
+                    // 统一宣告 MSS=1240 确保双向零分片、零丢包。
+                    inbounds[i]["mtu"] = 1280
                     // 【APP18 任务2】gvisor 栈：进入 utun 的 Safari / RDP 流量在用户态
                     // 内存中直接调用 go-lan-home.DialContext，与 Clash API 延迟
                                         // 探测（388/468 ms）走 100% 相同的内存路径，彻底规避
@@ -1322,7 +1302,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 //    gVisor 会按最长前缀匹配选它做源 IP，而 NAS 侧只放行
                 //    隧道地址（10.196.0.2），数据面全部静默丢包；
                 //    这些地址的 /24 已由 Rust 合并进 route.rules ip_cidr。
-                // 2) 隧道 MTU 保留用户配置（通常 1420），不再压到 1280。
+                // 2) 隧道 MTU 内核侧统一强制 1280（与 tun-in 和 settings.mtu 三层对齐）。
                 if tag == "go-lan-home" {
                     // 【APP17 任务5.1】local_address 仅保留第 1 个地址，且保持
                     // /24 前缀（无前缀补 /24）：gVisor 需要同子网前缀才认可
@@ -1347,18 +1327,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             outbounds[i]["local_address"] = [finalAddr]
                         }
                     }
-                    // 【APP19 任务1】严禁把 go-lan-home 的 MTU 压到 1280：
-                    // 家庭 WG 服务端 MTU 为 1420，飞牛 NAS / SMB 会发回
-                    // 1420 字节满载 TCP 分段，1280 缓冲区会静默丢包
-                    // （RDP 小包能通、网页与 SMB 大包全部卡死）。
-                    // 用户配置在 [1280, 9000] 内原样保留（通常 1420），
-                    // 否则回落默认 1420。
-                    let rawGoLanMtu = (outbounds[i]["mtu"] as? NSNumber)?.intValue
-                    if let m = rawGoLanMtu, m >= 1280, m <= 9000 {
-                        outbounds[i]["mtu"] = m
-                    } else {
-                        outbounds[i]["mtu"] = 1420
-                    }
+                    // 【APP20 任务2.2】go-lan-home 内核侧 MTU 强制 1280（与
+                    // tun-in 和 settings.mtu 三层对齐），统一宣告 MSS=1240，
+                    // 确保 5G 蜂窝链路下飞牛网页 / SMB / 打印机等所有内网
+                    // 大包零分片零丢包。
+                    outbounds[i]["mtu"] = 1280
                     // 【APP17 任务5.1】WireGuard 出站绑定真实物理网卡，
                     // 避免握手/数据 UDP 被系统默认路由送回隧道自身而死循环。
                     let bindIfName = findActivePhysicalInterface().name

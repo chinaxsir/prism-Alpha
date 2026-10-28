@@ -33,7 +33,9 @@
       })();
     </script>
   </head>
-  <body>
+  <!-- 【APP20 任务1】body 内联深色背景 + 隐藏溢出：防止 iOS WebView
+       初始化 / 上滑最小化圆角裁剪时透出系统默认白底 -->
+  <body style="background-color: #0b0e14; margin: 0; padding: 0; overflow: hidden;">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

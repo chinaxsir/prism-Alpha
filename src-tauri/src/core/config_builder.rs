@@ -1022,12 +1022,12 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP19 任务1】tun-in MTU 1360 = go-lan-home(1420) − 60 字节 WG 头。
-            // 入口 MTU 决定 TCP 向对端宣告的 MSS（1360−40=1320），对端回包
-            // 最大 1360 字节可 100% 无损通过 1420 的隧道缓冲区；旧值 9000
-            // 会让本端宣告超大 MSS，NAS 回 1420 满载包后被 gVisor 丢弃，
-            // 表现为 RDP 能连、飞牛网页 / SMB 文件块全部卡死。
-            "mtu": 1360,
+            // 【APP20 任务2.1】tun-in MTU 统一 1280，与 go-lan-home 同值。
+            // 原理：go-lan-home(1280) 向内网 NAS 发起 TCP SYN 时宣告
+            // MSS=1240（1280−40），NAS 回包最大 1280 字节；加上 60 字节
+            // WG 头 = 1340，在 5G 蜂窝（pdp_ip0）1500 链路下 100% 零分片。
+            // tun-in 同步 1280 让系统栈与隧道栈完全对齐，MSS=1240 双向对称。
+            "mtu": 1280,
             "auto_route": true,
             // 【APP18 任务2】统一 gvisor 栈（移动端原为 mixed）：
             // 进入 utun 的内网流量在用户态内存中直接调用 go-lan-home
@@ -2929,8 +2929,9 @@ rules:
             Some("10.8.0.2/24"),
             "local_address 必须是主隧道地址 /24"
         );
-        // 【APP19 任务1】go-lan-home MTU 采用用户配置 1420（严禁写死 1280）
-        assert_eq!(wg["mtu"].as_u64(), Some(1420), "go-lan-home MTU 必须为 1420");
+        // 【APP20 任务2.1】go-lan-home MTU 强制 1280（内核层统一，
+        // 用户配置仅保存于前端 settings.json）
+        assert_eq!(wg["mtu"].as_u64(), Some(1280), "go-lan-home MTU 必须为 1280");
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
         assert!(
