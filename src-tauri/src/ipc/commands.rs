@@ -1024,8 +1024,9 @@ const SUBSCRIPTION_UAS: [&str; 3] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ];
 
-/// 单次订阅请求超时（方案要求 12 秒；黑洞地址由 connect_timeout 快速失败）
-const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// 单次订阅请求总超时。【APP15 任务3.1】12s → 30s：大订阅（数千行 YAML）
+/// 在弱网/CDN 回源慢时 12s 经常读到一半就断开，导致尾部截断的畸形 YAML。
+const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 清洗订阅 URL：剔除首尾空白与零宽/不可见控制字符。
 /// 从微信、网页复制的链接常带入 \u2060（Word Joiner）、\u200B..\u200F、
@@ -1085,7 +1086,7 @@ async fn fetch_remote_text(
             .user_agent(ua)
             .timeout(SUBSCRIPTION_TIMEOUT)
             // 连接阶段独立短超时：黑洞地址快速失败
-            .connect_timeout(std::time::Duration::from_secs(8))
+            .connect_timeout(std::time::Duration::from_secs(10))
             // 部分机场使用自签名/过期证书，忽略校验换取可用性
             .danger_accept_invalid_certs(true)
             // 机场面板常有 CDN 多级跳转，最多跟随 5 次

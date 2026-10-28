@@ -401,110 +401,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// 【APP14 任务2】向 App Group vpn_trace.log 追加一行 [GoLan-Ext] 实况，
-    /// 供主 App 运行日志展示扩展进程内的真实探测结果。
-    private func appendGoLanExtTrace(_ message: String) {
-        let ts = Int(Date().timeIntervalSince1970)
-        let line = "\(ts) INFO [GoLan-Ext] \(message)\n"
-        for dir in sharedDirURLs() {
-            let url = dir.appendingPathComponent("vpn_trace.log")
-            if let h = try? FileHandle(forWritingTo: url) {
-                h.seekToEndOfFile()
-                h.write(line.data(using: .utf8) ?? Data())
-                try? h.close()
-            } else {
-                try? line.write(to: url, atomically: true, encoding: .utf8)
-            }
-        }
-    }
-
-    /// 【APP14 任务2】扩展进程内 WireGuard 对端的 UDP 握手可达性探测。
-    ///
-    /// 目的：把「扩展自身 Socket 能否发出 148 字节 UDP 握手包」这件事直接
-    /// 写进日志，一眼区分两类故障：
-    ///   - `result=connect-failed(...)` / `Network is unreachable` /
-    ///     `Operation not permitted` → 扩展进程发不出包（网络层被堵），
-    ///     与内网目标无关，问题在 Socket 绑定/路由策略；
-    ///   - `result=timeout after 600ms` → UDP 已发出（connect 成功即代表
-    ///     内核已选出源地址与出口网卡），只是没收到对端回包（对端
-    ///     正常只会对合法 Noise 握手包回包，故 timeout 属预期）。
-    private func probeGoLanUdpHandshake(server: String, port: UInt16) {
-        let physical = cachedPhysicalIfName.isEmpty ? "?" : cachedPhysicalIfName
-        let physicalIdx = cachedPhysicalIfIndex
-        appendGoLanExtTrace(
-            "path=扩展进程内 udp -> 服务器 \(server):\(port), 物理网卡=\(physical)(index=\(physicalIdx))"
-        )
-
-        // 目标必须是 IP 字面量（WireGuard 出站的 server 已在配置里预解析为 IP）
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        let ipStr = server.hasPrefix("[") ? "" : server
-        guard !ipStr.isEmpty, inet_pton(AF_INET, ipStr, &addr.sin_addr) == 1 else {
-            appendGoLanExtTrace("udp handshake -> 服务器 \(server):\(port) result=skip(非 IPv4 字面量)")
-            return
-        }
-
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else {
-            appendGoLanExtTrace("udp handshake -> 服务器 \(server):\(port) result=socket failed(errno=\(errno))")
-            return
-        }
-        defer { close(fd) }
-        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
-
-        let connected = withUnsafePointer(to: &addr) { p -> Int32 in
-            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if connected != 0 {
-            appendGoLanExtTrace(
-                "udp handshake -> 服务器 \(server):\(port) result=connect-failed(errno=\(errno): \(String(cString: strerror(errno))))"
-            )
-            return
-        }
-
-        // 148 字节 = WireGuard handshake initiation 的标准长度
-        var payload = [UInt8](repeating: 0, count: 148)
-        let sent = payload.withUnsafeBytes { raw -> Int in
-            send(fd, raw.baseAddress, raw.count, 0)
-        }
-        guard sent > 0 else {
-            appendGoLanExtTrace(
-                "udp handshake -> 服务器 \(server):\(port) result=send-failed(errno=\(errno): \(String(cString: strerror(errno))))"
-            )
-            return
-        }
-
-        var buf = [UInt8](repeating: 0, count: 2048)
-        let deadline = Date().addingTimeInterval(0.6)
-        var got: Int = -1
-        while Date() < deadline {
-            let n = recv(fd, &buf, buf.count, 0)
-            if n > 0 {
-                got = n
-                break
-            }
-            if errno != EAGAIN && errno != EWOULDBLOCK {
-                appendGoLanExtTrace(
-                    "udp handshake -> 服务器 \(server):\(port) result=recv-failed(errno=\(errno): \(String(cString: strerror(errno))))"
-                )
-                return
-            }
-            usleep(20_000)
-        }
-        if got > 0 {
-            appendGoLanExtTrace(
-                "udp handshake -> 服务器 \(server):\(port) result=reply(\(got) bytes)"
-            )
-        } else {
-            appendGoLanExtTrace(
-                "udp handshake -> 服务器 \(server):\(port) result=timeout after 600ms (UDP 已发出，仅无回包)"
-            )
-        }
-    }
-
     private func loadRawConfigText() throws -> String {
         if let configPath = (protocolConfiguration as? NETunnelProviderProtocol)?
             .providerConfiguration?["config_path"] as? String,
@@ -806,8 +702,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        let rawMtu = (json["mtu"] as? NSNumber)?.int32Value ?? 1400
-        let mtu: Int32 = (rawMtu >= 1280 && rawMtu <= 9000) ? rawMtu : 1400
+        // 【APP15 任务1.2.2】外层 utun MTU 固定 1500。
+        // 旧值 1400 < 内层 go-lan-home 1420，TLS 握手大包（>1400）在 utun
+        // 出口被直接丢弃，表现为 https://192.168.10.253:8001 一直卡死。
+        // 内层 go-lan-home 已固定 1280（MSS 1240），+60 字节 WG 头 = 1340，
+        // 小于任何链路 MTU，双层 MTU 不再互相打架。
+        let mtu: Int32 = 1500
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -867,10 +767,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 结论：让 go-lan-home 与常规代理节点使用完全一致的 Socket 路径，
         // 全部交给 iOS NECP 按当前活跃物理网卡（pdp_ip0 / en0）自动路由。
         // 仅保留「允许局域网连接」的 /24 回包闭环与直连 DNS 两条排除路由。
+        // 【APP15 任务1.2.3】记录所有回家网段，供「允许局域网连接」排除判断
+        // 时做重叠保护（本机 Wi-Fi /24 与回家网段相同时绝不能排除）。
+        var goLanNets: [(net: UInt32, prefix: UInt8)] = []
         if let rules = (json["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
             for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
                 for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
                     guard let p = parseCIDR(cidr), !p.address.isEmpty else { continue }
+                    if p.prefix > 0, let base = ipv4ToUInt32(p.address) {
+                        goLanNets.append((base, p.prefix))
+                    }
                     let route = p.prefix <= 0
                         ? NEIPv4Route.default()
                         : NEIPv4Route(
@@ -922,7 +828,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         if lanEnabled, !bindIPv4.isEmpty, let selfIp = ipv4ToUInt32(bindIPv4) {
             let lanMask: UInt32 = 0xFFFF_FF00
-            if let net = uint32ToIPv4(selfIp & lanMask) {
+            // 【APP15 任务1.2.3】回到家里、本机 Wi-Fi 与回家网段同一 /24 时
+            // （如 192.168.10.x），把整段 /24 排除会把回家路由剔掉，导致
+            // NAS 完全不可达。只有不与任何回家网段重叠时才允许排除。
+            let selfNet = selfIp & lanMask
+            let overlaps = goLanNets.contains { item in
+                let mask: UInt32 = item.prefix == 0
+                    ? 0
+                    : ~UInt32(0) << (32 - UInt32(min(item.prefix, 32)))
+                return (selfNet & mask) == (item.net & mask)
+            }
+            if !overlaps, let net = uint32ToIPv4(selfNet) {
                 excludedV4.append(
                     NEIPv4Route(destinationAddress: net, subnetMask: "255.255.255.0")
                 )
@@ -1154,18 +1070,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ($0["tag"] as? String) == "go-lan-home" && ($0["type"] as? String) == "wireguard"
         }) else { return }
 
-        // 【APP14 任务2】先把「扩展进程能否发出 UDP 握手包」写进日志
-        let wgServer = wg["server"] as? String ?? ""
-        let wgPort = UInt16(
-            (wg["server_port"] as? NSNumber)?.intValue
-                ?? (wg["server_port"] as? Int) ?? 0
-        )
-        if !wgServer.isEmpty && wgPort > 0 {
-            vpnQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.probeGoLanUdpHandshake(server: wgServer, port: wgPort)
-            }
-        }
-
         var gateways: [String] = []
         func pushGateway(_ ip: String) {
             let parts = ip.split(separator: ".")
@@ -1313,7 +1217,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i].removeValue(forKey: "interface_name")
                     inbounds[i]["strict_route"] = false
                     inbounds[i]["auto_route"] = true
-                    inbounds[i]["mtu"] = 1400
+                    // 【APP15 任务1.2.2】外层 utun MTU 1500（与 NEPacketTunnel-
+                    // NetworkSettings 一致），内层 go-lan-home 单独固定 1280
+                    inbounds[i]["mtu"] = 1500
                     // mixed 栈：TCP 走系统原生栈、UDP 走 gvisor（sing-box 默认），
                     // 大幅提升大流量下载吞吐并降低单核 CPU 占用
                     inbounds[i]["stack"] = "mixed"
@@ -1439,6 +1345,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 } else if let la = outbounds[i]["local_address"] as? String, !la.isEmpty {
                     outbounds[i]["local_address"] = [normalizePrefixString(la)]
                 }
+                // 【APP15 任务1.1 / 1.2.2】go-lan-home 双重加固：
+                // 1) local_address 只保留第 1 个 IPv4 并强制 /32。逗号分隔的
+                //    第 2 个地址（如 192.168.10.222/24）绝不能留在这里——
+                //    gVisor 会按最长前缀匹配选它做源 IP，而 NAS 侧只放行
+                //    隧道地址（10.196.0.2），数据面全部静默丢包；
+                //    这些地址的 /24 已由 Rust 合并进 route.rules ip_cidr。
+                // 2) 内核侧 mtu 固定 1280（外层 utun 1500）：MSS 1240 +
+                //    60 字节 WG 头 = 1340 < 任何链路 MTU，TLS 大包不再丢失。
+                if tag == "go-lan-home" {
+                    var primaryAddr: [String] = []
+                    for raw in ((outbounds[i]["local_address"] as? [String]) ?? []) {
+                        let tokens = raw.split(whereSeparator: { ch in
+                            ch == "," || ch == ";" || ch == "\u{FF0C}" || ch == "\u{FF1B}"
+                                || ch == "\n" || ch == "\r" || ch == " " || ch == "\t"
+                        })
+                        for tok in tokens {
+                            let ipOnly = tok.split(separator: "/").first.map(String.init) ?? ""
+                            if isValidIPv4Literal(ipOnly) {
+                                primaryAddr = ["\(ipOnly)/32"]
+                                break
+                            }
+                        }
+                        if !primaryAddr.isEmpty { break }
+                    }
+                    if !primaryAddr.isEmpty {
+                        outbounds[i]["local_address"] = primaryAddr
+                    }
+                    outbounds[i]["mtu"] = 1280
+                }
                 // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
                 // 强制 ipv4_only 保证 WireGuard 握手包可正常发出
                 outbounds[i]["domain_strategy"] = "ipv4_only"
@@ -1538,6 +1473,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             blockOutboundTag = "block"
         }
         root["outbounds"] = outbounds
+
+        // 【APP15 任务2】mixed-in 入站必须始终存在（Rust 端已始终注入，
+        // 此处兜底历史版本生成的旧配置）：否则内网检测在 1ms 内就因
+        // 127.0.0.1:2080 Connection refused 而报「本地代理端口未就绪」。
+        var mixedInbounds = (root["inbounds"] as? [[String: Any]]) ?? []
+        if !mixedInbounds.contains(where: { ($0["tag"] as? String) == "mixed-in" }) {
+            mixedInbounds.append([
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 2080,
+                "sniff": false
+            ])
+            root["inbounds"] = mixedInbounds
+        }
 
         // 2.5 GO-AIM 4 路隔离探针兜底（APP-4 任务3.1）
         // Rust 端 config_builder 已注入探针入站（127.0.0.1:2083-2086）与
@@ -1750,6 +1700,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 尝试 DoT 直连 8.8.8.8:853 / 8.8.4.4:853 会反复 i/o timeout
             // 刷屏耗电；直接 block 853，逼使回退到标准 53 端口 DNS。
             ["port": [853], "outbound": finalBlockTag],
+            // 【APP15 任务3.2】公共 DNS 的 DoH/DoT 端点拦截：紧跟 853 之后，
+            // iOS 系统与部分 App 直连 8.8.8.8/8.8.4.4/1.1.1.1/1.0.0.1 的
+            // 443/853 会绕过本地 DNS 劫持并反复超时刷屏。
+            [
+                "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
+                "port": [443, 853],
+                "outbound": finalBlockTag
+            ],
             ["protocol": ["quic"], "outbound": finalBlockTag],
             ["network": ["udp"], "port": [443], "outbound": finalBlockTag]
         ]
@@ -1806,21 +1764,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         root["route"] = route
 
-        // 5. 修正 experimental.cache_file
-        if var experimental = root["experimental"] as? [String: Any] {
-            if var cacheFile = experimental["cache_file"] as? [String: Any] {
-                cacheFile.removeValue(forKey: "store_selected")
-                cacheFile["enabled"] = false
-                cacheFile["path"] = cacheDBURL.path
-                experimental["cache_file"] = cacheFile
-            }
-            if var clashAPI = experimental["clash_api"] as? [String: Any] {
-                clashAPI.removeValue(forKey: "external_ui")
-                clashAPI.removeValue(forKey: "external_ui_download_url")
-                experimental["clash_api"] = clashAPI
-            }
-            root["experimental"] = experimental
+        // 5. 修正 experimental.cache_file / clash_api
+        // 【APP15 任务2】clash_api 必须始终存在：内网检测的通道2（
+        // `/proxies/go-lan-home/delay`）与前端实时数据都依赖它。
+        var experimental = (root["experimental"] as? [String: Any]) ?? [:]
+        var cacheFile = (experimental["cache_file"] as? [String: Any]) ?? [:]
+        cacheFile.removeValue(forKey: "store_selected")
+        cacheFile["enabled"] = false
+        cacheFile["path"] = cacheDBURL.path
+        experimental["cache_file"] = cacheFile
+
+        var clashAPI = (experimental["clash_api"] as? [String: Any]) ?? [:]
+        clashAPI.removeValue(forKey: "external_ui")
+        clashAPI.removeValue(forKey: "external_ui_download_url")
+        if (clashAPI["external_controller"] as? String ?? "").isEmpty {
+            clashAPI["external_controller"] = "127.0.0.1:9090"
         }
+        if (clashAPI["default_mode"] as? String ?? "").isEmpty {
+            clashAPI["default_mode"] = "rule"
+        }
+        experimental["clash_api"] = clashAPI
+        root["experimental"] = experimental
 
         // 6. 开启 box.log（warn 级别）：正常上网的每条连接不再同步写盘，
         // 消除高频磁盘 I/O 阻塞（info 级别会为每次路由匹配写一行）

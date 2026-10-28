@@ -87,12 +87,127 @@ pub struct ClashProfileView {
     pub proxy_providers: HashMap<String, ProviderView>,
 }
 
+/// 【APP15 任务3.1】Clash YAML 截断/畸形自愈解析器。
+///
+/// 机场返回的订阅在弱网下常被截断在第 N 行（如尾部某个节点的半截
+/// flow mapping `- { name: 香港 01, type: vmess, server: ...`），
+/// 整份 YAML 因此解析失败，用户看到「订阅内容不是有效的 Clash YAML」。
+///
+/// 三级自愈：
+/// 1. 直接完整解析（正常路径，零开销）；
+/// 2. 策略 A：从尾部按「安全断点」（列表项开头 / 顶层键 / 空行）逐级
+///    回退截断，丢弃被截断的残行/残节点后重试；
+/// 3. 策略 B：逐行提取 `proxies:` 段的 `- { ... }` 节点对象单独解析，
+///    只要逐个节点合法即可恢复绝大部分可用节点。
+fn parse_clash_profile_resilient(text: &str) -> Result<ClashProfile> {
+    let trimmed = text.trim();
+    if let Ok(profile) = serde_yaml::from_str::<ClashProfile>(trimmed) {
+        return Ok(profile);
+    }
+    let first_err = serde_yaml::from_str::<ClashProfile>(trimmed)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+
+    // ---- 策略 A：尾部安全断点回退截断 ----
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in (1..lines.len()).rev() {
+        let line = lines[i];
+        let is_break_point = line.trim().is_empty()
+            || line.trim_start().starts_with("- ")
+            || !line.starts_with([' ', '\t']);
+        if is_break_point {
+            candidates.push(i);
+            if candidates.len() >= 60 {
+                break;
+            }
+        }
+    }
+    for cut in candidates {
+        let candidate = lines[..cut].join("\n");
+        if let Ok(profile) = serde_yaml::from_str::<ClashProfile>(&candidate) {
+            tracing::warn!("订阅 YAML 尾部截断，已在第 {cut} 行回退自愈解析");
+            return Ok(profile);
+        }
+    }
+
+    // ---- 策略 B：逐行提取 `- { ... }` 节点对象单独解析 ----
+    let nodes = extract_flow_style_nodes(trimmed);
+    if !nodes.is_empty() {
+        tracing::warn!(
+            "订阅 YAML 畸形，已逐行提取自愈恢复 {} 个节点（原始错误: {first_err}）",
+            nodes.len()
+        );
+        return Ok(ClashProfile {
+            proxies: nodes,
+            ..Default::default()
+        });
+    }
+
+    Err(anyhow::anyhow!(
+        "订阅内容不是有效的 Clash YAML（{first_err}）"
+    ))
+}
+
+/// 【APP15 任务3.1】从 `proxies:` 段逐行提取 `- { ... }` flow mapping 节点，
+/// 按花括号配对合并跨行片段，逐个独立解析（单节点失败不影响其它节点）。
+fn extract_flow_style_nodes(text: &str) -> Vec<ClashNode> {
+    let mut out: Vec<ClashNode> = Vec::new();
+    let mut in_proxies = false;
+    let mut buf = String::new();
+    let mut depth: i32 = 0;
+    let balance = |s: &str| -> i32 {
+        s.chars().fold(0, |acc, c| match c {
+            '{' => acc + 1,
+            '}' => acc - 1,
+            _ => acc,
+        })
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if !in_proxies {
+            if t == "proxies:" {
+                in_proxies = true;
+            }
+            continue;
+        }
+        // proxies 段结束：出现新的顶层键
+        if !line.starts_with([' ', '\t']) && !t.is_empty() && !t.starts_with('-') {
+            break;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if depth == 0 {
+            let Some(rest) = t.strip_prefix("- ") else {
+                continue;
+            };
+            buf = rest.trim().to_string();
+            depth = balance(&buf);
+        } else {
+            buf.push(' ');
+            buf.push_str(t);
+            depth += balance(t);
+        }
+        if depth <= 0 {
+            if let Ok(node) = serde_yaml::from_str::<ClashNode>(&buf) {
+                out.push(node);
+            }
+            buf.clear();
+            depth = 0;
+        }
+    }
+    out
+}
+
 /// 订阅内容落盘前校验：必须包含节点 / 策略组 / proxy-provider 之一。
 /// 防止机场返回 HTML 错误页、限流提示等无效内容覆盖掉本地可用订阅，
 /// 导致启动时报「未解析到任何节点或策略组」。
 pub fn validate_subscription_text(text: &str) -> Result<(), String> {
-    let profile: ClashProfile = serde_yaml::from_str(text.trim())
-        .map_err(|e| format!("订阅内容不是有效的 Clash YAML（{e}）"))?;
+    // 【APP15 任务3.1】走自愈解析器：尾部被截断的订阅不再整份拒绝
+    let profile: ClashProfile =
+        parse_clash_profile_resilient(text).map_err(|e| format!("{e}"))?;
 
     // 检查 proxies：不仅要有节点，且节点 server 不能全是环回地址（机场提示页）
     // 注意：emit_node 会跳过 127.x/localhost 节点，这里必须同步过滤，否则
@@ -381,7 +496,8 @@ pub fn build(
     let mut global_rename: HashMap<String, String> = HashMap::new();
 
     for (url, sub_name, text) in profiles {
-        let profile: ClashProfile = serde_yaml::from_str(text.trim())
+        // 【APP15 任务3.1】自愈解析：尾部截断/畸形 YAML 也能恢复可用节点
+        let profile: ClashProfile = parse_clash_profile_resilient(text)
             .with_context(|| format!("无法解析订阅「{sub_name}」为 Clash YAML（请检查订阅格式）"))?;
 
         // 读取已落盘的 proxy-provider 节点（update_subscription 时按 URL 下载）
@@ -875,21 +991,19 @@ pub fn build(
     }
 
     // 4. 入站
-    // 移动端（iOS/Android）所有流量经 TUN 接管，默认不注入 mixed 入站
-    // （避免 NetworkExtension 沙箱内绑定端口失败导致内核启动失败）；
-    // 但开启「允许局域网连接」后必须注入 mixed 入站并监听 0.0.0.0，
-    // 否则局域网其他设备（192.168.x.x 等）的代理请求会在 TCP 握手阶段
-    // 被系统内核直接拒绝（Connection refused）。
+    // 【APP15 任务2】移动端也必须始终注入 mixed 入站（默认 127.0.0.1:2080）：
+    // 「允许局域网连接」开启时监听 0.0.0.0，否则仅本机 127.0.0.1。
+    // 此前移动端默认不注入，导致「内网检测」在 1ms 内因 127.0.0.1:2080
+    // Connection refused 而报「本地代理端口未就绪」——检测链路完全没有
+    // 可用的本地 SOCKS5 通道。clash_api（9090）同样始终可用。
+    // 注：iOS 沙箱内绑定 127.0.0.1 端口由内核自身完成，不会导致启动失败。
     let mut inbounds: Vec<Value> = Vec::new();
-    let is_mobile = cfg!(any(target_os = "ios", target_os = "android"));
-    if settings.allow_lan || !is_mobile {
-        inbounds.push(json!({
-            "type": "mixed",
-            "tag": MIXED_TAG,
-            "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
-            "listen_port": settings.mixed_port,
-        }));
-    }
+    inbounds.push(json!({
+        "type": "mixed",
+        "tag": MIXED_TAG,
+        "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
+        "listen_port": settings.mixed_port,
+    }));
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
     // 普通 App 无法设置系统代理，libbox 经 tun 入站回调 PlatformInterface.OpenTun
@@ -1078,6 +1192,19 @@ pub fn build(
     // 在最顶部 block 853，逼使系统立即回退到标准 53 端口 DNS。
     // （route_rules 自身不用 853，插入 index 0 不影响 DNS 劫持优先级）
     route_rules.insert(0, json!({ "port": 853, "outbound": "block" }));
+
+    // 【APP15 任务3.2】公共 DNS 的 DoH/DoT 端点直连拦截：iOS 系统与部分 App
+    // 会尝试直连 8.8.8.8/8.8.4.4/1.1.1.1/1.0.0.1 的 443(DoH)/853(DoT)，
+    // 在隧道未就绪时反复 i/o timeout 刷屏并绕过本地 DNS 劫持。
+    // 紧跟在 853 拦截之后，确保优先于任何代理/直连规则命中。
+    route_rules.insert(
+        1,
+        json!({
+            "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
+            "port": [443, 853],
+            "outbound": "block"
+        }),
+    );
 
     // Android DNS 清洗（APP-2 断层二修复）：两条规则放在 route_rules 最顶部
     // （最先匹配），确保所有 UDP/53 和 DNS 协议请求都被劫持到 dns-out，
@@ -1937,6 +2064,43 @@ fn strip_nulls(value: &mut Value) {
 mod tests {
     use super::*;
 
+    /// 【APP15 任务3.1】尾部被截断的订阅 YAML 必须能自愈解析出可用节点，
+    /// 绝不能整份拒绝（用户场景：12s 超时读一半导致第 438 行截断）。
+    #[test]
+    fn truncated_subscription_yaml_self_heals() {
+        let full = r#"
+proxies:
+  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+  - {name: HK2, type: ss, server: 5.6.7.8, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK1, HK2]}
+rules:
+  - MATCH,节点选择
+"#;
+        // 策略 A：在 `proxy-groups:` 处截断 → 回退丢弃尾部残余
+        let cut_a = full
+            .split("proxy-groups:")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let p = parse_clash_profile_resilient(&cut_a).expect("策略A 应自愈");
+        assert_eq!(p.proxies.len(), 2, "截断后仍应保留 2 个节点");
+
+        // 策略 B：最后一行被截成半截 flow mapping 且无合法尾部断点可回退
+        let broken = format!(
+            "proxies:\n  - {{name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}}\n  - {{name: HK2, type: ss, server: 5.6.7.8, port: 8388, cipher: aes-256"
+        );
+        let p = parse_clash_profile_resilient(&broken).expect("策略B 应自愈");
+        assert!(!p.proxies.is_empty(), "至少应恢复 1 个完整节点");
+        assert_eq!(p.proxies[0].name, "HK1");
+
+        // 正常订阅零开销走完整解析
+        assert_eq!(
+            parse_clash_profile_resilient(full).unwrap().proxies.len(),
+            2
+        );
+    }
+
     /// 回归（协议补全）：hysteria v1 认证字段 auth-str / auth_str / auth_str2
     /// 与 password 依次回退；全部缺失时节点被跳过并给出原因
     #[test]
@@ -2721,11 +2885,15 @@ rules:
             wg.get("peer_public_key").is_some(),
             "顶层单节点模式必须写 peer_public_key"
         );
+        // 【APP15 任务1.1】local_address 只写第 1 个主隧道地址并强制 /32，
+        // 严禁扩为 /24（否则 gVisor 最长前缀匹配会选错源 IP 被对端丢弃）
         assert_eq!(
             wg["local_address"][0].as_str(),
-            Some("10.8.0.2/24"),
-            "local_address 必须扩为 /24 以便识别同网段网关（APP-12 任务1.2）"
+            Some("10.8.0.2/32"),
+            "local_address 必须是主隧道地址 /32"
         );
+        // 【APP15 任务1.2.2】内核侧 MTU 固定 1280
+        assert_eq!(wg["mtu"].as_u64(), Some(1280), "go-lan-home 内核 MTU 固定 1280");
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
         assert!(

@@ -44,7 +44,7 @@
     }
   },
   "productName": "Prism",
-  "version": "0.3.40",
+  "version": "0.3.41",
   "identifier": "com.prism.proxy",
   "plugins": {},
   "app": {

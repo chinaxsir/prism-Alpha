@@ -110,6 +110,28 @@ const cleanInput = (s: string): string => s.replace(INVISIBLE_CHARS, "");
 /** 零宽隐形字符（保留空白与换行，供逐行解析使用） */
 const INVISIBLE_ONLY = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
 
+/** 【APP15 任务1.1】拆分 WireGuard Local Address（支持逗号/分号/中文标点/
+ *  换行/空白分隔）：
+ *  - primary：第 1 个地址，原样留在「本机虚拟地址」（后端会强制 /32）；
+ *  - cidrs：其余每个 IPv4 地址对应的 /24 网段，需并入「回家内网网段」。
+ *  绝不能把第 2 个地址（如 192.168.10.222/24）写进 Local Address，
+ *  否则 gVisor 会按最长前缀匹配选它做源 IP，被对端 NAS 静默丢弃。 */
+function splitLocalAddresses(raw: string): { primary: string; cidrs: string[] } {
+  let primary = "";
+  const cidrs: string[] = [];
+  for (const token of raw.split(/[\r\n,;，；\s]+/)) {
+    const tok = cleanInput(token);
+    if (!tok) continue;
+    if (!primary) primary = tok;
+    const m = tok.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/\d{1,2})?$/);
+    if (!m) continue;
+    const parts = m[1].split(".");
+    const net = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+    if (!cidrs.includes(net)) cidrs.push(net);
+  }
+  return { primary, cidrs };
+}
+
 const WG_KNOWN_KEYS =
   /^(PrivateKey|Address|DNS|MTU|ListenPort|Table|PublicKey|PresharedKey|PreSharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=/i;
 
@@ -175,7 +197,15 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
   const priv = get("interface", "privatekey");
   if (priv) out.wgPrivateKey = priv;
   const addr = get("interface", "address");
-  if (addr) out.wgLocalIp = addr.split(",")[0].trim();
+  // 【APP15 任务1.1】Address 可能是逗号分隔的多个地址（如
+  // "10.196.0.2/32,192.168.10.222/24"）：第 1 个留在「本机虚拟地址」，
+  // 其余地址全部转 /24 并入「回家内网网段」。
+  let addrCidrs: string[] = [];
+  if (addr) {
+    const parsed = splitLocalAddresses(addr);
+    out.wgLocalIp = parsed.primary;
+    addrCidrs = parsed.cidrs;
+  }
   const mtuRaw = get("interface", "mtu");
   if (mtuRaw) {
     // 【APP14 任务1】只提取纯数字部分，576..9000 范围内 100% 原样保留
@@ -199,12 +229,9 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
       out.wgServerPort = 51820;
     }
   }
-  // 回家内网网段：Address 所在 /24 + AllowedIPs 非默认网段
+  // 回家内网网段：Address 拆分出的全部 /24 + AllowedIPs 非默认网段
   const cidrs = new Set<string>();
-  if (out.wgLocalIp) {
-    const parts = out.wgLocalIp.split("/")[0].split(".");
-    if (parts.length === 4) cidrs.add(`${parts[0]}.${parts[1]}.${parts[2]}.0/24`);
-  }
+  for (const c of addrCidrs) cidrs.add(c);
   const allowed = get("peer", "allowedips");
   if (allowed) {
     for (const c of allowed.split(",")) {
@@ -402,6 +429,9 @@ export default function GoLanModal({ open, onClose }: Props) {
     setBusy(true);
     try {
       const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
+      // 【APP15 任务1.1】保存时同样按逗号拆分「本机虚拟地址」：
+      // 第 1 个留在 Local Address，其余地址转 /24 并入回家网段。
+      const localAddr = splitLocalAddresses(form.wgLocalIp);
       const wgAnyFilled = [
         form.wgServer,
         form.wgPrivateKey,
@@ -416,7 +446,8 @@ export default function GoLanModal({ open, onClose }: Props) {
               privateKey: cleanInput(form.wgPrivateKey),
               peerPublicKey: cleanInput(form.wgPeerPublicKey),
               preSharedKey: cleanInput(form.wgPreSharedKey) || null,
-              localIp: cleanInput(form.wgLocalIp) || WG_DEFAULTS.localIp,
+              localIp: cleanInput(localAddr.primary) || WG_DEFAULTS.localIp,
+              // 前端 UI 保留用户配置值（如 1420）；内核侧由后端固定 1280
               mtu: form.wgMtu || WG_DEFAULTS.mtu,
             }
           : null;
@@ -435,7 +466,10 @@ export default function GoLanModal({ open, onClose }: Props) {
         mode: form.mode,
         nodeUri: cleanInput(form.nodeUri),
         wgConfig,
-        lanCidrs: splitCidrs(form.lanCidrs),
+        // 【APP15 任务1.1】Local Address 拆分出的附加地址 /24 一并并入回家网段
+        lanCidrs: Array.from(
+          new Set([...splitCidrs(form.lanCidrs), ...localAddr.cidrs]),
+        ),
         lanDns: cleanInput(form.lanDns) || null,
         lanDomains: splitCidrs(form.lanDomains),
         managedServer: cleanInput(form.managedServer) || MANAGED_SERVER_DEFAULT,
@@ -610,6 +644,9 @@ export default function GoLanModal({ open, onClose }: Props) {
                   placeholder="10.195.0.2/32"
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
+                <span className="mt-1 block text-[10px] leading-4 text-gray-500">
+                  支持逗号分隔多个地址：第 1 个写入隧道，其余自动转为 /24 并入回家网段
+                </span>
               </label>
               <label className="block">
                 <span className="mb-1 block text-xs text-gray-400">MTU</span>
