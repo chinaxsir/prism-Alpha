@@ -38,11 +38,12 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP15 任务1.2.2】传给内核 gVisor 协议栈的 go-lan-home 内层 MTU。
-/// 外层 utun MTU 为 1500，内层 1280 → MSS 1240，+60 字节 WG 头 = 1340，
-/// 小于任何链路 MTU，避免 TLS 大包被丢弃导致 HTTPS 卡死。
-/// 前端 UI 与 settings.json 仍保留并显示用户配置值（如 1420）。
-pub const KERNEL_GO_LAN_MTU: u32 = 1280;
+/// 【APP19 任务1】go-lan-home 出站 MTU 下限：比 tun-in(1360) 大 60 字节
+/// 的 WireGuard 头预算。低于该值的用户配置会被钳制回 1420。
+pub const GO_LAN_MTU_FLOOR: u32 = 1280;
+
+/// 【APP19 任务1】go-lan-home 默认 MTU（对齐家庭 WG 服务端 1420）。
+pub const GO_LAN_MTU_DEFAULT: u32 = 1420;
 
 // ---------------------------------------------------------------- 数据模型
 
@@ -538,9 +539,11 @@ pub fn resolve_probe_target(target_ip_raw: Option<&str>, lan: &GoLanSettings) ->
     derive_gateway_from_local_address(local)
 }
 
-/// 【APP18 任务3】需要发送协议首包、读取远端特征字节的内网服务端口。
+/// 【APP18 任务3 / APP19 任务4】需要发送协议首包、读取远端特征字节的端口。
+/// 445 走 SMB2 Negotiate，21 走 FTP 欢迎语；139/515/631/9100 等无统一
+/// 明文欢迎语的服务以 TCP 建连成功判定（流量已穿过 go-lan-home）。
 fn is_raw_probe_port(port: u16) -> bool {
-    matches!(port, 3389 | 22 | 445)
+    matches!(port, 3389 | 22 | 21 | 445 | 139 | 515 | 631 | 9100)
 }
 
 /// 【APP18 任务3】单端口探测命中结果。
@@ -711,9 +714,69 @@ async fn probe_raw_service(
                 Err(format!("SSH 应答非 SSH- 特征（收到 {n} 字节）"))
             }
         }
+        21 => {
+            // FTP 服务器建立连接后主动回 220 欢迎语
+            let mut buf = [0u8; 64];
+            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
+                .await
+                .map_err(|_| "FTP 欢迎语超时".to_string())?
+                .map_err(|e| format!("FTP 欢迎语读取失败: {e}"))?;
+            if n >= 3 && &buf[..3] == b"220" {
+                Ok(("FTP 服务握手成功".to_string(), elapsed_ms(start)))
+            } else {
+                Err(format!("FTP 欢迎语非 220 特征（收到 {n} 字节）"))
+            }
+        }
+        445 => {
+            // SMB2 Negotiate Protocol 请求：NBSS(4) + SMB2 Header(64) + 体(36)
+            let mut req: Vec<u8> = vec![0x00, 0x00, 0x00, 0x64]; // NBSS，长度 100
+            req.extend_from_slice(&[0xFE, b'S', b'M', b'B']); // ProtocolId
+            req.extend_from_slice(&[0x40, 0x00]); // StructureSize 64
+            req.extend_from_slice(&[0x00, 0x00]); // CreditCharge
+            req.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Status
+            req.extend_from_slice(&[0x00, 0x00]); // Command = NEGOTIATE
+            req.extend_from_slice(&[0x01, 0x00]); // Credits
+            req.extend_from_slice(&[0x00u8; 4]); // Flags
+            req.extend_from_slice(&[0x00u8; 4]); // NextCommand
+            req.extend_from_slice(&[0x00u8; 8]); // MessageId
+            req.extend_from_slice(&[0x00u8; 4]); // ProcessId
+            req.extend_from_slice(&[0x00u8; 4]); // TreeId
+            req.extend_from_slice(&[0x00u8; 8]); // SessionId
+            req.extend_from_slice(&[0x00u8; 16]); // Signature
+            req.extend_from_slice(&[0x24, 0x00]); // StructureSize 36
+            req.extend_from_slice(&[0x02, 0x00]); // DialectCount = 2
+            req.extend_from_slice(&[0x01, 0x00]); // SecurityMode
+            req.extend_from_slice(&[0x00, 0x00]); // Reserved
+            req.extend_from_slice(&[0x00u8; 4]); // Capabilities
+            req.extend_from_slice(&[0x00u8; 16]); // ClientGuid
+            req.extend_from_slice(&[0x00u8; 8]); // ClientStartTime
+            req.extend_from_slice(&[0x10, 0x02]); // SMB 2.1.0
+            req.extend_from_slice(&[0x02, 0x02]); // SMB 2.0.2
+            stream
+                .write_all(&req)
+                .await
+                .map_err(|e| format!("SMB2 Negotiate 发送失败: {e}"))?;
+            let mut buf = [0u8; 32];
+            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
+                .await
+                .map_err(|_| "SMB2 Negotiate 应答超时".to_string())?
+                .map_err(|e| format!("SMB2 应答读取失败: {e}"))?;
+            if n >= 8 && buf[0] == 0x00 && &buf[4..8] == [0xFE, b'S', b'M', b'B'] {
+                Ok((
+                    format!("SMB 文件共享 Negotiate 握手成功（{n} 字节应答）"),
+                    elapsed_ms(start),
+                ))
+            } else {
+                Err(format!("SMB2 应答非 NBSS/SMB 特征（收到 {n} 字节）"))
+            }
+        }
         _ => {
-            // SMB 445：TCP 建连成功即证明数据包已穿过 go-lan-home 隧道抵达对端
-            Ok(("SMB 端口已连通".to_string(), elapsed_ms(start)))
+            // NetBIOS / IPP / RAW / LPD 等无统一明文欢迎语：TCP 建连成功即
+            // 证明数据包已穿过 go-lan-home 隧道抵达对端。
+            Ok((
+                format!("端口 {port} 已连通（TCP 建连成功）"),
+                elapsed_ms(start),
+            ))
         }
     }
 }
@@ -835,9 +898,13 @@ async fn probe_http_port(
     Err(last_err)
 }
 
-/// 【APP18 任务3】用户未指定端口时并发探测的常用内网服务端口。
-/// 前两位是飞牛 NAS 的 8000 / 8001，其后覆盖网页、远程桌面、SMB 与 SSH。
-const COMMON_PROBE_PORTS: [u16; 9] = [8000, 8001, 80, 443, 3389, 8080, 5000, 445, 22];
+/// 【APP18 任务3 / APP19 任务4】用户未指定端口时并发探测的常用内网服务端口。
+/// 覆盖飞牛/群晖/威联通 NAS、网页、SMB、远程桌面、SSH、FTP、打印机。
+const COMMON_PROBE_PORTS: [u16; 17] = [
+    8000, 8001, 5666, 5667, 80, 443, 5000, 5001, 8080, // NAS / 网页 / WebDAV
+    445, 139, 3389, 22, 21, // SMB / NetBIOS / RDP / SSH / FTP
+    631, 9100, 515, // IPP / RAW / LPD 打印机
+];
 
 /// 【APP18 任务3】按端口优先级并发探测，首个真实命中胜出。
 /// 显式端口只探测该端口；未指定则遍历 COMMON_PROBE_PORTS。
@@ -1200,11 +1267,15 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    // 【APP15 任务1.2.2】内核侧 MTU 固定 1280：外层 utun MTU 已改为 1500，
-    // 内层 go-lan-home 1280 使 MSS 钳制到 1240，+60 字节 WG 头 = 1340，
-    // 小于任何链路 MTU，彻底解决 TLS 大包被丢弃导致的 HTTPS 卡死。
-    // 注意：前端 UI 与 settings.json 仍保留并显示用户配置值（如 1420）。
-    let mtu = KERNEL_GO_LAN_MTU;
+    // 【APP19 任务1】严禁再把内核侧 MTU 写死 1280！家庭 WG 服务端 MTU 为
+    // 1420，若隧道缓冲区只有 1280，NAS 发回的 1420 字节满载 TCP 分段会被
+    // gVisor 静默丢弃——表现为 RDP（握手包仅十几字节）能连、飞牛网页与
+    // SMB 文件块全部卡死。用户配置在 [1280, 9000] 内原样采用，否则默认 1420。
+    let mtu = if (GO_LAN_MTU_FLOOR..=9000).contains(&wg.mtu) {
+        wg.mtu
+    } else {
+        GO_LAN_MTU_DEFAULT
+    };
     outbound["mtu"] = json!(mtu);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
@@ -1879,17 +1950,17 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
-        // 【APP15 任务1.2.2】内核侧 MTU 固定 1280（外层 utun 1500）
+        // 【APP19 任务1】用户配置 1420 必须原样写入内核，严禁再压成 1280
         assert_eq!(
             ob["mtu"].as_u64(),
-            Some(1280),
-            "内核侧 go-lan-home MTU 必须固定 1280"
+            Some(1420),
+            "go-lan-home MTU 必须采用用户配置 1420"
         );
     }
 
-    /// 【APP15 任务1.2.2】内核侧 MTU 恒为 1280，用户 UI 里的 1420 不写入内核。
+    /// 【APP19 任务1】MTU 合法区间 [1280, 9000] 原样采用，其余回落 1420。
     #[test]
-    fn test_wg_kernel_mtu_fixed_1280() {
+    fn test_wg_mtu_from_user_config() {
         let make = |mtu: u32| GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -1903,13 +1974,22 @@ mod tests {
             }),
             ..Default::default()
         };
-        for mtu in [1420_u32, 1400, 1280, 1500, 0] {
+        for mtu in [1420_u32, 1400, 1280, 1500] {
             let (outbound, _) = build_outbound(&make(mtu));
             let ob = outbound.expect("合法配置应构建出站");
             assert_eq!(
                 ob["mtu"].as_u64(),
-                Some(KERNEL_GO_LAN_MTU as u64),
-                "用户配置 MTU {mtu} 时内核侧仍必须固定 1280"
+                Some(mtu as u64),
+                "用户配置 MTU {mtu} 在 [1280, 9000] 内必须原样写入"
+            );
+        }
+        for mtu in [0_u32, 1000, 9001, 65535] {
+            let (outbound, _) = build_outbound(&make(mtu));
+            let ob = outbound.expect("合法配置应构建出站");
+            assert_eq!(
+                ob["mtu"].as_u64(),
+                Some(GO_LAN_MTU_DEFAULT as u64),
+                "越界 MTU {mtu} 必须回落 1420"
             );
         }
     }

@@ -1022,7 +1022,12 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            "mtu": 9000,
+            // 【APP19 任务1】tun-in MTU 1360 = go-lan-home(1420) − 60 字节 WG 头。
+            // 入口 MTU 决定 TCP 向对端宣告的 MSS（1360−40=1320），对端回包
+            // 最大 1360 字节可 100% 无损通过 1420 的隧道缓冲区；旧值 9000
+            // 会让本端宣告超大 MSS，NAS 回 1420 满载包后被 gVisor 丢弃，
+            // 表现为 RDP 能连、飞牛网页 / SMB 文件块全部卡死。
+            "mtu": 1360,
             "auto_route": true,
             // 【APP18 任务2】统一 gvisor 栈（移动端原为 mixed）：
             // 进入 utun 的内网流量在用户态内存中直接调用 go-lan-home
@@ -1094,6 +1099,21 @@ pub fn build(
     if !cus_dns_local_domains.is_empty() {
         dns_rules.push(json!({ "domain_suffix": cus_dns_local_domains, "server": "dns-local" }));
     }
+    // 【APP19 任务3】内网反向 DNS 与局域网后缀快速解析：iOS「文件」App
+    // 挂载 SMB、AirPrint 打印机发现、WebDAV 等系统组件会频繁查询
+    // *.in-addr.arpa / *.ip6.arpa / .local / .lan，若被送到海外
+    // dns-remote（tcp://8.8.8.8）会等待数秒超时，表现为共享文件夹打开
+    // 极慢或报错。统一走本地直连 DNS（dns-local，detour=direct）。
+    dns_rules.insert(
+        0,
+        json!({
+            "domain_suffix": [
+                ".in-addr.arpa", ".ip6.arpa", ".lan", ".local",
+                ".home", ".internal", ".localdomain"
+            ],
+            "server": "dns-local"
+        }),
+    );
     // Go Lan 家庭 DNS：lan_domains 域名经隧道内家庭 DNS 解析（置顶最高优先级）
     if let Some(rule) = lan_dns_rule {
         dns_rules.insert(0, rule);
@@ -1213,11 +1233,24 @@ pub fn build(
     // 直连外发；非 Android 平台使用原始 route_rules
     #[cfg(target_os = "android")]
     let final_route_rules: Vec<serde_json::Value> = {
-        let mut android_sanitized = vec![
+        // 【APP19 任务3】回家规则必须排在 DNS 劫持之前：用户/系统直连家里
+        // 路由器或 NAS 的 53 端口（192.168.10.1:53、192.168.10.253:53）时，
+        // 绝不能被 protocol dns / port 53 规则劫持到外网 DNS。
+        let dns_hijack = vec![
             json!({ "protocol": "dns", "outbound": "dns-out" }),
             json!({ "port": 53, "outbound": "dns-out" }),
         ];
-        android_sanitized.extend(route_rules);
+        let go_lan_lead = route_rules
+            .iter()
+            .take_while(|r| {
+                r.get("outbound").and_then(|o| o.as_str())
+                    == Some(crate::core::go_lan::GO_LAN_TAG)
+            })
+            .count();
+        let mut android_sanitized = Vec::with_capacity(route_rules.len() + 2);
+        android_sanitized.extend(route_rules[..go_lan_lead].iter().cloned());
+        android_sanitized.extend(dns_hijack);
+        android_sanitized.extend(route_rules[go_lan_lead..].iter().cloned());
         android_sanitized
     };
     #[cfg(not(target_os = "android"))]
@@ -2896,8 +2929,8 @@ rules:
             Some("10.8.0.2/24"),
             "local_address 必须是主隧道地址 /24"
         );
-        // 【APP15 任务1.2.2】内核侧 MTU 固定 1280
-        assert_eq!(wg["mtu"].as_u64(), Some(1280), "go-lan-home 内核 MTU 固定 1280");
+        // 【APP19 任务1】go-lan-home MTU 采用用户配置 1420（严禁写死 1280）
+        assert_eq!(wg["mtu"].as_u64(), Some(1420), "go-lan-home MTU 必须为 1420");
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
         assert!(
