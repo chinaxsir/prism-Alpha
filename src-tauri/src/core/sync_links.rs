@@ -118,7 +118,7 @@ async fn api_get_links(base: &str, key: &str, email: &str) -> Result<Vec<CloudLi
             .header("X-Request-Source", "prism-app")
     })
     .await
-    .map_err(|e| SyncError::Transient(e.to_string()))?;
+    .map_err(|e| SyncError::Transient(license::sanitize_license_error(&e.to_string())))?;
     let body = check_response(resp).await?;
     Ok(body
         .get("links")
@@ -151,7 +151,7 @@ async fn api_put_link(
             .json(&body)
     })
     .await
-    .map_err(|e| SyncError::Transient(e.to_string()))?;
+    .map_err(|e| SyncError::Transient(license::sanitize_license_error(&e.to_string())))?;
     let body = check_response(resp).await?;
     Ok(body
         .get("link")
@@ -176,7 +176,7 @@ async fn api_delete_link(base: &str, key: &str, email: &str, url: &str) -> Resul
             }))
     })
     .await
-    .map_err(|e| SyncError::Transient(e.to_string()))?;
+    .map_err(|e| SyncError::Transient(license::sanitize_license_error(&e.to_string())))?;
     check_response(resp).await?;
     Ok(())
 }

@@ -501,6 +501,49 @@ pub(crate) fn api_base(_settings: &UserSettings) -> String {
     default_server().trim_end_matches('/').to_string()
 }
 
+/// 【APP23 任务2.1】错误脱敏：reqwest 的 `Error::to_string()` 固定携带
+/// `error sending request for url (https://.../api/license/activate)`，
+/// 断网/离线激活时若直接透传，会把后端完整验证接口地址暴露到界面上。
+/// 本函数把所有网络层错误统一转为用户可读文案，并强制剥离任何
+/// `http(s)://` URL 以及 `for url (...)` 片段。
+/// 授权、云端同步、后台巡检全部必须经过本函数。
+pub fn sanitize_license_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("error sending request")
+        || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("failed to lookup address")
+        || lower.contains("dns error")
+        || lower.contains("no route to host")
+        || lower.contains("software caused connection abort")
+    {
+        return "网络连接失败，请检查网络设置后重试".to_string();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "连接服务器超时，请检查网络后重试".to_string();
+    }
+    // 强制剥离任何 http:// 或 https:// URL 以及 "for url (...)" 片段，
+    // 严禁暴露任何后端接口地址
+    let mut cleaned = raw.to_string();
+    while let Some(start) = cleaned.find("http://").or_else(|| cleaned.find("https://")) {
+        let rest = &cleaned[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == '>')
+            .unwrap_or(rest.len());
+        cleaned.replace_range(start..start + end, "");
+    }
+    cleaned = cleaned
+        .replace("for url ()", "")
+        .replace("for url ( )", "")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "请求失败，请检查网络连接后重试".to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub(crate) fn http_builder() -> Result<reqwest::ClientBuilder> {
     Ok(reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -526,12 +569,15 @@ pub(crate) async fn send_with_v4_fallback(
         match make(&b.build()?).send().await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
-                tracing::warn!("license request (force_v4={force_v4}) failed: {e}");
-                last = Some(e.to_string());
+                // 【APP23 任务2.1】日志与界面均只写脱敏文案，严禁打印
+                // "error sending request for url (https://...)" 原始报错
+                let clean = sanitize_license_error(&e.to_string());
+                tracing::warn!("license request (force_v4={force_v4}) failed: {clean}");
+                last = Some(clean);
             }
         }
     }
-    bail!("网络请求失败：{}（已尝试 IPv4 直连）", last.unwrap_or_default())
+    bail!("{}", last.unwrap_or_else(|| "网络连接失败，请检查网络设置后重试".to_string()))
 }
 
 /// POST JSON 带兜底重试
@@ -720,7 +766,7 @@ async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<Stat
         license_key,
     )
     .await
-    .map_err(|e| StatusError::Transient(e.to_string()))?;
+    .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
     let code = resp.status().as_u16();
     if code == 429 {
         return Err(StatusError::RateLimited(retry_after_secs(resp).await));
@@ -733,7 +779,7 @@ async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<Stat
     }
     resp.json()
         .await
-        .map_err(|e| StatusError::Transient(e.to_string()))
+        .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))
 }
 
 // ---------------- 状态映射 ----------------
@@ -1193,6 +1239,27 @@ mod tests {
         assert!(enforce_expiry(&mut ent, now));
         assert_eq!(ent.status, "expired");
         assert!(!ent.is_unlocked());
+    }
+
+    /// 【APP23 任务2.2】断网激活：reqwest 原始报错含完整验证接口 URL，
+    /// 脱敏后必须是纯中文提示，绝不能出现 http 或 prism.sarl
+    #[test]
+    fn test_sanitize_license_error_strips_urls() {
+        let raw = "error sending request for url (https://prism.sarl/api/license/activate): client error (Connect)";
+        let out = sanitize_license_error(raw);
+        assert_eq!(out, "网络连接失败，请检查网络设置后重试");
+        assert!(!out.contains("http"));
+        assert!(!out.contains("prism.sarl"));
+
+        // 非网络类错误：仅剥离 URL 片段，保留其余可读信息
+        let raw2 = "激活未通过 for url (https://prism.sarl/api/license/activate) HTTP 403";
+        let out2 = sanitize_license_error(raw2);
+        assert!(!out2.contains("http"));
+        assert!(!out2.contains("prism.sarl"));
+
+        // 超时走统一文案
+        let out3 = sanitize_license_error("operation timed out");
+        assert_eq!(out3, "连接服务器超时，请检查网络后重试");
     }
 
     #[test]

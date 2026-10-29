@@ -300,19 +300,14 @@ final class PrismTunnelController {
         }
     }
 
+    /// 【APP23 任务1.1】只设置窗口/根容器与 WKWebView 自身底色，
+    /// **严禁递归修改 WKWebView.subviews**：WKScrollView → WKContentView →
+    /// WKCompositingView 等内部合成层被涂成不透明 #0B0E14 后，等于在网页
+    /// 上方盖了一块黑铁板，整个界面直接黑屏。找到 WKWebView 立即 return。
     private static func enforceDarkWindowAndWebView() {
         let darkBg = UIColor(red: 11.0 / 255.0, green: 14.0 / 255.0, blue: 20.0 / 255.0, alpha: 1.0)
-        func styleViewRecursively(_ view: UIView) {
-            view.backgroundColor = darkBg
-            view.isOpaque = true
-            if let scrollView = view as? UIScrollView {
-                scrollView.backgroundColor = darkBg
-                scrollView.bounces = false
-                scrollView.alwaysBounceVertical = false
-                scrollView.contentInsetAdjustmentBehavior = .never
-            }
+        func findAndStyleWebView(_ view: UIView) {
             if let webView = view as? WKWebView {
-                webView.isOpaque = false
                 webView.backgroundColor = darkBg
                 webView.scrollView.backgroundColor = darkBg
                 webView.scrollView.bounces = false
@@ -320,18 +315,20 @@ final class PrismTunnelController {
                 if #available(iOS 15.0, *) {
                     webView.underPageBackgroundColor = darkBg
                 }
+                // 关键：找到 WKWebView 后立即 return，绝不遍历 webView.subviews
+                return
             }
             for sub in view.subviews {
-                styleViewRecursively(sub)
+                findAndStyleWebView(sub)
             }
         }
         for scene in UIApplication.shared.connectedScenes {
             if let windowScene = scene as? UIWindowScene {
                 for window in windowScene.windows {
                     window.backgroundColor = darkBg
-                    window.isOpaque = true
                     if let rootView = window.rootViewController?.view {
-                        styleViewRecursively(rootView)
+                        rootView.backgroundColor = darkBg
+                        findAndStyleWebView(rootView)
                     }
                 }
             }

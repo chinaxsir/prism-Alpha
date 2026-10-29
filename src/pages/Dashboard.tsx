@@ -390,11 +390,14 @@ export default function Dashboard() {
           count: aimUnlocked,
         })
     : t("dashboard.aim.idle");
+  // 【APP23 任务1.2】字段缺失兜底：goLanSettings 任一层为 undefined 时
+  // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
+  const lanCidrs = lan?.lanCidrs ?? [];
   const lanStatus =
-    lan && lan.lanCidrs.length > 0
+    lanCidrs.length > 0
       ? t("dashboard.lan.configured", {
-          mode: t(lan.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
-          cidrs: lan.lanCidrs.join(", "),
+          mode: t(lan?.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
+          cidrs: lanCidrs.join(", "),
         })
       : t("dashboard.lan.unset");
   const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];

@@ -659,11 +659,15 @@ pub async fn force_runtime_check(
     Ok((ent, revoke_reason))
 }
 
+/// 【APP23 任务2.1】巡检/云同步错误脱敏：先经授权模块统一剥离
+/// http(s) URL 与网络错误原始报错，再截断到 200 字符，
+/// 严禁把 /api/app/check 等后端接口地址暴露到界面或日志。
 fn sanitize(s: &str) -> String {
-    if s.len() > 200 {
-        s.chars().take(200).collect()
+    let clean = super::license::sanitize_license_error(s);
+    if clean.len() > 200 {
+        clean.chars().take(200).collect()
     } else {
-        s.to_string()
+        clean
     }
 }
 

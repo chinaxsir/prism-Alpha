@@ -176,6 +176,28 @@ export function ActivateProModal({
     return formatExpiry(e.expiresAt);
   };
 
+  /** 【APP23 任务2】前端二次兜底脱敏：即使后端漏网，也强制抹除任何
+   *  http(s):// URL 与 "for url (...)" 片段——断网激活时 reqwest 原始报错
+   *  形如 "error sending request for url (https://.../api/license/activate)"，
+   *  严禁把后端验证接口地址暴露给用户。 */
+  const cleanErrorMsg = (raw: unknown): string => {
+    const s = String(raw ?? "")
+      .replace(/^Error:\s*/i, "")
+      .replace(/for url \([^)]*\)/gi, "")
+      .replace(/https?:\/\/[^\s)"']+/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (
+      !s ||
+      /error sending request|failed to fetch|networkerror|network is unreachable|connection refused|dns error|no route to host/i.test(
+        s
+      )
+    ) {
+      return t("pro.networkFailed");
+    }
+    return s;
+  };
+
   // License Key 激活：服务端强制「Key + 注册邮箱」联合校验，两者均为必填
   const submitLicense = async () => {
     if (busy || counting) return;
@@ -211,18 +233,22 @@ export function ActivateProModal({
     } else {
       // 必须读 store 里的最新错误——本闭包捕获的 error 是激活前的旧值(null)，
       // 直接用它会丢失服务端返回的具体错误原因/错误码。
-      const freshError = useProStore.getState().error ?? "";
-      const wait = parseRetryAfter(freshError);
+      const rawError = useProStore.getState().error ?? "";
+      const wait = parseRetryAfter(rawError);
       if (wait > 0) setRetryAfter(wait);
+      // 【APP23 任务2】进入文案前先做前端脱敏（剥离 URL / 网络错误原文）
+      const freshError = cleanErrorMsg(rawError);
       // 【APP21 任务1】无论是否命中标准错误码，错误一律渲染到弹窗内错误
       // 卡片（输入框下方 text-red-400 区域），绝不触发顶部全局 Toast 横幅。
-      const mapped = parseLicenseError(freshError);
+      const mapped = parseLicenseError(rawError);
       setParsedError(
-        mapped ?? {
-          code: "activation_failed",
-          title: freshError || t("pro.activateFailed"),
-          detail: wait > 0 ? t("pro.rateLimited", { secs: wait }) : "",
-        }
+        mapped
+          ? { ...mapped, title: cleanErrorMsg(mapped.title) }
+          : {
+              code: "activation_failed",
+              title: freshError || t("pro.activateFailed"),
+              detail: wait > 0 ? t("pro.rateLimited", { secs: wait }) : "",
+            }
       );
     }
   };
