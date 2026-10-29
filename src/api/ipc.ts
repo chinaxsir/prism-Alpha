@@ -229,10 +229,33 @@ export interface GoLanSettings {
   homeName?: string | null;
 }
 
-export const getGoLanSettings = () => invoke<GoLanSettings>("get_go_lan_settings");
+/** 【APP24 任务4.1】后端返回字段缺失兜底：wgConfig 可能为 null、
+ *  lanCidrs/lanDomains/nodeUri/deviceCode 等可能因旧配置缺失而为
+ *  null/undefined，前端一律规范化为合法默认值，杜绝 React 渲染期
+ *  对 undefined 调用 .join/.map/.trim 导致 #root 卸载黑屏 */
+export const normalizeGoLanSettings = (raw: GoLanSettings | null): GoLanSettings => {
+  const r = raw ?? ({} as GoLanSettings);
+  return {
+    enabled: r.enabled === true,
+    mode: r.mode === "managed" ? "managed" : "manual",
+    nodeUri: typeof r.nodeUri === "string" ? r.nodeUri : "",
+    wgConfig: r.wgConfig ?? null,
+    lanCidrs: Array.isArray(r.lanCidrs) ? r.lanCidrs : [],
+    lanDns: r.lanDns ?? null,
+    lanDomains: Array.isArray(r.lanDomains) ? r.lanDomains : [],
+    managedServer: typeof r.managedServer === "string" ? r.managedServer : "",
+    deviceCode: typeof r.deviceCode === "string" ? r.deviceCode : "",
+    cachedManagedOutbound: r.cachedManagedOutbound ?? null,
+    homeName: r.homeName ?? null,
+  };
+};
+
+export const getGoLanSettings = async (): Promise<GoLanSettings> =>
+  normalizeGoLanSettings(await invoke<GoLanSettings>("get_go_lan_settings"));
 export const saveGoLanSettings = (settings: GoLanSettings) =>
   invoke<string[]>("save_go_lan_settings", { settings });
-export const syncGoLanManaged = () => invoke<GoLanSettings>("sync_go_lan_managed");
+export const syncGoLanManaged = async (): Promise<GoLanSettings> =>
+  normalizeGoLanSettings(await invoke<GoLanSettings>("sync_go_lan_managed"));
 
 /** 【APP-5 任务2 / APP6 任务2】穿过 go-lan-home 隧道检测指定内网 IP 可达性。
  *  targetIp 可省略：后端自动从 WireGuard local_address 推导对端网关 */
@@ -268,18 +291,20 @@ export const exportAppLogs = (moduleFilter?: string) =>
  *    server/privateKey/peerPublicKey 均非空）
  *  - managed：deviceCode 非空且 lanCidrs 非空（已成功拉取过配置） */
 export const isGoLanConfigured = (cfg: GoLanSettings): boolean => {
+  // 【APP24 任务4.1】字段缺失兜底：任何字段为 null/undefined 时不抛异常
+  const lanCidrs = Array.isArray(cfg?.lanCidrs) ? cfg.lanCidrs : [];
   if (cfg.mode === "manual") {
-    const hasCidrs = cfg.lanCidrs.length > 0;
-    const hasUri = cfg.nodeUri.trim().length > 0;
+    const hasCidrs = lanCidrs.length > 0;
+    const hasUri = (cfg.nodeUri ?? "").trim().length > 0;
     const wg = cfg.wgConfig;
     const hasWg =
       !!wg &&
-      wg.server.trim().length > 0 &&
-      wg.privateKey.trim().length > 0 &&
-      wg.peerPublicKey.trim().length > 0;
+      (wg.server ?? "").trim().length > 0 &&
+      (wg.privateKey ?? "").trim().length > 0 &&
+      (wg.peerPublicKey ?? "").trim().length > 0;
     return hasCidrs && (hasUri || hasWg);
   }
-  return cfg.deviceCode.trim().length > 0 && cfg.lanCidrs.length > 0;
+  return (cfg.deviceCode ?? "").trim().length > 0 && lanCidrs.length > 0;
 };
 
 // ---- Go Cus ----

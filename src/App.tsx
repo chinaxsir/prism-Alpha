@@ -22,6 +22,7 @@ import {
   getGoLanSettings,
   getGoCusSettings,
   listSubscriptions,
+  normalizeGoLanSettings,
   setAppForeground,
   type Entitlement,
   type GoCusSettings,
@@ -110,7 +111,9 @@ export default function App() {
       if (e.payload) store.setSettings(e.payload);
     }).then((fn) => unsubs.push(fn));
     listen<GoLanSettings>("go-lan://updated", (e) => {
-      if (e.payload) store.setGoLanSettings(e.payload);
+      // 【APP24 任务4.1】事件 payload 同样需规范化，防止后端字段缺失
+      // 直接入 store 后在渲染期触发 undefined.join/map 崩溃黑屏
+      if (e.payload) store.setGoLanSettings(normalizeGoLanSettings(e.payload));
     }).then((fn) => unsubs.push(fn));
     listen<GoCusSettings>("go-cus://updated", (e) => {
       if (e.payload) store.setGoCusSettings(e.payload);
