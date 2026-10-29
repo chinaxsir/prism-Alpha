@@ -62,19 +62,6 @@ html {
   background-color: rgb(var(--surface));
 }
 
-/* 【APP20 任务1】html / body / #root 三层深色背景 + 撑满视口：
-   iOS 上滑最小化时圆角裁剪会短暂露出 html 底色或 WebView 默认白底，
-   三层同时设色并强制 min-height 100dvh 彻底消除露白；
-   overscroll-behavior: none 屏蔽 iOS 橡皮筋回弹拉到底部的白边。 */
-html,
-body,
-#root {
-  background-color: rgb(var(--surface)) !important;
-  min-height: 100vh;
-  min-height: 100dvh;
-  overscroll-behavior: none;
-}
-
 /* 杜绝任何子元素把页面撑宽导致内容横向溢出屏幕（iOS WKWebView 上
    曾出现个别设置行整体偏移出卡片右缘，页面级裁剪兜底） */
 html,

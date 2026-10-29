@@ -584,14 +584,7 @@ pub fn build(
     let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
     let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
     let mut go_lan_rules: Vec<Value> = Vec::new();
-    // 【APP21 任务2B】go-lan-home 服务端地址（可能为域名或 IP），
-    // 用于 tun 排除路由与 route.rules 顶端直连规则，防止 WG 流量回环进 TUN。
-    let mut go_lan_server_host: Option<String> = None;
     if let Some(outbound) = lan_outbound {
-        go_lan_server_host = outbound
-            .get("server")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         outbounds.push(outbound);
         go_lan_rules = lan_rules;
         // 【APP6 任务1】[GoLan] 模块日志：路由网段注入状态
@@ -1029,18 +1022,20 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP20 任务2.1】tun-in MTU 统一 1280，与 go-lan-home 同值。
-            // 原理：go-lan-home(1280) 向内网 NAS 发起 TCP SYN 时宣告
-            // MSS=1240（1280−40），NAS 回包最大 1280 字节；加上 60 字节
-            // WG 头 = 1340，在 5G 蜂窝（pdp_ip0）1500 链路下 100% 零分片。
-            // tun-in 同步 1280 让系统栈与隧道栈完全对齐，MSS=1240 双向对称。
-            "mtu": 1280,
+            // 【APP19 任务1】tun-in MTU 1360 = go-lan-home(1420) − 60 字节 WG 头。
+            // 入口 MTU 决定 TCP 向对端宣告的 MSS（1360−40=1320），对端回包
+            // 最大 1360 字节可 100% 无损通过 1420 的隧道缓冲区；旧值 9000
+            // 会让本端宣告超大 MSS，NAS 回 1420 满载包后被 gVisor 丢弃，
+            // 表现为 RDP 能连、飞牛网页 / SMB 文件块全部卡死。
+            "mtu": 1360,
             "auto_route": true,
-            // 【APP18 任务2】统一 gvisor 栈（移动端原为 mixed）：
-            // 进入 utun 的内网流量在用户态内存中直接调用 go-lan-home
-            // 出站 DialContext，与 Clash API 延迟探测走完全相同的内存路径，
-            // 不再依赖 mixed 栈的 172.19.0.2 <-> 172.19.0.1 内核回环 NAT。
-            "stack": "gvisor",
+            // 【APP21 任务3.2】system 栈：go-lan-home(WireGuard) 出站内部
+            // 已经运行了一个 gVisor TCP/IP 协议栈；tun-in 再用 gvisor 时两个
+            // gonet.TCPConn 直接拼接，HTTP 大响应流（Safari 打开飞牛网页、
+            // 飞牛 App 登录）会在 TCP 握手完成后卡死并报「服务器已停止响应」。
+            // 改用 system 栈由操作系统内核原生处理 TUN 流量，彻底消除双层
+            // gVisor 死锁与 MTU 截断。
+            "stack": "system",
             // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
             // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
             // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，
@@ -1059,45 +1054,6 @@ pub fn build(
             } else {
                 obj.insert("strict_route".into(), json!(true));
                 obj.insert("interface_name".into(), json!("prism-tun"));
-            }
-            // 【APP21 任务2A】Go Lan 启用时显式声明 TUN 路由表：
-            // - inet4_route_address：0.0.0.0/1 + 128.0.0.0/1 保持全量接管，
-            //   再显式追加全部回家网段——严禁把包含了回家网段的父网段
-            //   （192.168.0.0/16、10.0.0.0/8）留在排除侧，否则系统内核会把
-            //   发往 192.168.10.x 的包直接交给物理网卡（5G 下 Safari /
-            //   飞牛 App 全挂，Clash API 内部却能通）。
-            // - inet4_route_exclude_address：只排除回环 / 链路本地 / 组播 /
-            //   广播，以及 go-lan-home WireGuard 服务端公网 IP /32
-            //   （防止 WG 数据包被路由回 TUN 造成回环）。
-            if !go_lan_rules.is_empty() {
-                let local_addr = go_lan_cfg
-                    .wg_config
-                    .as_ref()
-                    .map(|wg| wg.local_ip.as_str())
-                    .unwrap_or("");
-                let lan_cidrs =
-                    normalize_cidr_list(&go_lan_cfg.lan_cidrs, local_addr);
-                let mut route_addr = vec![
-                    json!("0.0.0.0/1"),
-                    json!("128.0.0.0/1"),
-                ];
-                for c in &lan_cidrs {
-                    route_addr.push(json!(c));
-                }
-                obj.insert("inet4_route_address".into(), json!(route_addr));
-
-                let mut route_excl = vec![
-                    json!("127.0.0.0/8"),
-                    json!("169.254.0.0/16"),
-                    json!("224.0.0.0/4"),
-                    json!("255.255.255.255/32"),
-                ];
-                if let Some(host) = go_lan_server_host.as_deref()
-                    && host.parse::<std::net::Ipv4Addr>().is_ok()
-                {
-                    route_excl.push(json!(format!("{host}/32")));
-                }
-                obj.insert("inet4_route_exclude_address".into(), json!(route_excl));
             }
         }
         inbounds.push(tun);
@@ -1268,21 +1224,8 @@ pub fn build(
     // Android 上由下方 DNS 清洗在本数组前再插入两条 dns-out，最终顺序
     // 即「protocol dns → port 53 → go-lan-home → 其余」。
     if !go_lan_rules.is_empty() {
-        let lead = go_lan_rules.len();
         for (i, rule) in go_lan_rules.into_iter().enumerate() {
             route_rules.insert(i, rule);
-        }
-        // 【APP21 任务2B】WireGuard 服务端防回环：go-lan-home 的 server
-        // 公网 IP/域名必须直连物理网卡，否则 WG 数据包被 auto_route 抓回
-        // TUN，内核报 `sendmsg: network is unreachable`（log4.txt 实证）。
-        // 规则紧随 go-lan-home 之后、仍在 DNS 劫持 / clash_mode 之前。
-        if let Some(host) = go_lan_server_host.as_deref() {
-            let direct_rule = if host.parse::<std::net::IpAddr>().is_ok() {
-                json!({ "ip_cidr": [format!("{host}/32")], "outbound": "direct" })
-            } else {
-                json!({ "domain": [host], "outbound": "direct" })
-            };
-            route_rules.insert(lead, direct_rule);
         }
     }
 
@@ -2981,16 +2924,15 @@ rules:
             wg.get("peer_public_key").is_some(),
             "顶层单节点模式必须写 peer_public_key"
         );
-        // 【APP17 任务5.1】local_address 只写第 1 个主隧道地址并保持 /24
-        // （gVisor 需同子网前缀识别邻居；其余地址转 /24 进 ip_cidr）
+        // 【APP21 任务3.1】local_address 完整保留全部地址；单地址统一 /24
+        // （协议栈需同子网前缀识别邻居；多地址原前缀全保留）
         assert_eq!(
             wg["local_address"][0].as_str(),
             Some("10.8.0.2/24"),
-            "local_address 必须是主隧道地址 /24"
+            "单地址 local_address 必须统一 /24"
         );
-        // 【APP20 任务2.1】go-lan-home MTU 强制 1280（内核层统一，
-        // 用户配置仅保存于前端 settings.json）
-        assert_eq!(wg["mtu"].as_u64(), Some(1280), "go-lan-home MTU 必须为 1280");
+        // 【APP19 任务1】go-lan-home MTU 采用用户配置 1420（严禁写死 1280）
+        assert_eq!(wg["mtu"].as_u64(), Some(1420), "go-lan-home MTU 必须为 1420");
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
         assert!(

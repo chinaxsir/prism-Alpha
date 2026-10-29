@@ -49,9 +49,11 @@ const WG_DEFAULTS = { localIp: "10.0.0.2/24", mtu: 1420 };
 const MANAGED_SERVER_DEFAULT = "https://prism.sarl";
 
 /** 【APP6 任务2.3】从 WireGuard local_address（如 10.1.8.2/24）推导
- *  对端家庭网关（同网段 .1），作为「内网连通性检测」默认目标 */
+ *  对端家庭网关（同网段 .1），作为「内网连通性检测」默认目标。
+ *  【APP21 任务3.1】多地址（逗号分隔）时取第 1 个地址推导。 */
 function deriveGateway(localIp: string): string {
-  const m = localIp.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\/\d{1,2}$/);
+  const first = localIp.trim().split(/[\r\n,;，；\s]+/)[0] ?? "";
+  const m = first.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/\d{1,2})?$/);
   if (!m) return "";
   const parts = m[1].split(".");
   parts[3] = "1";
@@ -110,26 +112,31 @@ const cleanInput = (s: string): string => s.replace(INVISIBLE_CHARS, "");
 /** 零宽隐形字符（保留空白与换行，供逐行解析使用） */
 const INVISIBLE_ONLY = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
 
-/** 【APP15 任务1.1】拆分 WireGuard Local Address（支持逗号/分号/中文标点/
+/** 【APP21 任务3.1】解析 WireGuard Local Address（支持逗号/分号/中文标点/
  *  换行/空白分隔）：
- *  - primary：第 1 个地址，原样留在「本机虚拟地址」（后端会强制 /32）；
- *  - cidrs：其余每个 IPv4 地址对应的 /24 网段，需并入「回家内网网段」。
- *  绝不能把第 2 个地址（如 192.168.10.222/24）写进 Local Address，
- *  否则 gVisor 会按最长前缀匹配选它做源 IP，被对端 NAS 静默丢弃。 */
-function splitLocalAddresses(raw: string): { primary: string; cidrs: string[] } {
-  let primary = "";
+ *  - addresses：**完整保留全部合法地址**（用英文逗号连接写回输入框，如
+ *    "10.196.0.2/32, 192.168.10.222/24"）——第 2 个地址是服务端分配的
+ *    同网段源 IP，访问 192.168.10.253 时内核按最长前缀匹配自动选用
+ *    192.168.10.222，严禁只取第 1 个地址而删掉后面的地址；
+ *    掩码缺失补 /24，输入框截断的小掩码（<8，如 /2）自动还原 /24。
+ *  - cidrs：每个 IPv4 地址对应的 /24 网段，需并入「回家内网网段」。 */
+function splitLocalAddresses(raw: string): { addresses: string[]; cidrs: string[] } {
+  const addresses: string[] = [];
   const cidrs: string[] = [];
   for (const token of raw.split(/[\r\n,;，；\s]+/)) {
     const tok = cleanInput(token);
     if (!tok) continue;
-    if (!primary) primary = tok;
-    const m = tok.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/\d{1,2})?$/);
+    const m = tok.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/(\d{1,2}))?$/);
     if (!m) continue;
+    let prefix = m[2] ? parseInt(m[2], 10) : 24;
+    if (Number.isNaN(prefix) || prefix < 8 || prefix > 32) prefix = 24;
+    const addr = `${m[1]}/${prefix}`;
+    if (!addresses.includes(addr)) addresses.push(addr);
     const parts = m[1].split(".");
     const net = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
     if (!cidrs.includes(net)) cidrs.push(net);
   }
-  return { primary, cidrs };
+  return { addresses, cidrs };
 }
 
 const WG_KNOWN_KEYS =
@@ -197,13 +204,14 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
   const priv = get("interface", "privatekey");
   if (priv) out.wgPrivateKey = priv;
   const addr = get("interface", "address");
-  // 【APP15 任务1.1】Address 可能是逗号分隔的多个地址（如
-  // "10.196.0.2/32,192.168.10.222/24"）：第 1 个留在「本机虚拟地址」，
-  // 其余地址全部转 /24 并入「回家内网网段」。
+  // 【APP21 任务3.1】Address 可能是逗号分隔的多个地址（如
+  // "10.196.0.2/32,192.168.10.222/24"）：**完整保留全部地址**写回
+  // 「本机虚拟地址」输入框（英文逗号连接），严禁只取第 1 个删掉其余；
+  // 同时把每个地址对应的 /24 网段并入「回家内网网段」。
   let addrCidrs: string[] = [];
   if (addr) {
     const parsed = splitLocalAddresses(addr);
-    out.wgLocalIp = parsed.primary;
+    if (parsed.addresses.length > 0) out.wgLocalIp = parsed.addresses.join(", ");
     addrCidrs = parsed.cidrs;
   }
   const mtuRaw = get("interface", "mtu");
@@ -346,10 +354,12 @@ export default function GoLanModal({ open, onClose }: Props) {
       // 【APP14 任务1】识别成功但缺 PrivateKey 时给出明确内联提示，
       // 而不是让用户面对「只填了 IP 和 Port」的空白表单不知所措。
       if (!parsed.wgPrivateKey) {
-        setPasteHint(t("settings.goLan.recognizedMissingKey"));
+        setPasteHint(
+          "已识别到服务器地址，但配置里没找到 PrivateKey = 行，请确认完整复制了 [Interface] 段",
+        );
       }
       if (!opts?.silent) {
-        toast.success(t("settings.goLan.recognized"));
+        toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
       }
       return true;
     }
@@ -368,11 +378,11 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (text) setPasteBuf(text);
     }
     if (!text.trim()) {
-      setPasteHint(t("settings.goLan.needPaste"));
+      setPasteHint("请先将 WireGuard 配置文本长按粘贴到上方输入框中");
       return;
     }
     if (!recognizeFromText(text)) {
-      setPasteHint(t("settings.goLan.notRecognized"));
+      setPasteHint("未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式");
     }
   };
 
@@ -383,7 +393,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       setLoaded(s);
       setForm(applyGoLanLoaded(s));
       setGoLanSettings(s);
-      toast.success(t("settings.goLan.syncToast"));
+      toast.success(t("goLan.syncSuccess") || "已拉取家庭节点配置");
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -415,20 +425,20 @@ export default function GoLanModal({ open, onClose }: Props) {
   const handleSave = async () => {
     // 必填校验
     if (form.mode === "manual" && form.method === "wg") {
-      if (!form.wgServer.trim()) return toast.error(t("settings.goLan.needServer"));
-      if (!form.wgPrivateKey.trim()) return toast.error(t("settings.goLan.needPrivateKey"));
-      if (!form.wgPeerPublicKey.trim()) return toast.error(t("settings.goLan.needPeerKey"));
+      if (!form.wgServer.trim()) return toast.error("请填写服务器地址");
+      if (!form.wgPrivateKey.trim()) return toast.error("请填写客户端私钥");
+      if (!form.wgPeerPublicKey.trim()) return toast.error("请填写服务端公钥");
     }
     if (form.mode === "manual" && form.method === "uri") {
-      if (!form.nodeUri.trim()) return toast.error(t("settings.goLan.needNodeUri"));
+      if (!form.nodeUri.trim()) return toast.error("请粘贴回家节点分享链接");
     }
-    if (!form.lanCidrs.trim()) return toast.error(t("settings.goLan.needCidr"));
+    if (!form.lanCidrs.trim()) return toast.error("请填写回家内网网段（如 10.195.0.0/24）");
 
     setBusy(true);
     try {
       const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
-      // 【APP15 任务1.1】保存时同样按逗号拆分「本机虚拟地址」：
-      // 第 1 个留在 Local Address，其余地址转 /24 并入回家网段。
+      // 【APP21 任务3.1】保存时完整保留「本机虚拟地址」里的全部地址
+      // （英文逗号连接，严禁只取第 1 个）；每个地址的 /24 网段并入回家网段。
       const localAddr = splitLocalAddresses(form.wgLocalIp);
       const wgAnyFilled = [
         form.wgServer,
@@ -444,8 +454,10 @@ export default function GoLanModal({ open, onClose }: Props) {
               privateKey: cleanInput(form.wgPrivateKey),
               peerPublicKey: cleanInput(form.wgPeerPublicKey),
               preSharedKey: cleanInput(form.wgPreSharedKey) || null,
-              localIp: cleanInput(localAddr.primary) || WG_DEFAULTS.localIp,
-              // 前端 UI 保留用户配置值（如 1420）；内核侧由后端固定 1280
+              localIp:
+                localAddr.addresses.join(", ") || WG_DEFAULTS.localIp,
+              // 前端 UI 保留用户配置值（如 1420）；后端严禁压到 1280，
+              // 低于 1420 的值会被钳制回 1420（匹配家庭 WG 服务端）
               mtu: form.wgMtu || WG_DEFAULTS.mtu,
             }
           : null;
@@ -479,7 +491,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       const warnings = await Promise.race([
         saveGoLanSettings(payload),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(t("settings.goLan.saveTimeout"))), 2500),
+          setTimeout(() => reject(new Error("保存超时，请稍后重试")), 2500),
         ),
       ]);
       // 回读最新设置到全局 store（含 enabled 状态）
@@ -488,50 +500,9 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (warnings && warnings.length > 0) {
         toast.error(warnings[0]);
       } else {
-        toast.success(t("settings.goLan.saveToast"));
+        toast.success(t("goLan.saved") || "Go Lan 配置已保存");
       }
       onClose();
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // 【APP17 任务2】一键清空：立即重置弹窗所有表单状态，并把空的默认
-  // GoLanSettings 持久化到后端（VPN 运行中时后端自动热重载移除 go-lan-home）
-  const handleClearConfig = async () => {
-    setForm({ ...EMPTY_GO_LAN, wgLocalIp: "", wgMtu: WG_DEFAULTS.mtu });
-    setPasteBuf("");
-    setPasteHint("");
-    setProbeTarget("");
-    setProbeMsg("");
-    setProbeOk(null);
-    setShowPrivKey(false);
-    try {
-      localStorage.removeItem("prism.golan.probe_ip");
-    } catch {
-      /* localStorage 不可用时静默忽略 */
-    }
-    setBusy(true);
-    try {
-      const payload: GoLanSettings = {
-        ...(loaded ?? ({} as GoLanSettings)),
-        enabled: false,
-        mode: "manual",
-        nodeUri: "",
-        wgConfig: null,
-        lanCidrs: [],
-        lanDns: null,
-        lanDomains: [],
-        managedServer: loaded?.managedServer || MANAGED_SERVER_DEFAULT,
-        deviceCode: "",
-      };
-      await saveGoLanSettings(payload);
-      const fresh = await getGoLanSettings();
-      setLoaded(fresh);
-      setGoLanSettings(fresh);
-      toast.success(t("settings.goLan.clearToast"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -680,7 +651,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                 <input
                   value={form.wgLocalIp}
                   onChange={(e) => patch({ wgLocalIp: e.target.value })}
-                  placeholder="10.195.0.2/24"
+                  placeholder="10.195.0.2/32"
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
                 <span className="mt-1 block text-[10px] leading-4 text-gray-500">
@@ -804,7 +775,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             <input
               value={probeTarget}
               onChange={(e) => setProbeTarget(e.target.value)}
-              placeholder="如 192.168.10.253:8001 或 http://192.168.10.253:8000/webman"
+              placeholder="如 10.1.8.1 或 192.168.1.1"
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 focus:border-accent focus:outline-none"
             />
             <button
@@ -832,30 +803,22 @@ export default function GoLanModal({ open, onClose }: Props) {
         </div>
         </div>
 
-        {/* 底部操作栏（固定，永不被屏幕底部截断）：左「清空配置」，右「取消 / 保存配置」 */}
-        <div className="flex shrink-0 items-center gap-2 border-t border-border bg-surface px-4 py-3">
-          <button
-            onClick={handleClearConfig}
-            disabled={busy}
-            className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-          >
-            {t("settings.goLan.clearBtn")}
-          </button>
-          <div className="flex-1" />
+        {/* 底部操作栏（固定，永不被屏幕底部截断） */}
+        <div className="flex shrink-0 gap-2 border-t border-border bg-surface px-4 py-3">
           {/* 【IPA9 任务2】取消按钮永不禁用：任何时候点击都立即关闭弹窗，
               防止 saving 状态卡死时用户无法退出 */}
           <button
             onClick={onClose}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
           >
-            {t("settings.goLan.cancelBtn")}
+            取消
           </button>
           <button
             onClick={handleSave}
             disabled={busy}
             className="flex-1 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            {busy ? t("settings.goLan.savingBtn") : t("settings.goLan.saveBtn")}
+            {busy ? "保存中..." : "保存配置"}
           </button>
         </div>
       </div>

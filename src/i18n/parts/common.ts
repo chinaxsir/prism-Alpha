@@ -99,7 +99,6 @@ const zh: Record<string, string> = {
   "logs.clear": "清空日志",
   "logs.cleared": "日志已清空",
   "logs.exportCopied": "日志全文已复制，并已导出 .log 文件",
-  "logs.nothingToExport": "暂无日志可导出",
   "logs.goLanPanel": "Go Lan 实时日志",
   "logs.probe": "检测内网",
   "logs.probing": "检测中...",
@@ -149,7 +148,7 @@ const zh: Record<string, string> = {
     "激活失败时请记下提示中的错误码，可在官网帮助中心按错误码查询具体原因。",
   "pro.retryIn": "请 {secs} 秒后重试",
   "pro.rateLimited": "激活尝试过于频繁，请 {secs} 秒后重试",
-  "pro.activateFailed": "激活请求失败，请检查网络或授权码格式",
+  "pro.activateFailed": "激活未通过，服务端返回的具体原因见提示卡片",
   "pro.licensingBusy": "校验中...",
   "pro.verifyNow": "校验授权",
   "pro.verifySuccess": "授权校验成功：当前设备绑定与有效期正常",
@@ -188,6 +187,8 @@ const zh: Record<string, string> = {
   "pro.remainDays": "剩余 {days} 天",
   "pro.unboundBanner":
     "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
+  "pro.expiredBanner":
+    "授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」续期后恢复。",
   "pro.proxySuite": "Pro 代理套件",
   "pro.proxySuiteDesc": "激活授权解锁实时连接监控、分流规则与 Go Cus 覆写引擎",
   "pro.expiredAt": "授权已于 {time} 到期，Pro 功能已自动停止。",
@@ -315,7 +316,6 @@ const en: Record<string, string> = {
   "logs.clear": "Clear",
   "logs.cleared": "Logs cleared",
   "logs.exportCopied": "Logs copied to clipboard and exported as .log",
-  "logs.nothingToExport": "No logs to export",
   "logs.goLanPanel": "Go Lan Live Logs",
   "logs.probe": "Probe LAN",
   "logs.probing": "Probing...",
@@ -365,7 +365,7 @@ const en: Record<string, string> = {
     "On failure, note the error code in the message and look it up in the official help center.",
   "pro.retryIn": "Retry in {secs}s",
   "pro.rateLimited": "Too many attempts, retry in {secs}s",
-  "pro.activateFailed": "Activation request failed — check your network or license key format",
+  "pro.activateFailed": "Activation rejected — see the card for the server's exact reason",
   "pro.licensingBusy": "Verifying...",
   "pro.verifyNow": "Verify",
   "pro.verifySuccess": "License verified: device binding and expiry look good",
@@ -404,6 +404,8 @@ const en: Record<string, string> = {
   "pro.remainDays": "{days} days left",
   "pro.unboundBanner":
     "This device has been unbound from your account. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Re-activate in Settings → Prism Pro.",
+  "pro.expiredBanner":
+    "Your license has expired. Go AIM, Go Lan, Go Cus and Connection Monitor have been stopped. Renew in Settings → Prism Pro to restore them.",
   "pro.proxySuite": "Pro Proxy Suite",
   "pro.proxySuiteDesc": "Activate Pro to unlock Connections, Rules & Go Cus",
   "pro.expiredAt": "License expired at {time}. Pro features have been stopped.",

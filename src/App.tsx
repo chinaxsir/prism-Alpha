@@ -160,10 +160,8 @@ export default function App() {
     };
   }, [t]);
 
-  // IPA-3 任务2 / APP17 任务3：授权剥夺广播（设备解绑 / 授权到期）。
-  // - 到期（expired）：仅静默锁定（proUnlocked=false），严禁任何 Toast/Alert
-  //   弹窗打扰启动流程；各 Pro 功能入口自行置灰即可。
-  // - 解绑（unbound）：用户主动操作的结果，仍按 reason 精准提示一次。
+  // IPA-3 任务2：授权剥夺广播（设备解绑 / 授权到期）——按 reason 精准提示，
+  // 严禁把「设备已解绑」显示成「授权已到期」。payload 由后端统一给出 zh/en。
   useEffect(() => {
     const unlisten = listen<{
       reason?: "unbound" | "expired";
@@ -173,10 +171,11 @@ export default function App() {
       const reason =
         event.payload?.reason === "unbound" ? "unbound" : "expired";
       useProStore.getState().setRevokeReason(reason);
-      if (reason === "expired") return;
       const localized =
         language === "en" ? event.payload?.en : event.payload?.zh;
-      toast.error(localized || t("pro.unboundBanner"));
+      toast.error(
+        localized || t(reason === "unbound" ? "pro.unboundBanner" : "pro.expiredBanner"),
+      );
     });
     return () => {
       unlisten.then((fn) => fn());

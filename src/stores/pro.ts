@@ -42,8 +42,6 @@ interface ProState {
   init: () => Promise<void>;
   setEntitlement: (e: Entitlement) => void;
   setRevokeReason: (r: RevokeReason) => void;
-  /** 【APP21 任务1】清空残留错误（打开激活 Modal 时调用，防止底层页旧错误闪现） */
-  clearError: () => void;
   /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
@@ -64,19 +62,11 @@ export const useProStore = create<ProState>((set, get) => ({
     try {
       const e = await getEntitlement();
       set({ entitlement: e, unlocked: unlockedOf(e), ready: true });
-      // 重启后按落盘原因还原状态：解绑 ≠ 到期，严禁统一显示成「已到期」
+      // 重启后按落盘原因还原横幅：解绑 ≠ 到期，严禁统一显示成「已到期」
       if (!unlockedOf(e)) {
         try {
           const reason = await getRevokeReason();
-          // 【APP18 任务1】全新安装（status=inactive）绝不能因残留的
-          // revoke_state.json（reason=expired）被误判为「授权已到期」：
-          // 仅当原因为 unbound，或本地确实已 expired 时才还原。
-          if (
-            reason === "unbound" ||
-            (reason === "expired" && e.status === "expired")
-          ) {
-            set({ revokeReason: reason });
-          }
+          if (reason) set({ revokeReason: reason });
         } catch {
           /* 读取失败按无横幅处理，不影响主流程 */
         }
@@ -134,8 +124,6 @@ export const useProStore = create<ProState>((set, get) => ({
 
   setRevokeReason: (r) => set({ revokeReason: r }),
 
-  clearError: () => set({ error: null }),
-
   activate: async (licenseKey, email) => {
     set({ busy: true, error: null });
     try {
@@ -145,22 +133,14 @@ export const useProStore = create<ProState>((set, get) => ({
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
       return unlockedOf(e);
     } catch (err) {
-      // 保留完整错误文本（429 限流时含 retry_after，UI 需解析）。
-      // 【APP17 任务4】仅剥掉 Tauri IPC 自带的 "Error: " 前缀，
-      // 其余 100% 原样展示官网返回的错误描述/错误码。
-      // 【APP21 任务1】原子化报错：只在拿到最终错误文案后写入一次；
-      // 剥前缀后为空时给明确兜底，绝不让空字符串流入 UI（空红框根因）。
+      // 保留完整错误文本（429 限流时含 retry_after，UI 需解析）
       const message =
         typeof err === "string"
           ? err
           : err instanceof Error
             ? err.message
             : String(err);
-      const cleaned = message.replace(/^Error:\s*/, "").trim();
-      set({
-        busy: false,
-        error: cleaned.length > 0 ? cleaned : "激活请求失败，请检查网络或授权码格式",
-      });
+      set({ busy: false, error: message || "激活失败" });
       return false;
     }
   },

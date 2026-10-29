@@ -25,11 +25,12 @@ const clean = (message: string) => message.replace(/sing-?box|libbox/gi, "内核
 export const useToast = create<ToastState>((set) => ({
   toasts: [],
   push: (type, message) => {
-    // 【APP21 任务1】严格非空渲染守卫：空字符串 / 纯空白 / 非字符串消息
-    // 一律不入列——否则 UI 会渲染出只有 ⓧ 图标没有任何文字的空红框。
-    if (typeof message !== "string" || message.trim().length === 0) return;
+    // 【APP21 任务1】空文本守卫：消息为空 / 纯空白时直接丢弃，绝不渲染
+    // 顶部「空白红叉黑框」（图1 激活报错上方出现空白红色横幅的根因）。
+    const text = clean(message);
+    if (!text.trim()) return;
     const id = nextId++;
-    set((s) => ({ toasts: [...s.toasts, { id, type, message }] }));
+    set((s) => ({ toasts: [...s.toasts, { id, type, message: text }] }));
   },
   dismiss: (id) =>
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
@@ -37,9 +38,9 @@ export const useToast = create<ToastState>((set) => ({
 
 /// 全局 toast API：toast.success("...") / toast.error("...") / toast.info("...")
 export const toast = {
-  success: (message: string) => useToast.getState().push("success", clean(message)),
-  error: (message: string) => useToast.getState().push("error", clean(message)),
-  info: (message: string) => useToast.getState().push("info", clean(message)),
+  success: (message: string) => useToast.getState().push("success", message),
+  error: (message: string) => useToast.getState().push("error", message),
+  info: (message: string) => useToast.getState().push("info", message),
 };
 
 export default function ToastViewport() {
@@ -48,8 +49,9 @@ export default function ToastViewport() {
   return (
     // 【APP-4 任务4.2】顶部安全区偏移：iPhone 刘海屏/灵动岛下不遮挡状态栏
     <div className="fixed top-[calc(env(safe-area-inset-top,24px)+12px)] inset-x-4 md:inset-x-auto md:right-4 md:w-80 z-50 space-y-2">
+      {/* 【APP21 任务1】渲染层双保险：空消息绝不渲染（防历史脏数据入队） */}
       {toasts
-        .filter((t) => typeof t.message === "string" && t.message.trim().length > 0)
+        .filter((t) => t.message.trim().length > 0)
         .map((t) => (
           <ToastCard key={t.id} item={t} />
         ))}
@@ -95,7 +97,8 @@ function ToastCard({ item }: { item: ToastItem }) {
       ) : (
         <XCircle size={16} className="mt-0.5 shrink-0 text-latency-bad" />
       )}
-      <span className="break-all text-gray-200">{item.message}</span>
+      {/* 【APP21 任务1】显式指定浅色文字：防止继承深色文字导致黑底黑字看不见 */}
+      <span className="break-all text-slate-100 font-medium">{item.message}</span>
     </div>
   );
 }

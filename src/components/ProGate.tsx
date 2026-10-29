@@ -136,6 +136,8 @@ export function ActivateProModal({
 }) {
   const { t } = useTranslation();
   const activate = useProStore((s) => s.activate);
+  const revokeReason = useProStore((s) => s.revokeReason);
+  const entitlementStatus = useProStore((s) => s.entitlement.status);
   const [licenseKey, setLicenseKey] = useState("");
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -154,15 +156,6 @@ export function ActivateProModal({
     const timer = setTimeout(() => setRetryAfter((s) => Math.max(0, s - 1)), 1000);
     return () => clearTimeout(timer);
   }, [retryAfter]);
-
-  // 【APP21 任务1.3】Modal 作用域内聚：打开激活弹窗时立即清空
-  // 底层设置页残留的授权错误状态与上次的错误卡片，避免背景页
-  // 闪现旧红框、或上一次失败的卡片在新一轮激活前残留。
-  useEffect(() => {
-    if (!open) return;
-    useProStore.getState().clearError();
-    setParsedError(null);
-  }, [open]);
 
   if (!open) return null;
 
@@ -188,13 +181,24 @@ export function ActivateProModal({
   // License Key 激活：服务端强制「Key + 注册邮箱」联合校验，两者均为必填
   const submitLicense = async () => {
     if (busy || counting) return;
-    // 本地必填/格式校验：缺项绝不打服务端，避免白白触发 3 次防爆破锁定
+    // 【APP21 任务1】激活相关的所有报错（含本地校验）只在弹窗内部以错误
+    // 卡片展示，严禁调用 toast.error 触发页面顶部全局红色横幅（图1 空白
+    // 红叉黑框的根因之一）。
     if (!licenseKey.trim() || !email.trim()) {
-      toast.error(t("pro.requiredMissing"));
+      // 本地必填/格式校验：缺项绝不打服务端，避免白白触发 3 次防爆破锁定
+      setParsedError({
+        code: "invalid_input",
+        title: t("pro.requiredMissing"),
+        detail: "",
+      });
       return;
     }
     if (!emailOk) {
-      toast.error(t("pro.emailInvalid"));
+      setParsedError({
+        code: "invalid_input",
+        title: t("pro.emailInvalid"),
+        detail: "",
+      });
       return;
     }
     setBusy(true);
@@ -207,24 +211,21 @@ export function ActivateProModal({
       setLicenseKey("");
       setEmail("");
     } else {
-      // 【APP21 任务1.2】消灭两段式状态更新：await 之后必须经
-      // useProStore.getState() 取最新 error——直接用渲染闭包里的 error
-      // 拿到的是 activate 开头清空后的 null，剥前缀后变空字符串，
-      // toast.error("") 正是「先闪空红框、后显示真实报错」的根因。
-      const latestError = useProStore.getState().error ?? "";
-      const wait = parseRetryAfter(latestError);
+      // 必须读 store 里的最新错误——本闭包捕获的 error 是激活前的旧值(null)，
+      // 直接用它会丢失服务端返回的具体错误原因/错误码。
+      const freshError = useProStore.getState().error ?? "";
+      const wait = parseRetryAfter(freshError);
       if (wait > 0) setRetryAfter(wait);
-      // 命中标准错误码 → 弹窗内渲染错误卡片；其余（含官网原文）→ 原样 Toast。
-      // 【APP17 任务4】只剥离 Tauri IPC 的 "Error: " 前缀，绝不拼接
-      // "激活未通过 / 激活失败" 等自定义前缀。
-      const rawError = latestError.replace(/^Error:\s*/, "").trim();
-      const mapped = parseLicenseError(rawError);
-      setParsedError(mapped);
-      if (!mapped) {
-        // 兜底文案保证 Toast 永远非空（Toast 层另有非空守卫双保险）
-        const fallback = t("pro.activateFailed");
-        toast.error(wait > 0 ? t("pro.rateLimited", { secs: wait }) : rawError || fallback);
-      }
+      // 【APP21 任务1】无论是否命中标准错误码，错误一律渲染到弹窗内错误
+      // 卡片（输入框下方 text-red-400 区域），绝不触发顶部全局 Toast 横幅。
+      const mapped = parseLicenseError(freshError);
+      setParsedError(
+        mapped ?? {
+          code: "activation_failed",
+          title: freshError || t("pro.activateFailed"),
+          detail: wait > 0 ? t("pro.rateLimited", { secs: wait }) : "",
+        }
+      );
     }
   };
 
@@ -284,8 +285,23 @@ export function ActivateProModal({
               <h3 className="text-base font-semibold">{t("pro.activateTitle")}</h3>
             </div>
 
-            {/* 【APP18 任务1】激活弹窗只保留标题 / 输入框 / 按钮，
-                严禁任何「授权已到期 / Pro 功能已自动停止」警告横幅。 */}
+            {/* APP-5 任务1：到期 / 解绑提示移入激活弹窗内部展示（柔和橙色调，
+                不是常驻红色横幅）；解绑与到期文案严格区分 */}
+            {(revokeReason === "unbound" ||
+              revokeReason === "expired" ||
+              entitlementStatus === "expired") && (
+              <div
+                className={
+                  revokeReason === "unbound"
+                    ? "rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+                    : "rounded-lg border border-orange-500/30 bg-orange-500/10 px-3 py-2 text-xs text-orange-200"
+                }
+              >
+                {revokeReason === "unbound"
+                  ? t("pro.unboundBanner")
+                  : t("pro.expiredBanner")}
+              </div>
+            )}
 
             {/* License Key + 注册邮箱（联合校验，均为必填） */}
             <div className="space-y-3">

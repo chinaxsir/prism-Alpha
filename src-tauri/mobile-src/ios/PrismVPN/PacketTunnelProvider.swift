@@ -644,11 +644,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.writeSharedError("网络切换(\(oldIf)->\(newIf))重载失败: \(msg)")
                 } else {
                     self.writeHeartbeat("running(\(newIf))")
-                    // 【APP21 任务2B.3】切网热重载成功后立即重新触发
-                    // go-lan-home 主动握手：WG UDP Socket 已随内核重启
-                    // 绑定到新物理网卡，主动发包让隧道秒级恢复，不等
-                    // 业务流量触发，杜绝旧接口死绑期的连接黑洞。
-                    self.scheduleGoLanWarmup(sanitizedConfig: updatedConfig)
                 }
             }
             self.isReloadingForNetworkChange = false
@@ -738,8 +733,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// openTun 拿到的 optionsJSON 来自 Go 侧 tunOptionsJSON（仅含 mtu /
     /// 地址 / DNS，不含 route.rules），因此 go-lan-home 真正生效的
     /// ip_cidr 由 sanitizeConfigForExtension 写入 workDir/golan_routes.json，
-    /// 供此处在默认路由之外显式追加子网 includedRoutes（APP20 起
-    /// 不再携带 gatewayAddress）。
+    /// 供此处构造带 gatewayAddress 的 includedRoutes。
     private func loadGoLanRouteCIDRs() -> [String] {
         guard let dir = activeWorkDir else { return [] }
         let url = dir.appendingPathComponent("golan_routes.json")
@@ -761,11 +755,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP20 任务2.2】外层 utun MTU 强制 1280，与 tun-in 和 go-lan-home
-        // 三层对齐：go-lan-home 宣告 MSS=1240，tun-in 同步 1280 让 iOS 内核
-        // TCP 栈也宣告 MSS=1240，双向对称；+60 字节 WG 头 = 1340，
-        // 在 5G 蜂窝（pdp_ip0，链路 MTU 1500）下 100% 零分片、零丢包。
-        let mtu: Int32 = 1280
+        // 【APP19 任务1】外层 utun MTU 与 tun-in 统一 1360
+        // （= go-lan-home 1420 − 60 字节 WireGuard 头预算）。
+        // 1360 会自动向对端宣告 MSS = 1320，飞牛 NAS 回送的网页 TLS
+        // 证书 / JS 大包 / SMB 文件块最大 1360 字节，可 100% 无损穿过
+        // MTU 1420 的 go-lan-home；历史 1500/1280 倒挂会把满载分段静默丢弃。
+        let mtu: Int32 = 1360
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -790,12 +785,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        // 【APP20 任务2.2】includedRoutes = 默认路由 + 回家网段子网路由；
-        // 不加 gatewayAddress（保持默认 nil），让 iOS XNU 把子网路由装成
-        // 正常的三层直连路由——流量由系统路由层送入 utun，再经 tun-in(gvisor)
-        // → route.rules → go-lan-home 直达家中内网。
-        // APP19 实测 gatewayAddress="172.19.0.1" 会触发自环黑洞
-        // （系统尝试发到 172.19.0.1 却经 172.19.0.1 路由回自己）。
+        // 【APP19 任务2】includedRoutes = 系统默认路由 + 回家网段子网路由。
+        // 每条子网路由必须显式设置 gatewayAddress = "172.19.0.1"：
+        // 无 gatewayAddress 时 iOS XNU 会把子网路由装成「二层链路克隆路由」，
+        // 「文件」App 的 mount_smbfs / NetAuthSysAgent、打印机 cupsd、
+        // Safari WebKit 等系统守护进程发往 192.168.10.x 的包会在进入 utun
+        // 之前就被内核丢弃（APP18 去掉子网路由后 RDP 能通、SMB 与打印机仍不通）。
+        // 带 gatewayAddress 后才是真正的三层隧道路由，系统守护进程全部走隧道。
         var included: [NEIPv4Route] = [NEIPv4Route.default()]
         for cidrStr in loadGoLanRouteCIDRs() {
             guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
@@ -803,7 +799,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 destinationAddress: parsed.networkAddress,
                 subnetMask: parsed.subnetMask
             )
+            subnetRoute.gatewayAddress = "172.19.0.1"
             included.append(subnetRoute)
+            // /24 额外注入两条带 gatewayAddress 的 /25 最长前缀匹配路由：
+            // 设备连着外部 Wi-Fi 时，更具体的 /25 优先于物理网卡的
+            // 同网段链路路由，确保回家流量 100% 进入 Go Lan 隧道。
+            if parsed.prefix == 24 {
+                let lowHalf = NEIPv4Route(
+                    destinationAddress: ipv4String(parsed.net),
+                    subnetMask: "255.255.255.128"
+                )
+                lowHalf.gatewayAddress = "172.19.0.1"
+                let highHalf = NEIPv4Route(
+                    destinationAddress: ipv4String(parsed.net | 128),
+                    subnetMask: "255.255.255.128"
+                )
+                highHalf.gatewayAddress = "172.19.0.1"
+                included.append(lowHalf)
+                included.append(highHalf)
+            }
         }
         ipv4.includedRoutes = included
         ipv4.excludedRoutes = []
@@ -1171,15 +1185,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
-                    // 【APP20 任务2.2】tun-in MTU 强制 1280（与 NEPacketTunnel-
-                    // NetworkSettings 的 settings.mtu 和 go-lan-home 三层对齐），
-                    // 统一宣告 MSS=1240 确保双向零分片、零丢包。
-                    inbounds[i]["mtu"] = 1280
-                    // 【APP18 任务2】gvisor 栈：进入 utun 的 Safari / RDP 流量在用户态
-                    // 内存中直接调用 go-lan-home.DialContext，与 Clash API 延迟
-                                        // 探测（388/468 ms）走 100% 相同的内存路径，彻底规避
-                    // mixed 栈依赖的 172.19.0.2 <-> 172.19.0.1 内核回环 NAT。
-                    inbounds[i]["stack"] = "gvisor"
+                    // 【APP19 任务1】tun-in MTU 与 NEPacketTunnelNetworkSettings
+                    // 的 settings.mtu 严格一致，统一 1360：向对端宣告
+                    // MSS=1320，go-lan-home(1420) 可完整容纳所有满载回包。
+                    inbounds[i]["mtu"] = 1360
+                    // 【APP21 任务3.2】system 栈：go-lan-home(WireGuard) 出站内部
+                    // 已经运行了一个 gVisor TCP/IP 协议栈；tun-in 再用 gvisor 时
+                    // 两个 gonet.TCPConn 直接拼接，HTTP 大响应流（Safari 打开飞牛
+                    // 网页、飞牛 App 登录）会在 TCP 握手完成后卡死并报
+                    // 「因为服务器已停止响应」。改用 system 栈由 iOS 内核原生
+                    // 处理 utun 流量，彻底消除双层 gVisor 死锁与 MTU 截断。
+                    inbounds[i]["stack"] = "system"
                     // 【APP10 任务2.1】tun-in 严禁 sniff=true：
                     // sniff 开启时 sing-box 会在 tun-in 收到发往
                     // 192.168.10.253:80 的包时先在本地伪造 TCP 握手
@@ -1220,6 +1236,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
             let tag = (outbounds[i]["tag"] as? String) ?? ""
+            // 【APP21 任务2】彻底移除全部出站的网卡强绑字段：扩展进程自身
+            // Socket 由 iOS NECP 按当前活跃物理网卡（5G pdp_ip0 / Wi-Fi en0）
+            // 原生路由，Wi-Fi ↔ 5G 随时无缝切换；强绑 bind_interface /
+            // inet4_bind_address / routing_mark 只会在切换瞬间把 WireGuard
+            // UDP 握手包堵死（log4 第 10 行 sendmsg: network is unreachable）。
+            outbounds[i].removeValue(forKey: "bind_interface")
+            outbounds[i].removeValue(forKey: "inet4_bind_address")
+            outbounds[i].removeValue(forKey: "routing_mark")
             if t == "dns" {
                 dnsOutboundTag = tag.isEmpty ? "dns-out" : tag
             } else if t == "block" {
@@ -1302,48 +1326,72 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 } else if let la = outbounds[i]["local_address"] as? String, !la.isEmpty {
                     outbounds[i]["local_address"] = [normalizePrefixString(la)]
                 }
-                // 【APP15 任务1.1 / APP19 任务1】go-lan-home 双重加固：
-                // 1) local_address 只保留第 1 个 IPv4（保持原前缀，无前缀补 /24）。
-                //    逗号分隔的第 2 个地址（如 192.168.10.222/24）绝不能留在这里——
-                //    gVisor 会按最长前缀匹配选它做源 IP，而 NAS 侧只放行
-                //    隧道地址（10.196.0.2），数据面全部静默丢包；
-                //    这些地址的 /24 已由 Rust 合并进 route.rules ip_cidr。
-                // 2) 隧道 MTU 内核侧统一强制 1280（与 tun-in 和 settings.mtu 三层对齐）。
+                // 【APP21 任务3.1 / 任务3.2】go-lan-home 双重加固：
+                // 1) local_address 完整保留全部合法 IPv4 CIDR（严禁再用 .first
+                //    截断）：服务端专门分配的第 2 个地址（如 192.168.10.222/24）
+                //    是访问同网段内网（飞牛 NAS 192.168.10.253）时必须使用的
+                //    同网段源 IP，丢弃会导致跨网段源 IP 回包受阻；
+                // 2) 隧道 MTU 保留用户配置（通常 1420），严禁压到 1280。
                 if tag == "go-lan-home" {
-                    // 【APP17 任务5.1】local_address 仅保留第 1 个地址，且保持
-                    // /24 前缀（无前缀补 /24）：gVisor 需要同子网前缀才认可
-                    // 链路内邻居；逗号分隔的其余地址已由 Rust 转成 /24 并入
-                    // route.rules 的 ip_cidr → go-lan-home。
+                    // 【APP21 任务3.1】保留 local_address 数组中的所有合法
+                    // IPv4 CIDR 地址（与官方 WireGuard 客户端 100% 一致：
+                    // 访问 192.168.10.x 时内核按最长前缀匹配自动选用同网段
+                    // 源 IP 192.168.10.222；访问 10.196.0.x 时选 10.196.0.2）。
+                    // 掩码缺失补 /24；输入框截断的 /2 等非法小掩码（<8）自动
+                    // 还原为 /24。
                     let rawLocal = outbounds[i]["local_address"]
-                    var firstRaw = ""
-                    if let arr = rawLocal as? [String], let f = arr.first {
-                        firstRaw = f
+                    var rawItems: [String] = []
+                    if let arr = rawLocal as? [String] {
+                        rawItems = arr
                     } else if let s = rawLocal as? String {
-                        firstRaw = s
+                        rawItems = [s]
                     }
-                    let tokens = firstRaw
-                        .components(separatedBy: CharacterSet(charactersIn: ",; \r\n\t"))
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                    if let primary = tokens.first {
-                        let allowed = Set("0123456789./")
-                        let clean = String(primary.unicodeScalars.filter { allowed.contains(Character($0)) })
-                        if !clean.isEmpty {
-                            let finalAddr = clean.contains("/") ? clean : "\(clean)/24"
-                            outbounds[i]["local_address"] = [finalAddr]
+                    var validAddrs: [String] = []
+                    let allowedChars = Set("0123456789./")
+                    for item in rawItems {
+                        let parts = item.components(separatedBy: CharacterSet(charactersIn: ",; \r\n\t"))
+                        for part in parts {
+                            let clean = String(part.unicodeScalars.filter { allowedChars.contains(Character($0)) })
+                            guard !clean.isEmpty else { continue }
+                            let slashParts = clean.split(separator: "/", omittingEmptySubsequences: false)
+                            let ipStr = String(slashParts[0])
+                            var addr = in_addr()
+                            let ptonRet = inet_pton(AF_INET, ipStr, &addr)
+                            guard ptonRet == 1 else { continue }
+                            var prefixBits = 24
+                            if slashParts.count > 1, let p = Int(slashParts[1]), p >= 8 && p <= 32 {
+                                prefixBits = p
+                            }
+                            let cidr = "\(ipStr)/\(prefixBits)"
+                            if !validAddrs.contains(cidr) {
+                                validAddrs.append(cidr)
+                            }
                         }
                     }
-                    // 【APP20 任务2.2】go-lan-home 内核侧 MTU 强制 1280（与
-                    // tun-in 和 settings.mtu 三层对齐），统一宣告 MSS=1240，
-                    // 确保 5G 蜂窝链路下飞牛网页 / SMB / 打印机等所有内网
-                    // 大包零分片零丢包。
-                    outbounds[i]["mtu"] = 1280
-                    // 【APP17 任务5.1】WireGuard 出站绑定真实物理网卡，
-                    // 避免握手/数据 UDP 被系统默认路由送回隧道自身而死循环。
-                    let bindIfName = findActivePhysicalInterface().name
-                    if !bindIfName.isEmpty {
-                        outbounds[i]["bind_interface"] = bindIfName
+                    if !validAddrs.isEmpty {
+                        outbounds[i]["local_address"] = validAddrs
                     }
+                    // 【APP21 任务3.2】严禁把 go-lan-home 的 MTU 压到 1280：
+                    // 家庭 WG 服务端 MTU 为 1420，飞牛 NAS / SMB 会发回
+                    // 1420 字节满载 TCP 分段，1280 缓冲区会静默丢包
+                    // （RDP 小包能通、网页与 SMB 大包全部卡死）。
+                    // 用户配置在 [1280, 9000] 内原样保留（通常 1420），
+                    // 否则回落默认 1420。
+                    let rawGoLanMtu = (outbounds[i]["mtu"] as? NSNumber)?.intValue
+                    if let m = rawGoLanMtu, m >= 1280, m <= 9000 {
+                        outbounds[i]["mtu"] = m
+                    } else {
+                        outbounds[i]["mtu"] = 1420
+                    }
+                    // 【APP21 任务2】严禁再给 go-lan-home 注入 bind_interface：
+                    // WireGuard UDP 握手/数据包由 iOS NECP 按当前活跃物理网卡
+                    // 原生发出，5G 下或 Wi-Fi→5G 切换时绝不再报
+                    // sendmsg: network is unreachable（本循环顶部已统一
+                    // removeValue bind_interface / inet4_bind_address /
+                    // routing_mark，此处仅作说明性兜底）。
+                    outbounds[i].removeValue(forKey: "bind_interface")
+                    outbounds[i].removeValue(forKey: "inet4_bind_address")
+                    outbounds[i].removeValue(forKey: "routing_mark")
                 }
                 // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
                 // 强制 ipv4_only 保证 WireGuard 握手包可正常发出
@@ -1668,9 +1716,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP-9 任务2.1a / APP21 任务2C 黄金优先级】提取 Go Lan 回家规则
-        // 并提升到 route.rules 最顶部第 1 条（GO-AIM 探针、DNS 劫持、
-        // clash_mode / ip_is_private 全部之前）——无论用户处于
+        // 【APP-9 任务2.1a 黄金优先级】提取 Go Lan 回家规则并提升到
+        // headRules 之后、clash_mode / ip_is_private 之前——无论用户处于
         // 「规则」「全局」还是「直连」模式，回家流量永远 100% 走 go-lan-home
         // 隧道，绝不被 clash_mode: global 或 ip_is_private 抢先命中。
         var goLanRules: [[String: Any]] = []
@@ -1683,10 +1730,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         // 【APP19 任务2】把最终生效的回家网段落盘为 sidecar，
-        // 供 openTun 在默认路由之外显式追加这些子网的 includedRoutes
+        // 供 openTun 构造带 gatewayAddress="172.19.0.1" 的 includedRoutes
         // （打通「文件」App SMB 挂载、打印机 cupsd 等系统守护进程）。
-        // 【APP20】已移除 gatewayAddress（实测触发自环黑洞），
-        // 子网路由保持三层直连样式由系统路由层送入 utun。
         // 注意：已因「本机 Wi-Fi 就在该网段」被改判直连的规则不会进入
         // goLanRules，因此不会注入多余的系统路由。
         var goLanCidrs: [String] = []
@@ -1721,9 +1766,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // GO-AIM 探针路由兜底（APP-4 任务3.1 + APP-9 任务4.1）：
-        // inbound -> GO-AIM-PROBE-N 排在 go-lan 之后、DNS 劫持头规则
-        // 与 clash_mode 之前（APP21 任务2C：go-lan 置顶第 1 条；
-        // 探针目标是公网测速地址，与回家私网网段匹配集不相交）。
+        // inbound -> GO-AIM-PROBE-N 必须紧随 DNS 劫持头规则之后、
+        // Go Lan 与 clash_mode 规则之前（inbound 匹配优先于模式规则，
+        // 否则全局模式下探针流量被 GLOBAL 组吞掉）。
         // Rust 配置已携带这 4 条规则，此处仅防缺失。
         var aimProbeRules: [[String: Any]] = []
         if !allRealProxyTags.isEmpty {
@@ -1736,21 +1781,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP21 任务2C】黄金优先级顺序（自上而下）：
-        // 1. Go Lan 回家内网无条件全通（ip_cidr → go-lan-home，无 port /
-        //    network 限制）：必须排在最顶部第 1 条——先于 GO-AIM 探针、
-        //    protocol dns、port 53、853、DoH、block_quic 与 clash_mode，
-        //    否则发往家里的 HTTP/3(QUIC)、UDP 443、SMB 137/138/139/445、
-        //    飞牛 8000/8001、打印机 515/631/9100 以及内网 DNS(53) 都会被
-        //    提前拦截或劫持，且 sniff 不再阻塞非标协议首包。
-        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
-        //    127.0.0.1:2083..2086 探针入站；探测目标是公网测速地址，
-        //    与回家私网网段匹配集不相交，排在 go-lan 之后不受影响）
+        // 【APP19 任务3】黄金优先级顺序（自上而下）：
+        // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
+        //    127.0.0.1:2083..2086 探针入站）
+        // 2. Go Lan 回家内网无条件全通（ip_cidr → go-lan-home，无 port /
+        //    network 限制）：必须排在 protocol dns、port 53、853、DoH、
+        //    block_quic 与 clash_mode 全部之前，否则发往家里的
+        //    HTTP/3(QUIC)、UDP 443、SMB 137/138/139/445、飞牛 8000/8001、
+        //    打印机 515/631/9100 以及内网 DNS(53) 都会被提前拦截或劫持。
         // 3. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
-        // 4. 私有地址直连（排除已被第 1 优先级命中的家庭网段）
+        // 4. 私有地址直连（排除已被第 2 优先级命中的家庭网段）
         // 5. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
-        var finalHead = goLanRules
-        finalHead.append(contentsOf: aimProbeRules)
+        var finalHead = aimProbeRules
+        finalHead.append(contentsOf: goLanRules)
         finalHead.append(contentsOf: headRules)
         finalHead.append(["ip_is_private": true, "outbound": "direct"])
         rules.insert(contentsOf: finalHead, at: 0)
