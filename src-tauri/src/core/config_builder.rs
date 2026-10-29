@@ -584,7 +584,14 @@ pub fn build(
     let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
     let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
     let mut go_lan_rules: Vec<Value> = Vec::new();
+    // 【APP21 任务2B】go-lan-home 服务端地址（可能为域名或 IP），
+    // 用于 tun 排除路由与 route.rules 顶端直连规则，防止 WG 流量回环进 TUN。
+    let mut go_lan_server_host: Option<String> = None;
     if let Some(outbound) = lan_outbound {
+        go_lan_server_host = outbound
+            .get("server")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         outbounds.push(outbound);
         go_lan_rules = lan_rules;
         // 【APP6 任务1】[GoLan] 模块日志：路由网段注入状态
@@ -1053,6 +1060,45 @@ pub fn build(
                 obj.insert("strict_route".into(), json!(true));
                 obj.insert("interface_name".into(), json!("prism-tun"));
             }
+            // 【APP21 任务2A】Go Lan 启用时显式声明 TUN 路由表：
+            // - inet4_route_address：0.0.0.0/1 + 128.0.0.0/1 保持全量接管，
+            //   再显式追加全部回家网段——严禁把包含了回家网段的父网段
+            //   （192.168.0.0/16、10.0.0.0/8）留在排除侧，否则系统内核会把
+            //   发往 192.168.10.x 的包直接交给物理网卡（5G 下 Safari /
+            //   飞牛 App 全挂，Clash API 内部却能通）。
+            // - inet4_route_exclude_address：只排除回环 / 链路本地 / 组播 /
+            //   广播，以及 go-lan-home WireGuard 服务端公网 IP /32
+            //   （防止 WG 数据包被路由回 TUN 造成回环）。
+            if !go_lan_rules.is_empty() {
+                let local_addr = go_lan_cfg
+                    .wg_config
+                    .as_ref()
+                    .map(|wg| wg.local_ip.as_str())
+                    .unwrap_or("");
+                let lan_cidrs =
+                    normalize_cidr_list(&go_lan_cfg.lan_cidrs, local_addr);
+                let mut route_addr = vec![
+                    json!("0.0.0.0/1"),
+                    json!("128.0.0.0/1"),
+                ];
+                for c in &lan_cidrs {
+                    route_addr.push(json!(c));
+                }
+                obj.insert("inet4_route_address".into(), json!(route_addr));
+
+                let mut route_excl = vec![
+                    json!("127.0.0.0/8"),
+                    json!("169.254.0.0/16"),
+                    json!("224.0.0.0/4"),
+                    json!("255.255.255.255/32"),
+                ];
+                if let Some(host) = go_lan_server_host.as_deref()
+                    && host.parse::<std::net::Ipv4Addr>().is_ok()
+                {
+                    route_excl.push(json!(format!("{host}/32")));
+                }
+                obj.insert("inet4_route_exclude_address".into(), json!(route_excl));
+            }
         }
         inbounds.push(tun);
     }
@@ -1222,8 +1268,21 @@ pub fn build(
     // Android 上由下方 DNS 清洗在本数组前再插入两条 dns-out，最终顺序
     // 即「protocol dns → port 53 → go-lan-home → 其余」。
     if !go_lan_rules.is_empty() {
+        let lead = go_lan_rules.len();
         for (i, rule) in go_lan_rules.into_iter().enumerate() {
             route_rules.insert(i, rule);
+        }
+        // 【APP21 任务2B】WireGuard 服务端防回环：go-lan-home 的 server
+        // 公网 IP/域名必须直连物理网卡，否则 WG 数据包被 auto_route 抓回
+        // TUN，内核报 `sendmsg: network is unreachable`（log4.txt 实证）。
+        // 规则紧随 go-lan-home 之后、仍在 DNS 劫持 / clash_mode 之前。
+        if let Some(host) = go_lan_server_host.as_deref() {
+            let direct_rule = if host.parse::<std::net::IpAddr>().is_ok() {
+                json!({ "ip_cidr": [format!("{host}/32")], "outbound": "direct" })
+            } else {
+                json!({ "domain": [host], "outbound": "direct" })
+            };
+            route_rules.insert(lead, direct_rule);
         }
     }
 

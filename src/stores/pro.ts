@@ -42,6 +42,8 @@ interface ProState {
   init: () => Promise<void>;
   setEntitlement: (e: Entitlement) => void;
   setRevokeReason: (r: RevokeReason) => void;
+  /** 【APP21 任务1】清空残留错误（打开激活 Modal 时调用，防止底层页旧错误闪现） */
+  clearError: () => void;
   /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
@@ -132,6 +134,8 @@ export const useProStore = create<ProState>((set, get) => ({
 
   setRevokeReason: (r) => set({ revokeReason: r }),
 
+  clearError: () => set({ error: null }),
+
   activate: async (licenseKey, email) => {
     set({ busy: true, error: null });
     try {
@@ -144,13 +148,19 @@ export const useProStore = create<ProState>((set, get) => ({
       // 保留完整错误文本（429 限流时含 retry_after，UI 需解析）。
       // 【APP17 任务4】仅剥掉 Tauri IPC 自带的 "Error: " 前缀，
       // 其余 100% 原样展示官网返回的错误描述/错误码。
+      // 【APP21 任务1】原子化报错：只在拿到最终错误文案后写入一次；
+      // 剥前缀后为空时给明确兜底，绝不让空字符串流入 UI（空红框根因）。
       const message =
         typeof err === "string"
           ? err
           : err instanceof Error
             ? err.message
             : String(err);
-      set({ busy: false, error: message.replace(/^Error:\s*/, "") });
+      const cleaned = message.replace(/^Error:\s*/, "").trim();
+      set({
+        busy: false,
+        error: cleaned.length > 0 ? cleaned : "激活请求失败，请检查网络或授权码格式",
+      });
       return false;
     }
   },

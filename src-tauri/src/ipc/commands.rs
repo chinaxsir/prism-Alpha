@@ -2377,12 +2377,10 @@ pub async fn test_go_lan_ip(
 ) -> Result<crate::core::go_lan::GoLanProbeResult, String> {
     // 提前 .clone() 取走锁内值，避免 parking_lot::RwLockReadGuard（非 Send）
     // 跨越 await 边界导致 tauri::command Future + Send 要求失败
-    let (go_lan_enabled, mixed_port, api_addr, api_secret, lan) = {
+    let (go_lan_enabled, api_addr, api_secret, lan) = {
         let go_lan_cfg = state.go_lan.read();
-        let settings = state.settings.read();
         (
             go_lan_cfg.enabled,
-            settings.mixed_port,
             state.api_addr.read().clone(),
             state.api_secret.read().clone(),
             go_lan_cfg.clone(),
@@ -2394,7 +2392,6 @@ pub async fn test_go_lan_ip(
     let is_running = is_vpn_actually_running(&state);
     let result = crate::core::go_lan::probe_intranet_ip(
         target_ip.as_deref(),
-        mixed_port,
         &api_addr,
         &api_secret,
         is_running,

@@ -25,6 +25,9 @@ const clean = (message: string) => message.replace(/sing-?box|libbox/gi, "内核
 export const useToast = create<ToastState>((set) => ({
   toasts: [],
   push: (type, message) => {
+    // 【APP21 任务1】严格非空渲染守卫：空字符串 / 纯空白 / 非字符串消息
+    // 一律不入列——否则 UI 会渲染出只有 ⓧ 图标没有任何文字的空红框。
+    if (typeof message !== "string" || message.trim().length === 0) return;
     const id = nextId++;
     set((s) => ({ toasts: [...s.toasts, { id, type, message }] }));
   },
@@ -45,9 +48,11 @@ export default function ToastViewport() {
   return (
     // 【APP-4 任务4.2】顶部安全区偏移：iPhone 刘海屏/灵动岛下不遮挡状态栏
     <div className="fixed top-[calc(env(safe-area-inset-top,24px)+12px)] inset-x-4 md:inset-x-auto md:right-4 md:w-80 z-50 space-y-2">
-      {toasts.map((t) => (
-        <ToastCard key={t.id} item={t} />
-      ))}
+      {toasts
+        .filter((t) => typeof t.message === "string" && t.message.trim().length > 0)
+        .map((t) => (
+          <ToastCard key={t.id} item={t} />
+        ))}
     </div>
   );
 }

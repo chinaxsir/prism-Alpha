@@ -136,7 +136,6 @@ export function ActivateProModal({
 }) {
   const { t } = useTranslation();
   const activate = useProStore((s) => s.activate);
-  const error = useProStore((s) => s.error);
   const [licenseKey, setLicenseKey] = useState("");
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -155,6 +154,15 @@ export function ActivateProModal({
     const timer = setTimeout(() => setRetryAfter((s) => Math.max(0, s - 1)), 1000);
     return () => clearTimeout(timer);
   }, [retryAfter]);
+
+  // 【APP21 任务1.3】Modal 作用域内聚：打开激活弹窗时立即清空
+  // 底层设置页残留的授权错误状态与上次的错误卡片，避免背景页
+  // 闪现旧红框、或上一次失败的卡片在新一轮激活前残留。
+  useEffect(() => {
+    if (!open) return;
+    useProStore.getState().clearError();
+    setParsedError(null);
+  }, [open]);
 
   if (!open) return null;
 
@@ -199,16 +207,23 @@ export function ActivateProModal({
       setLicenseKey("");
       setEmail("");
     } else {
-      const wait = parseRetryAfter(error ?? "");
+      // 【APP21 任务1.2】消灭两段式状态更新：await 之后必须经
+      // useProStore.getState() 取最新 error——直接用渲染闭包里的 error
+      // 拿到的是 activate 开头清空后的 null，剥前缀后变空字符串，
+      // toast.error("") 正是「先闪空红框、后显示真实报错」的根因。
+      const latestError = useProStore.getState().error ?? "";
+      const wait = parseRetryAfter(latestError);
       if (wait > 0) setRetryAfter(wait);
       // 命中标准错误码 → 弹窗内渲染错误卡片；其余（含官网原文）→ 原样 Toast。
       // 【APP17 任务4】只剥离 Tauri IPC 的 "Error: " 前缀，绝不拼接
       // "激活未通过 / 激活失败" 等自定义前缀。
-      const rawError = (error ?? "").replace(/^Error:\s*/, "").trim();
+      const rawError = latestError.replace(/^Error:\s*/, "").trim();
       const mapped = parseLicenseError(rawError);
       setParsedError(mapped);
       if (!mapped) {
-        toast.error(wait > 0 ? t("pro.rateLimited", { secs: wait }) : rawError);
+        // 兜底文案保证 Toast 永远非空（Toast 层另有非空守卫双保险）
+        const fallback = t("pro.activateFailed");
+        toast.error(wait > 0 ? t("pro.rateLimited", { secs: wait }) : rawError || fallback);
       }
     }
   };

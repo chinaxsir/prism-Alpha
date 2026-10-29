@@ -552,418 +552,132 @@ struct PortProbeHit {
     latency_ms: u64,
 }
 
-/// 【APP18 任务3】经本地 mixed 入站建立到 (ip, port) 的 SOCKS5 连接。
-/// 手写最小握手（免认证 + CONNECT IPv4），零额外依赖。
-async fn socks5_connect(
-    mixed_port: u16,
+/// 【APP21 任务2D】阶段一：Clash API 直驱 go-lan-home 出站验证隧道连通性。
+/// 对全部 HTTP 候选端口并发发起 /proxies/go-lan-home/delay，任一返回
+/// HTTP 200 且 delay > 0 即证明 WireGuard 隧道本身可用，返回实测延迟。
+/// 失败仅返回 None（可能隧道未建立，也可能目标无 HTTP 服务），
+/// 最终判定由阶段二系统级全链路探测收口。
+async fn probe_tunnel_via_clash_api(
     ip: &str,
-    port: u16,
-) -> Result<tokio::net::TcpStream, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tokio::net::TcpStream::connect(("127.0.0.1", mixed_port)),
-    )
-    .await
-    .map_err(|_| "本地代理连接超时".to_string())?
-    .map_err(|e| format!("本地代理连接失败: {e}"))?;
-
-    // 1) 问候：仅支持免认证
-    stream
-        .write_all(&[0x05, 0x01, 0x00])
-        .await
-        .map_err(|e| format!("SOCKS5 问候写入失败: {e}"))?;
-    let mut head = [0u8; 2];
-    stream
-        .read_exact(&mut head)
-        .await
-        .map_err(|e| format!("SOCKS5 问候读取失败: {e}"))?;
-    if head[0] != 0x05 || head[1] != 0x00 {
-        return Err("本地代理不支持免认证 SOCKS5".into());
+    http_ports: &[u16],
+    path: &str,
+    api_addr: &str,
+    api_secret: &str,
+) -> Option<u64> {
+    if api_addr.is_empty() || http_ports.is_empty() {
+        return None;
     }
-
-    // 2) CONNECT 目标 IPv4
-    let v4: std::net::Ipv4Addr = ip
-        .parse()
-        .map_err(|_| format!("目标 IP 非 IPv4 字面量: {ip}"))?;
-    let mut req = vec![0x05u8, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&v4.octets());
-    req.extend_from_slice(&port.to_be_bytes());
-    stream
-        .write_all(&req)
-        .await
-        .map_err(|e| format!("SOCKS5 CONNECT 写入失败: {e}"))?;
-
-    let mut rep = [0u8; 4];
-    stream
-        .read_exact(&mut rep)
-        .await
-        .map_err(|e| format!("SOCKS5 CONNECT 应答读取失败: {e}"))?;
-    if rep[0] != 0x05 || rep[1] != 0x00 {
-        return Err(format!("SOCKS5 目标不可达 (code 0x{:02x})", rep[1]));
+    let base = api_addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let mut tasks: tokio::task::JoinSet<Option<u64>> = tokio::task::JoinSet::new();
+    for &p in http_ports {
+        let base_c = base.clone();
+        let target = format!("http://{ip}:{p}{path}");
+        let secret = api_secret.to_string();
+        let client_c = client.clone();
+        tasks.spawn(async move {
+            let mut req = client_c
+                .get(format!("http://{base_c}/proxies/go-lan-home/delay"))
+                .query(&[("url", target.as_str()), ("timeout", "3000")]);
+            if !secret.is_empty() {
+                req = req.bearer_auth(&secret);
+            }
+            let resp = req.send().await.ok()?;
+            if resp.status().as_u16() != 200 {
+                return None;
+            }
+            let body = resp.text().await.ok()?;
+            let v = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+            let delay = v.get("delay").and_then(|d| d.as_u64())?;
+            if delay > 0 { Some(delay) } else { None }
+        });
     }
-    match rep[3] {
-        0x01 => {
-            let mut b = [0u8; 4];
-            stream.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+    let mut result = None;
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(Some(d)) = joined {
+            result = Some(d);
+            break;
         }
-        0x03 => {
-            let mut l = [0u8; 1];
-            stream.read_exact(&mut l).await.map_err(|e| e.to_string())?;
-            let mut b = vec![0u8; l[0] as usize];
-            stream.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-        }
-        0x04 => {
-            let mut b = [0u8; 16];
-            stream.read_exact(&mut b).await.map_err(|e| e.to_string())?;
-        }
-        _ => return Err("SOCKS5 应答地址类型异常".into()),
     }
-    let mut tail = [0u8; 2];
-    stream.read_exact(&mut tail).await.map_err(|e| e.to_string())?;
-    Ok(stream)
+    result
 }
 
-/// 【APP18 任务3】建立探测流：优先经本地 mixed 代理（SOCKS5），
-/// 失败再回落到 TUN 直连（VPN 运行中时 App 进程的 TCP 同样被 utun 默认
-/// 路由接管，与 Safari / 远程桌面走同一条 go-lan-home 路径）。
-async fn open_probe_stream(
-    ip: &str,
-    port: u16,
-    mixed_port: u16,
-) -> Result<tokio::net::TcpStream, String> {
-    let mut proxy_err = String::new();
-    if mixed_port > 0 {
-        match socks5_connect(mixed_port, ip, port).await {
-            Ok(s) => return Ok(s),
-            Err(e) => proxy_err = e,
-        }
-    }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::net::TcpStream::connect((ip, port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(if proxy_err.is_empty() {
-            format!("直连失败: {e}")
-        } else {
-            format!("{proxy_err}; 直连失败: {e}")
-        }),
-        Err(_) => Err(if proxy_err.is_empty() {
-            "连接超时".to_string()
-        } else {
-            format!("{proxy_err}; 直连超时")
-        }),
-    }
-}
-
-/// 【APP18 任务3】对 RDP(3389) / SSH(22) / SMB(445) 发送协议首包并读取远端
-/// 特征字节：只有真实在线的内网主机才会回 X.224 TPKT 或 "SSH-" 应答，
-/// 不存在的 IP 必然超时 → 100% 判定不可达。
-async fn probe_raw_service(
-    ip: &str,
-    port: u16,
-    mixed_port: u16,
-) -> Result<(String, u64), String> {
-    use std::time::{Duration, Instant};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let start = Instant::now();
-    let mut stream = open_probe_stream(ip, port, mixed_port).await?;
-    let read_timeout = Duration::from_secs(5);
-    let elapsed_ms = |start: Instant| start.elapsed().as_millis().max(1) as u64;
-
-    match port {
-        3389 => {
-            // RDP 标准 X.224 Connection Request（19 字节）
-            const X224: [u8; 19] = [
-                0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-                0x08, 0x00, 0x03, 0x00, 0x00, 0x00,
-            ];
-            stream
-                .write_all(&X224)
-                .await
-                .map_err(|e| format!("RDP 握手包发送失败: {e}"))?;
-            let mut buf = [0u8; 16];
-            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
-                .await
-                .map_err(|_| "RDP 握手应答超时".to_string())?
-                .map_err(|e| format!("RDP 应答读取失败: {e}"))?;
-            if n >= 2 && buf[0] == 0x03 && buf[1] == 0x00 {
-                Ok((
-                    format!("远程桌面 RDP 握手成功（X.224 {n} 字节应答）"),
-                    elapsed_ms(start),
-                ))
-            } else {
-                Err(format!("RDP 应答非 TPKT 特征（收到 {n} 字节）"))
-            }
-        }
-        22 => {
-            let mut buf = [0u8; 64];
-            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
-                .await
-                .map_err(|_| "SSH 握手应答超时".to_string())?
-                .map_err(|e| format!("SSH 应答读取失败: {e}"))?;
-            if n >= 4 && &buf[..4] == b"SSH-" {
-                Ok(("SSH 服务握手成功".to_string(), elapsed_ms(start)))
-            } else {
-                Err(format!("SSH 应答非 SSH- 特征（收到 {n} 字节）"))
-            }
-        }
-        21 => {
-            // FTP 服务器建立连接后主动回 220 欢迎语
-            let mut buf = [0u8; 64];
-            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
-                .await
-                .map_err(|_| "FTP 欢迎语超时".to_string())?
-                .map_err(|e| format!("FTP 欢迎语读取失败: {e}"))?;
-            if n >= 3 && &buf[..3] == b"220" {
-                Ok(("FTP 服务握手成功".to_string(), elapsed_ms(start)))
-            } else {
-                Err(format!("FTP 欢迎语非 220 特征（收到 {n} 字节）"))
-            }
-        }
-        445 => {
-            // SMB2 Negotiate Protocol 请求：NBSS(4) + SMB2 Header(64) + 体(36)
-            let mut req: Vec<u8> = vec![0x00, 0x00, 0x00, 0x64]; // NBSS，长度 100
-            req.extend_from_slice(&[0xFE, b'S', b'M', b'B']); // ProtocolId
-            req.extend_from_slice(&[0x40, 0x00]); // StructureSize 64
-            req.extend_from_slice(&[0x00, 0x00]); // CreditCharge
-            req.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Status
-            req.extend_from_slice(&[0x00, 0x00]); // Command = NEGOTIATE
-            req.extend_from_slice(&[0x01, 0x00]); // Credits
-            req.extend_from_slice(&[0x00u8; 4]); // Flags
-            req.extend_from_slice(&[0x00u8; 4]); // NextCommand
-            req.extend_from_slice(&[0x00u8; 8]); // MessageId
-            req.extend_from_slice(&[0x00u8; 4]); // ProcessId
-            req.extend_from_slice(&[0x00u8; 4]); // TreeId
-            req.extend_from_slice(&[0x00u8; 8]); // SessionId
-            req.extend_from_slice(&[0x00u8; 16]); // Signature
-            req.extend_from_slice(&[0x24, 0x00]); // StructureSize 36
-            req.extend_from_slice(&[0x02, 0x00]); // DialectCount = 2
-            req.extend_from_slice(&[0x01, 0x00]); // SecurityMode
-            req.extend_from_slice(&[0x00, 0x00]); // Reserved
-            req.extend_from_slice(&[0x00u8; 4]); // Capabilities
-            req.extend_from_slice(&[0x00u8; 16]); // ClientGuid
-            req.extend_from_slice(&[0x00u8; 8]); // ClientStartTime
-            req.extend_from_slice(&[0x10, 0x02]); // SMB 2.1.0
-            req.extend_from_slice(&[0x02, 0x02]); // SMB 2.0.2
-            stream
-                .write_all(&req)
-                .await
-                .map_err(|e| format!("SMB2 Negotiate 发送失败: {e}"))?;
-            let mut buf = [0u8; 32];
-            let n = tokio::time::timeout(read_timeout, stream.read(&mut buf))
-                .await
-                .map_err(|_| "SMB2 Negotiate 应答超时".to_string())?
-                .map_err(|e| format!("SMB2 应答读取失败: {e}"))?;
-            if n >= 8 && buf[0] == 0x00 && &buf[4..8] == [0xFE, b'S', b'M', b'B'] {
-                Ok((
-                    format!("SMB 文件共享 Negotiate 握手成功（{n} 字节应答）"),
-                    elapsed_ms(start),
-                ))
-            } else {
-                Err(format!("SMB2 应答非 NBSS/SMB 特征（收到 {n} 字节）"))
-            }
-        }
-        _ => {
-            // NetBIOS / IPP / RAW / LPD 等无统一明文欢迎语：TCP 建连成功即
-            // 证明数据包已穿过 go-lan-home 隧道抵达对端。
-            Ok((
-                format!("端口 {port} 已连通（TCP 建连成功）"),
-                elapsed_ms(start),
-            ))
-        }
-    }
-}
-
-/// 【APP18 任务3】HTTP / HTTPS 端口三条真实通道探测，任一成功即判定可达：
-/// 1) 本地 mixed 代理（127.0.0.1:{mixed_port}）转发真实 GET；
-/// 2) Clash API /proxies/go-lan-home/delay（HTTP 200 且 delay > 0）；
-/// 3) TUN 直连（App 进程自身流量已被 utun 默认路由接管）。
-/// 本地代理代答的 502 / 504 一律不算成功。
-async fn probe_http_port(
+/// 【APP21 任务2D】阶段二：系统级全链路探测——验证「TUN 路由表 → sing-box
+/// → go-lan-home」完整链路。严禁走本地 mixed 代理：只有 App 进程直连目标、
+/// 被系统路由表送进 TUN 的流量，才与 Safari / 飞牛 App / 远程桌面走
+/// 同一条路径。
+/// - HTTP 端口：直连 GET，收到任何 HTTP 状态码（200/301/302/401/403/404…）
+///   即判定可达，不再要求应答体非空；
+/// - 裸协议端口（RDP/SSH/SMB/FTP/打印机）：TCP 握手成功即判定可达。
+async fn probe_system_full_path(
     ip: &str,
     port: u16,
     path: &str,
-    mixed_port: u16,
-    api_addr: &str,
-    api_secret: &str,
 ) -> Result<(String, u64), String> {
-    let mut last_err = String::from("HTTP 探测超时");
+    use std::time::Instant;
+    let start = Instant::now();
+    let elapsed_ms = || start.elapsed().as_millis().max(1) as u64;
+
+    if is_raw_probe_port(port) {
+        return match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect((ip, port)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok((
+                format!("端口 {port} TCP 握手成功（系统全链路）"),
+                elapsed_ms(),
+            )),
+            Ok(Err(e)) => Err(format!("系统直连失败: {e}")),
+            Err(_) => Err("系统直连超时".to_string()),
+        };
+    }
+
     let schemes: [&str; 2] = if matches!(port, 443 | 5001) {
         ["https", "http"]
     } else {
         ["http", "https"]
     };
-
-    let build = |proxy: Option<&str>| -> Result<reqwest::Client, String> {
-        let mut b = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(4));
-        b = match proxy {
-            Some(p) => b.proxy(reqwest::Proxy::all(p).map_err(|e| format!("代理构建失败: {e}"))?),
-            None => b.no_proxy(),
-        };
-        b.build().map_err(|e| format!("探测客户端构建失败: {e}"))
-    };
-
-    // 通道 1：本地 mixed 代理
-    if mixed_port > 0 {
-        if let Ok(client) = build(Some(&format!("http://127.0.0.1:{mixed_port}"))) {
-            for scheme in schemes {
-                let url = format!("{scheme}://{ip}:{port}{path}");
-                let start = std::time::Instant::now();
-                match client.get(&url).send().await {
-                    Ok(resp) => {
-                        let code = resp.status().as_u16();
-                        let bytes = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
-                        let ms = start.elapsed().as_millis().max(1) as u64;
-                        if code != 502 && code != 504 && bytes > 0 {
-                            return Ok((format!("HTTP {code} · {bytes} 字节"), ms));
-                        }
-                        last_err = format!("本地代理代答 HTTP {code}（对端不可达）");
-                    }
-                    Err(e) => last_err = format!("代理 GET 失败: {e}"),
-                }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("探测客户端构建失败: {e}"))?;
+    let mut last_err = String::from("系统直连 HTTP 超时");
+    for scheme in schemes {
+        let url = format!("{scheme}://{ip}:{port}{path}");
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                return Ok((format!("HTTP {code}（系统全链路）"), elapsed_ms()));
             }
+            Err(e) => last_err = format!("系统直连 GET 失败: {e}"),
         }
     }
-
-    // 通道 2：Clash API 直驱 go-lan-home 出站
-    if !api_addr.is_empty() {
-        let base = api_addr
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
-        if let Ok(client) = build(None) {
-            for scheme in schemes {
-                let target = format!("{scheme}://{ip}:{port}{path}");
-                let mut req = client
-                    .get(format!("http://{base}/proxies/go-lan-home/delay"))
-                    .query(&[("url", target.as_str()), ("timeout", "3000")]);
-                if !api_secret.is_empty() {
-                    req = req.bearer_auth(api_secret);
-                }
-                match req.send().await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let body = resp.text().await.unwrap_or_default();
-                        if status == 200 {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
-                                    if d > 0 {
-                                        return Ok((
-                                            "go-lan-home 实测延迟（Clash API）".to_string(),
-                                            d,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        last_err = format!("Clash API HTTP {status}");
-                    }
-                    Err(e) => last_err = format!("Clash API 请求失败: {e}"),
-                }
-            }
-        }
-    }
-
-    // 通道 3：TUN 直连
-    if let Ok(client) = build(None) {
-        for scheme in schemes {
-            let url = format!("{scheme}://{ip}:{port}{path}");
-            let start = std::time::Instant::now();
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    let bytes = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
-                    let ms = start.elapsed().as_millis().max(1) as u64;
-                    if code != 502 && code != 504 && bytes > 0 {
-                        return Ok((format!("HTTP {code} · {bytes} 字节"), ms));
-                    }
-                    last_err = format!("直连 HTTP {code} 且无应答数据");
-                }
-                Err(e) => last_err = format!("直连 GET 失败: {e}"),
-            }
-        }
-    }
-
     Err(last_err)
 }
 
-/// 【APP18 任务3 / APP19 任务4】用户未指定端口时并发探测的常用内网服务端口。
-/// 覆盖飞牛/群晖/威联通 NAS、网页、SMB、远程桌面、SSH、FTP、打印机。
+/// 【APP18 任务3 / APP19 任务4 / APP21 任务2D】用户未指定端口时并发探测的
+/// 常用内网服务端口组。APP21 指定 [8000, 8001, 8080, 5666, 5667, 80, 443,
+/// 5000, 5001, 3389, 22]，此处为其超集，额外覆盖 SMB / NetBIOS / FTP /
+/// 打印机，任意一个端口响应（TCP 握手成功或任何 HTTP 状态码）即判定可达。
 const COMMON_PROBE_PORTS: [u16; 17] = [
     8000, 8001, 5666, 5667, 80, 443, 5000, 5001, 8080, // NAS / 网页 / WebDAV
     445, 139, 3389, 22, 21, // SMB / NetBIOS / RDP / SSH / FTP
     631, 9100, 515, // IPP / RAW / LPD 打印机
 ];
-
-/// 【APP18 任务3】按端口优先级并发探测，首个真实命中胜出。
-/// 显式端口只探测该端口；未指定则遍历 COMMON_PROBE_PORTS。
-async fn probe_target_ports(
-    ip: &str,
-    explicit_port: Option<u16>,
-    path: &str,
-    mixed_port: u16,
-    api_addr: &str,
-    api_secret: &str,
-) -> Result<PortProbeHit, String> {
-    let ports: Vec<u16> = match explicit_port {
-        Some(p) => vec![p],
-        None => COMMON_PROBE_PORTS.to_vec(),
-    };
-    let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
-        tokio::task::JoinSet::new();
-    for &p in &ports {
-        let ip_owned = ip.to_string();
-        let path_owned = path.to_string();
-        let api_owned = api_addr.to_string();
-        let secret_owned = api_secret.to_string();
-        tasks.spawn(async move {
-            let res = if is_raw_probe_port(p) {
-                probe_raw_service(&ip_owned, p, mixed_port).await
-            } else {
-                probe_http_port(
-                    &ip_owned,
-                    p,
-                    &path_owned,
-                    mixed_port,
-                    &api_owned,
-                    &secret_owned,
-                )
-                .await
-            };
-            (p, res)
-        });
-    }
-    let mut last_err = String::from("隧道探测超时");
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok((p, res)) = joined {
-            match res {
-                Ok((detail, latency_ms)) => {
-                    return Ok(PortProbeHit {
-                        port: p,
-                        detail,
-                        latency_ms,
-                    })
-                }
-                Err(e) => {
-                    if !e.contains("超时") {
-                        last_err = e;
-                    }
-                }
-            }
-        }
-    }
-    Err(last_err)
-}
 
 /// 【APP15 任务2】解析用户输入的检测目标，支持纯 IP、`IP:Port` 与
 /// `https://IP:Port/path`、`http://IP:Port/path` 三种写法。
@@ -1033,18 +747,19 @@ fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
     false
 }
 
-/// 【APP11 任务2 / APP17 任务5.2】穿过 go-lan-home 隧道检测内网 IP：
+/// 【APP11 任务2 / APP17 任务5.2 / APP21 任务2D】穿过 go-lan-home 隧道检测内网 IP：
 ///
 /// - 网段归属硬校验：target_ip 必须落在已配置的回家网段
 ///   （lan_cidrs ∪ local_address 所在 /24）内，否则直接拒绝、绝不发起探测；
 ///   同时拒绝探测本机自身的 WireGuard 虚拟 IP；
 /// - 严禁用网关结果顶替目标：reachable 只由 target_ip 本身的真实应答决定；
-/// - **真实字节判据**：走 Clash API / go-lan-home 隧道发一次真实 HTTP GET，
-///   以「实际收到的应答字节数 > 0」为唯一成功标准，彻底杜绝端口连通但
-///   零数据的假成功（此前 SOCKS5/TCP 探测会把伪造 SYN-ACK 当成可达）。
+/// - 【APP21 任务2D】两段式判据：阶段一 Clash API 直驱 go-lan-home 验证
+///   隧道本身连通性；阶段二系统级 TCP/HTTP 并发探测端口组验证
+///   「TUN 路由表 → sing-box → go-lan-home」全链路——任意端口响应
+///   （TCP 握手成功或任何 HTTP 状态码）即判内网可达；只有全链路打通
+///   才提示绿色成功，隧道通而全链路不通时给出明确归因。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
-    mixed_port: u16,
     api_addr: &str,
     api_secret: &str,
     is_running: bool,
@@ -1161,41 +876,99 @@ pub async fn probe_intranet_ip(
         ),
     );
 
-    // 4. 【APP18 任务3】三条真实通道并发探测（本地代理 / Clash API /
-    // TUN 直连），HTTP 端口要求真实状态码 + 非空应答体，RDP/SSH 端口要求
-    // 协议特征字节；提示信息 100% 针对用户输入的 target_ip。
-    match probe_target_ports(
-        &target_ip,
-        explicit_port,
-        &req_path,
-        mixed_port,
-        api_addr,
-        api_secret,
-    )
-    .await
-    {
-        Ok(hit) => {
+    // 4. 【APP21 任务2D】两段式探测（两阶段并发执行，判定收口）：
+    //    阶段一（隧道）：Clash API /proxies/go-lan-home/delay 直驱
+    //    go-lan-home 出站，验证 WireGuard 隧道本身连通性；
+    //    阶段二（全链路）：系统级 TCP/HTTP 并发探测端口组，验证
+    //    「TUN 路由表 → sing-box → go-lan-home」完整链路。
+    //    只有全链路打通才提示绿色成功；隧道通而全链路不通时给出
+    //    明确归因（对应 Safari / 飞牛 App 全挂但 Clash API 能通的场景）。
+    let ports: Vec<u16> = match explicit_port {
+        Some(p) => vec![p],
+        None => COMMON_PROBE_PORTS.to_vec(),
+    };
+    let http_ports: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|p| !is_raw_probe_port(*p))
+        .collect();
+
+    let tunnel_probe = {
+        let ip = target_ip.clone();
+        let path = req_path.clone();
+        let api = api_addr.to_string();
+        let secret = api_secret.to_string();
+        tokio::spawn(async move {
+            probe_tunnel_via_clash_api(&ip, &http_ports, &path, &api, &secret).await
+        })
+    };
+
+    let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
+        tokio::task::JoinSet::new();
+    for &p in &ports {
+        let ip_owned = target_ip.clone();
+        let path_owned = req_path.clone();
+        tasks.spawn(async move {
+            let res = probe_system_full_path(&ip_owned, p, &path_owned).await;
+            (p, res)
+        });
+    }
+    let mut last_err = String::from("系统全链路探测超时");
+    let mut hit: Option<PortProbeHit> = None;
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((p, res)) = joined {
+            match res {
+                Ok((detail, latency_ms)) => {
+                    hit = Some(PortProbeHit {
+                        port: p,
+                        detail,
+                        latency_ms,
+                    });
+                    break;
+                }
+                Err(e) => {
+                    if !e.contains("超时") {
+                        last_err = e;
+                    }
+                }
+            }
+        }
+    }
+    let tunnel_latency = tunnel_probe.await.unwrap_or(None);
+
+    match hit {
+        Some(h) => {
+            let tunnel_note = match tunnel_latency {
+                Some(ms) => format!("，隧道实测 {ms} ms"),
+                None => String::new(),
+            };
             crate::core::logger::info(
                 log,
                 &format!(
-                    "✅ 内网检测成功: {target_ip}:{} {}，延迟 {} ms",
-                    hit.port, hit.detail, hit.latency_ms
+                    "✅ 内网检测成功: {target_ip}:{} {}，延迟 {} ms{}",
+                    h.port, h.detail, h.latency_ms, tunnel_note
                 ),
             );
             GoLanProbeResult {
                 reachable: true,
                 target_ip: target_ip.clone(),
-                latency_ms: Some(hit.latency_ms),
+                latency_ms: Some(h.latency_ms),
                 message: format!(
-                    "✅ 已成功到达内网 {target_ip}:{}（{} · {} ms）",
-                    hit.port, hit.detail, hit.latency_ms
+                    "✅ 已成功到达内网 {target_ip}:{}（{} · {} ms{}）",
+                    h.port, h.detail, h.latency_ms, tunnel_note
                 ),
             }
         }
-        Err(e) => {
-            let message = format!(
-                "❌ 未能到达内网 {target_ip}（{e}），请检查该设备是否在线及 WG 服务端转发配置"
-            );
+        None => {
+            let message = match tunnel_latency {
+                Some(ms) => format!(
+                    "❌ go-lan-home 隧道本身可达（Clash API 实测 {ms} ms），但系统全链路（TUN 路由表 → sing-box → go-lan-home）未打通：{last_err}。请检查 TUN 路由表是否覆盖 {target_ip} 所在网段"
+                ),
+                None => format!(
+                    "❌ 未能到达内网 {target_ip}（已并发探测 {} 个常用端口均失败：{last_err}），请检查该设备是否在线及 WG 服务端转发配置",
+                    ports.len()
+                ),
+            };
             crate::core::logger::warn(log, &message);
             GoLanProbeResult {
                 reachable: false,
@@ -1811,7 +1584,7 @@ mod tests {
             ..Default::default()
         };
         // 192.168.0.1 不在 [10.1.8.0/24, 192.168.10.0/24] 内 → 直接拒绝，不发起探测
-        let r = probe_intranet_ip(Some("192.168.0.1"), 0, "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("192.168.0.1"), "", "", true, true, &lan).await;
         assert!(!r.reachable, "网段外 IP 必须拒绝: {r:?}");
         assert!(
             r.message.contains("不在已配置的回家网段"),
@@ -1837,7 +1610,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = probe_intranet_ip(Some("10.1.8.2"), 0, "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("10.1.8.2"), "", "", true, true, &lan).await;
         assert!(!r.reachable, "本机虚拟 IP 必须拒绝: {r:?}");
         assert!(
             r.message.contains("本机自身"),

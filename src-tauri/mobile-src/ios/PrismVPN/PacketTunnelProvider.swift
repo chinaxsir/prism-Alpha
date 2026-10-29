@@ -644,6 +644,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.writeSharedError("网络切换(\(oldIf)->\(newIf))重载失败: \(msg)")
                 } else {
                     self.writeHeartbeat("running(\(newIf))")
+                    // 【APP21 任务2B.3】切网热重载成功后立即重新触发
+                    // go-lan-home 主动握手：WG UDP Socket 已随内核重启
+                    // 绑定到新物理网卡，主动发包让隧道秒级恢复，不等
+                    // 业务流量触发，杜绝旧接口死绑期的连接黑洞。
+                    self.scheduleGoLanWarmup(sanitizedConfig: updatedConfig)
                 }
             }
             self.isReloadingForNetworkChange = false
@@ -733,7 +738,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// openTun 拿到的 optionsJSON 来自 Go 侧 tunOptionsJSON（仅含 mtu /
     /// 地址 / DNS，不含 route.rules），因此 go-lan-home 真正生效的
     /// ip_cidr 由 sanitizeConfigForExtension 写入 workDir/golan_routes.json，
-    /// 供此处构造带 gatewayAddress 的 includedRoutes。
+    /// 供此处在默认路由之外显式追加子网 includedRoutes（APP20 起
+    /// 不再携带 gatewayAddress）。
     private func loadGoLanRouteCIDRs() -> [String] {
         guard let dir = activeWorkDir else { return [] }
         let url = dir.appendingPathComponent("golan_routes.json")
@@ -1662,8 +1668,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP-9 任务2.1a 黄金优先级】提取 Go Lan 回家规则并提升到
-        // headRules 之后、clash_mode / ip_is_private 之前——无论用户处于
+        // 【APP-9 任务2.1a / APP21 任务2C 黄金优先级】提取 Go Lan 回家规则
+        // 并提升到 route.rules 最顶部第 1 条（GO-AIM 探针、DNS 劫持、
+        // clash_mode / ip_is_private 全部之前）——无论用户处于
         // 「规则」「全局」还是「直连」模式，回家流量永远 100% 走 go-lan-home
         // 隧道，绝不被 clash_mode: global 或 ip_is_private 抢先命中。
         var goLanRules: [[String: Any]] = []
@@ -1676,8 +1683,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         // 【APP19 任务2】把最终生效的回家网段落盘为 sidecar，
-        // 供 openTun 构造带 gatewayAddress="172.19.0.1" 的 includedRoutes
+        // 供 openTun 在默认路由之外显式追加这些子网的 includedRoutes
         // （打通「文件」App SMB 挂载、打印机 cupsd 等系统守护进程）。
+        // 【APP20】已移除 gatewayAddress（实测触发自环黑洞），
+        // 子网路由保持三层直连样式由系统路由层送入 utun。
         // 注意：已因「本机 Wi-Fi 就在该网段」被改判直连的规则不会进入
         // goLanRules，因此不会注入多余的系统路由。
         var goLanCidrs: [String] = []
@@ -1712,9 +1721,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // GO-AIM 探针路由兜底（APP-4 任务3.1 + APP-9 任务4.1）：
-        // inbound -> GO-AIM-PROBE-N 必须紧随 DNS 劫持头规则之后、
-        // Go Lan 与 clash_mode 规则之前（inbound 匹配优先于模式规则，
-        // 否则全局模式下探针流量被 GLOBAL 组吞掉）。
+        // inbound -> GO-AIM-PROBE-N 排在 go-lan 之后、DNS 劫持头规则
+        // 与 clash_mode 之前（APP21 任务2C：go-lan 置顶第 1 条；
+        // 探针目标是公网测速地址，与回家私网网段匹配集不相交）。
         // Rust 配置已携带这 4 条规则，此处仅防缺失。
         var aimProbeRules: [[String: Any]] = []
         if !allRealProxyTags.isEmpty {
@@ -1727,19 +1736,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP19 任务3】黄金优先级顺序（自上而下）：
-        // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
-        //    127.0.0.1:2083..2086 探针入站）
-        // 2. Go Lan 回家内网无条件全通（ip_cidr → go-lan-home，无 port /
-        //    network 限制）：必须排在 protocol dns、port 53、853、DoH、
-        //    block_quic 与 clash_mode 全部之前，否则发往家里的
-        //    HTTP/3(QUIC)、UDP 443、SMB 137/138/139/445、飞牛 8000/8001、
-        //    打印机 515/631/9100 以及内网 DNS(53) 都会被提前拦截或劫持。
+        // 【APP21 任务2C】黄金优先级顺序（自上而下）：
+        // 1. Go Lan 回家内网无条件全通（ip_cidr → go-lan-home，无 port /
+        //    network 限制）：必须排在最顶部第 1 条——先于 GO-AIM 探针、
+        //    protocol dns、port 53、853、DoH、block_quic 与 clash_mode，
+        //    否则发往家里的 HTTP/3(QUIC)、UDP 443、SMB 137/138/139/445、
+        //    飞牛 8000/8001、打印机 515/631/9100 以及内网 DNS(53) 都会被
+        //    提前拦截或劫持，且 sniff 不再阻塞非标协议首包。
+        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
+        //    127.0.0.1:2083..2086 探针入站；探测目标是公网测速地址，
+        //    与回家私网网段匹配集不相交，排在 go-lan 之后不受影响）
         // 3. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
-        // 4. 私有地址直连（排除已被第 2 优先级命中的家庭网段）
+        // 4. 私有地址直连（排除已被第 1 优先级命中的家庭网段）
         // 5. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
-        var finalHead = aimProbeRules
-        finalHead.append(contentsOf: goLanRules)
+        var finalHead = goLanRules
+        finalHead.append(contentsOf: aimProbeRules)
         finalHead.append(contentsOf: headRules)
         finalHead.append(["ip_is_private": true, "outbound": "direct"])
         rules.insert(contentsOf: finalHead, at: 0)
