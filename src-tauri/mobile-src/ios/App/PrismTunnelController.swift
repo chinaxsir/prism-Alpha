@@ -4,6 +4,7 @@
 
 import Foundation
 import UIKit
+import WebKit
 import NetworkExtension
 import Security
 import Darwin
@@ -232,6 +233,12 @@ func prismIosTakePendingRestart() -> Int32 {
 /// 否则用户换 Apple ID 设备会共享 device_id → 一解绑全解绑）。
 @_cdecl("prism_ios_get_device_id")
 func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
+    // 【APP22 任务3】APP 启动早期（Rust 授权初始化）必走此入口，
+    // 在此安装深色窗口锁定钩子，保证用户未启动 VPN 时上滑最小化
+    // 左下/右下角也不露白
+    DispatchQueue.main.async {
+        PrismTunnelController.installBackgroundFixObservers()
+    }
     let account = "prism.device_id" as CFString
 
     // 1. 先查 Keychain
@@ -259,7 +266,77 @@ func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
 final class PrismTunnelController {
     static let shared = PrismTunnelController()
 
-    private init() {}
+    private init() {
+        // 【APP22 任务3】主 App 进程内尽早安装深色窗口锁定钩子，
+        // 修复上滑最小化快到图标位置时左下角/右下角露白
+        DispatchQueue.main.async {
+            PrismTunnelController.installBackgroundFixObservers()
+        }
+    }
+
+    // MARK: - 【APP22 任务3】深色窗口锁定（最小化露白根治）
+
+    /// WKWebView.underPageBackgroundColor 默认纯白，且上滑最小化手势会
+    /// 触发 scrollView 底部橡皮筋回弹，窗口缩成圆角图标瞬间露出左下/右下
+    /// 白边；且 prism_ios_vpn_* 执行时 WKWebView 可能尚未创建完成，背景色
+    /// 未能挂上。通过 didBecomeActive / willResignActive（上滑最小化的瞬间）
+    /// 钩子 + 多次延迟重刷，把深色背景强制锁定到窗口与全部子视图。
+    private static var bgObserverInstalled = false
+
+    static func installBackgroundFixObservers() {
+        guard !bgObserverInstalled else { return }
+        bgObserverInstalled = true
+        let center = NotificationCenter.default
+        center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            enforceDarkWindowAndWebView()
+        }
+        center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { _ in
+            enforceDarkWindowAndWebView()
+        }
+        for delay in [0.05, 0.25, 0.8, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                enforceDarkWindowAndWebView()
+            }
+        }
+    }
+
+    private static func enforceDarkWindowAndWebView() {
+        let darkBg = UIColor(red: 11.0 / 255.0, green: 14.0 / 255.0, blue: 20.0 / 255.0, alpha: 1.0)
+        func styleViewRecursively(_ view: UIView) {
+            view.backgroundColor = darkBg
+            view.isOpaque = true
+            if let scrollView = view as? UIScrollView {
+                scrollView.backgroundColor = darkBg
+                scrollView.bounces = false
+                scrollView.alwaysBounceVertical = false
+                scrollView.contentInsetAdjustmentBehavior = .never
+            }
+            if let webView = view as? WKWebView {
+                webView.isOpaque = false
+                webView.backgroundColor = darkBg
+                webView.scrollView.backgroundColor = darkBg
+                webView.scrollView.bounces = false
+                webView.scrollView.alwaysBounceVertical = false
+                if #available(iOS 15.0, *) {
+                    webView.underPageBackgroundColor = darkBg
+                }
+            }
+            for sub in view.subviews {
+                styleViewRecursively(sub)
+            }
+        }
+        for scene in UIApplication.shared.connectedScenes {
+            if let windowScene = scene as? UIWindowScene {
+                for window in windowScene.windows {
+                    window.backgroundColor = darkBg
+                    window.isOpaque = true
+                    if let rootView = window.rootViewController?.view {
+                        styleViewRecursively(rootView)
+                    }
+                }
+            }
+        }
+    }
 
     /// 最近一次 loadAllFromPreferences 可见的配置数。诊断用：
     /// 若系统设置里存在旧 Prism 条目而此处为 0，说明该条目属于

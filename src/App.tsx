@@ -160,8 +160,9 @@ export default function App() {
     };
   }, [t]);
 
-  // IPA-3 任务2：授权剥夺广播（设备解绑 / 授权到期）——按 reason 精准提示，
-  // 严禁把「设备已解绑」显示成「授权已到期」。payload 由后端统一给出 zh/en。
+  // 【APP22 任务1】授权剥夺广播（设备解绑 / 授权到期）：只允许静默更新状态
+  // 收口 Pro 功能，严禁弹任何全局 Toast / 横幅 / 自动打开激活弹窗——
+  // 启动与巡检时的到期提示已全部清除。
   useEffect(() => {
     const unlisten = listen<{
       reason?: "unbound" | "expired";
@@ -171,16 +172,11 @@ export default function App() {
       const reason =
         event.payload?.reason === "unbound" ? "unbound" : "expired";
       useProStore.getState().setRevokeReason(reason);
-      const localized =
-        language === "en" ? event.payload?.en : event.payload?.zh;
-      toast.error(
-        localized || t(reason === "unbound" ? "pro.unboundBanner" : "pro.expiredBanner"),
-      );
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [t, language]);
+  }, []);
 
   // 监听内核状态广播：订阅增删改/设置变更触发的 restart_core
   // 对前端透明，重启成功或失败转 Error 都能即时对齐，无需轮询

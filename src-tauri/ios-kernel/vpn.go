@@ -112,12 +112,28 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 }
 
 //export PrismVPNStop
+// 【APP22 任务2】非阻塞超时关闭：先摘除全局指针并释放锁，再异步限时关闭
+// 旧实例。此前在持锁状态下同步 Close()，wireguard[go-lan-home] 关闭阻塞时
+// vpnMu 永远无法释放，后续 PrismVPNStart 死锁超时 60 秒触发
+// code=12: The VPN session failed to connect in a timely manner。
 func PrismVPNStop() {
 	vpnMu.Lock()
-	defer vpnMu.Unlock()
-	if vpnService != nil {
-		_ = vpnService.Close()
-		vpnService = nil
+	inst := vpnService
+	vpnService = nil
+	vpnMu.Unlock()
+
+	if inst != nil {
+		done := make(chan struct{})
+		go func(b *libbox.BoxService) {
+			_ = b.Close()
+			close(done)
+		}(inst)
+		select {
+		case <-done:
+		case <-time.After(1500 * time.Millisecond):
+			// 防止 wireguard[go-lan-home] Close 阻塞卡死扩展进程与互斥锁
+			vpnLogf("vpn: close abandoned after 1500ms (deadlock guard)")
+		}
 	}
 }
 
