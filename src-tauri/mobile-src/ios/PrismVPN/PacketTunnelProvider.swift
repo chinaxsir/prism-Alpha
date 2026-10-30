@@ -352,12 +352,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeBoundInterface: String = ""
     private var isReloadingForNetworkChange: Bool = false
 
-    /// 【APP25 任务2.2】本次内核实际监听的 mixed-in 端口（默认 2080）。
-    /// openTun 构造 NEProxySettings 时把系统 HTTP/HTTPS 代理指向
-    /// 127.0.0.1:<该端口>，Safari 等 App 的内网请求由此 100% 进入
-    /// sing-box 路由（IP 规则 / 域名规则均可命中 go-lan-home）。
-    private var effectiveMixedPort: Int = 2080
-
     // MARK: - 生命周期
 
     /// 【build 169 方案】init() 级最早心跳：系统 pkd 实例化扩展进程的
@@ -757,9 +751,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP26 任务1.1】外层 utun MTU 与 tun-in 统一 1400，与家庭
-        // WireGuard 服务端的 1420 隧道 MTU 对齐。
-        let mtu: Int32 = 1400
+        // 【APP30 任务1】外层 utun MTU 与 tun-in 锁死 1280：log8.txt 实测
+        // MTU 1420 时 gVisor 向 NAS 宣告 MSS 1380，飞牛回包 1420 字节 +
+        // 60 字节 WG 头在蜂窝/PPPoE 链路上被丢弃。1280 时 MSS=1240，
+        // 网页/TLS 证书/SMB 大包可 100% 通过。
+        let mtu: Int32 = 1280
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -792,21 +788,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
-        // 【APP25 任务2.2 / APP26 任务1.1】NEProxySettings 把系统 HTTP/HTTPS
-        // 代理指向 127.0.0.1:<mixed-in 端口>：Safari 访问任何
-        // http/https://IP:端口 都直接进入 mixed-in → go-lan-home，
-        // 100% 绕开 utun 的 `report handshake success: connection refused`。
-        // exceptionList 只排除回环，严禁排除内网网段（否则请求被系统直连绕过）。
-        let proxySettings = NEProxySettings()
-        let proxyServer = NEProxyServer(address: "127.0.0.1", port: effectiveMixedPort)
-        proxySettings.httpEnabled = true
-        proxySettings.httpServer = proxyServer
-        proxySettings.httpsEnabled = true
-        proxySettings.httpsServer = proxyServer
-        proxySettings.excludeSimpleHostnames = false
-        proxySettings.exceptionList = ["127.0.0.1", "localhost", "::1"]
-        settings.proxySettings = proxySettings
-        NSLog("[PrismVPN] proxy 127.0.0.1:\(effectiveMixedPort)")
+        // 【APP30 任务1】删除 NEProxySettings：Safari 不再被系统 HTTP 代理
+        // 劫持到 127.0.0.1:2080（mixed-in）。log8.txt 实证远程桌面（直走
+        // utun）正常，而 Safari 下载内网网页连续报
+        // `connection download closed: unexpected EOF`。现在浏览器与远程
+        // 桌面 100% 同一条 utun（tun-in → go-lan-home）三层直通隧道。
+        settings.proxySettings = nil
+        NSLog("[PrismVPN] proxy disabled, browser traffic goes through utun")
 
         let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
         if !v6Addresses.isEmpty {
@@ -1188,8 +1176,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
-                    // 【APP26 任务1.1】tun-in MTU 与 settings.mtu 一致，统一 1400
-                    inbounds[i]["mtu"] = 1400
+                    // 【APP30 任务1】tun-in MTU 与 settings.mtu 统一锁死 1280：
+                    // gVisor 向对端宣告 MSS 1240，彻底消除 MTU 1420 时
+                    // 网页大包 + WG 头在蜂窝链路上被丢弃的问题。
+                    inbounds[i]["mtu"] = 1280
                     // 【APP26 任务1.1】tun-in 栈改为 "mixed"：gvisor 在等待
                     // go-lan-home 建连期间不回 SYN-ACK，Safari 的 NWConnection
                     // 重传/重置 → 内核报 `report handshake success:
@@ -1214,17 +1204,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             root["inbounds"] = inbounds
         }
 
-        // 【APP25 任务2.2】记录 mixed-in 实际监听端口，供 openTun 的
-        // NEProxySettings 使用（Rust 端默认 2080，此处按实际配置读取）
-        if let ins = root["inbounds"] as? [[String: Any]] {
-            for item in ins where (item["type"] as? String) == "mixed" {
-                if let p = (item["listen_port"] as? NSNumber)?.intValue, p > 0, p < 65536 {
-                    effectiveMixedPort = p
-                    break
-                }
-            }
-        }
-
         // 2. 检查 outbounds：绑定当前活跃物理网卡 (en0 或 pdp_ip0)，收集全部真实代理节点 tag
         var dnsOutboundTag: String? = nil
         var blockOutboundTag: String? = nil
@@ -1237,24 +1216,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【APP14 任务2】不再给出站注入 bind_interface：
-        // 实证（文本(1).txt）——155 个常规代理节点在 5G 下全部正常，而
-        // go-lan-home 握手失败。扩展进程自身 Socket 由 iOS NECP 天然走
-        // 当前活跃物理网卡（pdp_ip0 / en0），额外的 IP_BOUND_IF 强绑反而
-        // 把发往 WireGuard 对端的 UDP 握手包堵死。让 go-lan-home 与常规
-        // 代理节点使用 100% 相同的底层 Socket 创建方式。
+        // 【APP30 任务1】物理网卡纯直链：go-lan-home 的外层 UDP 51821 与
+        // direct（系统组件直连）显式绑定当前活跃物理网卡（en0 / pdp_ip0），
+        // 其余出站仍由 iOS NECP 原生路由，并保留下面的字段清理。
         _ = phyIPv4
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
             let tag = (outbounds[i]["tag"] as? String) ?? ""
-            // 【APP21 任务2】彻底移除全部出站的网卡强绑字段：扩展进程自身
-            // Socket 由 iOS NECP 按当前活跃物理网卡（5G pdp_ip0 / Wi-Fi en0）
-            // 原生路由，Wi-Fi ↔ 5G 随时无缝切换；强绑 bind_interface /
-            // inet4_bind_address / routing_mark 只会在切换瞬间把 WireGuard
-            // UDP 握手包堵死（log4 第 10 行 sendmsg: network is unreachable）。
+            // 【APP21 任务2】先移除全部出站的网卡强绑字段，避免历史缓存里的
+            // bind_interface / inet4_bind_address / routing_mark 触发
+            // sendmsg: network is unreachable（log4 第 10 行）。
             outbounds[i].removeValue(forKey: "bind_interface")
             outbounds[i].removeValue(forKey: "inet4_bind_address")
             outbounds[i].removeValue(forKey: "routing_mark")
+            // 【APP30 任务1】只给 go-lan-home 与 direct 重新注入物理网卡绑定：
+            // 确保外层 WireGuard UDP 100% 从物理网卡直链发出（100% 纯直链）。
+            if !phyName.isEmpty, tag == "go-lan-home" || t == "direct" {
+                outbounds[i]["bind_interface"] = phyName
+            }
             if t == "dns" {
                 dnsOutboundTag = tag.isEmpty ? "dns-out" : tag
             } else if t == "block" {
@@ -1382,21 +1361,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if !validAddrs.isEmpty {
                         outbounds[i]["local_address"] = validAddrs
                     }
-                    // 【APP26 任务1.1】go-lan-home 出站 MTU 改为 1420，
-                    // 与家庭 WireGuard 服务端一致；同时设置 connect_timeout
-                    // 5s，避免连不上的内网端口在隧道内挂起 2 分 07 秒
-                    //（log7.txt 22 条 `operation timed out (2m7s)`）。
-                    outbounds[i]["mtu"] = 1420
+                    // 【APP30 任务1】go-lan-home 出站 MTU 无条件锁死 1280：
+                    // 覆盖用户 UI 里导入的 1420（前端仍显示 1420，但内核
+                    // 运行时必须 1280，gVisor 才会宣告 MSS 1240）；同时保留
+                    // connect_timeout 5s，避免连不上的内网端口挂起 2m7s。
+                    outbounds[i]["mtu"] = 1280
                     outbounds[i]["connect_timeout"] = "5s"
-                    // 【APP21 任务2】严禁再给 go-lan-home 注入 bind_interface：
-                    // WireGuard UDP 握手/数据包由 iOS NECP 按当前活跃物理网卡
-                    // 原生发出，5G 下或 Wi-Fi→5G 切换时绝不再报
-                    // sendmsg: network is unreachable（本循环顶部已统一
-                    // removeValue bind_interface / inet4_bind_address /
-                    // routing_mark，此处仅作说明性兜底）。
-                    outbounds[i].removeValue(forKey: "bind_interface")
+                    // 【APP30 任务1】网卡绑定已在循环顶部按 phyName 统一注入，
+                    // 此处只做兜底清理 inet4_bind_address / routing_mark，
+                    // 保留 bind_interface 让外层 UDP 走物理网卡直链。
                     outbounds[i].removeValue(forKey: "inet4_bind_address")
                     outbounds[i].removeValue(forKey: "routing_mark")
+                    if !phyName.isEmpty {
+                        outbounds[i]["bind_interface"] = phyName
+                    }
                 }
                 // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
                 // 强制 ipv4_only 保证 WireGuard 握手包可正常发出
@@ -1678,15 +1656,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // 4. 修正 route
-        // 【APP14 任务2】彻底移除 route.default_interface 与 auto_detect_interface
-        // 的手工干预：
-        // - 不再写 default_interface = 物理网卡（手工指定网卡名在蜂窝/Wi-Fi
-        //   切换瞬间极易指向已消失的接口，导致 network is unreachable）；
-        // - auto_detect_interface 保持 false（关闭），让 sing-box 完全不做
-        //   接口探测/绑定，与常规代理节点走同一条系统 NECP 默认路由。
+        // 【APP30 任务1】显式写入 route.default_interface：物理网卡
+        // （en0 / pdp_ip0）在 setTunnelNetworkSettings 之前由
+        // findActivePhysicalInterface() 探测得到，go-lan-home 的外层
+        // UDP 51821 由此 100% 从物理网卡纯直链发出；
+        // auto_detect_interface 保持 false（iOS 无 netlink 实现）。
         var route = (root["route"] as? [String: Any]) ?? [:]
         route["auto_detect_interface"] = false
-        route.removeValue(forKey: "default_interface")
+        if !phyName.isEmpty {
+            route["default_interface"] = phyName
+        } else {
+            route.removeValue(forKey: "default_interface")
+        }
         route["final"] = mainProxyTag
 
         var rules = (route["rules"] as? [[String: Any]]) ?? []
@@ -1786,19 +1767,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP19 任务3】黄金优先级顺序（自上而下）：
-        // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
+        // 【APP19 任务3 / APP30 任务1】黄金优先级顺序（自上而下）：
+        // 1. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
+        //    严格排在 route.rules 首位，先于 clash_mode、ip_is_private、
+        //    protocol dns、port 53、853、DoH 与全部分流规则。
+        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
         //    127.0.0.1:2083..2086 探针入站）
-        // 2. Go Lan 回家内网无条件全通（ip_cidr → go-lan-home，无 port /
-        //    network 限制）：必须排在 protocol dns、port 53、853、DoH、
-        //    block_quic 与 clash_mode 全部之前，否则发往家里的
-        //    HTTP/3(QUIC)、UDP 443、SMB 137/138/139/445、飞牛 8000/8001、
-        //    打印机 515/631/9100 以及内网 DNS(53) 都会被提前拦截或劫持。
-        // 3. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
-        // 4. 私有地址直连（排除已被第 2 优先级命中的家庭网段）
-        // 5. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
-        var finalHead = aimProbeRules
-        finalHead.append(contentsOf: goLanRules)
+        // 3. Go Lan 回家域名（domain_suffix → go-lan-home）
+        // 4. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
+        // 5. 私有地址直连（排除已被第 1 优先级命中的家庭网段）
+        // 6. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        var finalHead = goLanRules.filter { $0["ip_cidr"] != nil }
+        finalHead.append(contentsOf: aimProbeRules)
+        finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] == nil })
         finalHead.append(contentsOf: headRules)
         finalHead.append(["ip_is_private": true, "outbound": "direct"])
         rules.insert(contentsOf: finalHead, at: 0)

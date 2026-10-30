@@ -2328,33 +2328,37 @@ fn go_lan_gateway_targets(lan: &crate::core::go_lan::GoLanSettings) -> Vec<Strin
 /// 内核就绪后（延迟 800ms）对 go-lan-home 出站逐个探测家庭网关：
 /// 哪怕网关不响应 HTTP，探测包也会穿过隧道，立即在家庭路由器上
 /// 产生 WireGuard 握手与连接记录。
+/// 【APP30 任务3】回家配置保存后主动握手：仅向主网关发起 1 次 Clash API
+/// delay（timeout 1500ms），绝不再对 10.196.0.1 / 10.31.2.1 / 192.168.10.1
+/// 等多个网关逐个发裸 TCP / SOCKS5 握手——log8.txt 第 78~81 行 4 条
+/// `operation timed out (2m7s)` 就是多目标裸探测留下的半开连接。
 fn spawn_go_lan_warmup(
     api_addr: String,
     api_secret: String,
     lan: &crate::core::go_lan::GoLanSettings,
 ) {
-    let targets = go_lan_gateway_targets(lan);
-    if targets.is_empty() || api_addr.is_empty() {
+    let gateway = go_lan_gateway_targets(lan).into_iter().next();
+    if api_addr.is_empty() {
         return;
     }
+    let Some(gw) = gateway else {
+        return;
+    };
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let api = KernelApi::new(&api_addr, &api_secret);
-        for gw in targets.clone() {
-            // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
-            let _ = api
-                .test_delay(
-                    crate::core::go_lan::GO_LAN_TAG,
-                    &format!("http://{gw}"),
-                    1500,
-                )
-                .await;
-        }
+        // 探测结果不重要（家庭网关多半不开 HTTP），只要 1 次请求触发握手
+        let _ = api
+            .test_delay(
+                crate::core::go_lan::GO_LAN_TAG,
+                &format!("http://{gw}"),
+                1500,
+            )
+            .await;
         crate::core::logger::info(
             crate::core::logger::MOD_GO_LAN,
-            &format!("主动握手探测完成，已向家庭网关发包: {targets:?}"),
+            &format!("主动握手探测完成，已向家庭网关 {gw} 发送 1 次 Clash API 请求"),
         );
-        tracing::info!("[go-lan] 主动握手探测已完成");
     });
 }
 
@@ -2381,6 +2385,18 @@ pub async fn save_go_lan_settings(
     }
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
+
+    // 【APP30 任务3】保存即预热 Endpoint 域名解析（DoH 60s 缓存）：
+    // 下次启动 build_config 直接命中缓存拿到最新 IPv4，避免扩展侧系统
+    // getaddrinfo 读到旧 DDNS 记录（log8.txt 第 39~44 行
+    // ishow.indevs.in 旧 14.105.65.44 / 新 14.105.65.122）。
+    if let Some(server) = lan.wg_config.as_ref().map(|wg| wg.server.clone()) {
+        if !server.trim().is_empty() {
+            std::thread::spawn(move || {
+                let _ = crate::core::go_lan::resolve_endpoint_host_to_ip(&server);
+            });
+        }
+    }
 
     let (_, warnings) = crate::core::go_lan::go_lan_route_rules(&lan);
 

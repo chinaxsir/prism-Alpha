@@ -1027,10 +1027,10 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP26 任务1.1】tun-in MTU 1400：入口 MTU 决定 TCP 向对端宣告的
-            // MSS（1400−40=1360），配合 go-lan-home 的 1420 隧道 MTU，
-            // 与家庭 WireGuard 服务端保持一致。
-            "mtu": 1400,
+            // 【APP30 任务2】tun-in MTU 锁死 1280：入口 MTU 决定 TCP 向对端
+            // 宣告的 MSS（1280−40=1240），配合 go-lan-home 运行时 MTU 1280，
+            // 彻底消除 MTU 1420 时大包 + WG 头被丢弃（log8.txt 第 25 行）。
+            "mtu": 1280,
             "auto_route": true,
             // 【APP26 任务1.1】tun-in 栈改为 "mixed"：gvisor 在等待出站
             // （go-lan-home）建连期间迟迟不回 SYN-ACK，iOS Safari 的
@@ -2935,11 +2935,11 @@ rules:
             Some("10.8.0.2/24"),
             "单地址 local_address 必须统一 /24"
         );
-        // 【APP26 任务1.1】go-lan-home 写入内核的 MTU 与家庭 WG 服务端一致 1420
+        // 【APP30 任务2】go-lan-home 写入内核的运行时 MTU 无条件 1280
         assert_eq!(
             wg["mtu"].as_u64(),
-            Some(1420),
-            "go-lan-home 写入内核的 MTU 必须为 1420"
+            Some(1280),
+            "go-lan-home 写入内核的 MTU 必须为 1280"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
