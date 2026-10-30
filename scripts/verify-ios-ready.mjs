@@ -355,6 +355,39 @@ try {
     pass('prism_protect_socket 无 withMemoryRebound 调用 ✓');
   }
 
+  // ---- 7.3b NEIPv4Route 签名硬性校验（ERR0 / APP25 新增）----
+  // iOS NetworkExtension 签名：
+  //   NEIPv4Route(destinationAddress: String, subnetMask: String) —— 严禁 networkPrefixLength
+  //   NEIPv6Route(destinationAddress: String, networkPrefixLength: NSNumber) —— 合法
+  // 曾把 NEIPv6Route 的参数错套到 NEIPv4Route：
+  //   let route = NEIPv4Route(destinationAddress: "...", networkPrefixLength: NSNumber(value: n))
+  // 直接触发 Swift 编译 error: cannot convert value of type 'NSNumber' to expected argument type 'String'
+  // 这里遍历每个 NEIPv4Route(...) 调用，若其内部出现 networkPrefixLength: 则硬拦截。
+  {
+    const v4Re = /NEIPv4Route\s*\(/g;
+    let m;
+    while ((m = v4Re.exec(rawExt)) !== null) {
+      // 从起点扫描到配对闭括号（支持嵌套括号）
+      let depth = 1, i = m.index + m[0].length;
+      while (i < rawExt.length && depth > 0) {
+        if (rawExt[i] === '(') depth++;
+        else if (rawExt[i] === ')') depth--;
+        i++;
+      }
+      const call = rawExt.slice(m.index, i);
+      if (call.includes('networkPrefixLength:')) {
+        const line = rawExt.slice(0, m.index).split('\n').length;
+        fail(
+          `PacketTunnelProvider.swift 第 ${line} 行 \`NEIPv4Route(...)\` 内部出现了 ` +
+          `\`networkPrefixLength:\`——NEIPv4Route 的第二个参数必须是 ` +
+          `\`subnetMask: String\`（子网掩码如 "255.255.255.0"），` +
+          `\`networkPrefixLength: NSNumber\` 是 NEIPv6Route 的签名，严禁混用！`
+        );
+      }
+    }
+    if (!failed) pass('NEIPv4Route / NEIPv6Route 参数签名正确 ✓');
+  }
+
   // 保守扫描：对所有 .withMemoryRebound( 调用，其前置变量名（剥掉 .pointee. 链后）
   // 若不在白名单里则 warning 提示开发者手动确认该变量是指针类型。
   // 白名单 = 已验证的 UnsafePointer 参数名（addrPtr / p / addr 都经 UnsafePointer 传入）

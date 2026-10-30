@@ -813,7 +813,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     else { continue }
                     let route = NEIPv4Route(
                         destinationAddress: String(parts[0]),
-                        networkPrefixLength: NSNumber(value: prefixLen)
+                        subnetMask: subnetMask(prefix: prefixLen)
                     )
                     route.gatewayAddress = gatewayIp
                     includedRoutes.append(route)
