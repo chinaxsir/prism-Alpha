@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { useCoreStore } from "@/stores/core";
 import {
   activatePro,
   deactivatePro,
@@ -156,6 +157,29 @@ export const useProStore = create<ProState>((set, get) => ({
   },
 
   deactivate: async () => {
+    // 【APP28 任务3】0ms 乐观失效：先本地置 inactive 并同步关闭 Go AIM /
+    // Go Lan / Go Cus 的启用标志，弹窗与 Toast 由调用方立即完成；后端本地
+    // 清理完成后返回真实状态，再以权威值收口（事件通知同样会到达）。
+    const core = useCoreStore.getState();
+    if (core.goAimStatus) {
+      core.setGoAimStatus({
+        ...core.goAimStatus,
+        enabled: false,
+        lockedNode: null,
+      });
+    }
+    if (core.goLanSettings) {
+      core.setGoLanSettings({ ...core.goLanSettings, enabled: false });
+    }
+    if (core.goCusSettings) {
+      core.setGoCusSettings({ ...core.goCusSettings, enabled: false });
+    }
+    set({
+      entitlement: INACTIVE,
+      unlocked: false,
+      revokeReason: null,
+      error: null,
+    });
     const e = await deactivatePro();
     set({ entitlement: e, unlocked: unlockedOf(e), error: null });
   },

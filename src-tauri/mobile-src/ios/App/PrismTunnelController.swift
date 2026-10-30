@@ -254,98 +254,16 @@ func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
     return strdup(hex)
 }
 
-// MARK: - 【APP26 任务3.1】深色底锁定入口（供 Rust setup 调用）
-
-/// 主 App 启动时安装深色底锁定，消除上滑退后台缩成桌面图标时
-/// 左下角/右下角短暂露白。返回 0 恒定成功（仅调度，不阻塞 Rust）。
-@_cdecl("prism_ios_ui_dark_init")
-public func prismIosUiDarkInit() -> Int32 {
-    PrismTunnelController.installDarkAppearance()
-    return 0
-}
-
 // MARK: - 控制器
 
 final class PrismTunnelController {
     static let shared = PrismTunnelController()
 
-    // 【APP24 任务2】本控制器 100% 只负责 NETunnelProviderManager VPN 隧道
-    // 控制，严禁触碰任何 UIWindow / UIView / UIScrollView / WKWebView 属性
-    //（此前两轮为修复最小化露白而遍历涂黑视图树，直接导致整屏黑屏）。
-    // 【APP26 任务3.1】唯一例外：installDarkAppearance / enforceDarkWindowAndWebView
-    // 仅锁定窗口底色与 WKWebView 的 opaque/underPage 背景，绝不递归修改
-    // 其它子视图背景（APP24 黑屏教训）。
+    // 【APP24 / APP28 任务1】本控制器 100% 只负责 NETunnelProviderManager VPN
+    // 隧道控制，严禁触碰任何 UIWindow / UIView / UIScrollView / WKWebView 属性：
+    // 递归遍历视图树给 WKCompositingView / WKContentView 刷底色会导致
+    // 切换 App 时整屏黑屏且无法触摸（APP26 曾加回，APP28 已彻底移除）。
     private init() {}
-
-    /// 【APP26 任务3.1】深色底锁定安装（进程内只安装一次监听）：
-    /// 立即执行一次，并在 0.3s / 1.0s 后补执行，覆盖 WebView 挂载完成时刻；
-    /// 同时监听退后台/回前台通知，保证手指刚触碰底部横条时底色已就位。
-    static func installDarkAppearance() {
-        DispatchQueue.main.async {
-            if darkAppearanceInstalled {
-                return
-            }
-            darkAppearanceInstalled = true
-            let nc = NotificationCenter.default
-            nc.addObserver(
-                forName: UIApplication.willResignActiveNotification,
-                object: nil,
-                queue: .main
-            ) { _ in
-                PrismTunnelController.enforceDarkWindowAndWebView()
-            }
-            nc.addObserver(
-                forName: UIApplication.didBecomeActiveNotification,
-                object: nil,
-                queue: .main
-            ) { _ in
-                PrismTunnelController.enforceDarkWindowAndWebView()
-            }
-            PrismTunnelController.enforceDarkWindowAndWebView()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                PrismTunnelController.enforceDarkWindowAndWebView()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                PrismTunnelController.enforceDarkWindowAndWebView()
-            }
-        }
-    }
-
-    /// 是否已安装深色底监听（进程内幂等）
-    private static var darkAppearanceInstalled = false
-
-    /// 【APP26 任务3.1】锁定窗口底色与 WebView 背景，消除退后台圆角裁剪露白
-    private static func enforceDarkWindowAndWebView() {
-        let darkBg = UIColor(red: 11.0 / 255.0, green: 14.0 / 255.0, blue: 20.0 / 255.0, alpha: 1.0)
-        for scene in UIApplication.shared.connectedScenes {
-            if let windowScene = scene as? UIWindowScene {
-                for window in windowScene.windows {
-                    window.overrideUserInterfaceStyle = .dark
-                    window.backgroundColor = darkBg
-                    if let root = window.rootViewController?.view {
-                        styleWebViews(in: root, darkBg: darkBg)
-                    }
-                }
-            }
-        }
-    }
-
-    /// 仅按类名定位 WKWebView 并设置非白底属性；其它视图一律不动
-    /// （APP24 黑屏根因是递归涂黑所有子视图，这里严格规避）。
-    private static func styleWebViews(in view: UIView, darkBg: UIColor) {
-        let className = NSStringFromClass(type(of: view))
-        if className.contains("WKWebView") || className.contains("WryWebView") {
-            view.isOpaque = false
-            view.backgroundColor = .clear
-            if #available(iOS 15.0, *) {
-                // 不 import WebKit（APP24 移除），经 KVC 设置 WKWebView 专有属性
-                view.setValue(darkBg, forKey: "underPageBackgroundColor")
-            }
-        }
-        for sub in view.subviews {
-            styleWebViews(in: sub, darkBg: darkBg)
-        }
-    }
 
     /// 最近一次 loadAllFromPreferences 可见的配置数。诊断用：
     /// 若系统设置里存在旧 Prism 条目而此处为 0，说明该条目属于

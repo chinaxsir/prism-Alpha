@@ -1141,38 +1141,50 @@ pub async fn submit_store_receipt(
     bail!("商店内购激活暂未开放，请使用授权码 + 邮箱激活");
 }
 
-/// 【APP-13 任务4】通知服务端解绑当前设备（POST /api/license/deactivate），
-/// 释放设备名额，让用户可在其他设备直接激活而不占座。
-///
-/// best-effort 语义：必须在清理本地缓存 **之前** 调用（依赖缓存中的
-/// license_key / email）；断网、404、服务端未实现该接口均静默返回 false，
-/// 绝不阻断本地移除授权（本地移除永远 100% 成功）。
-pub async fn release_device(data_dir: &Path, settings: &UserSettings) -> bool {
-    let Some((license_key, email)) = cached_credentials(data_dir) else {
-        return false;
-    };
-    let Ok(dev) = device_id(data_dir) else {
-        return false;
-    };
-    let base = server_base(settings);
-    let result = post_with_fallback(
-        &format!("{base}{}", crate::obf!("/api/license/deactivate")),
-        &serde_json::json!({
-            "license_key": license_key,
-            "email": email,
-            "device_id": dev,
-        }),
-    )
-    .await;
-    match result {
-        Ok(resp) => {
-            let ok = resp.status().is_success();
-            tracing::info!("license deactivate notify: http={} ok={ok}", resp.status().as_u16());
-            ok
-        }
-        Err(e) => {
-            tracing::warn!("license deactivate notify failed (ignored): {e}");
-            false
+/// 【APP28 任务3】解绑所需的服务端凭据快照。
+/// 必须在删除本地缓存 **之前** 捕获（凭据存在 license.dat 内），之后交给
+/// 后台任务异步 POST，前端无需等待网络返回。
+pub struct ReleaseBinding {
+    base: String,
+    license_key: String,
+    email: String,
+    device_id: String,
+}
+
+impl ReleaseBinding {
+    /// 从本地缓存捕获解绑凭据；未激活 / 缺邮箱 / 取不到设备 ID 时返回 None
+    pub fn capture(data_dir: &Path, settings: &UserSettings) -> Option<Self> {
+        let (license_key, email) = cached_credentials(data_dir)?;
+        let device_id = device_id(data_dir).ok()?;
+        Some(Self {
+            base: server_base(settings),
+            license_key,
+            email,
+            device_id,
+        })
+    }
+
+    /// POST /api/license/deactivate：best-effort，断网/404 静默返回 false
+    pub async fn notify(&self) -> bool {
+        let result = post_with_fallback(
+            &format!("{}{}", self.base, crate::obf!("/api/license/deactivate")),
+            &serde_json::json!({
+                "license_key": self.license_key,
+                "email": self.email,
+                "device_id": self.device_id,
+            }),
+        )
+        .await;
+        match result {
+            Ok(resp) => {
+                let ok = resp.status().is_success();
+                tracing::info!("license deactivate notify: http={} ok={ok}", resp.status().as_u16());
+                ok
+            }
+            Err(e) => {
+                tracing::warn!("license deactivate notify failed (ignored): {e}");
+                false
+            }
         }
     }
 }

@@ -1796,17 +1796,26 @@ pub async fn refresh_entitlement(
 /// 移除本机授权：清理本地授权/同步缓存文件，并自动关闭依赖 Pro 授权的开关
 /// （Go AIM / Go Lan / Go Cus 落盘保存为关闭），防止移除授权后后台仍残留运行
 /// Pro 模块。所有清理均为 best-effort，绝不导致移除失败。
+///
+/// 【APP28 任务3】零等待：先同步捕获解绑凭据 → 立即删除本地授权文件、关闭
+/// Pro 模块并广播状态 → 服务端解绑（POST /api/license/deactivate）放入
+/// `tauri::async_runtime::spawn` 后台异步执行，前端 1ms 内即可收到 Ok。
 #[tauri::command]
 pub async fn deactivate_pro(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
-    // 【APP-13 任务4】先通知服务端解绑（释放设备名额，其他设备可直接激活），
-    // 必须在本地缓存清理前调用；失败静默忽略，绝不阻断本地移除。
-    // 先克隆 settings 再 await：避免 RwLock 读锁跨 await 导致 future 非 Send。
-    let settings_snapshot = state.settings.read().clone();
-    let _ = crate::core::license::release_device(&state.data_dir, &settings_snapshot).await;
+    // 解绑凭据（license_key / email / device_id）存在 license.dat 内，
+    // 必须在下方本地清理前同步捕获，随后交给后台任务异步上报。
+    let binding = {
+        let settings = state.settings.read().clone();
+        crate::core::license::ReleaseBinding::capture(&state.data_dir, &settings)
+    };
+
+    // 本地清理（同步、纯磁盘操作）：license.dat / license_cache.json /
+    // sync_links.json；runtime_cache.json 一并清除避免残留旧感知数据。
     let next = crate::core::license::deactivate(&state.data_dir);
+    let _ = std::fs::remove_file(state.data_dir.join("runtime_cache.json"));
     state.apply_entitlement(next.clone());
     // 用户主动移除授权：不是「被解绑/已到期」，清掉历史原因避免误弹横幅
     crate::core::app_control::clear_revoke_reason(&state.data_dir);
@@ -1833,6 +1842,13 @@ pub async fn deactivate_pro(
         cus.enabled = false;
         let _ = crate::core::go_cus::save(&state.data_dir, &cus);
         *state.go_cus.write() = cus;
+    }
+
+    // 服务端解绑：后台异步执行，不阻塞前端返回（失败静默忽略）
+    if let Some(binding) = binding {
+        tauri::async_runtime::spawn(async move {
+            let _ = binding.notify().await;
+        });
     }
 
     Ok(next)

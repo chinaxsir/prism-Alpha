@@ -34,9 +34,6 @@ mod sys {
         /// 返回 App Group（group.com.prism.proxy）共享容器路径（APP6 任务1）；
         /// nilptr 表示 Swift 侧拿不到
         pub fn prism_ios_app_group_dir() -> *const std::os::raw::c_char;
-        /// 【APP26 任务3.1】安装主 App 深色底锁定（窗口 + WKWebView 背景），
-        /// 消除上滑退后台缩成桌面图标时四角露白；恒定返回 0
-        pub fn prism_ios_ui_dark_init() -> i32;
     }
 }
 
@@ -69,9 +66,6 @@ mod sys {
     }
     pub unsafe fn prism_ios_app_group_dir() -> *const c_char {
         std::ptr::null()
-    }
-    pub unsafe fn prism_ios_ui_dark_init() -> i32 {
-        0
     }
 }
 
@@ -157,8 +151,4 @@ pub fn app_group_dir() -> Option<String> {
     }
 }
 
-/// 【APP26 任务3.1】主 App 启动时安装深色底锁定（窗口底色 + WKWebView
-/// 的 isOpaque/underPageBackgroundColor）。Swift 侧仅调度到主队列，不阻塞。
-pub fn ui_dark_init() {
-    let _ = unsafe { sys::prism_ios_ui_dark_init() };
-}
+

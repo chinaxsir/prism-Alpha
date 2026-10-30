@@ -99,9 +99,6 @@ export default function ProManageModal({ open, onClose }: Props) {
   const deactivatePro = useProStore((s) => s.deactivate);
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
-  // ipa-8：移除授权的组件内二次确认（iOS WKWebView 会静默拦截 window.confirm 返回 false）
-  const [confirmDeactivate, setConfirmDeactivate] = useState(false);
-  const [deactivating, setDeactivating] = useState(false);
 
   // 【APP-4 任务2】剩余天数：订阅版在到期时间旁展示
   const remainDays = (() => {
@@ -164,25 +161,13 @@ export default function ProManageModal({ open, onClose }: Props) {
     }
   };
 
-  // ipa-8：反向激活——组件内二次确认替代 window.confirm：
-  // 第一次点击进入红色确认态（3 秒未点击自动恢复），第二次点击才真正执行解绑
-  const handleDeactivate = async () => {
-    if (!confirmDeactivate) {
-      setConfirmDeactivate(true);
-      setTimeout(() => setConfirmDeactivate(false), 3000);
-      return;
-    }
-    setDeactivating(true);
-    try {
-      await deactivatePro();
-      toast.success(t("pro.removedToast"));
-      onClose();
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      setDeactivating(false);
-      setConfirmDeactivate(false);
-    }
+  // 【APP28 任务3】反向激活：零二次确认、零等待——点击瞬间前端乐观置 Pro
+  // 失效（store 内同步关闭 Go AIM / Go Lan / Go Cus 开关），立即关闭弹窗并
+  // Toast；后端本地清理同步完成，服务端解绑在后台异步执行，无需等待网络。
+  const handleDeactivate = () => {
+    toast.success(t("pro.removedToast"));
+    onClose();
+    void deactivatePro().catch((e) => toast.error(String(e)));
   };
 
   if (!open) return null;
@@ -324,15 +309,9 @@ export default function ProManageModal({ open, onClose }: Props) {
           </button>
           <button
             onClick={handleDeactivate}
-            disabled={deactivating}
-            className={clsx(
-              "flex-1 rounded-lg px-3 py-2 text-xs transition-colors disabled:opacity-50",
-              confirmDeactivate
-                ? "bg-latency-bad/20 text-latency-bad hover:bg-latency-bad/30"
-                : "bg-surface-hover text-gray-400 hover:bg-latency-bad/20 hover:text-latency-bad"
-            )}
+            className="flex-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-400 transition-colors hover:bg-latency-bad/20 hover:text-latency-bad"
           >
-            {confirmDeactivate ? t("pro.removeConfirm") : t("pro.remove")}
+            {t("pro.remove")}
           </button>
         </div>
       </div>

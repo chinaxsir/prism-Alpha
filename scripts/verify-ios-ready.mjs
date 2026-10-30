@@ -2,7 +2,7 @@
 /**
  * verify-ios-ready.mjs —— iOS / Android 构建本地硬性预检（1 秒跑完）
  *
- * 8 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
+ * 11 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
  *   1. UTF-8 BOM 头扫描
  *   2. Rust ios.rs ↔ build.rs ↔ Swift @_cdecl 三方 C ABI 符号对齐
  *   3. Swift 缺失 import 框架自动检测
@@ -12,12 +12,16 @@
  *      import "C" 块完整性 + 可用时的 gofmt -e 语法校验）
  *   7. 扩展源码作用域预检（关键标识符先声明后使用 + gen 副本一致性）
  *   8. Swift 冻结指令（严禁 as! / 命名元组类型声明 + gen 副本字节一致）
+ *   9. Rust cargo check（本机 + iOS aarch64-apple-ios 目标）
+ *  10. WKWebView 染色防复发（禁 subviews / underPageBackgroundColor / 前后台监听）
+ *  11. AppIcon 四角满铺校验（不透明彩色，无白/黑/透明角）
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, delimiter } from 'node:path';
 import { execSync } from 'node:child_process';
+import sharp from 'sharp';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 let failed = false;
@@ -576,6 +580,89 @@ cargoCheck('本机', '');
 cargoCheck('iOS（aarch64-apple-ios）', 'aarch64-apple-ios');
 
 // ============================================================
+// 检查 10：【APP28 任务1】Swift 禁止触碰 WebView 内部视图树（黑屏防复发）
+// 根因：递归给 WKCompositingView/WKContentView 刷 backgroundColor 会让
+// 切换 App 时整屏黑屏且无法触摸。任何 `subviews` 遍历、WebView 页面底色
+// 修改、退后台/回前台染色监听都必须立即阻断。
+// ============================================================
+console.log('\n--- 检查 10：WKWebView 染色防复发 ---');
+const tunnelSwift = readFileSync(
+  resolve(ROOT, 'src-tauri/mobile-src/ios/App/PrismTunnelController.swift'),
+  'utf8'
+);
+const BANNED_SWIFT = [
+  ['subviews', '遍历子视图树'],
+  ['underPageBackgroundColor', '修改 WebView 页面底色'],
+  ['willResignActiveNotification', '注册退后台染色监听'],
+  ['didBecomeActiveNotification', '注册回前台染色监听'],
+];
+const swiftHits = BANNED_SWIFT.filter(([token]) => tunnelSwift.includes(token));
+if (swiftHits.length > 0) {
+  fail(
+    `PrismTunnelController.swift 出现禁用写法：${swiftHits
+      .map(([token, desc]) => `${token}（${desc}）`)
+      .join('、')}；递归染色会导致切换 App 黑屏（APP24/APP28 教训）`
+  );
+} else {
+  pass('PrismTunnelController.swift 未触碰 WKWebView 内部视图树 ✓');
+}
+
+// ============================================================
+// 检查 11：【APP28 任务2】AppIcon 四角必须满铺不透明彩色背景
+// iOS 要求提交的图标为 100% 直角满铺方形（圆角由系统裁切）；四角出现
+// 白色/透明/#0B0E14 深黑时，SpringBoard 拉伸底边会露出黑块或白块。
+// gen/apple 只在 macOS 构建时生成，缺失时回退到仓库内 icons/ios。
+// ============================================================
+console.log('\n--- 检查 11：AppIcon 四角满铺校验 ---');
+const ICON_DIRS = [
+  resolve(ROOT, 'src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset'),
+  resolve(ROOT, 'src-tauri/icons/ios'),
+].filter((d) => existsSync(d));
+function badCornerReason(r, g, b, a) {
+  if (a < 250) return '透明';
+  const mx = Math.max(r, g, b);
+  const mn = Math.min(r, g, b);
+  if (mx > 245 && mn > 200) return '白色';
+  if (mx < 45) return '近黑(#0B0E14)';
+  if (mx - mn < 20) return '灰白';
+  return null;
+}
+if (ICON_DIRS.length === 0) {
+  fail('未找到 AppIcon 图标目录（icons/ios 缺失）');
+} else {
+  const badIcons = [];
+  let checked = 0;
+  for (const dir of ICON_DIRS) {
+    for (const file of readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.png'))) {
+      const { data, info } = await sharp(resolve(dir, file))
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const ch = info.channels;
+      const corners = [
+        [0, 0],
+        [info.width - 1, 0],
+        [0, info.height - 1],
+        [info.width - 1, info.height - 1],
+      ];
+      for (const [x, y] of corners) {
+        const i = (y * info.width + x) * ch;
+        const reason = badCornerReason(data[i], data[i + 1], data[i + 2], ch >= 4 ? data[i + 3] : 255);
+        if (reason) {
+          badIcons.push(`${file}(${x},${y})=${reason}`);
+          break;
+        }
+      }
+      checked += 1;
+    }
+  }
+  if (badIcons.length > 0) {
+    fail(`AppIcon 四角未满铺（应为不透明彩色背景，不得有白/黑/透明）：${badIcons.slice(0, 6).join('，')}${badIcons.length > 6 ? ` 等 ${badIcons.length} 张` : ''}`);
+  } else {
+    pass(`AppIcon 四角满铺校验通过（${checked} 张）✓`);
+  }
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
@@ -583,5 +670,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 9 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 11 项检查绿灯通过，iOS / Android 构建就绪！');
 }
