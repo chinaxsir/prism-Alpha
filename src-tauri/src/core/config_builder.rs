@@ -2928,8 +2928,13 @@ rules:
             Some("10.8.0.2/24"),
             "单地址 local_address 必须统一 /24"
         );
-        // 【APP19 任务1】go-lan-home MTU 采用用户配置 1420（严禁写死 1280）
-        assert_eq!(wg["mtu"].as_u64(), Some(1420), "go-lan-home MTU 必须为 1420");
+        // 【APP25 任务2.1】go-lan-home 写入内核的 MTU 必须锁定 1280
+        // （用户配置 1420 仅用于界面展示 / settings.json）
+        assert_eq!(
+            wg["mtu"].as_u64(),
+            Some(1280),
+            "go-lan-home 写入内核的 MTU 必须为 1280"
+        );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
         assert!(

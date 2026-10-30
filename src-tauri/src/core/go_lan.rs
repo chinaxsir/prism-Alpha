@@ -38,14 +38,25 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP21 任务3.2】go-lan-home 出站 MTU 下限直接对齐家庭 WG 服务端
-/// 1420：历史版本曾把下限放宽到 1280，导致用户存量配置里的 1280 被
-/// 原样采用——飞牛 NAS 发回的 1281~1420 字节数据包会被 wireguard-go
-/// 接收缓冲区静默丢弃（Safari「服务器已停止响应」、飞牛 App 卡
-/// 「正在连接...」）。低于 1420 的用户配置一律钳制回 1420。
-pub const GO_LAN_MTU_FLOOR: u32 = 1420;
+/// 【APP25 任务2.1】go-lan-home 出站**运行时 MTU 强制锁定 1280**。
+///
+/// log6.txt 铁证：MTU 1420 时 gVisor 协议栈向内网 Web 服务器宣告
+/// MSS = 1380，NAS / 路由器 / 内网服务回传的 1420 字节满载 HTTP/TLS 包
+/// 套上 60 字节 WireGuard UDP 头后达 1480 字节，在 5G 蜂窝 / 家宽 PPPoE
+/// 链路上被整包丢弃（PMTU 黑洞）——表现为 RDP 3389（16 字节小包）92ms
+/// 秒通，而飞牛 .253 / 路由器 .254 / 10.31.2.102 等 Web 端口 3000ms 超时。
+/// 而 log3.txt / log4.txt 中 MTU 1280 时 .253:8001（229ms）与
+/// .253:8080（360ms）均成功连通。1280 让内核向内网宣告 MSS = 1240，
+/// 所有回包不超过 1280 字节，套 WG 头仅 1340 字节，100% 穿透。
+///
+/// 注意：`settings.json` 与前端界面仍保存用户填写的 MTU（如 1420），
+/// 只在生成内核 JSON 时强制改写为 1280。
+pub const GO_LAN_RUNTIME_MTU: u32 = 1280;
 
-/// 【APP19 任务1】go-lan-home 默认 MTU（对齐家庭 WG 服务端 1420）。
+/// 历史常量：用户配置 MTU 的展示默认值（不再直接写入内核 JSON）
+pub const GO_LAN_MTU_FLOOR: u32 = 1280;
+
+/// 历史常量：用户配置 MTU 的展示默认值（对齐家庭 WG 服务端 1420）
 pub const GO_LAN_MTU_DEFAULT: u32 = 1420;
 
 // ---------------------------------------------------------------- 数据模型
@@ -878,41 +889,131 @@ async fn probe_http_port(
         }
     }
 
-    // 通道 3：TUN 直连
-    if let Ok(client) = build(None) {
-        for scheme in schemes {
-            let url = format!("{scheme}://{ip}:{port}{path}");
-            let start = std::time::Instant::now();
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    let bytes = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
-                    let ms = start.elapsed().as_millis().max(1) as u64;
-                    if code != 502 && code != 504 && bytes > 0 {
-                        return Ok((format!("HTTP {code} · {bytes} 字节"), ms));
-                    }
-                    last_err = format!("直连 HTTP {code} 且无应答数据");
-                }
-                Err(e) => last_err = format!("直连 GET 失败: {e}"),
-            }
-        }
-    }
+    // 【APP25 任务2.3】已删除「通道 3：TUN 直连」——tun-in 的 gvisor 栈
+    // 会对目标主机伪造 SYN-ACK，直连「成功」并不能证明内网主机在线
+    // （历史「TUN直连:80 延迟 2502 ms」假阳性即由此产生）。内网理解
+    // 一律以 mixed-in / Clash API 的真实回包为准。
 
     Err(last_err)
 }
 
-/// 【APP18 任务3 / APP19 任务4】用户未指定端口时并发探测的常用内网服务端口。
-/// 覆盖飞牛/群晖/威联通 NAS、网页、SMB、远程桌面、SSH、FTP、打印机。
-const COMMON_PROBE_PORTS: [u16; 17] = [
-    8000, 8001, 5666, 5667, 80, 443, 5000, 5001, 8080, // NAS / 网页 / WebDAV
-    445, 139, 3389, 22, 21, // SMB / NetBIOS / RDP / SSH / FTP
-    631, 9100, 515, // IPP / RAW / LPD 打印机
-];
+/// 【APP25 任务2.3】分批探测：第一批「Web 服务 + 远程桌面」最常用端口。
+/// 单批窗口 1800ms，命中即返回；否则进入第二批，彻底避免一批 17 个
+/// 端口全部排队到 3000ms 才失败的「整批超时」假阴性。
+const PROBE_BATCH_1: [u16; 6] = [8000, 8001, 443, 80, 3389, 5666];
 
-/// 【APP18 任务3 / APP21 任务4】按端口优先级并发探测，首个真实命中胜出。
-/// 显式端口只探测该端口；未指定则遍历 COMMON_PROBE_PORTS。
-/// 全端口 JoinSet 并发 + 3000ms 总超时：任意端口率先返回有效响应立即
-/// 胜出并取消其余任务，检测在 200~400ms 内出结果，不再串行苦等 10 秒。
+/// 【APP25 任务2.3】第二批「WebDAV / SMB / SSH / 备用 Web」端口。
+const PROBE_BATCH_2: [u16; 7] = [8080, 5000, 5001, 5667, 445, 22, 8443];
+
+/// 单批并发窗口：连接 + 最小握手 + 等首个响应字节的总耗时上限。
+const PROBE_BATCH_WINDOW_MS: u64 = 1800;
+
+/// 【APP25 任务2.3】经 SOCKS5 单层流探测 Web 端口。
+///
+/// 关键改进：不再走 reqwest（连接池 + 完整 HTTP 响应体，内网设备
+/// 不返回 body 时会一直等到超时）。这里一次 TCP 建连 + 一个最小
+/// `HEAD` 请求，读到首个响应字节即判定可达；SOCKS5 CONNECT 成功本身
+/// 就代表 go-lan-home 已在 WireGuard 隧道内与目标完成三次握手，
+/// 即使目标端口是 TLS（回二进制 alert）或直接关闭连接，也说明端口真实开放。
+async fn probe_web_port_via_stream(
+    ip: &str,
+    port: u16,
+    path: &str,
+    mixed_port: u16,
+) -> Result<(String, u64), String> {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let start = Instant::now();
+    let mut stream = open_probe_stream(ip, port, mixed_port).await?;
+
+    let req = format!(
+        "HEAD {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: PrismProbe/1.0\r\nConnection: close\r\n\r\n",
+        path, ip
+    );
+    let _ = stream.write_all(req.as_bytes()).await;
+
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_millis(1200), stream.read(&mut buf)).await;
+    let ms = start.elapsed().as_millis().max(1) as u64;
+    match read {
+        Ok(Ok(n)) if n > 0 => {
+            // 首包可能是 HTTP 状态行，也可能是 TLS 二进制告警 —— 均为真实回包
+            Ok((format!("TCP 建连 + 服务响应（首包 {n} 字节）"), ms))
+        }
+        Ok(Err(_)) => Ok(("TCP 建连成功（端口开放，对端已关闭连接）".to_string(), ms)),
+        Ok(Ok(_)) => Ok(("TCP 建连成功（端口开放）".to_string(), ms)),
+        Err(_) => Ok(("TCP 建连成功（端口开放，未回 HTTP 头）".to_string(), ms)),
+    }
+}
+
+/// 【APP25 任务2.3】单端口探测调度：原始协议端口走协议首包校验，
+/// 其余 Web 端口优先走 SOCKS5 单层流，失败再回落 HTTP/Clash 三通道。
+async fn probe_one_port(
+    ip: &str,
+    port: u16,
+    path: &str,
+    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+) -> Result<(String, u64), String> {
+    if is_raw_probe_port(port) {
+        return probe_raw_service(ip, port, mixed_port).await;
+    }
+    match probe_web_port_via_stream(ip, port, path, mixed_port).await {
+        Ok(hit) => Ok(hit),
+        Err(stream_err) => {
+            // mixed 入站未就绪（旧配置 / 内核未起）时保留历史三通道兜底
+            probe_http_port(ip, port, path, mixed_port, api_addr, api_secret)
+                .await
+                .map_err(|_| stream_err)
+        }
+    }
+}
+
+/// 【APP25 任务2.3】单批端口并发探测：JoinSet 并发 + 独立 1800ms 窗口，
+/// 首个真实命中立即胜出。
+async fn probe_port_batch(
+    ports: &[u16],
+    ip: &str,
+    path: &str,
+    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+) -> Result<PortProbeHit, String> {
+    let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
+        tokio::task::JoinSet::new();
+    for &p in ports {
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
+        let api_owned = api_addr.to_string();
+        let secret_owned = api_secret.to_string();
+        tasks.spawn(async move {
+            let res = probe_one_port(&ip_owned, p, &path_owned, mixed_port, &api_owned, &secret_owned).await;
+            (p, res)
+        });
+    }
+    let window = tokio::time::sleep(std::time::Duration::from_millis(PROBE_BATCH_WINDOW_MS));
+    tokio::pin!(window);
+    loop {
+        tokio::select! {
+            _ = &mut window => return Err("本批端口在探测窗口内无应答".to_string()),
+            joined = tasks.join_next() => {
+                match joined {
+                    Some(Ok((p, Ok((detail, latency_ms))))) => {
+                        return Ok(PortProbeHit { port: p, detail, latency_ms });
+                    }
+                    Some(Ok((_, Err(_)))) | Some(Err(_)) => continue,
+                    None => return Err("本批端口全部不可达".to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// 【APP25 任务2.3】按批次并发探测：显式端口只测该端口（窗口 2000ms）；
+/// 未指定则先测第一批，无命中再测第二批。两批独立窗口，任意端口
+/// 率先返回有效响应立即胜出并取消其余任务。
 async fn probe_target_ports(
     ip: &str,
     explicit_port: Option<u16>,
@@ -921,14 +1022,15 @@ async fn probe_target_ports(
     api_addr: &str,
     api_secret: &str,
 ) -> Result<PortProbeHit, String> {
+    let total_ms = if explicit_port.is_some() { 2000 } else { 4000 };
     match tokio::time::timeout(
-        std::time::Duration::from_millis(3000),
+        std::time::Duration::from_millis(total_ms),
         probe_target_ports_inner(ip, explicit_port, path, mixed_port, api_addr, api_secret),
     )
     .await
     {
         Ok(res) => res,
-        Err(_) => Err("隧道探测超时（3000ms 内无任何端口应答）".to_string()),
+        Err(_) => Err(format!("隧道探测超时（{total_ms}ms 内无任何端口应答）")),
     }
 }
 
@@ -940,51 +1042,20 @@ async fn probe_target_ports_inner(
     api_addr: &str,
     api_secret: &str,
 ) -> Result<PortProbeHit, String> {
-    let ports: Vec<u16> = match explicit_port {
-        Some(p) => vec![p],
-        None => COMMON_PROBE_PORTS.to_vec(),
-    };
-    let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
-        tokio::task::JoinSet::new();
-    for &p in &ports {
-        let ip_owned = ip.to_string();
-        let path_owned = path.to_string();
-        let api_owned = api_addr.to_string();
-        let secret_owned = api_secret.to_string();
-        tasks.spawn(async move {
-            let res = if is_raw_probe_port(p) {
-                probe_raw_service(&ip_owned, p, mixed_port).await
-            } else {
-                probe_http_port(
-                    &ip_owned,
-                    p,
-                    &path_owned,
-                    mixed_port,
-                    &api_owned,
-                    &secret_owned,
-                )
-                .await
-            };
-            (p, res)
+    if let Some(p) = explicit_port {
+        let (detail, latency_ms) =
+            probe_one_port(ip, p, path, mixed_port, api_addr, api_secret).await?;
+        return Ok(PortProbeHit {
+            port: p,
+            detail,
+            latency_ms,
         });
     }
     let mut last_err = String::from("隧道探测超时");
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok((p, res)) = joined {
-            match res {
-                Ok((detail, latency_ms)) => {
-                    return Ok(PortProbeHit {
-                        port: p,
-                        detail,
-                        latency_ms,
-                    })
-                }
-                Err(e) => {
-                    if !e.contains("超时") {
-                        last_err = e;
-                    }
-                }
-            }
+    for batch in [PROBE_BATCH_1.as_slice(), PROBE_BATCH_2.as_slice()] {
+        match probe_port_batch(batch, ip, path, mixed_port, api_addr, api_secret).await {
+            Ok(hit) => return Ok(hit),
+            Err(e) => last_err = e,
         }
     }
     Err(last_err)
@@ -1299,16 +1370,11 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    // 【APP21 任务3.2】严禁把内核侧 MTU 压到 1280！家庭 WG 服务端 MTU 为
-    // 1420，若隧道缓冲区只有 1280，NAS 发回的 1420 字节满载 TCP 分段会被
-    // 静默丢弃——表现为 RDP（握手包仅十几字节）能连、飞牛网页与 SMB 文件块
-    // 全部卡死。用户配置在 [1420, 9000] 内原样采用（含存量 1280 在内的
-    // 低值一律钳制回 1420），否则默认 1420。
-    let mtu = if (GO_LAN_MTU_FLOOR..=9000).contains(&wg.mtu) {
-        wg.mtu
-    } else {
-        GO_LAN_MTU_DEFAULT
-    };
+    // 【APP25 任务2.1】内核 JSON 的 go-lan-home MTU 强制 1280：
+    // 用户配置值（通常 1420）仅用于界面展示与 settings.json，
+    // 传给内核必须锁定 1280，向内网宣告 MSS = 1240，彻底消除
+    // Web 满载包在 5G / PPPoE 链路上的 PMTU 黑洞（log6.txt 根因）。
+    let mtu = GO_LAN_RUNTIME_MTU;
     outbound["mtu"] = json!(mtu);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
@@ -2016,18 +2082,18 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
-        // 【APP19 任务1】用户配置 1420 必须原样写入内核，严禁再压成 1280
+        // 【APP25 任务2.1】内核 JSON 的 MTU 必须强制 1280（用户配置仅展示用）
         assert_eq!(
             ob["mtu"].as_u64(),
-            Some(1420),
-            "go-lan-home MTU 必须采用用户配置 1420"
+            Some(GO_LAN_RUNTIME_MTU as u64),
+            "go-lan-home 写入内核的 MTU 必须锁定 1280"
         );
     }
 
-    /// 【APP21 任务3.2】MTU 合法区间 [1420, 9000] 原样采用；
-    /// 低于 1420（含存量配置里的 1280）一律钳制回 1420，严禁 1280 生效。
+    /// 【APP25 任务2.1】无论用户配置多少（1420 / 1500 / 存量 1280），
+    /// 写入内核 JSON 的 go-lan-home MTU 一律强制 1280，消除 PMTU 黑洞。
     #[test]
-    fn test_wg_mtu_from_user_config() {
+    fn test_wg_runtime_mtu_forced_1280() {
         let make = |mtu: u32| GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -2041,22 +2107,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        for mtu in [1420_u32, 1500, 2000, 9000] {
+        for mtu in [0_u32, 1000, 1280, 1400, 1420, 1500, 9000] {
             let (outbound, _) = build_outbound(&make(mtu));
             let ob = outbound.expect("合法配置应构建出站");
             assert_eq!(
                 ob["mtu"].as_u64(),
-                Some(mtu as u64),
-                "用户配置 MTU {mtu} 在 [1420, 9000] 内必须原样写入"
-            );
-        }
-        for mtu in [0_u32, 1000, 1280, 1400, 1419, 9001, 65535] {
-            let (outbound, _) = build_outbound(&make(mtu));
-            let ob = outbound.expect("合法配置应构建出站");
-            assert_eq!(
-                ob["mtu"].as_u64(),
-                Some(GO_LAN_MTU_DEFAULT as u64),
-                "越界/偏低 MTU {mtu} 必须钳制回 1420（严禁 1280 生效）"
+                Some(GO_LAN_RUNTIME_MTU as u64),
+                "用户配置 MTU {mtu} 必须强制改写为 1280"
             );
         }
     }

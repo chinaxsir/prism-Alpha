@@ -352,6 +352,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeBoundInterface: String = ""
     private var isReloadingForNetworkChange: Bool = false
 
+    /// 【APP25 任务2.2】本次内核实际监听的 mixed-in 端口（默认 2080）。
+    /// openTun 构造 NEProxySettings 时把系统 HTTP/HTTPS 代理指向
+    /// 127.0.0.1:<该端口>，Safari 等 App 的内网请求由此 100% 进入
+    /// sing-box 路由（IP 规则 / 域名规则均可命中 go-lan-home）。
+    private var effectiveMixedPort: Int = 2080
+
     // MARK: - 生命周期
 
     /// 【build 169 方案】init() 级最早心跳：系统 pkd 实例化扩展进程的
@@ -781,15 +787,58 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        // 【APP22 任务4.1】includedRoutes 只保留系统默认路由，
-        // 不添加任何自定义子网路由（log3.txt 实测：NEIPv4Route.default()
-        // 已让系统把全部内网 IP 流量直接送入 utun，再由内核 route.rules
-        // 的 ip_cidr → go-lan-home 精准分流，网页/SMB/RDP 全通）。
-        // excludedRoutes 必须为空数组——任何排除路由都会让对应流量
-        // 绕过隧道直连物理网卡。
-        ipv4.includedRoutes = [NEIPv4Route.default()]
+        // 【APP22 任务4.1】includedRoutes 必须包含系统默认路由，让全部
+        // 流量进入 utun，再由内核 route.rules 的 ip_cidr → go-lan-home 分流。
+        var includedRoutes: [NEIPv4Route] = [NEIPv4Route.default()]
+
+        // 【APP25 任务2.2】再把回家网段显式下发给系统（gatewayAddress 指向
+        // 隧道自身地址 172.19.0.1）。系统守护进程（「文件」App SMB、
+        // 打印 cupsd）不走 App 的 HTTP 代理，只能依赖这条系统级路由；
+        // 同时 iPhone 自身 Wi-Fi 与回家网段重叠时，显式路由优先接管。
+        // 10.196.0.0/24 是 go-lan-home 的 WireGuard 管理网段，必须排除，
+        // 否则会把隧道自身的握手流量再喂回隧道形成环路。
+        let gatewayIp = v4Addresses.first?.address ?? "172.19.0.1"
+        let sidecarDir = activeWorkDir ?? resolvedSharedDirURL
+        var lanRouteCount = 0
+        if let dir = sidecarDir {
+            let sidecarURL = dir.appendingPathComponent("golan_routes.json")
+            if let rawData = try? Data(contentsOf: sidecarURL),
+               let cidrList = (try? JSONSerialization.jsonObject(with: rawData)) as? [String] {
+                for cidr in cidrList {
+                    if cidr == "10.196.0.0/24" { continue }
+                    let parts = cidr.split(separator: "/")
+                    guard parts.count == 2,
+                          let prefixLen = Int(parts[1]),
+                          prefixLen > 0, prefixLen < 32
+                    else { continue }
+                    let route = NEIPv4Route(
+                        destinationAddress: String(parts[0]),
+                        networkPrefixLength: NSNumber(value: prefixLen)
+                    )
+                    route.gatewayAddress = gatewayIp
+                    includedRoutes.append(route)
+                    lanRouteCount += 1
+                }
+            }
+        }
+        ipv4.includedRoutes = includedRoutes
         ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
+
+        // 【APP25 任务2.2】NEProxySettings 把系统 HTTP/HTTPS 代理指向
+        // 127.0.0.1:<mixed-in 端口>：Safari / 飞牛 App 等内网 Web 请求
+        // 100% 进入 sing-box 的 mixed-in，再按 route.rules 命中
+        // go-lan-home，避免「只有 http 协议能过、https 直连被内网设备重置」。
+        // exceptionList 仅保留回环地址，严禁放行内网网段（否则请求绕过代理）。
+        let proxySettings = NEProxySettings()
+        let proxyServer = NEProxyServer(address: "127.0.0.1", port: effectiveMixedPort)
+        proxySettings.httpEnabled = true
+        proxySettings.httpServer = proxyServer
+        proxySettings.httpsEnabled = true
+        proxySettings.httpsServer = proxyServer
+        proxySettings.exceptionList = ["127.0.0.1", "localhost"]
+        settings.proxySettings = proxySettings
+        NSLog("[PrismVPN] proxy 127.0.0.1:\(effectiveMixedPort) lanRoutes=\(lanRouteCount)")
 
         let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
         if !v6Addresses.isEmpty {
@@ -1198,6 +1247,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             root["inbounds"] = inbounds
         }
 
+        // 【APP25 任务2.2】记录 mixed-in 实际监听端口，供 openTun 的
+        // NEProxySettings 使用（Rust 端默认 2080，此处按实际配置读取）
+        if let ins = root["inbounds"] as? [[String: Any]] {
+            for item in ins where (item["type"] as? String) == "mixed" {
+                if let p = (item["listen_port"] as? NSNumber)?.intValue, p > 0, p < 65536 {
+                    effectiveMixedPort = p
+                    break
+                }
+            }
+        }
+
         // 2. 检查 outbounds：绑定当前活跃物理网卡 (en0 或 pdp_ip0)，收集全部真实代理节点 tag
         var dnsOutboundTag: String? = nil
         var blockOutboundTag: String? = nil
@@ -1355,18 +1415,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if !validAddrs.isEmpty {
                         outbounds[i]["local_address"] = validAddrs
                     }
-                    // 【APP21 任务3.2】严禁把 go-lan-home 的 MTU 压到 1280：
-                    // 家庭 WG 服务端 MTU 为 1420，飞牛 NAS / SMB 会发回
-                    // 1420 字节满载 TCP 分段，1280 缓冲区会静默丢包
-                    // （RDP 小包能通、网页与 SMB 大包全部卡死）。
-                    // 用户配置在 [1280, 9000] 内原样保留（通常 1420），
-                    // 否则回落默认 1420。
-                    let rawGoLanMtu = (outbounds[i]["mtu"] as? NSNumber)?.intValue
-                    if let m = rawGoLanMtu, m >= 1280, m <= 9000 {
-                        outbounds[i]["mtu"] = m
-                    } else {
-                        outbounds[i]["mtu"] = 1420
-                    }
+                    // 【APP25 任务2.1】go-lan-home 出站 MTU 强制锁定 1280：
+                    // log6.txt 实证 1420 会向内网 Web 服务器宣告 MSS=1380，
+                    // 满载 1420 字节回包 + 60 字节 WG 头 = 1480 字节，在
+                    // 5G / PPPoE 链路上整包丢弃（RDP 小包 92ms 能通、Web
+                    // 端口全部 3000ms 超时）。1280 → MSS=1240，全部回包
+                    // ≤1280 字节，套 WG 头仅 1340 字节，100% 穿透。
+                    outbounds[i]["mtu"] = 1280
                     // 【APP21 任务2】严禁再给 go-lan-home 注入 bind_interface：
                     // WireGuard UDP 握手/数据包由 iOS NECP 按当前活跃物理网卡
                     // 原生发出，5G 下或 Wi-Fi→5G 切换时绝不再报

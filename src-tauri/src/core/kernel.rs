@@ -1254,9 +1254,12 @@ async fn auto_select_best_proxy(
         best = test_fastest(api, &nodes, TEST_URL, TEST_TIMEOUT_MS).await;
     }
 
-    // 后台静默跑一次 Go AIM 解锁探测（B，或 C 启动瞬间结果为空时）；
-    // 延迟数秒触发以等待内核状态迁移到 Running（start_probe 要求内核运行中）
-    let trigger_probe = pro_unlocked && (!go_aim_enabled || priority.is_empty());
+    // 后台静默跑一次 Go AIM 解锁探测；延迟数秒触发以等待内核状态迁移到
+    // Running（start_probe 要求内核运行中）。
+    // 【APP25 任务3】重启内核（保存回家配置 / 网络切换热重载）后必须
+    // 无条件重跑一次探测：旧逻辑仅在「AIM 未开启」或「优先池为空」时触发，
+    // 导致用户已有评级结果且开启 AIM 时，重启后仍沿用旧缓存锁定旧线路。
+    let trigger_probe = pro_unlocked;
     if trigger_probe {
         let probe_app = app_handle.clone();
         tauri::async_runtime::spawn(async move {
