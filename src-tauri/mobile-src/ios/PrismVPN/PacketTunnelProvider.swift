@@ -326,6 +326,50 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     return attached(PhysicalInterface(name: "en0", index: enIdx, hasRoutableIP: false))
 }
 
+/// 【APP31 任务1】零路由依赖的物理网卡名称获取：直接扫描 getifaddrs()
+/// 中拥有合法 IPv4 地址的 en0 或蜂窝 pdp_ip*，不受 utun 是否已启动影响。
+/// 用于给 go-lan-home / direct 出站与 route.default_interface 强制写入
+/// bind_interface，让外层 WireGuard UDP 100% 从 5G/Wi-Fi 天线直链发出，
+/// 绝不被 iOS 默认路由吸回 utun 送进海外 VLESS-WebSocket 节点
+///（log9.txt 第 37~42 行 ws closed: 1005 的根因）。
+private func findPhysicalInterfaceName() -> String {
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>? = nil
+    guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else { return "en0" }
+    defer { freeifaddrs(ifaddrPtr) }
+
+    var wifiName = ""
+    var cellularName = ""
+    var otherName = ""
+
+    var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+    while let ifa = ptr?.pointee {
+        defer { ptr = ifa.ifa_next }
+        let flags = Int32(ifa.ifa_flags)
+        guard (flags & IFF_UP) != 0, let addr = ifa.ifa_addr, Int32(addr.pointee.sa_family) == AF_INET else { continue }
+        let name = String(cString: ifa.ifa_name)
+        if name.hasPrefix("lo") || name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("ap") {
+            continue
+        }
+        var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { continue }
+        let ip = String(cString: buf)
+        if ip.hasPrefix("127.") || ip.hasPrefix("169.254.") || ip.hasPrefix("172.19.") { continue }
+
+        if name == "en0" {
+            wifiName = name
+        } else if name.hasPrefix("pdp_ip") && cellularName.isEmpty {
+            cellularName = name
+        } else if name.hasPrefix("en") && otherName.isEmpty {
+            otherName = name
+        }
+    }
+    if !wifiName.isEmpty { return wifiName }
+    if !cellularName.isEmpty { return cellularName }
+    if !otherName.isEmpty { return otherName }
+    return "pdp_ip0"
+}
+
 final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private enum TunnelState {
@@ -438,7 +482,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         let ts = Int(Date().timeIntervalSince1970)
-        let line = "\(ts) INFO [GoLan-Ext] 扩展已加载 go-lan-home -> server=\(server):\(port), local=\(local), 路由网段=[\(cidrs.joined(separator: ", "))]\n"
+        // 【APP31 任务1】日志必须带 bind_if，现场确认外层 UDP 是否锁定物理网卡
+        let bindIf = golan["bind_interface"] as? String ?? "-"
+        let line = "\(ts) INFO [GoLan-Ext] 扩展已加载 go-lan-home -> server=\(server):\(port), bind_if=\(bindIf), local=\(local), 路由网段=[\(cidrs.joined(separator: ", "))]\n"
         for dir in sharedDirURLs() {
             let url = dir.appendingPathComponent("vpn_trace.log")
             if let h = try? FileHandle(forWritingTo: url) {
@@ -785,7 +831,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 229ms 连通；加入自定义 NEIPv4Route 子网路由后（log7.txt）
         // 立刻超时——自定义子网路由会破坏 iOS 系统路由表优先级。
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        ipv4.excludedRoutes = []
+        // 【APP31 任务1】excludedRoutes 排除 WG 服务端公网 IP（/32）：
+        // 与 bind_interface + route.rules 顶部豁免构成三重直链锁定，
+        // 发往 14.105.65.122 的 UDP 包绝不进 utun。
+        var v4Excluded: [NEIPv4Route] = []
+        if let dir = activeWorkDir,
+           let wgServerRaw = try? String(contentsOf: dir.appendingPathComponent("golan_wg_server.txt"), encoding: .utf8) {
+            let wgServerIP = wgServerRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
+                v4Excluded.append(NEIPv4Route(destinationAddress: wgServerIP, subnetMask: "255.255.255.255"))
+            }
+        }
+        ipv4.excludedRoutes = v4Excluded
         settings.ipv4Settings = ipv4
 
         // 【APP30 任务1】删除 NEProxySettings：Safari 不再被系统 HTTP 代理
@@ -1167,6 +1224,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let cacheDBURL = workDir.appendingPathComponent("cache.db")
         try? FileManager.default.removeItem(at: cacheDBURL)
 
+        // 【APP31 任务1】物理网卡名以 getifaddrs 扫描为准（不受 utun 是否
+        // 已启动影响），go-lan-home / direct 的 bind_interface 与
+        // route.default_interface 全部以此为准。
+        let physIfName = findPhysicalInterfaceName()
+
         // 1. 修正 inbounds 中的 tun 配置
         if var inbounds = root["inbounds"] as? [[String: Any]] {
             for i in inbounds.indices {
@@ -1180,12 +1242,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // gVisor 向对端宣告 MSS 1240，彻底消除 MTU 1420 时
                     // 网页大包 + WG 头在蜂窝链路上被丢弃的问题。
                     inbounds[i]["mtu"] = 1280
-                    // 【APP26 任务1.1】tun-in 栈改为 "mixed"：gvisor 在等待
-                    // go-lan-home 建连期间不回 SYN-ACK，Safari 的 NWConnection
-                    // 重传/重置 → 内核报 `report handshake success:
-                    // connection refused`（log7.txt 第 44/45/69 行）。
-                    // "mixed" = TCP 走 system 栈（立即回 SYN-ACK）+ gvisor UDP。
-                    inbounds[i]["stack"] = "mixed"
+                    // 【APP31 任务1】tun-in 栈还原为 "gvisor"：外层 UDP 已由
+                    // bind_interface + wgServerIP/32→direct 双重锁定，gVisor
+                    // 纯内存转发支撑飞牛 App / 浏览器高并发 HTTP/HTTPS 连接。
+                    inbounds[i]["stack"] = "gvisor"
                     // 【APP10 任务2.1】tun-in 严禁 sniff=true：
                     // sniff 开启时 sing-box 会在 tun-in 收到发往
                     // 192.168.10.253:80 的包时先在本地伪造 TCP 握手
@@ -1210,15 +1270,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var hasDirectOutbound = false
         var firstSelectorTag: String? = nil
         var allRealProxyTags: [String] = []
+        // 【APP31 任务1】go-lan-home 服务端公网 IPv4（如 14.105.65.122），
+        // 用于 route.rules 顶部豁免规则与 excludedRoutes。
+        var wgServerIP = ""
 
         let proxyOutboundTypes: Set<String> = [
             "vless", "vmess", "trojan", "shadowsocks",
             "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        // 【APP30 任务1】物理网卡纯直链：go-lan-home 的外层 UDP 51821 与
-        // direct（系统组件直连）显式绑定当前活跃物理网卡（en0 / pdp_ip0），
-        // 其余出站仍由 iOS NECP 原生路由，并保留下面的字段清理。
+        // 【APP31 任务1】物理网卡纯直链：go-lan-home 的外层 UDP 51821 与
+        // direct 显式绑定 getifaddrs 扫描到的活跃物理网卡（en0 / pdp_ip0），
+        // 让 14.105.65.122:51821 的 UDP 包直接从手机天线飞往家里，
+        // 完全绕开 utun 虚拟网卡与海外 VLESS-WebSocket 节点。
         _ = phyIPv4
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
@@ -1229,10 +1293,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             outbounds[i].removeValue(forKey: "bind_interface")
             outbounds[i].removeValue(forKey: "inet4_bind_address")
             outbounds[i].removeValue(forKey: "routing_mark")
-            // 【APP30 任务1】只给 go-lan-home 与 direct 重新注入物理网卡绑定：
-            // 确保外层 WireGuard UDP 100% 从物理网卡直链发出（100% 纯直链）。
-            if !phyName.isEmpty, tag == "go-lan-home" || t == "direct" {
-                outbounds[i]["bind_interface"] = phyName
+            // 【APP31 任务1】只给 go-lan-home 与 direct 重新注入物理网卡绑定。
+            if !physIfName.isEmpty, tag == "go-lan-home" || t == "direct" {
+                outbounds[i]["bind_interface"] = physIfName
             }
             if t == "dns" {
                 dnsOutboundTag = tag.isEmpty ? "dns-out" : tag
@@ -1367,13 +1430,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // connect_timeout 5s，避免连不上的内网端口挂起 2m7s。
                     outbounds[i]["mtu"] = 1280
                     outbounds[i]["connect_timeout"] = "5s"
-                    // 【APP30 任务1】网卡绑定已在循环顶部按 phyName 统一注入，
-                    // 此处只做兜底清理 inet4_bind_address / routing_mark，
-                    // 保留 bind_interface 让外层 UDP 走物理网卡直链。
+                    // 【APP31 任务1】物理网卡硬绑定兜底清理 inet4_bind_address
+                    // / routing_mark，保留 bind_interface 让外层 UDP 直链。
                     outbounds[i].removeValue(forKey: "inet4_bind_address")
                     outbounds[i].removeValue(forKey: "routing_mark")
-                    if !phyName.isEmpty {
-                        outbounds[i]["bind_interface"] = phyName
+                    if !physIfName.isEmpty {
+                        outbounds[i]["bind_interface"] = physIfName
                     }
                 }
                 // iOS 关闭 IPv6 时双栈 UDP Socket 绑定 IPv4 网卡会被 EPERM 拒绝，
@@ -1411,6 +1473,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             outbounds[i]["server"] = ip
                         }
                     }
+                }
+                // 【APP31 任务1】记录 go-lan-home 服务端公网 IPv4（如
+                // 14.105.65.122），供 route.rules 顶部豁免规则与
+                // ipv4Settings.excludedRoutes 使用。
+                if tag == "go-lan-home" {
+                    wgServerIP = (outbounds[i]["server"] as? String) ?? ""
                 }
             } else if proxyOutboundTypes.contains(t) {
                 if !tag.isEmpty {
@@ -1656,15 +1724,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // 4. 修正 route
-        // 【APP30 任务1】显式写入 route.default_interface：物理网卡
-        // （en0 / pdp_ip0）在 setTunnelNetworkSettings 之前由
-        // findActivePhysicalInterface() 探测得到，go-lan-home 的外层
-        // UDP 51821 由此 100% 从物理网卡纯直链发出；
-        // auto_detect_interface 保持 false（iOS 无 netlink 实现）。
+        // 【APP31 任务1】显式写入 route.default_interface：物理网卡
+        // （en0 / pdp_ip0）由 findPhysicalInterfaceName() 通过 getifaddrs
+        // 直接扫描得到，go-lan-home 的外层 UDP 51821 由此 100% 从物理网卡
+        // 纯直链发出；auto_detect_interface 保持 false（iOS 无 netlink）。
         var route = (root["route"] as? [String: Any]) ?? [:]
         route["auto_detect_interface"] = false
-        if !phyName.isEmpty {
-            route["default_interface"] = phyName
+        if !physIfName.isEmpty {
+            route["default_interface"] = physIfName
         } else {
             route.removeValue(forKey: "default_interface")
         }
@@ -1691,7 +1758,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 rules[i]["ip_cidr"] = cidrs.map { cleanCIDR($0) }.filter { !$0.isEmpty }
             }
         }
-        if phyName.hasPrefix("en"), let localIP = localInterfaceIPv4(phyName) {
+        if physIfName.hasPrefix("en"), let localIP = localInterfaceIPv4(physIfName) {
             for i in rules.indices {
                 guard (rules[i]["outbound"] as? String) == "go-lan-home",
                       let cidrs = rules[i]["ip_cidr"] as? [String]
@@ -1714,6 +1781,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             return false
         }
+        // 【APP31 任务1】剔除 Rust 侧已注入的 wgServerIP/32 → direct 规则，
+        // 统一由下方按黄金顺序重建（aim-probe-in 之后、go-lan 网段之前）。
+        if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
+            let exemptCidr = "\(wgServerIP)/32"
+            rules.removeAll { rule in
+                (rule["outbound"] as? String) == "direct"
+                    && (rule["ip_cidr"] as? [String]) == [exemptCidr]
+            }
+        }
 
         // 【APP19 任务2】把最终生效的回家网段落盘为 sidecar，
         // 供 openTun 构造带 gatewayAddress="172.19.0.1" 的 includedRoutes
@@ -1731,6 +1807,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if let sidecarData = try? JSONSerialization.data(withJSONObject: goLanCidrs) {
             try? sidecarData.write(to: goLanSidecarURL)
         }
+        // 【APP31 任务1】WG 服务端公网 IPv4 落盘 sidecar，供 openTun 构造
+        // ipv4Settings.excludedRoutes（wgServerIP/32 不进 utun）。
+        let wgServerSidecarURL = workDir.appendingPathComponent("golan_wg_server.txt")
+        try? wgServerIP.write(to: wgServerSidecarURL, atomically: true, encoding: .utf8)
 
         let headRules: [[String: Any]] = [
             ["protocol": ["dns"], "outbound": finalDnsTag],
@@ -1767,18 +1847,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP19 任务3 / APP30 任务1】黄金优先级顺序（自上而下）：
-        // 1. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
-        //    严格排在 route.rules 首位，先于 clash_mode、ip_is_private、
-        //    protocol dns、port 53、853、DoH 与全部分流规则。
-        // 2. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
+        // 【APP31 任务1】黄金优先级顺序（自上而下）：
+        // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
         //    127.0.0.1:2083..2086 探针入站）
-        // 3. Go Lan 回家域名（domain_suffix → go-lan-home）
-        // 4. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
-        // 5. 私有地址直连（排除已被第 1 优先级命中的家庭网段）
-        // 6. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
-        var finalHead = goLanRules.filter { $0["ip_cidr"] != nil }
-        finalHead.append(contentsOf: aimProbeRules)
+        // 2. WG 服务端公网 IP 直连豁免（wgServerIP/32 → direct）：任何发往
+        //    家里 WireGuard 服务端的握手 / UDP 封装包 100% 强制走 direct，
+        //    绝不被路由进海外 VLESS-WebSocket 节点（log9.txt ws closed: 1005）
+        // 3. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
+        // 4. Go Lan 回家域名（domain_suffix → go-lan-home）
+        // 5. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
+        // 6. 私有地址直连（排除已被第 3 优先级命中的家庭网段）
+        // 7. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        var finalHead = aimProbeRules
+        if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
+            finalHead.append([
+                "ip_cidr": ["\(wgServerIP)/32"],
+                "outbound": "direct"
+            ])
+        }
+        finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] != nil })
         finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] == nil })
         finalHead.append(contentsOf: headRules)
         finalHead.append(["ip_is_private": true, "outbound": "direct"])

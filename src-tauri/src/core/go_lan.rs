@@ -930,16 +930,13 @@ async fn probe_raw_service(
     }
 }
 
-/// 【APP30 任务3】未指定端口时只并发探测 5 个 Web 端口（8000 / 8001 / 80
-/// / 443 / 5000），统一走 Clash API 单通道，单端口 2000ms。
-/// 严禁再向 TUN 并发轰炸 13~17 个端口：每条半开连接都会在 go-lan-home
-/// 内部挂起 2 分 07 秒（log8.txt 第 78~81 行 4 条
-/// `connect tcp ... operation timed out (2m7s)` 即由此产生）。
-/// 3389 不并入批量扫描，只在全部 Web 端口失败后单独做 1 次 RDP X.224
-/// 19 字节握手（见 probe_target_ports_inner）。
-const PROBE_DEFAULT_PORTS: [u16; 5] = [8000, 8001, 80, 443, 5000];
+/// 【APP31 任务3】未指定端口时并发探测 6 个 Web 端口（8000 / 8001 / 80
+/// / 443 / 5666 / 5000），每个端口走「Clash API 严格校验 + mixed 代理真实
+/// HTTP 状态码」双通道，单端口 2000ms。
+/// 3389 / 445 不并入批量扫描，只在全部 Web 端口失败后单独做协议握手兜底。
+const PROBE_DEFAULT_PORTS: [u16; 6] = [8000, 8001, 80, 443, 5666, 5000];
 
-/// 未指定端口时的整体探测窗口（5 个 Clash API 并发，单端口 2000ms）
+/// 未指定端口时的整体探测窗口（6 个端口并发，单端口 2000ms）
 const PROBE_WINDOW_MS: u64 = 2000;
 
 /// 显式端口（用户输入 `IP:端口`）时的 Clash API 单端口超时
@@ -989,8 +986,16 @@ async fn probe_clash_delay(
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
+                // 【APP31 任务3】严格校验：必须 HTTP 200，且 JSON 含
+                // delay > 0，且严禁携带 "message" 错误字段——
+                // log9.txt 中 :5000 / :8001 假阳性正是未校验 message
+                // 字段把内核错误响应当成了成功延迟。
                 if status == 200 {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if v.get("message").is_some() {
+                            last_err = format!("Clash API 返回错误字段: {}", &body[..body.len().min(120)]);
+                            continue;
+                        }
                         if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
                             if d > 0 {
                                 return Ok((
@@ -1009,10 +1014,58 @@ async fn probe_clash_delay(
     Err(last_err)
 }
 
-/// 【APP30 任务3】单端口探测调度：Clash API 是唯一通道。
-/// - Web / 任意显式端口 → 只发 1 次 Clash API delay（绝不裸 TCP 建连）；
-/// - Clash 失败且该端口属于原生协议（3389 RDP / 22 SSH / 445 SMB ...）
-///   → 才对这 1 个端口发起 1 次协议首包校验。
+/// 【APP31 任务3】经本地 mixed 代理（127.0.0.1:{mixed_port}）向内网目标
+/// 发起真实 HTTP/HTTPS GET 并校验响应状态码：
+/// 只有收到远端内网 Web 服务器返回的真实 HTTP 状态码
+/// （100 <= code < 500 或 code == 500，天然排除本地代理代答的 502/504）
+/// 才判定该端口真实可用，杜绝 Clash API 假阳性。
+async fn probe_http_port(
+    ip: &str,
+    port: u16,
+    path: &str,
+    mixed_port: u16,
+) -> Result<(String, u64), String> {
+    if mixed_port == 0 {
+        return Err("mixed 代理未就绪".to_string());
+    }
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{mixed_port}"))
+        .map_err(|e| format!("代理构建失败: {e}"))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(2500))
+        .build()
+        .map_err(|e| format!("探测客户端构建失败: {e}"))?;
+    let schemes: [&str; 2] = if matches!(port, 443 | 5001) {
+        ["https", "http"]
+    } else {
+        ["http", "https"]
+    };
+    let mut last_err = String::from("HTTP 探测超时");
+    for scheme in schemes {
+        let url = format!("{scheme}://{ip}:{port}{path}");
+        let start = std::time::Instant::now();
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                let ms = start.elapsed().as_millis().max(1) as u64;
+                if code >= 100 && code <= 500 {
+                    return Ok((format!("HTTP {code} 真实响应"), ms));
+                }
+                last_err = format!("本地代理代答 HTTP {code}（对端不可达）");
+            }
+            Err(e) => last_err = format!("代理 GET 失败: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+/// 【APP31 任务3】单端口探测调度：
+/// - Web 端口 → Clash API 严格校验 + mixed 代理真实 HTTP 状态码双通道并发，
+///   首个真实命中立即胜出；
+/// - 原生协议端口（3389 RDP / 445 SMB / 22 SSH ...）→ 协议首包握手校验。
 async fn probe_one_port(
     ip: &str,
     port: u16,
@@ -1022,20 +1075,42 @@ async fn probe_one_port(
     api_secret: &str,
     clash_timeout_ms: u64,
 ) -> Result<(String, u64), String> {
-    match probe_clash_delay(ip, port, path, api_addr, api_secret, clash_timeout_ms).await {
-        Ok(hit) => Ok(hit),
-        Err(e) => {
-            if is_raw_probe_port(port) {
-                return probe_raw_service(ip, port, mixed_port).await;
-            }
-            Err(e)
+    if is_raw_probe_port(port) {
+        return probe_raw_service(ip, port, mixed_port).await;
+    }
+    let mut tasks: tokio::task::JoinSet<Result<(String, u64), String>> =
+        tokio::task::JoinSet::new();
+    {
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
+        let api_owned = api_addr.to_string();
+        let secret_owned = api_secret.to_string();
+        tasks.spawn(async move {
+            probe_clash_delay(&ip_owned, port, &path_owned, &api_owned, &secret_owned, clash_timeout_ms)
+                .await
+        });
+    }
+    if mixed_port > 0 {
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
+        tasks.spawn(async move {
+            probe_http_port(&ip_owned, port, &path_owned, mixed_port).await
+        });
+    }
+    let mut last_err = String::from("端口探测超时");
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(hit)) => return Ok(hit),
+            Ok(Err(e)) => last_err = e,
+            Err(_) => continue,
         }
     }
+    Err(last_err)
 }
 
-/// 【APP30 任务3】并发探测一组端口：首个真实命中立即胜出。
-/// 每个探测任务内部只有 1 次 Clash API 请求（内核级超时），
-/// 绝不对 TUN 建立裸 TCP 半开连接。
+/// 【APP31 任务3】并发探测一组端口：首个真实命中立即胜出。
+/// 每个 Web 端口内部走「Clash API 严格校验 + mixed 代理真实 HTTP
+/// 状态码」双通道并发（内核级超时），绝不对 TUN 建立裸 TCP 半开连接。
 async fn probe_port_batch(
     ports: &[u16],
     ip: &str,
@@ -1076,9 +1151,9 @@ async fn probe_port_batch(
     Err(last_err)
 }
 
-/// 【APP30 任务3】探测入口：显式端口只测该端口（Clash API 2500ms）；
-/// 未指定则只并发测 5 个 Web 端口（8000 / 8001 / 80 / 443 / 5000，
-/// 单端口 2000ms）。
+/// 【APP31 任务3】探测入口：显式端口只测该端口（Clash API 2500ms）；
+/// 未指定则并发测 6 个 Web 端口（8000 / 8001 / 80 / 443 / 5666 / 5000，
+/// 单端口 2000ms），全部失败后 3389 RDP → 445 SMB 协议握手兜底。
 async fn probe_target_ports(
     ip: &str,
     explicit_port: Option<u16>,
@@ -1141,16 +1216,24 @@ async fn probe_target_ports_inner(
     {
         Ok(hit) => Ok(hit),
         Err(e) => {
-            // 【APP30 任务3】5 个 Web 端口全部无应答时唯一兜底：仅对
-            // 3389 发起 1 次 RDP X.224 19 字节握手，确认隧道本身是否通。
-            probe_raw_service(ip, 3389, mixed_port)
-                .await
-                .map(|(detail, latency_ms)| PortProbeHit {
+            // 【APP31 任务3】6 个 Web 端口全部无应答时的协议握手兜底：
+            // 先对 3389 发 RDP X.224 握手；失败再对 445 做 SMB 探测，
+            // 确认隧道本身是否通（两者均失败则返回原 Web 端口错误）。
+            match probe_raw_service(ip, 3389, mixed_port).await {
+                Ok((detail, latency_ms)) => Ok(PortProbeHit {
                     port: 3389,
                     detail,
                     latency_ms,
-                })
-                .map_err(|_| e)
+                }),
+                Err(_) => match probe_raw_service(ip, 445, mixed_port).await {
+                    Ok((detail, latency_ms)) => Ok(PortProbeHit {
+                        port: 445,
+                        detail,
+                        latency_ms,
+                    }),
+                    Err(_) => Err(e),
+                },
+            }
         }
     }
 }

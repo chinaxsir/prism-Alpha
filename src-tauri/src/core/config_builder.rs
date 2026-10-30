@@ -589,7 +589,17 @@ pub fn build(
     let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
     let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
     let mut go_lan_rules: Vec<Value> = Vec::new();
+    // 【APP31 任务2】WG 服务端公网 IP 直连豁免（全平台双保险）：任何发往
+    // WireGuard 服务端公网 IP 的外层 UDP / 握手包 100% 强制走 direct，
+    // 绝不进入海外 VLESS-WebSocket 节点（log9.txt 第 37~42 行
+    // `ws closed: 1005` 的根因）。
+    let mut wg_server_ip: Option<String> = None;
     if let Some(outbound) = lan_outbound {
+        if let Some(ip) = outbound["server"].as_str() {
+            if ip.parse::<std::net::Ipv4Addr>().is_ok() && !ip.starts_with("127.") {
+                wg_server_ip = Some(ip.to_string());
+            }
+        }
         outbounds.push(outbound);
         go_lan_rules = lan_rules;
         // 【APP6 任务1】[GoLan] 模块日志：路由网段注入状态
@@ -1032,14 +1042,12 @@ pub fn build(
             // 彻底消除 MTU 1420 时大包 + WG 头被丢弃（log8.txt 第 25 行）。
             "mtu": 1280,
             "auto_route": true,
-            // 【APP26 任务1.1】tun-in 栈改为 "mixed"：gvisor 在等待出站
-            // （go-lan-home）建连期间迟迟不回 SYN-ACK，iOS Safari 的
-            // NWConnection 会重传/重置，内核随即报
-            // `connection: report handshake success: connection refused`
-            // （log7.txt 第 44/45/69 行）。"mixed" = TCP 走 system 栈
-            // （立即回 SYN-ACK）、UDP 走 gvisor，既消除延迟握手报错，
-            // 又保留 gvisor 的 UDP NAT 会话能力。
-            "stack": "mixed",
+            // 【APP31 任务2】tun-in 栈还原为 "gvisor"：外层 UDP 已由
+            // bind_interface + wg_server_ip/32→direct 双重锁定走物理网卡，
+            // gVisor 纯内存转发可支撑飞牛 App / 浏览器 6~10 条并发
+            // HTTP/HTTPS 连接（"mixed" 的 system TCP 栈在扩展内与 utun
+            // 回环路径存在竞态）。
+            "stack": "gvisor",
             // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
             // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
             // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，
@@ -1227,8 +1235,19 @@ pub fn build(
     // 流量吞进海外节点或普通直连（log1.txt 实证 192.168.10.x 漏走节点）。
     // Android 上由下方 DNS 清洗在本数组前再插入两条 dns-out，最终顺序
     // 即「protocol dns → port 53 → go-lan-home → 其余」。
-    if !go_lan_rules.is_empty() {
-        for (i, rule) in go_lan_rules.into_iter().enumerate() {
+    // 【APP31 任务2】Go Lan 头部规则严格置顶（自上而下）：
+    // 1. wg_server_ip/32 → direct（WG 服务端公网 IP 直连豁免，先于一切）；
+    // 2. go-lan-home 回家网段 ip_cidr 与域名规则。
+    if !go_lan_rules.is_empty() || wg_server_ip.is_some() {
+        let mut head_rules: Vec<Value> = Vec::new();
+        if let Some(ip) = &wg_server_ip {
+            head_rules.push(json!({
+                "ip_cidr": [format!("{ip}/32")],
+                "outbound": "direct"
+            }));
+        }
+        head_rules.extend(go_lan_rules);
+        for (i, rule) in head_rules.into_iter().enumerate() {
             route_rules.insert(i, rule);
         }
     }
@@ -1249,8 +1268,25 @@ pub fn build(
         let go_lan_lead = route_rules
             .iter()
             .take_while(|r| {
-                r.get("outbound").and_then(|o| o.as_str())
-                    == Some(crate::core::go_lan::GO_LAN_TAG)
+                let ob = r.get("outbound").and_then(|o| o.as_str());
+                if ob == Some(crate::core::go_lan::GO_LAN_TAG) {
+                    return true;
+                }
+                // 【APP31 任务2】wg_server_ip/32 → direct 豁免规则与回家规则
+                // 同属头部区域，DNS 劫持必须排在其后。
+                if ob == Some("direct") {
+                    if let (Some(ip), Some(cidrs)) = (
+                        wg_server_ip.as_ref(),
+                        r.get("ip_cidr").and_then(|c| c.as_array()),
+                    ) {
+                        if cidrs.len() == 1
+                            && cidrs[0].as_str() == Some(format!("{ip}/32").as_str())
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
             })
             .count();
         let mut android_sanitized = Vec::with_capacity(route_rules.len() + 2);
@@ -1339,7 +1375,25 @@ pub fn build(
                 .iter()
                 .take_while(|r| {
                     let out = r.get("outbound").and_then(|o| o.as_str());
-                    out == Some("dns-out") || out == Some("go-lan-home")
+                    if out == Some("dns-out") || out == Some("go-lan-home") {
+                        return true;
+                    }
+                    // 【APP31 任务2】wg_server_ip/32 → direct 豁免规则同属
+                    // 头部区域，探针规则必须排在其后，否则豁免被挤到
+                    // aim-probe 之后（单测 go_lan_wireguard_outbound… 实证）。
+                    if out == Some("direct") {
+                        if let (Some(ip), Some(cidrs)) = (
+                            wg_server_ip.as_ref(),
+                            r.get("ip_cidr").and_then(|c| c.as_array()),
+                        ) {
+                            if cidrs.len() == 1
+                                && cidrs[0].as_str() == Some(format!("{ip}/32").as_str())
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    false
                 })
                 .count();
             for slot in 0..4 {
@@ -2948,14 +3002,25 @@ rules:
             "go-lan-home 严禁 inet4_bind_address（5G 蜂窝下 i/o timeout）"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
-        // 【APP17 任务5.1】回家规则必须置顶：先于 853/DoH 拦截、官网直连、
-        // block_quic 与 clash_mode/ip_is_private/订阅规则，否则 192.168.10.x
-        // 这类私有网段会被更靠前的规则吞进海外节点或普通直连。
+        // 【APP31 任务2】WG 服务端公网 IP 直连豁免规则必须严格位于
+        // route.rules 首位（10.0.0.1/32 → direct），go-lan 回家规则紧随其后，
+        // 先于 853/DoH 拦截、官网直连、block_quic 与 clash_mode/ip_is_private/
+        // 订阅规则，彻底杜绝外层 UDP 误入海外 VLESS 节点（log9.txt ws closed: 1005）。
+        assert_eq!(
+            rules[0]["ip_cidr"][0].as_str(),
+            Some("10.0.0.1/32"),
+            "route.rules 首位必须是 WG 服务端公网 IP /32 豁免"
+        );
+        assert_eq!(
+            rules[0]["outbound"].as_str(),
+            Some("direct"),
+            "WG 服务端豁免规则必须走 direct"
+        );
         let go_lan_first = rules
             .iter()
             .position(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
             .expect("go-lan 回家规则必须存在");
-        assert_eq!(go_lan_first, 0, "go-lan 回家规则必须位于 route.rules 首位");
+        assert_eq!(go_lan_first, 1, "go-lan 回家规则必须紧随 WG 服务端豁免规则");
         let cidrs: Vec<String> = rules
             .iter()
             .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
