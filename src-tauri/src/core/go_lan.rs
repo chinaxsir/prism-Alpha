@@ -1778,21 +1778,6 @@ fn network_of_v4(ip: std::net::Ipv4Addr, mask: u8) -> String {
     format!("{}/{mask}", std::net::Ipv4Addr::from(bits & net_mask))
 }
 
-/// 校验 CIDR 网段合法性
-pub(crate) fn is_valid_cidr(cidr: &str) -> bool {
-    let Some((ip, mask)) = cidr.split_once('/') else {
-        return false;
-    };
-    let Ok(mask) = mask.parse::<u8>() else {
-        return false;
-    };
-    if ip.contains(':') {
-        mask <= 128 && ip.parse::<std::net::Ipv6Addr>().is_ok()
-    } else {
-        mask <= 32 && ip.parse::<std::net::Ipv4Addr>().is_ok()
-    }
-}
-
 /// 合成回家路由规则（domain_suffix + ip_cidr → go-lan-home）。
 /// 这些规则必须插在 `geosite: private` / `ip_is_private -> direct` 之前。
 /// 【APP-10 任务1.2】自动将 WireGuard 虚拟子网（从 local_ip 推导 /24）

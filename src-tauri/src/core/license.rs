@@ -319,6 +319,8 @@ fn hardware_fingerprint() -> String {
     }
 }
 
+/// 主机名兜底（仅 Windows/Linux 及未知平台使用；iOS/Android/macOS 走各自分支）
+#[allow(dead_code)]
 fn hostname_fallback() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))

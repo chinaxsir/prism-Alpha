@@ -15,12 +15,15 @@
 //! - Android: VpnService.establish() 返回的 fd 传给内核 tun inbound
 //! - iOS:     NEPacketTunnelProvider，sing-box 以 Package 编译进扩展
 
-// run_cmd 仅在非 Windows 目标编译，Duration 随之门控
-#[cfg(not(target_os = "windows"))]
+// run_cmd 仅在 macOS/Linux 手动路由模式使用，Duration 随之门控
+// （APP27：移动端不编译该函数，避免 iOS 目标出现 unused 警告）
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+// Command 仅桌面手动路由/路由命令使用；移动端不编译（APP27 消除 unused 警告）
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use tokio::process::Command;
 
 /// TUN 网段固定使用 sing-box 默认 fake-tun 网段
@@ -136,7 +139,8 @@ impl TunGuard {
     }
 
     /// 回滚手动路由
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
+    // device 仅 Linux 分支消费（macOS/Windows 使用固定网段），允许未使用
+    #[allow(unused_variables)]
     async fn cleanup_routes(device: &str) -> Result<()> {
         #[cfg(windows)]
         {
@@ -238,7 +242,7 @@ async fn run_route(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),

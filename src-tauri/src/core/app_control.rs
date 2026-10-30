@@ -351,20 +351,30 @@ fn apple_device_info() -> (String, String) {
 unsafe fn sysctl_string(name: &[u8]) -> Option<String> {
     let mut size: libc::size_t = 0;
     let cname = std::ffi::CString::new(name).ok()?;
-    if libc::sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
-        != 0
-    {
+    // APP27：edition 2024 下 unsafe fn 内的 unsafe 调用也必须显式加 unsafe 块
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
         return None;
     }
     let mut buf = vec![0u8; size];
-    if libc::sysctlbyname(
-        cname.as_ptr(),
-        buf.as_mut_ptr() as *mut libc::c_void,
-        &mut size,
-        std::ptr::null_mut(),
-        0,
-    ) != 0
-    {
+    let rc2 = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc2 != 0 {
         return None;
     }
     buf.truncate(size.saturating_sub(1)); // 去掉结尾 NUL

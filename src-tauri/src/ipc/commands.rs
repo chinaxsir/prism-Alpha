@@ -11,7 +11,7 @@ use crate::core::kernel::{
     sanitize_kernel_error,
 };
 use crate::core::license::EntitlementStatus;
-use crate::core::state::{AppState, CoreStatus, OutboundMode, RunMode, UserSettings, is_port_free, pick_api_addr};
+use crate::core::state::{AppState, CoreStatus, OutboundMode, RunMode, UserSettings, pick_api_addr};
 
 /// 返回前端前的错误文本统一脱敏（抹除内核商标字样）
 fn sanitize_err(msg: &str) -> String {
@@ -168,7 +168,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         .map_err(|e| format!("创建内核工作目录失败: {}", e))?;
 
     // 读取全部启用订阅的 profile（多订阅模型；旧版单 profile.yaml 自动兼容）
-    let mut profiles = load_enabled_profiles(state);
+    let profiles = load_enabled_profiles(state);
     if profiles.is_empty() {
         // 空缓存兜底（ipa-8）：启用订阅存在但内容未拉取成功（云同步对账
         // 时网络抖动只建了保底记录）→ 启动前自动补拉一次，避免用户必须
@@ -190,7 +190,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
                     }
                 }
             }
-            profiles = load_enabled_profiles(state);
+            // 自动补拉后不再读取 profiles：下方直接返回错误提示
         }
         let has_records =
             !crate::core::store::load_subscriptions(&state.data_dir).is_empty();
@@ -216,7 +216,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         let listen_host = if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
-        if !is_port_free(listen_host, settings.mixed_port) {
+        if !crate::core::state::is_port_free(listen_host, settings.mixed_port) {
             return Err(format!(
                 "混合端口 {} 已被占用，请在“设置”中更换端口后重试",
                 settings.mixed_port
@@ -748,16 +748,19 @@ pub fn set_app_foreground(foreground: bool, state: State<'_, AppState>) {
 
 #[tauri::command]
 pub async fn set_mode(
-    mode: RunMode,
+    requested_mode: RunMode,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // iOS 强制 TUN 模式（build 149 方案）：不存在桌面端系统代理，
     // 前端若仍传 SystemProxy 一律归一为 Tun
     #[cfg(target_os = "ios")]
-    let mode = RunMode::Tun;
+    let mode = {
+        let _ = requested_mode;
+        RunMode::Tun
+    };
     #[cfg(not(target_os = "ios"))]
-    let mode = mode;
+    let mode = requested_mode;
     let prev = *state.mode.read();
     if prev == mode {
         return Ok(());

@@ -14,9 +14,9 @@
  *   8. Swift 冻结指令（严禁 as! / 命名元组类型声明 + gen 副本字节一致）
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, delimiter } from 'node:path';
 import { execSync } from 'node:child_process';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -536,6 +536,46 @@ for (const specRel of GEN_BYTE_PAIRS) {
 }
 
 // ============================================================
+// 检查 9：【APP27 任务3】四端 cargo check 编译门禁
+// 本地/CI 任何一次 error（如 E0133 / E0308）都必须立刻阻断提交：
+// 此前 Windows 上无法编译 iOS 专属代码，盲区里的错误只能在 CI 耗时
+// 编译阶段才暴露。
+// ============================================================
+console.log('\n--- 检查 9：Rust 编译门禁（cargo check）---');
+const cargoEnv = { ...process.env };
+if (process.platform !== 'darwin') {
+  // 非 macOS 本机没有 Xcode：借用仓库 fake-clang 桩工具链做 iOS 目标
+  // 类型检查（不链接）。桩目录可用 PRISM_FAKE_IOS_TOOLCHAIN 覆盖。
+  const shim = process.env.PRISM_FAKE_IOS_TOOLCHAIN || 'D:\\Prism\\fake-bin';
+  if (existsSync(shim)) {
+    // Windows 环境变量键名大小写不敏感：必须复用原有键（通常是 Path），
+    // 否则新增的 PATH 会覆盖掉系统 cargo 路径导致 "cargo 不是命令"
+    const pathKey =
+      Object.keys(cargoEnv).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    cargoEnv[pathKey] = `${shim}${delimiter}${cargoEnv[pathKey] ?? ''}`;
+    cargoEnv.SDKROOT = process.env.SDKROOT || 'D:\\Prism\\fake-sdk\\iPhoneOS.sdk';
+    cargoEnv.CC_aarch64_apple_ios = 'clang';
+    cargoEnv.CXX_aarch64_apple_ios = 'clang';
+    cargoEnv.AR_aarch64_apple_ios = 'ar';
+    cargoEnv.RANLIB_aarch64_apple_ios = 'ar';
+    console.log(`   （使用 iOS 桩工具链：${shim}）`);
+  } else {
+    console.log(`   （未找到 iOS 桩工具链 ${shim}，iOS check 可能因缺少 xcrun 失败）`);
+  }
+}
+function cargoCheck(label, target) {
+  const cmd = `cargo check --manifest-path src-tauri/Cargo.toml --lib${target ? ` --target ${target}` : ''}`;
+  try {
+    execSync(cmd, { cwd: ROOT, stdio: 'inherit', env: cargoEnv });
+    pass(`${label} cargo check 通过 ✓`);
+  } catch {
+    fail(`${label} cargo check 失败（存在编译错误，禁止提交）：${cmd}`);
+  }
+}
+cargoCheck('本机', '');
+cargoCheck('iOS（aarch64-apple-ios）', 'aarch64-apple-ios');
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
@@ -543,5 +583,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 8 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 9 项检查绿灯通过，iOS / Android 构建就绪！');
 }

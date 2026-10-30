@@ -431,6 +431,13 @@ jobs:
             src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift
           echo "✅ PacketTunnelProvider.swift typecheck passed"
 
+          # 【APP27 任务3.2】Swift 与 Rust iOS 目标双重编译器验真（前 15 秒）：
+          # iOS 专属 cfg 代码在 Windows/Linux 上无法编译，必须在此强制
+          # cargo check --target aarch64-apple-ios，绝不允许带病进入耗时
+          # 的 Go 内核编译与 Xcode Archive 阶段。
+          cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios --lib
+          echo "✅ Rust aarch64-apple-ios check passed"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:

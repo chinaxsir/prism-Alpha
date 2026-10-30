@@ -50,6 +50,9 @@ pub const EMBEDDED_VERSION: &str = "1.11.3";
 /// iOS 上内核运行于独立的 NEPacketTunnelProvider 扩展，回调由 Swift 注册，
 /// Rust 侧仅在启动隧道前用到 PrismKernelCheck。
 #[cfg(any(target_os = "ios", target_os = "android"))]
+// APP27：VPN 回调与 Start/Stop 符号仅 Android 使用；iOS 上保留同签名定义
+// 但不调用，允许 dead_code 以免 iOS 目标 check 出现警告。
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 mod mobile_ffi {
     use std::ffi::{CStr, CString};
     use std::os::raw::{c_char, c_int};
@@ -226,7 +229,6 @@ impl KernelHandle {
             // CREATE_NO_WINDOW 让内核进程不分配控制台，主进程保持 UI 干净。
             #[cfg(target_os = "windows")]
             {
-                use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
@@ -296,6 +298,8 @@ impl KernelHandle {
         }
 
         // 5. 订阅内核 WebSocket 数据流（traffic / connections / memory）
+        // （移动端会追加故障转移/掉线监控任务，桌面端不会 push，故条件允许）
+        #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(unused_mut))]
         let mut stream_tasks = super::events::spawn_all(
             &config.api_addr,
             &config.api_secret,
@@ -598,7 +602,6 @@ pub async fn check_config(
             .current_dir(work_dir);
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
         let output = cmd
@@ -648,7 +651,6 @@ pub async fn probe_version(binary: &std::path::Path) -> Option<String> {
         cmd.arg("version");
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
         let output = cmd.output().await.ok()?;

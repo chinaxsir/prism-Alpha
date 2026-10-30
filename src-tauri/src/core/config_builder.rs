@@ -314,6 +314,8 @@ pub(crate) struct ClashNode {
     #[serde(default, rename = "http-opts")]
     http_opts: Option<HttpOpts>,
     #[serde(default, rename = "h2-opts")]
+    // APP27：h2-opts 仅为完整保留 Clash 字段兼容性，当前版本不消费
+    #[allow(dead_code)]
     h2_opts: Option<H2Opts>,
 
     // ---- socks5 / http 节点鉴权 ----
@@ -373,6 +375,7 @@ struct HttpOpts {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct H2Opts {
     #[serde(default)]
     path: Option<String>,
@@ -382,6 +385,7 @@ struct H2Opts {
 
 /// proxy-provider 定义（仅 http 可由客户端拉取；file 依赖运行时目录，不支持）
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ProviderDef {
     #[serde(rename = "type")]
     kind: String,
@@ -397,6 +401,7 @@ struct ProviderPayload {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ClashGroup {
     name: String,
     #[serde(rename = "type")]
@@ -637,7 +642,7 @@ pub fn build(
     let mut node_tags: Vec<String> = Vec::new();
     for parsed in &parsed_list {
         let ParsedProfile {
-            name: sub_name,
+            name: _sub_name,
             profile,
             rename,
             provider_nodes,

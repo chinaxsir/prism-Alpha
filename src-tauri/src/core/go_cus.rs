@@ -564,7 +564,7 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
     let mut rule_buckets: Vec<(String, String, Vec<String>)> = Vec::new();
     let mut block_domains: Vec<String> = Vec::new();
 
-    let mut push_rule = |kind: &str, policy: &str, targets: Vec<String>, out: &mut CusCompiled| {
+    let push_rule = |kind: &str, policy: &str, targets: Vec<String>, out: &mut CusCompiled| {
         let matcher = match kind {
             "DOMAIN" => "domain",
             "DOMAIN-SUFFIX" => "domain_suffix",
