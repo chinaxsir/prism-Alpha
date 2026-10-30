@@ -146,6 +146,9 @@ pub fn run() {
             // 旧 appex，UI 显示未连接而实际仍在代理。
             #[cfg(target_os = "ios")]
             {
+                // 【APP26 任务3.1】尽早安装深色底锁定：窗口与 WKWebView 背景
+                // 固定 #0B0E14，消除上滑退后台缩成图标时的四角露白
+                platform::ios::ui_dark_init();
                 if platform::ios::upgrade_selfheal() {
                     tracing::info!("[upgrade] 检测到覆盖升级，已清理驻留的旧版扩展进程");
                 }

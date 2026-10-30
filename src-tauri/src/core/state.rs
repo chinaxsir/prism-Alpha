@@ -231,6 +231,10 @@ pub struct AppState {
     /// 节点页默认落在该组（GLOBAL 等虚拟组不在路由链路中，选择无效），
     /// 内核启动后自动对该组测速并切换至延迟最低的可用节点。
     pub main_selector: RwLock<Option<String>>,
+    /// 【APP26 任务2.3】用户是否手动点选过节点（仅 select_proxy 命令写入）。
+    /// None = 从未手动指定 → 未开启 Go AIM 时启动后自动选最低延迟节点；
+    /// Some = 用户已手动指定 → 自动优选不再覆盖用户选择
+    pub user_manually_selected_node: RwLock<Option<String>>,
     /// 当前 Pro 授权状态（启动时由 license 缓存恢复；后台校验后刷新）
     pub entitlement: RwLock<super::license::EntitlementStatus>,
     /// entitlement 的会话签名（防内存篡改：status 被改写后签名校验失败）
@@ -320,6 +324,7 @@ impl AppState {
             api_secret: RwLock::new(String::new()),
             kernel_version: RwLock::new(None),
             main_selector: RwLock::new(None),
+            user_manually_selected_node: RwLock::new(None),
             entitlement: RwLock::new(entitlement),
             entitlement_sign: RwLock::new(entitlement_sign),
             proxy_backup: RwLock::new(None),

@@ -1022,17 +1022,19 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP22 任务4.2】tun-in MTU 1280：入口 MTU 决定 TCP 向对端宣告的
-            // MSS（1280−40=1240），飞牛 NAS 回包不超过 1280 字节，加上 60 字节
-            // WireGuard 头部仅 1340 字节，100% 穿透 5G 蜂窝网络；旧值 9000
-            // 会让本端宣告超大 MSS，NAS 回满载包后被 gVisor 丢弃，
-            // 表现为 RDP 能连、飞牛网页 / SMB 文件块全部卡死。
-            "mtu": 1280,
+            // 【APP26 任务1.1】tun-in MTU 1400：入口 MTU 决定 TCP 向对端宣告的
+            // MSS（1400−40=1360），配合 go-lan-home 的 1420 隧道 MTU，
+            // 与家庭 WireGuard 服务端保持一致。
+            "mtu": 1400,
             "auto_route": true,
-            // 【APP22 任务2.1】tun-in 栈固定 gvisor：上一轮改用的 "system"
-            // 在 iOS 网络扩展沙盒中引发启动/关闭挂起（ERR7 code=12），
-            // 严禁在 iOS 上使用 system 栈。
-            "stack": "gvisor",
+            // 【APP26 任务1.1】tun-in 栈改为 "mixed"：gvisor 在等待出站
+            // （go-lan-home）建连期间迟迟不回 SYN-ACK，iOS Safari 的
+            // NWConnection 会重传/重置，内核随即报
+            // `connection: report handshake success: connection refused`
+            // （log7.txt 第 44/45/69 行）。"mixed" = TCP 走 system 栈
+            // （立即回 SYN-ACK）、UDP 走 gvisor，既消除延迟握手报错，
+            // 又保留 gvisor 的 UDP NAT 会话能力。
+            "stack": "mixed",
             // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
             // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
             // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，
@@ -2928,12 +2930,11 @@ rules:
             Some("10.8.0.2/24"),
             "单地址 local_address 必须统一 /24"
         );
-        // 【APP25 任务2.1】go-lan-home 写入内核的 MTU 必须锁定 1280
-        // （用户配置 1420 仅用于界面展示 / settings.json）
+        // 【APP26 任务1.1】go-lan-home 写入内核的 MTU 与家庭 WG 服务端一致 1420
         assert_eq!(
             wg["mtu"].as_u64(),
-            Some(1280),
-            "go-lan-home 写入内核的 MTU 必须为 1280"
+            Some(1420),
+            "go-lan-home 写入内核的 MTU 必须为 1420"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）

@@ -45,6 +45,8 @@ fn main() {
                 "_prism_ios_upgrade_selfheal",
                 "_prism_ios_get_device_id",
                 "_prism_ios_app_group_dir",
+                // APP26 任务3.1：退后台图标四角露白修复（深色底锁定）
+                "_prism_ios_ui_dark_init",
             ] {
                 println!("cargo:rustc-link-arg=-Wl,-U,{sym}");
             }

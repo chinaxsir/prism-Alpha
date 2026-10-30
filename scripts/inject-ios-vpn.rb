@@ -35,6 +35,18 @@ def lock_portrait(plist)
   system('/usr/bin/plutil', '-lint', plist, out: File::NULL, err: File::NULL)
 end
 
+# 【APP26 任务3.1】主 App 强制深色外观。
+# 防止 iOS SpringBoard 在浅色系统主题下为 App 切换动画生成白色快照底板，
+# 进而导致上滑退后台缩成桌面图标时四角露白。键可能已存在，必须先 Delete。
+def lock_dark_interface_style(plist)
+  pb = '/usr/libexec/PlistBuddy'
+  system(pb, '-c', 'Delete :UIUserInterfaceStyle', plist, out: File::NULL, err: File::NULL)
+  ok = system(pb, '-c', 'Add :UIUserInterfaceStyle string Dark',
+              plist, out: File::NULL, err: File::NULL)
+  puts "  [dark-style] UIUserInterfaceStyle => Dark (#{ok ? 'ok' : 'FAILED'})"
+  system('/usr/bin/plutil', '-lint', plist, out: File::NULL, err: File::NULL)
+end
+
 def inject
   project_path = Dir[File.join(GEN_APPLE, '*.xcodeproj')].first
   abort "[inject-ios-vpn] #{GEN_APPLE} 不存在，请先执行 npx tauri ios init" unless project_path
@@ -79,6 +91,8 @@ def inject
   # IPA-3 任务1：全终端强制竖屏，禁止随设备旋转横屏（移动端布局仅适配竖屏）。
   # iPhone 与 iPad 两个方向键都要覆盖，否则 iPad 横屏仍会旋转。
   lock_portrait(app_plist) if File.exist?(app_plist)
+  # APP26 任务3.1：强制深色外观，避免浅色主题下白底系统快照
+  lock_dark_interface_style(app_plist) if File.exist?(app_plist)
 
   # ---- 1. 拷贝扩展源文件 ----
   ext_dir = File.join(GEN_APPLE, EXT_NAME)

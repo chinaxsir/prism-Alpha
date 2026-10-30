@@ -38,20 +38,11 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP25 任务2.1】go-lan-home 出站**运行时 MTU 强制锁定 1280**。
-///
-/// log6.txt 铁证：MTU 1420 时 gVisor 协议栈向内网 Web 服务器宣告
-/// MSS = 1380，NAS / 路由器 / 内网服务回传的 1420 字节满载 HTTP/TLS 包
-/// 套上 60 字节 WireGuard UDP 头后达 1480 字节，在 5G 蜂窝 / 家宽 PPPoE
-/// 链路上被整包丢弃（PMTU 黑洞）——表现为 RDP 3389（16 字节小包）92ms
-/// 秒通，而飞牛 .253 / 路由器 .254 / 10.31.2.102 等 Web 端口 3000ms 超时。
-/// 而 log3.txt / log4.txt 中 MTU 1280 时 .253:8001（229ms）与
-/// .253:8080（360ms）均成功连通。1280 让内核向内网宣告 MSS = 1240，
-/// 所有回包不超过 1280 字节，套 WG 头仅 1340 字节，100% 穿透。
-///
-/// 注意：`settings.json` 与前端界面仍保存用户填写的 MTU（如 1420），
-/// 只在生成内核 JSON 时强制改写为 1280。
-pub const GO_LAN_RUNTIME_MTU: u32 = 1280;
+/// 【APP26 任务1.1】go-lan-home 出站隧道 MTU = 1420，与家庭 WireGuard
+/// 服务端保持一致（log7.txt 显示 1280 时 Web 端口仍全部失败，说明
+/// MTU 并非内网 Web 打不开的根因；真正的根因是 tun-in 的 gvisor 延迟
+/// 握手、缺失的 NEProxySettings 与被破坏的系统子网路由，均已在本轮修复）。
+pub const GO_LAN_RUNTIME_MTU: u32 = 1420;
 
 /// 历史常量：用户配置 MTU 的展示默认值（不再直接写入内核 JSON）
 pub const GO_LAN_MTU_FLOOR: u32 = 1280;
@@ -308,25 +299,82 @@ pub fn resolve_endpoint_host_to_ip(host: &str) -> String {
     if host.parse::<std::net::IpAddr>().is_ok() {
         return host.to_string();
     }
-    // 2. 系统原生解析（优先 IPv4）
-    if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 51820u16)) {
-        let mut v6: Option<String> = None;
-        for a in addrs.by_ref() {
-            match a {
-                std::net::SocketAddr::V4(v4) => return v4.ip().to_string(),
-                std::net::SocketAddr::V6(v6a) => {
-                    if v6.is_none() {
-                        v6 = Some(v6a.ip().to_string());
+    // 【APP26 任务2.2】命中缓存直接 0ms 返回：点击「启动」时 build_config
+    // 不再因 DoH/系统 DNS 阻塞数秒（log7.txt 启动耗时 9.8s 的主因之一）。
+    let key = host.to_ascii_lowercase();
+    if let Some(ip) = endpoint_cache_get(&key) {
+        return ip;
+    }
+    // 2. 未命中：系统原生解析，硬性限时 800ms（超时立即返回域名并在后台刷新）
+    if let Some(ip) = resolve_with_deadline(host, 800) {
+        endpoint_cache_put(&key, &ip);
+        return ip;
+    }
+    // 3. 超时：后台继续解析并回填缓存，本次先原样返回域名
+    //    （扩展侧 getaddrinfo + go-lan 剥离兜底仍会接管）。
+    let host_owned = host.to_string();
+    std::thread::spawn(move || {
+        if let Some(ip) = resolve_with_deadline(&host_owned, 5000) {
+            endpoint_cache_put(&host_owned.to_ascii_lowercase(), &ip);
+        }
+    });
+    host.to_string()
+}
+
+/// 【APP26 任务2.2】WireGuard Endpoint 域名 → IPv4 的进程内缓存。
+/// 首次解析命中后写入，后续 build_config 直接 0ms 取用。
+fn endpoint_ip_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn endpoint_cache_get(key: &str) -> Option<String> {
+    endpoint_ip_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(key).cloned())
+}
+
+fn endpoint_cache_put(key: &str, ip: &str) {
+    if let Ok(mut c) = endpoint_ip_cache().lock() {
+        c.insert(key.to_string(), ip.to_string());
+    }
+}
+
+/// 【APP26 任务2.2】限时域名解析：工作线程解析 + 通道超时，绝不阻塞调用方。
+fn resolve_with_deadline(host: &str, timeout_ms: u64) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    let host_owned = host.to_string();
+    std::thread::spawn(move || {
+        let mut result: Option<String> = None;
+        if let Ok(mut addrs) =
+            std::net::ToSocketAddrs::to_socket_addrs(&(host_owned.as_str(), 51820u16))
+        {
+            let mut v6: Option<String> = None;
+            for a in addrs.by_ref() {
+                match a {
+                    std::net::SocketAddr::V4(v4) => {
+                        result = Some(v4.ip().to_string());
+                        break;
+                    }
+                    std::net::SocketAddr::V6(v6a) => {
+                        if v6.is_none() {
+                            v6 = Some(v6a.ip().to_string());
+                        }
                     }
                 }
             }
+            if result.is_none() {
+                result = v6;
+            }
         }
-        if let Some(v6) = v6 {
-            return v6;
-        }
-    }
-    // 3. 失败，原样返回域名（扩展侧还有 getaddrinfo 预解析与 go-lan 剥离兜底）
-    host.to_string()
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms))
+        .ok()
+        .flatten()
 }
 
 /// 解析 `wireguard://`（含 `wg://`）分享链接 → WgManualConfig。
@@ -797,16 +845,14 @@ async fn probe_raw_service(
 
 /// 【APP18 任务3】HTTP / HTTPS 端口三条真实通道探测，任一成功即判定可达：
 /// 1) 本地 mixed 代理（127.0.0.1:{mixed_port}）转发真实 GET；
-/// 2) Clash API /proxies/go-lan-home/delay（HTTP 200 且 delay > 0）；
-/// 3) TUN 直连（App 进程自身流量已被 utun 默认路由接管）。
-/// 本地代理代答的 502 / 504 一律不算成功。
+/// 2) Clash API /proxies/go-lan-home/delay（见独立函数 probe_clash_delay）。
+/// 本地代理代答的 502 / 504 一律不算成功；APP26 已删除 TUN 直连通道
+/// （gvisor 会伪造 SYN-ACK，直连「成功」不能证明内网主机在线）。
 async fn probe_http_port(
     ip: &str,
     port: u16,
     path: &str,
     mixed_port: u16,
-    api_addr: &str,
-    api_secret: &str,
 ) -> Result<(String, u64), String> {
     let mut last_err = String::from("HTTP 探测超时");
     let schemes: [&str; 2] = if matches!(port, 443 | 5001) {
@@ -850,105 +896,92 @@ async fn probe_http_port(
         }
     }
 
-    // 通道 2：Clash API 直驱 go-lan-home 出站
-    if !api_addr.is_empty() {
-        let base = api_addr
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
-        if let Ok(client) = build(None) {
-            for scheme in schemes {
-                let target = format!("{scheme}://{ip}:{port}{path}");
-                let mut req = client
-                    .get(format!("http://{base}/proxies/go-lan-home/delay"))
-                    .query(&[("url", target.as_str()), ("timeout", "3000")]);
-                if !api_secret.is_empty() {
-                    req = req.bearer_auth(api_secret);
-                }
-                match req.send().await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let body = resp.text().await.unwrap_or_default();
-                        if status == 200 {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
-                                    if d > 0 {
-                                        return Ok((
-                                            "go-lan-home 实测延迟（Clash API）".to_string(),
-                                            d,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        last_err = format!("Clash API HTTP {status}");
-                    }
-                    Err(e) => last_err = format!("Clash API 请求失败: {e}"),
-                }
-            }
-        }
-    }
-
-    // 【APP25 任务2.3】已删除「通道 3：TUN 直连」——tun-in 的 gvisor 栈
-    // 会对目标主机伪造 SYN-ACK，直连「成功」并不能证明内网主机在线
-    // （历史「TUN直连:80 延迟 2502 ms」假阳性即由此产生）。内网理解
-    // 一律以 mixed-in / Clash API 的真实回包为准。
+    // 通道 2（Clash API 直驱 go-lan-home）已拆分到独立函数
+    // `probe_clash_delay`（APP26 任务1.2），与本地代理通道并发执行，
+    // 避免同一路径重复请求两次。
 
     Err(last_err)
 }
 
-/// 【APP25 任务2.3】分批探测：第一批「Web 服务 + 远程桌面」最常用端口。
-/// 单批窗口 1800ms，命中即返回；否则进入第二批，彻底避免一批 17 个
-/// 端口全部排队到 3000ms 才失败的「整批超时」假阴性。
-const PROBE_BATCH_1: [u16; 6] = [8000, 8001, 443, 80, 3389, 5666];
+/// 【APP26 任务1.2】未指定端口时只探测 5 个代表性端口——严禁向 TUN
+/// 一次性并发轰炸 13~17 个端口：每一条半开连接都会在 go-lan-home
+/// 内部挂起 2 分 07 秒（log7.txt 第 47~68 行 22 条
+/// `connect tcp ... operation timed out (2m7s)` 即由此产生）。
+const PROBE_DEFAULT_PORTS: [u16; 5] = [8000, 8001, 80, 443, 3389];
 
-/// 【APP25 任务2.3】第二批「WebDAV / SMB / SSH / 备用 Web」端口。
-const PROBE_BATCH_2: [u16; 7] = [8080, 5000, 5001, 5667, 445, 22, 8443];
+/// 未指定端口时的整体探测窗口（内核 Clash API 侧 2500ms 即回收连接）
+const PROBE_WINDOW_MS: u64 = 2500;
 
-/// 单批并发窗口：连接 + 最小握手 + 等首个响应字节的总耗时上限。
-const PROBE_BATCH_WINDOW_MS: u64 = 1800;
+/// 显式端口（用户输入 `IP:端口`）时的整体探测窗口
+const PROBE_EXPLICIT_WINDOW_MS: u64 = 3500;
 
-/// 【APP25 任务2.3】经 SOCKS5 单层流探测 Web 端口。
+/// 【APP26 任务1.2】Clash API 直驱 go-lan-home 出站延迟测试。
 ///
-/// 关键改进：不再走 reqwest（连接池 + 完整 HTTP 响应体，内网设备
-/// 不返回 body 时会一直等到超时）。这里一次 TCP 建连 + 一个最小
-/// `HEAD` 请求，读到首个响应字节即判定可达；SOCKS5 CONNECT 成功本身
-/// 就代表 go-lan-home 已在 WireGuard 隧道内与目标完成三次握手，
-/// 即使目标端口是 TLS（回二进制 alert）或直接关闭连接，也说明端口真实开放。
-async fn probe_web_port_via_stream(
+/// 与本地 HTTP 代理探测的本质区别：请求由 sing-box 内核的 ctx 承载，
+/// `timeout` 到期立即由内核 Close() 并销毁底层连接，绝不会在
+/// go-lan-home 内部残留半开连接（这是 log7.txt 中 2m7s 超时错误的根因）。
+async fn probe_clash_delay(
     ip: &str,
     port: u16,
     path: &str,
-    mixed_port: u16,
+    api_addr: &str,
+    api_secret: &str,
+    timeout_ms: u64,
 ) -> Result<(String, u64), String> {
-    use std::time::{Duration, Instant};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let start = Instant::now();
-    let mut stream = open_probe_stream(ip, port, mixed_port).await?;
-
-    let req = format!(
-        "HEAD {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: PrismProbe/1.0\r\nConnection: close\r\n\r\n",
-        path, ip
-    );
-    let _ = stream.write_all(req.as_bytes()).await;
-
-    let mut buf = [0u8; 64];
-    let read = tokio::time::timeout(Duration::from_millis(1200), stream.read(&mut buf)).await;
-    let ms = start.elapsed().as_millis().max(1) as u64;
-    match read {
-        Ok(Ok(n)) if n > 0 => {
-            // 首包可能是 HTTP 状态行，也可能是 TLS 二进制告警 —— 均为真实回包
-            Ok((format!("TCP 建连 + 服务响应（首包 {n} 字节）"), ms))
-        }
-        Ok(Err(_)) => Ok(("TCP 建连成功（端口开放，对端已关闭连接）".to_string(), ms)),
-        Ok(Ok(_)) => Ok(("TCP 建连成功（端口开放）".to_string(), ms)),
-        Err(_) => Ok(("TCP 建连成功（端口开放，未回 HTTP 头）".to_string(), ms)),
+    if api_addr.is_empty() {
+        return Err("Clash API 未就绪".to_string());
     }
+    let base = api_addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let schemes: [&str; 2] = if matches!(port, 443 | 5001) {
+        ["https", "http"]
+    } else {
+        ["http", "https"]
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_millis(800))
+        .timeout(std::time::Duration::from_millis(timeout_ms + 300))
+        .build()
+        .map_err(|e| format!("Clash 探测客户端构建失败: {e}"))?;
+    let mut last_err = String::from("Clash API 探测超时");
+    for scheme in schemes {
+        let target = format!("{scheme}://{ip}:{port}{path}");
+        let mut req = client
+            .get(format!("http://{base}/proxies/go-lan-home/delay"))
+            .query(&[("url", target.as_str()), ("timeout", &timeout_ms.to_string())]);
+        if !api_secret.is_empty() {
+            req = req.bearer_auth(api_secret);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                if status == 200 {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
+                            if d > 0 {
+                                return Ok((
+                                    "go-lan-home 实测延迟（Clash API）".to_string(),
+                                    d,
+                                ));
+                            }
+                        }
+                    }
+                }
+                last_err = format!("Clash API HTTP {status}");
+            }
+            Err(e) => last_err = format!("Clash API 请求失败: {e}"),
+        }
+    }
+    Err(last_err)
 }
 
-/// 【APP25 任务2.3】单端口探测调度：原始协议端口走协议首包校验，
-/// 其余 Web 端口优先走 SOCKS5 单层流，失败再回落 HTTP/Clash 三通道。
+/// 【APP26 任务1.2】单端口探测调度：
+/// - 原始协议端口（3389 RDP / 22 SSH / 445 SMB ...）→ 经 mixed-in 的协议首包校验；
+/// - Web 端口 → 本地 mixed 代理 HTTP（真实状态码）+ Clash API 双通道并发。
 async fn probe_one_port(
     ip: &str,
     port: u16,
@@ -956,23 +989,43 @@ async fn probe_one_port(
     mixed_port: u16,
     api_addr: &str,
     api_secret: &str,
+    clash_timeout_ms: u64,
 ) -> Result<(String, u64), String> {
     if is_raw_probe_port(port) {
         return probe_raw_service(ip, port, mixed_port).await;
     }
-    match probe_web_port_via_stream(ip, port, path, mixed_port).await {
-        Ok(hit) => Ok(hit),
-        Err(stream_err) => {
-            // mixed 入站未就绪（旧配置 / 内核未起）时保留历史三通道兜底
-            probe_http_port(ip, port, path, mixed_port, api_addr, api_secret)
+    let mut tasks: tokio::task::JoinSet<Result<(String, u64), String>> =
+        tokio::task::JoinSet::new();
+    {
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
+        let api_owned = api_addr.to_string();
+        let secret_owned = api_secret.to_string();
+        tasks.spawn(async move {
+            probe_clash_delay(&ip_owned, port, &path_owned, &api_owned, &secret_owned, clash_timeout_ms)
                 .await
-                .map_err(|_| stream_err)
+        });
+    }
+    if mixed_port > 0 {
+        let ip_owned = ip.to_string();
+        let path_owned = path.to_string();
+        tasks.spawn(async move {
+            probe_http_port(&ip_owned, port, &path_owned, mixed_port).await
+        });
+    }
+    let mut last_err = String::from("端口探测超时");
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(hit)) => return Ok(hit),
+            Ok(Err(e)) => last_err = e,
+            Err(_) => continue,
         }
     }
+    Err(last_err)
 }
 
-/// 【APP25 任务2.3】单批端口并发探测：JoinSet 并发 + 独立 1800ms 窗口，
-/// 首个真实命中立即胜出。
+/// 【APP26 任务1.2】并发探测一组端口：首个真实命中立即胜出。
+/// 每个探测任务内部都有独立的 2500ms 内核级超时，绝不会残留半开连接。
 async fn probe_port_batch(
     ports: &[u16],
     ip: &str,
@@ -980,6 +1033,7 @@ async fn probe_port_batch(
     mixed_port: u16,
     api_addr: &str,
     api_secret: &str,
+    clash_timeout_ms: u64,
 ) -> Result<PortProbeHit, String> {
     let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
         tokio::task::JoinSet::new();
@@ -989,31 +1043,31 @@ async fn probe_port_batch(
         let api_owned = api_addr.to_string();
         let secret_owned = api_secret.to_string();
         tasks.spawn(async move {
-            let res = probe_one_port(&ip_owned, p, &path_owned, mixed_port, &api_owned, &secret_owned).await;
+            let res =
+                probe_one_port(&ip_owned, p, &path_owned, mixed_port, &api_owned, &secret_owned, clash_timeout_ms)
+                    .await;
             (p, res)
         });
     }
-    let window = tokio::time::sleep(std::time::Duration::from_millis(PROBE_BATCH_WINDOW_MS));
-    tokio::pin!(window);
-    loop {
-        tokio::select! {
-            _ = &mut window => return Err("本批端口在探测窗口内无应答".to_string()),
-            joined = tasks.join_next() => {
-                match joined {
-                    Some(Ok((p, Ok((detail, latency_ms))))) => {
-                        return Ok(PortProbeHit { port: p, detail, latency_ms });
-                    }
-                    Some(Ok((_, Err(_)))) | Some(Err(_)) => continue,
-                    None => return Err("本批端口全部不可达".to_string()),
-                }
+    let mut last_err = String::from("本批端口全部不可达");
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((p, Ok((detail, latency_ms)))) => {
+                return Ok(PortProbeHit {
+                    port: p,
+                    detail,
+                    latency_ms,
+                })
             }
+            Ok((_, Err(e))) => last_err = e,
+            Err(_) => continue,
         }
     }
+    Err(last_err)
 }
 
-/// 【APP25 任务2.3】按批次并发探测：显式端口只测该端口（窗口 2000ms）；
-/// 未指定则先测第一批，无命中再测第二批。两批独立窗口，任意端口
-/// 率先返回有效响应立即胜出并取消其余任务。
+/// 【APP26 任务1.2】探测入口：显式端口只测该端口；未指定则只测
+/// 5 个代表性端口（8000 / 8001 / 80 / 443 / 3389），整体窗口 2500ms。
 async fn probe_target_ports(
     ip: &str,
     explicit_port: Option<u16>,
@@ -1022,7 +1076,11 @@ async fn probe_target_ports(
     api_addr: &str,
     api_secret: &str,
 ) -> Result<PortProbeHit, String> {
-    let total_ms = if explicit_port.is_some() { 2000 } else { 4000 };
+    let total_ms = if explicit_port.is_some() {
+        PROBE_EXPLICIT_WINDOW_MS
+    } else {
+        PROBE_WINDOW_MS
+    };
     match tokio::time::timeout(
         std::time::Duration::from_millis(total_ms),
         probe_target_ports_inner(ip, explicit_port, path, mixed_port, api_addr, api_secret),
@@ -1044,21 +1102,23 @@ async fn probe_target_ports_inner(
 ) -> Result<PortProbeHit, String> {
     if let Some(p) = explicit_port {
         let (detail, latency_ms) =
-            probe_one_port(ip, p, path, mixed_port, api_addr, api_secret).await?;
+            probe_one_port(ip, p, path, mixed_port, api_addr, api_secret, PROBE_WINDOW_MS).await?;
         return Ok(PortProbeHit {
             port: p,
             detail,
             latency_ms,
         });
     }
-    let mut last_err = String::from("隧道探测超时");
-    for batch in [PROBE_BATCH_1.as_slice(), PROBE_BATCH_2.as_slice()] {
-        match probe_port_batch(batch, ip, path, mixed_port, api_addr, api_secret).await {
-            Ok(hit) => return Ok(hit),
-            Err(e) => last_err = e,
-        }
-    }
-    Err(last_err)
+    probe_port_batch(
+        &PROBE_DEFAULT_PORTS,
+        ip,
+        path,
+        mixed_port,
+        api_addr,
+        api_secret,
+        PROBE_WINDOW_MS,
+    )
+    .await
 }
 
 /// 【APP15 任务2】解析用户输入的检测目标，支持纯 IP、`IP:Port` 与
@@ -1370,12 +1430,15 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
             None => {}
         }
     }
-    // 【APP25 任务2.1】内核 JSON 的 go-lan-home MTU 强制 1280：
-    // 用户配置值（通常 1420）仅用于界面展示与 settings.json，
-    // 传给内核必须锁定 1280，向内网宣告 MSS = 1240，彻底消除
-    // Web 满载包在 5G / PPPoE 链路上的 PMTU 黑洞（log6.txt 根因）。
+    // 【APP26 任务1.1】内核 JSON 的 go-lan-home MTU 统一 1420（对齐家庭
+    // WireGuard 服务端），并附加 connect_timeout 5s：连不上的内网端口
+    // 由内核在 5 秒内主动回收，绝不再出现 log7.txt 的
+    // `connect tcp ... operation timed out (2m7s)`。
     let mtu = GO_LAN_RUNTIME_MTU;
     outbound["mtu"] = json!(mtu);
+    // 【APP26 任务1.2】内网端口连不上时由内核 5 秒内主动回收连接，
+    // 杜绝 2 分 07 秒半开挂起堵死整条隧道。
+    outbound["connect_timeout"] = json!("5s");
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(
@@ -2082,18 +2145,23 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
-        // 【APP25 任务2.1】内核 JSON 的 MTU 必须强制 1280（用户配置仅展示用）
+        // 【APP26 任务1.1】内核 JSON 的 MTU 统一为 GO_LAN_RUNTIME_MTU（1420）
         assert_eq!(
             ob["mtu"].as_u64(),
             Some(GO_LAN_RUNTIME_MTU as u64),
-            "go-lan-home 写入内核的 MTU 必须锁定 1280"
+            "go-lan-home 写入内核的 MTU 必须为 1420"
+        );
+        assert_eq!(
+            ob["connect_timeout"].as_str(),
+            Some("5s"),
+            "go-lan-home 必须设置 connect_timeout 5s，避免半开连接挂起 2m7s"
         );
     }
 
-    /// 【APP25 任务2.1】无论用户配置多少（1420 / 1500 / 存量 1280），
-    /// 写入内核 JSON 的 go-lan-home MTU 一律强制 1280，消除 PMTU 黑洞。
+    /// 【APP26 任务1.1】无论用户配置多少（1280 / 1400 / 1500 / 9000），
+    /// 写入内核 JSON 的 go-lan-home MTU 一律统一为 1420。
     #[test]
-    fn test_wg_runtime_mtu_forced_1280() {
+    fn test_wg_runtime_mtu_unified_1420() {
         let make = |mtu: u32| GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -2113,7 +2181,7 @@ mod tests {
             assert_eq!(
                 ob["mtu"].as_u64(),
                 Some(GO_LAN_RUNTIME_MTU as u64),
-                "用户配置 MTU {mtu} 必须强制改写为 1280"
+                "用户配置 MTU {mtu} 必须统一改写为 1420"
             );
         }
     }

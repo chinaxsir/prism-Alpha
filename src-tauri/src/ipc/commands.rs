@@ -78,7 +78,10 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
         .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 启动后自动测速并切换到延迟最低的可用节点（用户随后仍可手动改选）
-    if let Some(group) = state.main_selector.read().clone() {
+    // 【APP26 任务2.3】仅当未开启 Go AIM 且用户从未手动点选节点时才自动优选
+    if should_auto_select(state)
+        && let Some(group) = state.main_selector.read().clone()
+    {
         spawn_auto_select(
             app.clone(),
             state.api_addr.read().clone(),
@@ -486,8 +489,11 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
         .transition(CoreStatus::Running)
         .map_err(|e| sanitize_err(&e.to_string()))?;
 
-    // 与 start_core 一致：重启后自动测速选点
-    if let Some(group) = state.main_selector.read().clone() {
+    // 与 start_core 一致：重启后自动测速选点（APP26：同样受 Go AIM /
+    // 用户手动选点条件约束）
+    if should_auto_select(state)
+        && let Some(group) = state.main_selector.read().clone()
+    {
         spawn_auto_select(
             app.clone(),
             state.api_addr.read().clone(),
@@ -517,10 +523,30 @@ async fn resolve_main_selector(api: &KernelApi, final_group: &str) -> Option<Str
     }
 }
 
+/// 【APP26 任务2.3】是否应执行「自动选最低延迟节点」：
+/// 仅当 Go AIM 未开启、且用户从未手动点选节点时成立（用户选择优先）。
+fn should_auto_select(state: &AppState) -> bool {
+    if state.settings.read().go_aim_enabled {
+        return false;
+    }
+    state.user_manually_selected_node.read().is_none()
+}
+
 /// 后台任务：对主选择组整组测速，自动切换到延迟最低的可用叶子节点
 fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group: String) {
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter as _;
+        // 【APP26 任务2.3 时机2】启动成功后延迟 800ms 再整组测速：给内核
+        // Clash API 与代理连接留出就绪时间，测速结果更准确
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // 等待期间用户手动点选节点或开启了 Go AIM → 尊重用户，不覆盖
+        {
+            let st = app.state::<AppState>();
+            if !should_auto_select(&st) {
+                tracing::info!("auto select skipped: Go AIM 已开启或用户已手动选点");
+                return;
+            }
+        }
         let api = KernelApi::new(&api_addr, &api_secret);
         match auto_select_fastest(&api, &group).await {
             Ok(Some(best)) => {
@@ -819,6 +845,9 @@ pub async fn select_proxy(
     if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
         return Err(format!("「{name}」是内置功能出站，不能作为代理节点选中"));
     }
+    // 【APP26 任务2.3】记录「用户已手动选点」：此后启动 / 关闭 Go AIM 时的
+    // 自动最低延迟优选不再覆盖用户的选择
+    *state.user_manually_selected_node.write() = Some(name.clone());
     // 【APP11 任务4.3】用户手动切换节点时，若 Go AIM 正在探测，立即发出
     // 中止信号：避免探测继续消耗探针槽位、干扰内核日志，并被随后的
     // 自动锁定覆盖掉用户刚选的节点。
@@ -2183,6 +2212,19 @@ pub async fn set_go_aim_enabled(
     if !enabled {
         *state.aim_locked_node.write() = None;
         let _ = app.emit(crate::core::go_aim::AIM_EVENT, serde_json::json!({ "locked": null }));
+        // 【APP26 任务2.3 时机3】关闭 Go AIM 且用户未手动点选节点 →
+        // 自动回退到实测延迟最低的节点
+        if *state.status.read() == CoreStatus::Running
+            && should_auto_select(&state)
+            && let Some(group) = state.main_selector.read().clone()
+        {
+            spawn_auto_select(
+                app.clone(),
+                state.api_addr.read().clone(),
+                state.api_secret.read().clone(),
+                group,
+            );
+        }
     }
     // 【APP-11 任务3】广播权威设置，仪表盘/代理页/设置页开关实时同步
     let _ = app.emit(

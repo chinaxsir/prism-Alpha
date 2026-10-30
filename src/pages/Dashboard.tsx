@@ -226,6 +226,36 @@ export default function Dashboard() {
     };
   }, []);
 
+  // 【APP26 任务2.2】启动期间 250ms 快速轮询：iOS 隧道通常约 1.5s 建好，
+  // 若后端状态事件滞后，界面也能立即切到「已连接」，不必等默认轮询周期
+  useEffect(() => {
+    if (status !== "starting") return;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      getCoreStatus()
+        .then((data) => {
+          if (stopped || data.status === "starting") return;
+          const store = useCoreStore.getState();
+          store.setStatus(data.status);
+          store.setMode(data.mode);
+          store.setUptime(data.uptimeSecs);
+          store.syncStartedAt({
+            status: data.status,
+            uptimeSecs: data.uptimeSecs,
+            startedAtMs: data.startedAtMs,
+          });
+          if (data.outboundMode) store.setOutboundMode(data.outboundMode);
+          stopped = true;
+          window.clearInterval(timer);
+        })
+        .catch(() => undefined);
+    }, 250);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [status]);
+
   // 实时展示的已连接秒数：固定公式 nowMs - startedAtMs 差值（IPA-12）；
   // 基准尚未就绪时回退 store 内 uptimeSecs（启动事件与首次拉取的间隙）
   const displayUptimeSecs = running
@@ -454,7 +484,7 @@ export default function Dashboard() {
               {running
                 ? t("status.connected")
                 : status === "starting"
-                  ? t("status.connecting")
+                  ? t("status.starting")
                   : status === "error"
                     ? t("status.startFailed")
                     : t("status.disconnected")}
