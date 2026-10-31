@@ -826,11 +826,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        // 【APP26 任务1.1】includedRoutes 固定为纯净的默认路由。
+        // 【APP26 任务1.1】includedRoutes 以纯净的默认路由为首。
         // log3.txt 实测：仅 [NEIPv4Route.default()] 时 192.168.10.253:8001
         // 229ms 连通；加入自定义 NEIPv4Route 子网路由后（log7.txt）
         // 立刻超时——自定义子网路由会破坏 iOS 系统路由表优先级。
-        ipv4.includedRoutes = [NEIPv4Route.default()]
+        // 【APP32 任务2.3】在 default() 之后追加回家内网网段路由
+        // （严禁设置 gatewayAddress，保持 nil）：default() 已覆盖全量流量，
+        // 追加更具体的内网网段是双保险，确保 Safari / WebKit 在任意
+        // Wi-Fi / 5G 下访问 192.168.10.253:8000/8001 时系统内核 100%
+        // 把数据包送入 utun；/24 网段额外拆分两条 /25 路由。
+        var v4Included: [NEIPv4Route] = [NEIPv4Route.default()]
+        if let dir = activeWorkDir,
+           let routesData = try? Data(contentsOf: dir.appendingPathComponent("golan_routes.json")),
+           let goLanCidrs = try? JSONSerialization.jsonObject(with: routesData) as? [String] {
+            for cidrStr in goLanCidrs {
+                guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
+                v4Included.append(NEIPv4Route(destinationAddress: parsed.networkAddress, subnetMask: parsed.subnetMask))
+                if parsed.prefix == 24 {
+                    v4Included.append(NEIPv4Route(destinationAddress: parsed.networkAddress, subnetMask: "255.255.255.128"))
+                    let highNet = parsed.net | 128
+                    v4Included.append(NEIPv4Route(destinationAddress: ipv4String(highNet), subnetMask: "255.255.255.128"))
+                }
+            }
+        }
+        ipv4.includedRoutes = v4Included
         // 【APP31 任务1】excludedRoutes 排除 WG 服务端公网 IP（/32）：
         // 与 bind_interface + route.rules 顶部豁免构成三重直链锁定，
         // 发往 14.105.65.122 的 UDP 包绝不进 utun。

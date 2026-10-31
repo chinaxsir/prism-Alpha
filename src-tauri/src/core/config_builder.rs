@@ -57,6 +57,99 @@ pub fn is_builtin_non_proxy_tag(tag: &str) -> bool {
     ) || t.to_ascii_uppercase().starts_with("GO-AIM-PROBE")
 }
 
+/// 【APP32 任务1.1】非正常节点（机场信息展示/广告类假节点）名称黑名单。
+/// 机场订阅常在节点列表顶部插入「剩余流量」「套餐到期」「官网」等条目，
+/// 其参数为非法占位值（port 0/1、127.0.0.1、非法 UUID），一旦被写入
+/// outbounds 或被默认选中，sing-box 在 decode config 阶段直接拒绝启动。
+const DUMMY_NODE_KEYWORDS: &[&str] = &[
+    "剩余流量", "流量剩余", "已用流量", "总流量", "套餐流量", "今日流量", "可用流量",
+    "到期时间", "套餐到期", "到期日", "过期时间", "有效期", "剩余天数",
+    "重置时间", "下次重置", "流量重置", "重置日", "距离下次重置",
+    "官网", "官方网址", "网址", "地址发布", "发布页", "最新地址", "备用地址", "防失联",
+    "群组", "官方群", "电报群", "tg群", "频道", "客服", "工单",
+    "公告", "通知", "说明", "提示", "教程", "使用必读", "必看",
+    "优惠", "折扣", "续费", "购买", "订阅套餐", "邀请好友", "返利", "推广",
+    "请更新", "更新订阅", "节点故障", "维护中", "过期请",
+    "http://", "https://", "www.", "t.me/",
+];
+
+/// 【APP32 任务1.1】节点合法性校验：名称黑名单 + 服务器/端口 + 协议关键
+/// 凭证三重过滤。订阅解析、provider 缓存加载、落盘校验统一调用，
+/// 从源头剔除会把 sing-box 配置校验搞崩的假节点。
+pub(crate) fn is_valid_usable_proxy_node(node: &ClashNode) -> bool {
+    // 1. 名称黑名单（剔除信息展示类与广告类假节点）
+    let name_lower = node.name.trim().to_lowercase();
+    if name_lower.is_empty() {
+        return false;
+    }
+    if DUMMY_NODE_KEYWORDS.iter().any(|k| name_lower.contains(k)) {
+        return false;
+    }
+    // 2. 服务器地址与端口合法性
+    let server = node.server.trim().to_lowercase();
+    if server.is_empty()
+        || matches!(
+            server.as_str(),
+            "127.0.0.1" | "0.0.0.0" | "localhost" | "::1" | "1.1.1.1" | "8.8.8.8" | "example.com"
+        )
+        || server.starts_with("127.")
+        || server.contains(' ')
+        || server.contains('/')
+        || server.contains("http:")
+        || server.contains("https:")
+        || !server.is_ascii()
+    {
+        return false;
+    }
+    if node.port <= 1 {
+        return false;
+    }
+    // 3. 协议关键凭证合法性（防止 sing-box decode config 崩溃）
+    match node.kind.to_lowercase().as_str() {
+        "vless" | "vmess" => {
+            let uuid = node.uuid.as_deref().unwrap_or("").trim();
+            let shape_ok = (32..=36).contains(&uuid.len())
+                && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            // 全 0 的占位 UUID 同样非法
+            let all_zero = !uuid.is_empty() && uuid.chars().all(|c| c == '0' || c == '-');
+            if !shape_ok || all_zero {
+                return false;
+            }
+        }
+        "ss" | "shadowsocks" => {
+            if node.password.as_deref().unwrap_or("").trim().is_empty() {
+                return false;
+            }
+            const SS_CIPHERS: &[&str] = &[
+                "aes-128-gcm", "aes-256-gcm", "aes-128-cfb", "aes-192-cfb",
+                "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+                "rc4-md5", "chacha20-ietf", "xchacha20",
+                "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+                "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                "2022-blake3-chacha20-poly1305", "none",
+            ];
+            let cipher = node.cipher.as_deref().unwrap_or("").trim().to_lowercase();
+            if !SS_CIPHERS.contains(&cipher.as_str()) {
+                return false;
+            }
+        }
+        "trojan" | "hysteria2" | "hy2" | "tuic" | "hysteria" => {
+            let credential = node
+                .password
+                .as_deref()
+                .or(node.auth_str.as_deref())
+                .or(node.uuid.as_deref())
+                .unwrap_or("")
+                .trim();
+            if credential.is_empty() {
+                return false;
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 pub struct BuiltConfig {
     pub config: Value,
     /// 转换过程中的降级/跳过提示（不致命）
@@ -209,16 +302,14 @@ pub fn validate_subscription_text(text: &str) -> Result<(), String> {
     let profile: ClashProfile =
         parse_clash_profile_resilient(text).map_err(|e| format!("{e}"))?;
 
-    // 检查 proxies：不仅要有节点，且节点 server 不能全是环回地址（机场提示页）
-    // 注意：emit_node 会跳过 127.x/localhost 节点，这里必须同步过滤，否则
+    // 检查 proxies：不仅要有节点，且节点必须通过合法性校验（剔除
+    // 「剩余流量/到期时间」等信息展示类假节点与 127.x 环回占位节点）。
+    // 注意：build() 会以同一标准过滤节点，这里必须同步，否则
     // 更新时通过校验、启动时却被过滤导致「无节点」
     let real_nodes: Vec<_> = profile
         .proxies
         .iter()
-        .filter(|n| {
-            let server = n.server.to_lowercase();
-            !server.starts_with("127.") && !server.starts_with("localhost") && !server.is_empty()
-        })
+        .filter(|n| is_valid_usable_proxy_node(n))
         .collect();
 
     // 有可用节点 或 有 proxy-providers（启动时会下载）即视为有效
@@ -502,8 +593,19 @@ pub fn build(
 
     for (url, sub_name, text) in profiles {
         // 【APP15 任务3.1】自愈解析：尾部截断/畸形 YAML 也能恢复可用节点
-        let profile: ClashProfile = parse_clash_profile_resilient(text)
+        let mut profile: ClashProfile = parse_clash_profile_resilient(text)
             .with_context(|| format!("无法解析订阅「{sub_name}」为 Clash YAML（请检查订阅格式）"))?;
+
+        // 【APP32 任务1.1】订阅解析入口过滤：剔除「剩余流量/到期时间/官网
+        // 广告」等信息展示类假节点与非法参数节点，绝不让其进入 outbounds。
+        let proxies_before = profile.proxies.len();
+        profile.proxies.retain(is_valid_usable_proxy_node);
+        let dropped = proxies_before - profile.proxies.len();
+        if dropped > 0 {
+            warnings.push(format!(
+                "订阅「{sub_name}」已过滤 {dropped} 个信息/广告类或参数非法的非正常节点"
+            ));
+        }
 
         // 读取已落盘的 proxy-provider 节点（update_subscription 时按 URL 下载）
         let mut provider_nodes: HashMap<String, Vec<ClashNode>> = HashMap::new();
@@ -519,7 +621,17 @@ pub fn build(
             match std::fs::read_to_string(&path) {
                 Ok(payload) => {
                     let parsed: ProviderPayload = serde_yaml::from_str(&payload).unwrap_or_default();
-                    provider_nodes.insert(pname.clone(), parsed.proxies);
+                    // 【APP32 任务1.1】provider 磁盘缓存节点同样过滤假节点
+                    let mut proxies = parsed.proxies;
+                    let before = proxies.len();
+                    proxies.retain(is_valid_usable_proxy_node);
+                    let dropped = before - proxies.len();
+                    if dropped > 0 {
+                        warnings.push(format!(
+                            "proxy-provider '{pname}' 已过滤 {dropped} 个非正常节点"
+                        ));
+                    }
+                    provider_nodes.insert(pname.clone(), proxies);
                 }
                 Err(_) => warnings.push(format!(
                     "proxy-provider '{pname}' 节点文件缺失（请更新订阅），已忽略"
@@ -1475,10 +1587,22 @@ fn emit_node(
     apply: &dyn Fn(&str) -> String,
     total_nodes: &mut usize,
 ) -> Option<String> {
-    let tag = apply(&node.name);
-    if !known_tags.insert(tag.clone()) {
-        warnings.push(format!("节点/组标签重复，已跳过：{}", tag));
-        return None;
+    // 【APP32 任务1.2】同名节点自动去重：两个相同 tag 的 outbound 会让
+    // sing-box 直接启动失败，自动追加 " (2)"/" (3)" 序号后缀确保 tag 唯一。
+    let mut tag = apply(&node.name);
+    if !known_tags.contains(&tag) {
+        known_tags.insert(tag.clone());
+    } else {
+        let base = tag.clone();
+        let mut n = 2u32;
+        loop {
+            let candidate = format!("{base} ({n})");
+            if known_tags.insert(candidate.clone()) {
+                tag = candidate;
+                break;
+            }
+            n += 1;
+        }
     }
     match node_to_outbound(node) {
         Some((mut outbound, note)) => {
@@ -2262,10 +2386,13 @@ rules:
             .unwrap()
             .iter()
             .all(|o| o["type"] != "hysteria"));
+        // 【APP32 任务1.1】缺凭证节点如今在上游被 is_valid_usable_proxy_node
+        // 直接过滤（"非正常节点"警告）；旧路径的"缺少 auth-str/password"
+        // 警告同样视为合法剔除原因。
         assert!(built
             .warnings
             .iter()
-            .any(|w| w.contains("缺少 auth-str/password")));
+            .any(|w| w.contains("缺少 auth-str/password") || w.contains("非正常节点")));
     }
 
     /// 回归（内置分流规则）：域名类内置规则在自定义之后、订阅规则之前；
@@ -2464,7 +2591,7 @@ rules:
 proxies:
   - {name: IN-01, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
   - {name: IN-02, type: trojan, server: 5.6.7.8, port: 443, password: pw2}
-  - {name: IN-03, type: vless, server: node-1.sub.example.cc, port: 443, uuid: u}
+  - {name: IN-03, type: vless, server: node-1.sub.example.cc, port: 443, uuid: 11111111-2222-3333-4444-555555555555}
 proxy-groups:
   - {name: 节点选择, type: select, proxies: [IN-01]}
 rules:
@@ -2508,7 +2635,7 @@ rules:
         let clash = r#"
 proxies:
   - {name: IP-NODE, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
-  - {name: DOM-NODE, type: vless, server: node-9.sub.ibuy.eu.cc, port: 443, uuid: u}
+  - {name: DOM-NODE, type: vless, server: node-9.sub.ibuy.eu.cc, port: 443, uuid: 11111111-2222-3333-4444-555555555555}
 proxy-groups:
   - {name: 节点选择, type: select, proxies: [IP-NODE, DOM-NODE]}
 rules:
@@ -3030,5 +3157,141 @@ rules:
             .collect();
         assert!(cidrs.contains(&"192.168.1.0/24".to_string()), "网段需归一化: {cidrs:?}");
         assert!(cidrs.contains(&"10.8.0.0/24".to_string()), "需并入虚拟子网: {cidrs:?}");
+    }
+
+    /// 【APP32 任务1.1】「剩余流量/到期时间/重置时间/官网广告」等机场
+    /// 信息展示类假节点必须在 build() 时被 100% 过滤，绝不进入 outbounds，
+    /// 且 GLOBAL/主选择器 default 自动纠偏到真实节点。
+    #[test]
+    fn dummy_info_nodes_are_filtered_and_default_corrected() {
+        let yaml = r#"
+proxies:
+  - {name: "剩余流量：99GB", type: ss, server: 127.0.0.1, port: 0, cipher: none, password: ""}
+  - {name: "到期时间：2026-12-01", type: vless, server: 0.0.0.0, port: 1, uuid: "00000000-0000-0000-0000-000000000000"}
+  - {name: "距离下次重置：10天", type: vmess, server: example.com, port: 443, uuid: "123456"}
+  - {name: "官网：https://xxx.com", type: trojan, server: "https://xxx.com", port: 443, password: ""}
+  - {name: 香港01, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: ["剩余流量：99GB", 香港01]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), yaml.to_string())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-dummy"),
+            &std::env::temp_dir().join("prism-cb-test-dummy/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let tags: Vec<&str> = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        for bad in ["剩余流量：99GB", "到期时间：2026-12-01", "距离下次重置：10天", "官网：https://xxx.com"] {
+            assert!(
+                !tags.iter().any(|t| t.contains(bad) || bad.contains(t)),
+                "假节点「{bad}」绝不能进入 outbounds: {tags:?}"
+            );
+        }
+        assert!(tags.contains(&"香港01"), "真实节点必须保留: {tags:?}");
+        // GLOBAL 选择器 default 必须指向真实节点（假节点已被剔除）
+        let global = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "GLOBAL")
+            .expect("GLOBAL 组必须存在");
+        assert_eq!(
+            global["default"].as_str(),
+            Some("香港01"),
+            "GLOBAL default 必须自动纠偏到真实节点"
+        );
+        assert!(
+            global["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t.as_str() == Some("香港01")),
+            "GLOBAL 候选池绝不含假节点"
+        );
+    }
+
+    /// 【APP32 任务1.2】同订阅/跨订阅同名节点自动追加 " (2)" 序号后缀，
+    /// 杜绝 sing-box 因重复 tag 启动失败。
+    #[test]
+    fn duplicate_node_tags_auto_renamed() {
+        let yaml = r#"
+proxies:
+  - {name: HK, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+  - {name: HK, type: ss, server: 5.6.7.8, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), yaml.to_string())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-dup"),
+            &std::env::temp_dir().join("prism-cb-test-dup/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let tags: Vec<&str> = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        let unique: std::collections::HashSet<&&str> = tags.iter().collect();
+        assert_eq!(tags.len(), unique.len(), "全部 outbound tag 必须唯一: {tags:?}");
+        assert!(tags.contains(&"HK"), "首个同名节点保留原名: {tags:?}");
+        assert!(tags.contains(&"HK (2)"), "第二个同名节点自动加序号: {tags:?}");
+    }
+
+    /// 【APP32 任务2.2/3】Tun 模式下 tun-in 必须锁死 gvisor 协议栈与
+    /// MTU 1280（根治 iOS system 栈 TCP 回环 NAT connection refused 与
+    /// MTU 1420 大包 unexpected EOF）。
+    #[test]
+    fn tun_in_locked_gvisor_mtu_1280() {
+        let built = build(
+            &[(
+                "https://sub.example".into(),
+                "订阅1".into(),
+                "proxies:\n  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}\nproxy-groups:\n  - {name: 节点选择, type: select, proxies: [HK1]}\nrules:\n  - MATCH,节点选择\n".to_string(),
+            )],
+            &[],
+            RunMode::Tun,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-tun"),
+            &std::env::temp_dir().join("prism-cb-test-tun/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let tun = built.config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == TUN_TAG)
+            .expect("tun-in 入站必须存在");
+        assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
+        assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
+        assert_eq!(tun["sniff"].as_bool(), Some(false));
     }
 }
