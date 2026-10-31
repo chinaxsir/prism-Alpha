@@ -57,95 +57,50 @@ pub fn is_builtin_non_proxy_tag(tag: &str) -> bool {
     ) || t.to_ascii_uppercase().starts_with("GO-AIM-PROBE")
 }
 
-/// 【APP32 任务1.1】非正常节点（机场信息展示/广告类假节点）名称黑名单。
-/// 机场订阅常在节点列表顶部插入「剩余流量」「套餐到期」「官网」等条目，
-/// 其参数为非法占位值（port 0/1、127.0.0.1、非法 UUID），一旦被写入
-/// outbounds 或被默认选中，sing-box 在 decode config 阶段直接拒绝启动。
-const DUMMY_NODE_KEYWORDS: &[&str] = &[
-    "剩余流量", "流量剩余", "已用流量", "总流量", "套餐流量", "今日流量", "可用流量",
-    "到期时间", "套餐到期", "到期日", "过期时间", "有效期", "剩余天数",
-    "重置时间", "下次重置", "流量重置", "重置日", "距离下次重置",
-    "官网", "官方网址", "网址", "地址发布", "发布页", "最新地址", "备用地址", "防失联",
-    "群组", "官方群", "电报群", "tg群", "频道", "客服", "工单",
-    "公告", "通知", "说明", "提示", "教程", "使用必读", "必看",
-    "优惠", "折扣", "续费", "购买", "订阅套餐", "邀请好友", "返利", "推广",
-    "请更新", "更新订阅", "节点故障", "维护中", "过期请",
-    "http://", "https://", "www.", "t.me/",
-];
+/// 【APP33 任务1.1】信息展示/广告类假节点名称识别。
+/// 只拦截"剩余流量/到期时间/官网公告"等信息类名称，绝不包含
+/// "下载/高速/专线/倍率/流媒体"等真实节点常用词，防止误杀
+/// 「美国凤凰城|高速下载」这类真实节点。
+pub(crate) fn is_info_or_ad_node_name(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    if n.is_empty() {
+        return true;
+    }
+    const KEYWORDS: &[&str] = &[
+        "剩余", "流量", "到期", "过期", "重置", "套餐", "有效期",
+        "官网", "网址", "发布页", "地址发布", "最新地址", "备用地址", "防失联",
+        "群组", "官方群", "电报群", "tg群", "频道", "客服", "工单",
+        "公告", "通知", "使用说明", "使用必读", "教程", "必看",
+        "优惠", "折扣", "续费", "购买", "邀请好友", "返利", "推广",
+        "请更新", "更新订阅", "节点故障", "维护中",
+        "http://", "https://", "t.me/",
+    ];
+    KEYWORDS.iter().any(|k| n.contains(k))
+}
 
-/// 【APP32 任务1.1】节点合法性校验：名称黑名单 + 服务器/端口 + 协议关键
-/// 凭证三重过滤。订阅解析、provider 缓存加载、落盘校验统一调用，
-/// 从源头剔除会把 sing-box 配置校验搞崩的假节点。
+/// 【APP33 任务1.1】节点合法性校验（放宽版，严禁误杀真实节点）。
+/// 仅在三种明确无效的情况下返回 false：
+/// 1. 名称命中信息/广告黑名单（如「剩余流量：96GB」）；
+/// 2. server 为空或为环回/占位地址（127.0.0.1 / 0.0.0.0 / localhost / ::1）；
+/// 3. port <= 1（端口 0/1）。
+/// UUID 长度/格式与 SS cipher 不再硬性拒绝——改由 node_to_outbound
+/// 做兼容映射（chacha20-poly1305→chacha20-ietf-poly1305，dummy/空→none），
+/// 杜绝误杀「美国凤凰城|高速下载」等真实节点导致策略组悬空引用崩溃。
 pub(crate) fn is_valid_usable_proxy_node(node: &ClashNode) -> bool {
-    // 1. 名称黑名单（剔除信息展示类与广告类假节点）
-    let name_lower = node.name.trim().to_lowercase();
-    if name_lower.is_empty() {
+    if is_info_or_ad_node_name(&node.name) {
         return false;
     }
-    if DUMMY_NODE_KEYWORDS.iter().any(|k| name_lower.contains(k)) {
-        return false;
-    }
-    // 2. 服务器地址与端口合法性
-    let server = node.server.trim().to_lowercase();
+    let server = node.server.trim();
     if server.is_empty()
         || matches!(
-            server.as_str(),
-            "127.0.0.1" | "0.0.0.0" | "localhost" | "::1" | "1.1.1.1" | "8.8.8.8" | "example.com"
+            server,
+            "127.0.0.1" | "0.0.0.0" | "localhost" | "::1"
         )
-        || server.starts_with("127.")
-        || server.contains(' ')
-        || server.contains('/')
-        || server.contains("http:")
-        || server.contains("https:")
-        || !server.is_ascii()
     {
         return false;
     }
     if node.port <= 1 {
         return false;
-    }
-    // 3. 协议关键凭证合法性（防止 sing-box decode config 崩溃）
-    match node.kind.to_lowercase().as_str() {
-        "vless" | "vmess" => {
-            let uuid = node.uuid.as_deref().unwrap_or("").trim();
-            let shape_ok = (32..=36).contains(&uuid.len())
-                && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-            // 全 0 的占位 UUID 同样非法
-            let all_zero = !uuid.is_empty() && uuid.chars().all(|c| c == '0' || c == '-');
-            if !shape_ok || all_zero {
-                return false;
-            }
-        }
-        "ss" | "shadowsocks" => {
-            if node.password.as_deref().unwrap_or("").trim().is_empty() {
-                return false;
-            }
-            const SS_CIPHERS: &[&str] = &[
-                "aes-128-gcm", "aes-256-gcm", "aes-128-cfb", "aes-192-cfb",
-                "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
-                "rc4-md5", "chacha20-ietf", "xchacha20",
-                "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
-                "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
-                "2022-blake3-chacha20-poly1305", "none",
-            ];
-            let cipher = node.cipher.as_deref().unwrap_or("").trim().to_lowercase();
-            if !SS_CIPHERS.contains(&cipher.as_str()) {
-                return false;
-            }
-        }
-        "trojan" | "hysteria2" | "hy2" | "tuic" | "hysteria" => {
-            let credential = node
-                .password
-                .as_deref()
-                .or(node.auth_str.as_deref())
-                .or(node.uuid.as_deref())
-                .unwrap_or("")
-                .trim();
-            if credential.is_empty() {
-                return false;
-            }
-        }
-        _ => {}
     }
     true
 }
@@ -815,6 +770,18 @@ pub fn build(
                     )),
                 }
             }
+            // 【APP33 任务1.3】剔除策略组成员中的信息/广告类假节点引用
+            // （如「剩余流量：96GB」），悬空的非顶层节点由下方
+            // sanitize_outbound_dependencies 兜底清理。
+            let members_before = members.len();
+            members.retain(|m| !is_info_or_ad_node_name(m));
+            if members.len() != members_before {
+                warnings.push(format!(
+                    "策略组 '{}' 已剔除 {} 个信息/广告类假节点引用",
+                    group.name,
+                    members_before - members.len()
+                ));
+            }
             if members.is_empty() {
                 warnings.push(format!(
                     "策略组 '{}' 没有任何成员（proxies/use 均为空或不可用）",
@@ -985,6 +952,11 @@ pub fn build(
             }
         }
     }
+
+    // 【APP33 任务2】出站依赖完整性闭环校验器：对所有 selector/urltest
+    // 策略组的 outbounds 与 default 做最终兜底清洗，100% 杜绝
+    // dependency[xxx] not found for outbound[yyy] 启动崩溃。
+    sanitize_outbound_dependencies(&mut outbounds, &node_tags);
 
     // 真实节点统一并入主选择组（build 159 用户方案）。
     // 部分订阅把节点全部挂在地区子分组下：旧「仅补游离节点」规则会让
@@ -1757,6 +1729,81 @@ fn parse_bandwidth(raw: &Option<String>) -> Option<u32> {
         .and_then(|head| head.parse::<u32>().ok())
 }
 
+/// 【APP33 任务2】出站依赖完整性闭环校验器。
+///
+/// 两遍清洗：
+/// 1. 收集顶层 outbounds 中所有真实存在的 tag 集合 existing；
+/// 2. 遍历所有 selector / urltest 策略组，只保留 outbounds 中
+///    "在 existing 中且非自身且非信息/广告假节点名" 的引用；
+///    清洗后为空则回填 real_proxy_tags（兜底 direct）；
+///    selector 的 default 失效时回退为首位成员；
+///    urltest 移除 default 字段（sing-box 不支持）。
+pub(crate) fn sanitize_outbound_dependencies(
+    outbounds: &mut Vec<Value>,
+    real_proxy_tags: &[String],
+) {
+    let existing: std::collections::HashSet<String> = outbounds
+        .iter()
+        .filter_map(|o| o["tag"].as_str().map(|s| s.to_string()))
+        .collect();
+    let fallback = real_proxy_tags
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "direct".to_string());
+
+    for ob in outbounds.iter_mut() {
+        let ty = ob["type"].as_str().unwrap_or("").to_string();
+        if ty != "selector" && ty != "urltest" {
+            continue;
+        }
+        let self_tag = ob["tag"].as_str().unwrap_or("").to_string();
+
+        // 清洗 outbounds 数组
+        let list = ob.get_mut("outbounds").and_then(Value::as_array_mut);
+        if let Some(list) = list {
+            list.retain(|v| {
+                let t = v.as_str().unwrap_or("");
+                !t.is_empty()
+                    && t != self_tag
+                    && existing.contains(t)
+                    && !is_info_or_ad_node_name(t)
+            });
+            if list.is_empty() {
+                if real_proxy_tags.is_empty() {
+                    list.push(json!("direct"));
+                } else {
+                    *list = real_proxy_tags.iter().map(|t| json!(t)).collect();
+                }
+            }
+        }
+
+        // default 字段处理
+        if ty == "selector" {
+            let list = ob
+                .get("outbounds")
+                .and_then(Value::as_array)
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<std::collections::HashSet<String>>()
+                })
+                .unwrap_or_default();
+            let cur = ob.get("default").and_then(|d| d.as_str()).unwrap_or("");
+            if cur.is_empty() || !list.contains(cur) || is_info_or_ad_node_name(cur) {
+                ob["default"] = json!(ob
+                    .get("outbounds")
+                    .and_then(Value::as_array)
+                    .and_then(|l| l.first())
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&fallback));
+            }
+        } else if let Some(obj) = ob.as_object_mut() {
+            // urltest 不支持 default 字段
+            obj.remove("default");
+        }
+    }
+}
+
 /// 节点转换；返回 (出站, 可选警告)，未知类型返回 None
 pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String>)> {
     let base = json!({
@@ -1767,9 +1814,23 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
 
     let outbound = match node.kind.as_str() {
         "ss" | "shadowsocks" => {
+            // 【APP33 任务1.1】SS 加密方式兼容映射：
+            // chacha20-poly1305（Clash 常用别名）→ sing-box 标准 chacha20-ietf-poly1305；
+            // dummy / 空 → none。绝不在 is_valid 阶段硬性拒绝，防止误杀真实节点。
+            let mut cipher = node
+                .cipher
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            match cipher.as_str() {
+                "" | "dummy" => cipher = "none".into(),
+                "chacha20-poly1305" => cipher = "chacha20-ietf-poly1305".into(),
+                _ => {}
+            }
             let mut o = json!({
                 "type": "shadowsocks",
-                "method": node.cipher.clone().unwrap_or_else(|| "aes-256-gcm".into()),
+                "method": cipher,
                 "password": node.password.clone().unwrap_or_default(),
             });
             merge(&mut o, &base);
@@ -3293,5 +3354,198 @@ rules:
         assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
         assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
         assert_eq!(tun["sniff"].as_bool(), Some(false));
+    }
+
+    /// 【APP33 任务2.1】出站依赖完整性闭环校验：
+    /// 1. urltest 组中不存在的悬空节点引用（如「美国凤凰城|高速下载」）必须被剔除；
+    /// 2. urltest 严禁残留 default 字段；
+    /// 3. selector 的 default 若为假节点/不在列表中，必须纠偏为列表首项；
+    /// 4. 列表被清空时必须回填 real_proxy_tags（兜底 direct）。
+    #[test]
+    fn sanitize_removes_dangling_and_fixes_default() {
+        use super::sanitize_outbound_dependencies;
+        use serde_json::json;
+
+        // 顶层 outbounds：direct + 2 个真实节点 + 1 个假节点（已在顶层存在）
+        let mut outbounds: Vec<Value> = vec![
+            json!({"tag": "direct", "type": "direct"}),
+            json!({"tag": "美国凤凰城|高速下载", "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388}),
+            json!({"tag": "日本东京", "type": "shadowsocks", "server": "5.6.7.8", "server_port": 8388}),
+            json!({"tag": "剩余流量：96GB", "type": "shadowsocks", "server": "9.9.9.9", "server_port": 8388}),
+            // urltest 组引用了一个不存在的悬空节点「新加坡 01」
+            json!({
+                "tag": "♻️ 自动选择",
+                "type": "urltest",
+                "outbounds": ["美国凤凰城|高速下载", "日本东京", "新加坡 01", "剩余流量：96GB"],
+                "default": "美国凤凰城|高速下载"
+            }),
+            // selector 组 default 指向假节点
+            json!({
+                "tag": "Proxy",
+                "type": "selector",
+                "outbounds": ["美国凤凰城|高速下载", "日本东京"],
+                "default": "剩余流量：96GB"
+            }),
+        ];
+        let real_tags = vec!["美国凤凰城|高速下载".to_string(), "日本东京".to_string()];
+
+        sanitize_outbound_dependencies(&mut outbounds, &real_tags);
+
+        // 定位 urltest 组
+        let urltest = outbounds
+            .iter()
+            .find(|o| o["tag"] == "♻️ 自动选择")
+            .expect("urltest 组必须存在");
+        let list: Vec<&str> = urltest["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        // 悬空节点「新加坡 01」与假节点「剩余流量：96GB」必须被剔除
+        assert!(
+            !list.contains(&"新加坡 01"),
+            "悬空节点引用必须被剔除: {list:?}"
+        );
+        assert!(
+            !list.contains(&"剩余流量：96GB"),
+            "假节点引用必须被剔除: {list:?}"
+        );
+        // 真实节点保留
+        assert!(list.contains(&"美国凤凰城|高速下载"), "真实节点必须保留: {list:?}");
+        assert!(list.contains(&"日本东京"), "真实节点必须保留: {list:?}");
+        // urltest 严禁 default 字段
+        assert!(
+            urltest.get("default").is_none(),
+            "urltest 严禁残留 default 字段"
+        );
+
+        // selector 组 default 必须纠偏为列表首项
+        let selector = outbounds
+            .iter()
+            .find(|o| o["tag"] == "Proxy")
+            .expect("selector 组必须存在");
+        let sel_list: Vec<&str> = selector["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let def = selector["default"].as_str().unwrap_or("");
+        assert_eq!(def, sel_list[0], "selector default 必须纠偏为列表首项");
+        assert_ne!(def, "剩余流量：96GB", "selector default 绝不能是假节点");
+    }
+
+    /// 【APP33 任务2.1】outbounds 列表被清空时回填 real_proxy_tags；
+    /// real_proxy_tags 也为空时兜底 "direct"。
+    #[test]
+    fn sanitize_empty_group_filled_with_real_tags() {
+        use super::sanitize_outbound_dependencies;
+        use serde_json::json;
+
+        // 只有 direct，没有任何真实代理节点
+        let mut outbounds: Vec<Value> = vec![
+            json!({"tag": "direct", "type": "direct"}),
+            json!({
+                "tag": "Proxy",
+                "type": "selector",
+                "outbounds": ["不存在的节点"],
+                "default": "不存在的节点"
+            }),
+        ];
+        let real_tags: Vec<String> = vec![];
+
+        sanitize_outbound_dependencies(&mut outbounds, &real_tags);
+
+        let selector = outbounds
+            .iter()
+            .find(|o| o["tag"] == "Proxy")
+            .expect("selector 组必须存在");
+        let list: Vec<&str> = selector["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(list, vec!["direct"], "空组必须兜底 direct: {list:?}");
+        assert_eq!(selector["default"].as_str(), Some("direct"));
+
+        // real_proxy_tags 非空时回填真实节点
+        let mut outbounds2: Vec<Value> = vec![
+            json!({"tag": "direct", "type": "direct"}),
+            json!({"tag": "香港 01", "type": "shadowsocks", "server": "1.1.1.1", "server_port": 443}),
+            json!({
+                "tag": "Proxy",
+                "type": "selector",
+                "outbounds": ["不存在的节点"],
+            }),
+        ];
+        let real_tags2 = vec!["香港 01".to_string()];
+        sanitize_outbound_dependencies(&mut outbounds2, &real_tags2);
+        let sel2 = outbounds2
+            .iter()
+            .find(|o| o["tag"] == "Proxy")
+            .unwrap();
+        let list2: Vec<&str> = sel2["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(list2, vec!["香港 01"], "空组必须回填 real_proxy_tags: {list2:?}");
+    }
+
+    /// 【APP33 任务2.1】策略组自引用（outbounds 含自身 tag）必须剔除，
+    /// 防止 sing-box 启动时递归解析死循环。
+    #[test]
+    fn sanitize_removes_self_reference() {
+        use super::sanitize_outbound_dependencies;
+        use serde_json::json;
+
+        let mut outbounds: Vec<Value> = vec![
+            json!({"tag": "direct", "type": "direct"}),
+            json!({"tag": "日本东京", "type": "shadowsocks", "server": "5.6.7.8", "server_port": 8388}),
+            json!({
+                "tag": "Proxy",
+                "type": "selector",
+                "outbounds": ["Proxy", "日本东京"],
+            }),
+        ];
+        let real_tags = vec!["日本东京".to_string()];
+        sanitize_outbound_dependencies(&mut outbounds, &real_tags);
+
+        let selector = outbounds.iter().find(|o| o["tag"] == "Proxy").unwrap();
+        let list: Vec<&str> = selector["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !list.contains(&"Proxy"),
+            "策略组自引用必须被剔除: {list:?}"
+        );
+        assert!(list.contains(&"日本东京"));
+    }
+
+    /// 【APP33 任务1.1】is_info_or_ad_node_name 关键词清单测试：
+    /// 必须拦截「剩余流量：96GB」等信息节点，绝不能误杀「美国凤凰城|高速下载」。
+    #[test]
+    fn is_info_or_ad_node_name_keywords() {
+        use super::is_info_or_ad_node_name;
+
+        assert!(is_info_or_ad_node_name("剩余流量：96.54 GB"));
+        assert!(is_info_or_ad_node_name("到期时间：2025-12-31"));
+        assert!(is_info_or_ad_node_name("距离下次重置还有 3 天"));
+        assert!(is_info_or_ad_node_name("官网：https://example.com"));
+        assert!(is_info_or_ad_node_name("TG 群：t.me/xxx"));
+        assert!(is_info_or_ad_node_name("   "));
+        assert!(is_info_or_ad_node_name(""));
+
+        // 真实节点常用词绝不能误杀
+        assert!(!is_info_or_ad_node_name("美国凤凰城|高速下载"));
+        assert!(!is_info_or_ad_node_name("香港 01 | 专线"));
+        assert!(!is_info_or_ad_node_name("日本东京-流媒体解锁"));
+        assert!(!is_info_or_ad_node_name("新加坡 03 x1.5倍率"));
     }
 }

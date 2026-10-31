@@ -104,6 +104,12 @@ pub struct UserSettings {
     /// None = 自动模式。节点页手动选中节点时自动写入。
     #[serde(default)]
     pub go_aim_pinned_node: Option<String>,
+    /// 【APP33 任务3.1】用户最近选中的代理节点名（持久化到 settings.json）。
+    /// 启动/刷新状态时由 ensure_valid_selected_node 纠偏：若为「剩余流量」
+    /// 等假节点或已不存在，自动替换为首个真实节点并写回磁盘，杜绝仪表盘
+    /// 「当前节点」长期残留假节点名。
+    #[serde(default)]
+    pub selected_node: Option<String>,
     /// 界面语言（system | zh | en；随设置表单一起落盘）
     #[serde(default = "default_system")]
     pub language: String,
@@ -136,6 +142,7 @@ impl Default for UserSettings {
             close_connections_on_switch: false,
             go_aim_enabled: false,
             go_aim_pinned_node: None,
+            selected_node: None,
             language: "system".to_string(),
             theme: "system".to_string(),
         }

@@ -1561,6 +1561,47 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             outbounds.append(["type": "block", "tag": "block"])
             blockOutboundTag = "block"
         }
+
+        // 【APP33 任务2.2】出站依赖完整性闭环校验（Swift 侧兜底）：
+        // 收集所有真实存在的 tag，对 selector / urltest 的 outbounds 数组
+        // 做存在性过滤，悬空引用回填真实节点；selector default 失效时
+        // 回退首位成员；urltest 移除 default。彻底杜绝
+        // dependency[xxx] not found for outbound[yyy] 启动崩溃。
+        let dummyKeywords = ["剩余", "流量", "到期", "过期", "重置", "套餐",
+                             "官网", "网址", "发布页", "公告", "通知", "续费",
+                             "http://", "https://", "t.me/"]
+        var finalTagSet = Set<String>()
+        for item in outbounds {
+            if let t = item["tag"] as? String, !t.isEmpty {
+                finalTagSet.insert(t)
+            }
+        }
+        let fallbackTag = allRealProxyTags.first ?? "direct"
+        for i in outbounds.indices {
+            let obType = (outbounds[i]["type"] as? String) ?? ""
+            if obType != "selector" && obType != "urltest" {
+                continue
+            }
+            let selfTag = (outbounds[i]["tag"] as? String) ?? ""
+            let rawList = (outbounds[i]["outbounds"] as? [String]) ?? []
+            var filteredList = rawList.filter { t in
+                !t.isEmpty && t != selfTag && finalTagSet.contains(t)
+                    && !dummyKeywords.contains(where: { t.lowercased().contains($0) })
+            }
+            if filteredList.isEmpty {
+                filteredList = allRealProxyTags.isEmpty ? ["direct"] : allRealProxyTags
+            }
+            outbounds[i]["outbounds"] = filteredList
+            if obType == "selector" {
+                let defTag = outbounds[i]["default"] as? String
+                if defTag == nil || !filteredList.contains(defTag!) {
+                    outbounds[i]["default"] = filteredList.first ?? fallbackTag
+                }
+            } else {
+                outbounds[i].removeValue(forKey: "default")
+            }
+        }
+
         root["outbounds"] = outbounds
 
         // 【APP15 任务2】mixed-in 入站必须始终存在（Rust 端已始终注入，

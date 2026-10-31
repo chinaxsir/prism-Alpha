@@ -14,7 +14,7 @@ import {
   type AimNodeResult,
   type GoAimStatus,
 } from "@/api/ipc";
-import { useCoreStore } from "@/stores/core";
+import { useCoreStore, isDummyNodeName } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
@@ -206,12 +206,17 @@ export default function Proxies() {
         const all = (group.all ?? [])
           .map((item) => (typeof item === "string" ? map[item] : item))
           .filter((item): item is ProxyEntry => Boolean(item))
-          .filter((item) => !GROUP_TYPES.includes(item.type));
+          .filter((item) => !GROUP_TYPES.includes(item.type))
+          // 【APP33 任务3.2】过滤「剩余流量/到期时间」等信息/广告类假节点
+          .filter((item) => !isDummyNodeName(item.name));
         setNodes(all);
         setCurrent(group.now ?? "");
 
-        // 未选默认延迟最低：now 为空或不在节点列表中，且用户未手动操作过
-        const nowValid = group.now && all.some((n) => n.name === group.now);
+        // 未选默认延迟最低：now 为空、为假节点或不在节点列表中，且用户未手动操作过
+        const nowValid =
+          group.now &&
+          !isDummyNodeName(group.now) &&
+          all.some((n) => n.name === group.now);
         if (!nowValid && !userTouchedRef.current && all.length > 0) {
           autoSelectFastest(groupName);
         }
@@ -228,11 +233,14 @@ export default function Proxies() {
   const loadCached = async () => {
     try {
       const list = await getCachedProxies();
-      const entries: ProxyEntry[] = list.map((p) => ({
-        name: p.name,
-        type: p.kind,
-        server: p.server,
-      }));
+      const entries: ProxyEntry[] = list
+        // 【APP33 任务3.2】过滤「剩余流量/到期时间」等信息/广告类假节点
+        .filter((p) => !isDummyNodeName(p.name))
+        .map((p) => ({
+          name: p.name,
+          type: p.kind,
+          server: p.server,
+        }));
       setNodes(entries);
       setCurrent("");
       setDelays({});
@@ -251,7 +259,7 @@ export default function Proxies() {
       > | null;
       if (!result || Object.keys(result).length === 0) return;
       const entries = Object.entries(result).filter(
-        ([, d]) => d > 0
+        ([name, d]) => d > 0 && !isDummyNodeName(name)
       );
       if (entries.length === 0) return;
       entries.sort((a, b) => a[1] - b[1]);

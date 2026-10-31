@@ -5,12 +5,17 @@ src-tauri/target/
 # License 服务端与 Cloudflare Worker 仅保留在本地，严禁同步到仓库
 license-server/
 license-worker/
+# fake-clang 桩工具链的构建产物，严禁入库
+fake-clang/target/
 # gen 下的 schemas 与构建产物忽略；gen/android、gen/apple 工程文件需提交（CI/本地构建 APK/IPA 依赖）
 src-tauri/gen/schemas
 src-tauri/gen/android/.gradle
+src-tauri/gen/android/.cxx
 src-tauri/gen/android/app/.cxx
 src-tauri/gen/android/app/build
 src-tauri/gen/android/build
+src-tauri/gen/android/.kotlin
+src-tauri/gen/android/.tauri
 src-tauri/binaries/
 # iOS c-archive / Android c-shared 内核与 NDK 本地包装器均为构建产物，严禁入库
 src-tauri/ios-kernel/libprismkernel.a
@@ -21,3 +26,7 @@ src-tauri/ios-kernel/libprismkernel-*
 fake-bin/
 *.log
 .DS_Store
+# Trae 分享包 / 用户指南 / 历史发布说明：仅本地保留，严禁入库
+.trae-html-share-packages/
+prism-user-guide/
+release-notes-v0.3.16.md

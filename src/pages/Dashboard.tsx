@@ -43,7 +43,7 @@ import {
   saveGoCusSettings,
   isGoLanConfigured,
 } from "@/api/ipc";
-import { useCoreStore, type RunMode } from "@/stores/core";
+import { useCoreStore, type RunMode, isDummyNodeName } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { useTranslation } from "@/i18n";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
@@ -118,10 +118,13 @@ export default function Dashboard() {
         setCurrentNode("");
         // 未启动兜底：读取订阅缓存节点展示第一个，并支持点击预选
         // （ipa-8 方案：启动前卡片不再显示「—」死状态）
+        // 【APP33 任务3.2】过滤「剩余流量/到期时间」等信息/广告类假节点
         try {
           const cached = await getCachedProxies();
           setNodes(
-            cached.map((c) => ({ name: c.name, type: c.kind, history: [] }))
+            cached
+              .filter((c) => !isDummyNodeName(c.name))
+              .map((c) => ({ name: c.name, type: c.kind, history: [] }))
           );
         } catch {
           setNodes([]);
@@ -134,13 +137,31 @@ export default function Dashboard() {
       const map = resp.proxies ?? {};
       const g = map[group];
       if (!g) return;
-      setCurrentNode(g.now ?? "");
-      setNodes(
-        (g.all ?? [])
-          .map((item) => (typeof item === "string" ? map[item] : item))
-          .filter((item): item is ProxyEntry => Boolean(item))
-          .filter((item) => !GROUP_TYPES.includes(item.type))
-      );
+      // 【APP33 任务3.2】过滤「剩余流量/到期时间」等信息/广告类假节点
+      const realNodes = (g.all ?? [])
+        .map((item) => (typeof item === "string" ? map[item] : item))
+        .filter((item): item is ProxyEntry => Boolean(item))
+        .filter((item) => !GROUP_TYPES.includes(item.type))
+        .filter((item) => !isDummyNodeName(item.name));
+      setNodes(realNodes);
+
+      const now = g.now ?? "";
+      // 当前选中节点是假节点或不在真实列表中 → 自动纠偏到首个真实节点
+      const nowValid = now && !isDummyNodeName(now) && realNodes.some((n) => n.name === now);
+      if (!nowValid) {
+        setCurrentNode("");
+        if (realNodes.length > 0) {
+          const first = realNodes[0].name;
+          try {
+            await selectProxy(group, first);
+            setCurrentNode(first);
+          } catch {
+            /* 后端 select_proxy 可能因内核未就绪拒绝，保持空态等待下次刷新 */
+          }
+        }
+      } else {
+        setCurrentNode(now);
+      }
     } catch {
       /* 内核未运行 / API 未就绪：保持空态 */
     }

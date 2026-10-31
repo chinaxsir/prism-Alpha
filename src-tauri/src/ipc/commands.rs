@@ -53,6 +53,9 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     if let Some(block) = state.control_block.read().clone() {
         return Err(block.message);
     }
+    // 【APP33 任务3.1】启动前纠偏 selected_node：若残留「剩余流量」等假
+    // 节点，立即替换为真实节点并落盘，避免仪表盘与内核默认节点不一致。
+    ensure_valid_selected_node(state);
     // 幂等：启动含下载内核/构建配置等长耗时步骤，期间重复点击或前端自动
     // 重试会再次进入本函数。只有一个调用完成 Stopped/Error -> Starting，
     // 其余若已在 Starting（启动进行中）或 Running（已启动）直接成功返回，
@@ -532,6 +535,71 @@ fn should_auto_select(state: &AppState) -> bool {
     state.user_manually_selected_node.read().is_none()
 }
 
+/// 【APP33 任务3.1】selected_node 自愈：若当前选中节点为「剩余流量」等
+/// 假节点或不在有效节点列表中，自动替换为首个真实节点并写回 settings.json，
+/// 杜绝仪表盘「当前节点」长期残留假节点名。返回纠偏后的节点名（可能为 None）。
+fn ensure_valid_selected_node(state: &AppState) -> Option<String> {
+    // 从已启用订阅加载真实节点名集合
+    let mut valid: Vec<String> = Vec::new();
+    let records = crate::core::store::load_subscriptions(&state.data_dir);
+    for r in records {
+        if !r.enabled {
+            continue;
+        }
+        let path = crate::core::store::profile_path(&state.data_dir, &r.url);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
+            if let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) {
+                for p in proxies {
+                    let name = crate::core::uri_parser::fix_utf8_mojibake(
+                        p.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
+                    let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("");
+                    let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if name.is_empty() || server.is_empty() || port <= 1 {
+                        continue;
+                    }
+                    if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
+                        continue;
+                    }
+                    if crate::core::config_builder::is_info_or_ad_node_name(&name) {
+                        continue;
+                    }
+                    if server.starts_with("127.") || server == "localhost" || server == "0.0.0.0" {
+                        continue;
+                    }
+                    if !valid.contains(&name) {
+                        valid.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let cur = state.settings.read().selected_node.clone();
+    let needs_correct = match &cur {
+        None => true,
+        Some(n) => {
+            crate::core::config_builder::is_info_or_ad_node_name(n) || !valid.contains(n)
+        }
+    };
+    if needs_correct {
+        if let Some(pick) = valid.first() {
+            let mut settings = state.settings.read().clone();
+            settings.selected_node = Some(pick.clone());
+            if let Err(e) = state.save_settings(settings) {
+                tracing::error!("save corrected selected_node failed: {e}");
+            }
+            *state.user_manually_selected_node.write() = Some(pick.clone());
+            tracing::info!("[APP33] selected_node 纠偏：{:?} -> {}", cur, pick);
+            return Some(pick.clone());
+        }
+    }
+    cur
+}
+
 /// 后台任务：对主选择组整组测速，自动切换到延迟最低的可用叶子节点
 fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group: String) {
     tauri::async_runtime::spawn(async move {
@@ -729,6 +797,10 @@ pub async fn get_core_status(
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
+    // 【APP33 任务3.1】仪表盘每次刷新状态时纠偏 selected_node：
+    // 若为「剩余流量：96GB」等假节点或已不存在，自动替换为真实节点并落盘。
+    ensure_valid_selected_node(state.inner());
+
     Ok(CoreStatusDto {
         status: *state.status.read(),
         mode: *state.mode.read(),
@@ -848,9 +920,23 @@ pub async fn select_proxy(
     if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
         return Err(format!("「{name}」是内置功能出站，不能作为代理节点选中"));
     }
+    // 【APP33 任务3.1】严禁选中「剩余流量/到期时间/官网」等信息/广告类假节点
+    if crate::core::config_builder::is_info_or_ad_node_name(&name) {
+        return Err(format!("「{name}」是信息/广告类假节点，已自动过滤"));
+    }
     // 【APP26 任务2.3】记录「用户已手动选点」：此后启动 / 关闭 Go AIM 时的
     // 自动最低延迟优选不再覆盖用户的选择
     *state.user_manually_selected_node.write() = Some(name.clone());
+    // 【APP33 任务3.1】持久化选中节点到 settings.json，重启后仪表盘恢复同一节点
+    {
+        let mut settings = state.settings.read().clone();
+        if settings.selected_node.as_deref() != Some(name.as_str()) {
+            settings.selected_node = Some(name.clone());
+            if let Err(e) = state.save_settings(settings) {
+                tracing::error!("save selected_node failed: {e}");
+            }
+        }
+    }
     // 【APP11 任务4.3】用户手动切换节点时，若 Go AIM 正在探测，立即发出
     // 中止信号：避免探测继续消耗探针槽位、干扰内核日志，并被随后的
     // 自动锁定覆盖掉用户刚选的节点。
@@ -1482,6 +1568,11 @@ pub async fn get_cached_proxies(
                     if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
                         continue;
                     }
+                    // 【APP33 任务1.1/3.2】过滤「剩余流量/到期时间/官网」等
+                    // 信息/广告类假节点，代理页与仪表盘节点弹窗彻底不显示。
+                    if crate::core::config_builder::is_info_or_ad_node_name(&name) {
+                        continue;
+                    }
                     // 跳过机场提示节点（127.x / localhost）
                     if server.starts_with("127.") || server == "localhost" {
                         continue;
@@ -1514,6 +1605,10 @@ pub async fn get_cached_proxies(
                 }
                 // 【APP-10 任务2】名为 direct/block/直连 的节点绝不进 UI 列表
                 if crate::core::config_builder::is_builtin_non_proxy_tag(&name) {
+                    continue;
+                }
+                // 【APP33 任务1.1/3.2】过滤信息/广告类假节点
+                if crate::core::config_builder::is_info_or_ad_node_name(&name) {
                     continue;
                 }
                 if server.starts_with("127.") || server == "localhost" {

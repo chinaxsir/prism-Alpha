@@ -254,3 +254,26 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
   setSubscriptions: (subscriptions) => set({ subscriptions }),
 }));
+
+/**
+ * 【APP33 任务3.2】信息/广告类假节点名称识别（前端版，与后端
+ * config_builder::is_info_or_ad_node_name 关键词严格一致）。
+ * 只拦截「剩余流量/到期时间/官网公告」等信息类名称，绝不包含
+ * 「下载/高速/专线/倍率/流媒体」等真实节点常用词，防止误杀
+ * 「美国凤凰城|高速下载」这类真实节点。
+ */
+export function isDummyNodeName(name?: string | null): boolean {
+  if (!name) return true;
+  const n = name.trim().toLowerCase();
+  if (n.length === 0) return true;
+  const keywords = [
+    "剩余", "流量", "到期", "过期", "重置", "套餐", "有效期", "剩余天数",
+    "官网", "网址", "发布页", "地址发布", "最新地址", "备用地址", "防失联",
+    "群组", "官方群", "电报群", "tg群", "频道", "客服", "工单",
+    "公告", "通知", "使用说明", "使用必读", "教程", "必看",
+    "优惠", "折扣", "续费", "购买", "邀请好友", "返利", "推广",
+    "请更新", "更新订阅", "节点故障", "维护中",
+    "http://", "https://", "t.me/",
+  ];
+  return keywords.some((kw) => n.includes(kw));
+}
