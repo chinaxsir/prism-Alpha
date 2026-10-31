@@ -102,6 +102,23 @@ export default function App() {
     document.documentElement.lang = resolveLang(language) === "zh" ? "zh-CN" : "en";
   }, [language]);
 
+  // 【APP36 任务2.2】拦截全局撤销/重做输入事件：焦点不在输入框时调用
+  // preventDefault()，彻底杜绝 iOS 晃动手机弹出 Undo Typing / Undo Paste。
+  useEffect(() => {
+    const onBeforeInput = (e: Event) => {
+      const ie = e as InputEvent;
+      if (ie.inputType !== "historyUndo" && ie.inputType !== "historyRedo") return;
+      const ae = document.activeElement as HTMLElement | null;
+      const inField =
+        !!ae &&
+        (ae.tagName === "TEXTAREA" ||
+          (ae.tagName === "INPUT" && !(ae as HTMLInputElement).readOnly));
+      if (!inField) e.preventDefault();
+    };
+    document.addEventListener("beforeinput", onBeforeInput, true);
+    return () => document.removeEventListener("beforeinput", onBeforeInput, true);
+  }, []);
+
   // 【APP-11 任务3】后端权威状态广播 → 全局 store，实现全 APP 开关实时双向同步：
   // 任意页面（仪表盘 / 设置 / 代理）改动开关，其余页面立即跟随，绝不回弹。
   useEffect(() => {

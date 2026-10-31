@@ -1322,12 +1322,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // connection refused；25MB 内存上限已保证不触发 Jetsam。
                     inbounds[i]["mtu"] = 1280
                     inbounds[i]["stack"] = "gvisor"
-                    // 【APP35 任务2.1】开启被动域名嗅探但不改写目标地址：
-                    // 仅供「分析」页提取域名，内网 IP 绝不被嗅探器改写，
-                    // ip_cidr → go-lan-home 规则保持精确匹配。
-                    inbounds[i]["sniff"] = true
-                    inbounds[i]["sniff_override_destination"] = false
-                    inbounds[i]["sniff_timeout"] = "300ms"
+                    // 【APP36 任务1.2】tun-in 关闭嗅探：域名嗅探仅由 mixed-in
+                    // 完成；tun-in 开启 sniff 会改写内网 IP 目标，破坏
+                    // ip_cidr → go-lan-home 的精确匹配，Safari 访问
+                    // https://192.168.10.253:8001 会报「服务器已停止响应」。
+                    inbounds[i]["sniff"] = false
+                    inbounds[i].removeValue(forKey: "sniff_override_destination")
+                    inbounds[i].removeValue(forKey: "sniff_timeout")
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }
@@ -1989,18 +1990,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP31 任务1】黄金优先级顺序（自上而下）：
+        // 【APP36 任务1.2】黄金优先级顺序（自上而下，与 Rust config_builder 一致）：
         // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
         //    127.0.0.1:2083..2086 探针入站）
-        // 2. WG 服务端公网 IP 直连豁免（wgServerIP/32 → direct）：任何发往
-        //    家里 WireGuard 服务端的握手 / UDP 封装包 100% 强制走 direct，
-        //    绝不被路由进海外 VLESS-WebSocket 节点（log9.txt ws closed: 1005）
-        // 3. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
-        // 4. Go Lan 回家域名（domain_suffix → go-lan-home）
-        // 5. DNS 劫持 / 853 与 DoH 拦截 / QUIC 拦截
-        // 6. 私有地址直连（排除已被第 3 优先级命中的家庭网段）
-        // 7. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        // 2. DNS 劫持（protocol dns / port 53 → dns-out）
+        // 3. 853 拦截 + 公共 DNS DoH/DoT 拦截 + QUIC 拦截（UDP 443 / protocol quic）
+        // 4. WG 服务端公网 IP 直连豁免（wgServerIP/32 → direct）
+        // 5. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
+        // 6. Go Lan 回家域名（domain_suffix → go-lan-home）
+        // 7. 私有地址直连（排除已被第 5 优先级命中的家庭网段）
+        // 8. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
         var finalHead = aimProbeRules
+        finalHead.append(contentsOf: headRules)
         if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
             finalHead.append([
                 "ip_cidr": ["\(wgServerIP)/32"],
@@ -2018,7 +2019,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ])
         }
         finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] == nil })
-        finalHead.append(contentsOf: headRules)
         finalHead.append([
             "ip_is_private": true, "outbound": "direct"
         ])

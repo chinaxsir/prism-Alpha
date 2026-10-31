@@ -915,16 +915,11 @@ pub fn build(
         route_rules.insert(1, json!({ "clash_mode": "direct", "outbound": "direct" }));
     }
 
-    // 阻止 QUIC：UDP/443 直接拦截，强制浏览器回退 TCP（规则链最前，优先级最高）
-    if settings.block_quic {
-        route_rules.insert(
-            0,
-            json!({ "network": "udp", "port": 443, "outbound": "block" }),
-        );
-    }
+    // 【APP36 任务1.1】QUIC 拦截统一在下方「头部规则」中构建并置于
+    // go-lan-home 之前（此处不再单独插入，避免顺序不可控）。
 
     // 【APP-9 任务2.1a / APP17 任务5.1】Go Lan 回家规则的最终落位在
-    // 下方「Android DNS 清洗」之前统一执行（强制置顶），此处仅先声明。
+    // 下方头部规则构建区统一执行（强制置顶），此处仅先声明。
 
     // 官网域名强制直连（最高优先级）：官方站点用于授权激活/续费与客户端下载，
     // 经节点在部分机场会被 CDN 或上游策略拦截，表现为「开代理后官网打不开」。
@@ -1133,21 +1128,20 @@ pub fn build(
             // report handshake success: connection refused；25MB 内存
             // 上限已保证扩展不触发 Jetsam。
             "stack": "gvisor",
-            // 【APP35 任务2.2】被动域名嗅探但不改写目标地址：仅供「分析」页
-            // 提取域名，内网 IP（192.168.10.253:8000）保持 ip_cidr 精确匹配。
-            "sniff": true,
-            "sniff_override_destination": false,
-            "sniff_timeout": "300ms",
+            // 【APP36 任务1.1】tun-in 关闭嗅探：域名嗅探统一由 mixed-in 完成，
+            // tun-in 若开启 sniff 会改写内网 IP 目标，破坏 ip_cidr 精确匹配。
+            "sniff": false,
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
         {
             let obj = tun.as_object_mut().expect("tun inbound is an object");
+            // 【APP36 任务1.1】strict_route 固定 false：避免 iOS/桌面额外
+            // 改写系统路由表，导致内网 Web 流量绕过 go-lan-home。
+            obj.insert("strict_route".into(), json!(false));
             if cfg!(target_os = "android") {
-                obj.remove("strict_route");
                 obj.remove("interface_name");
             } else {
-                obj.insert("strict_route".into(), json!(true));
                 obj.insert("interface_name".into(), json!("prism-tun"));
             }
         }
@@ -1293,92 +1287,44 @@ pub fn build(
         }
     });
 
-    // 【APP11 任务4.1】DNS-over-TLS(853) 顶部拦截：iOS/系统在隧道就绪前
-    // 尝试 DoT 直连 8.8.8.8:853 / 8.8.4.4:853，会反复报 i/o timeout 刷屏；
-    // 在最顶部 block 853，逼使系统立即回退到标准 53 端口 DNS。
-    // （route_rules 自身不用 853，插入 index 0 不影响 DNS 劫持优先级）
-    route_rules.insert(0, json!({ "port": 853, "outbound": "block" }));
-
-    // 【APP15 任务3.2】公共 DNS 的 DoH/DoT 端点直连拦截：iOS 系统与部分 App
-    // 会尝试直连 8.8.8.8/8.8.4.4/1.1.1.1/1.0.0.1 的 443(DoH)/853(DoT)，
-    // 在隧道未就绪时反复 i/o timeout 刷屏并绕过本地 DNS 劫持。
-    // 紧跟在 853 拦截之后，确保优先于任何代理/直连规则命中。
-    route_rules.insert(
-        1,
+    // 【APP36 任务1.1】route.rules 头部固定顺序（严格自上而下）：
+    // ① DNS 劫持（protocol dns / port 53 → dns-out）
+    // ② 853 拦截 + 公共 DNS 的 DoH/DoT 直连拦截
+    // ③ QUIC 拦截（protocol quic / UDP 443，强制 Safari 走 TCP）
+    // ④ wg_server_ip/32 → direct 豁免
+    // ⑤ ip_cidr: go_lan_cidrs → go-lan-home（必须早于 clash_mode: direct、
+    //    ip_is_private: true、clash_mode: global）
+    // 说明：853 拦截避免 iOS 在隧道就绪前直连 8.8.8.8:853 反复超时刷屏；
+    // 公共 DNS 的 DoH/DoT 端点（8.8.8.8 等 443/853）一律 block。
+    let mut head_rules: Vec<Value> = vec![
+        json!({ "protocol": "dns", "outbound": "dns-out" }),
+        json!({ "port": 53, "outbound": "dns-out" }),
+        json!({ "port": 853, "outbound": "block" }),
         json!({
             "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
             "port": [443, 853],
             "outbound": "block"
         }),
-    );
-
-    // 【APP17 任务5.1】Go Lan 回家规则强制置顶：紧随 DNS(53) 之后，
-    // 先于 853/DoH 拦截、官网直连、block_quic 与 clash_mode/ip_is_private/
-    // 订阅规则。家庭内网网段本身是私有 IP，任何更靠前的规则都会把回家
-    // 流量吞进海外节点或普通直连（log1.txt 实证 192.168.10.x 漏走节点）。
-    // Android 上由下方 DNS 清洗在本数组前再插入两条 dns-out，最终顺序
-    // 即「protocol dns → port 53 → go-lan-home → 其余」。
-    // 【APP31 任务2】Go Lan 头部规则严格置顶（自上而下）：
-    // 1. wg_server_ip/32 → direct（WG 服务端公网 IP 直连豁免，先于一切）；
-    // 2. go-lan-home 回家网段 ip_cidr 与域名规则。
-    if !go_lan_rules.is_empty() || wg_server_ip.is_some() {
-        let mut head_rules: Vec<Value> = Vec::new();
-        if let Some(ip) = &wg_server_ip {
-            head_rules.push(json!({
-                "ip_cidr": [format!("{ip}/32")],
-                "outbound": "direct"
-            }));
-        }
-        head_rules.extend(go_lan_rules);
-        for (i, rule) in head_rules.into_iter().enumerate() {
-            route_rules.insert(i, rule);
-        }
+    ];
+    // QUIC：APP36 要求置于 go-lan-home 之前；tun-in 已关闭 sniff，
+    // 仅靠 protocol 匹配无法识别，故同时用 UDP/443 兜底。
+    if settings.block_quic || !go_lan_rules.is_empty() {
+        head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
+        head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
+    }
+    if let Some(ip) = &wg_server_ip {
+        head_rules.push(json!({
+            "ip_cidr": [format!("{ip}/32")],
+            "outbound": "direct"
+        }));
+    }
+    head_rules.extend(go_lan_rules);
+    for (i, rule) in head_rules.into_iter().enumerate() {
+        route_rules.insert(i, rule);
     }
 
-    // Android DNS 清洗（APP-2 断层二修复）：两条规则放在 route_rules 最顶部
-    // （最先匹配），确保所有 UDP/53 和 DNS 协议请求都被劫持到 dns-out，
-    // 再由 DNS 模块按 detour 走主组出境，防止内核绕过 sing-box DNS 流程
-    // 直连外发；非 Android 平台使用原始 route_rules
-    #[cfg(target_os = "android")]
-    let final_route_rules: Vec<serde_json::Value> = {
-        // 【APP19 任务3】回家规则必须排在 DNS 劫持之前：用户/系统直连家里
-        // 路由器或 NAS 的 53 端口（192.168.10.1:53、192.168.10.253:53）时，
-        // 绝不能被 protocol dns / port 53 规则劫持到外网 DNS。
-        let dns_hijack = vec![
-            json!({ "protocol": "dns", "outbound": "dns-out" }),
-            json!({ "port": 53, "outbound": "dns-out" }),
-        ];
-        let go_lan_lead = route_rules
-            .iter()
-            .take_while(|r| {
-                let ob = r.get("outbound").and_then(|o| o.as_str());
-                if ob == Some(crate::core::go_lan::GO_LAN_TAG) {
-                    return true;
-                }
-                // 【APP31 任务2】wg_server_ip/32 → direct 豁免规则与回家规则
-                // 同属头部区域，DNS 劫持必须排在其后。
-                if ob == Some("direct") {
-                    if let (Some(ip), Some(cidrs)) = (
-                        wg_server_ip.as_ref(),
-                        r.get("ip_cidr").and_then(|c| c.as_array()),
-                    ) {
-                        if cidrs.len() == 1
-                            && cidrs[0].as_str() == Some(format!("{ip}/32").as_str())
-                        {
-                            return true;
-                        }
-                    }
-                }
-                false
-            })
-            .count();
-        let mut android_sanitized = Vec::with_capacity(route_rules.len() + 2);
-        android_sanitized.extend(route_rules[..go_lan_lead].iter().cloned());
-        android_sanitized.extend(dns_hijack);
-        android_sanitized.extend(route_rules[go_lan_lead..].iter().cloned());
-        android_sanitized
-    };
-    #[cfg(not(target_os = "android"))]
+    // 【APP36 任务1.1】DNS 劫持规则已在头部规则区统一置顶（全平台一致），
+    // Android 不再单独清洗，直接使用 route_rules。
     let final_route_rules: Vec<serde_json::Value> = route_rules;
 
     // 【APP-11B 任务3】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
@@ -1452,36 +1398,11 @@ pub fn build(
             }
         }
         if let Some(rules) = config["route"]["rules"].as_array_mut() {
-            // 【APP17 任务5.1】Go Lan 回家规则必须保持最前，探针规则插入到
-            // 「顶部 dns-out + go-lan-home」之后，绝不把回家规则挤下去。
-            let insert_at = rules
-                .iter()
-                .take_while(|r| {
-                    let out = r.get("outbound").and_then(|o| o.as_str());
-                    if out == Some("dns-out") || out == Some("go-lan-home") {
-                        return true;
-                    }
-                    // 【APP31 任务2】wg_server_ip/32 → direct 豁免规则同属
-                    // 头部区域，探针规则必须排在其后，否则豁免被挤到
-                    // aim-probe 之后（单测 go_lan_wireguard_outbound… 实证）。
-                    if out == Some("direct") {
-                        if let (Some(ip), Some(cidrs)) = (
-                            wg_server_ip.as_ref(),
-                            r.get("ip_cidr").and_then(|c| c.as_array()),
-                        ) {
-                            if cidrs.len() == 1
-                                && cidrs[0].as_str() == Some(format!("{ip}/32").as_str())
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                    false
-                })
-                .count();
+            // 【APP36 任务1.1】探针 inbound 匹配规则固定在 route.rules 最顶部
+            // （① aim-probe-in-0..3），先于 DNS 劫持与 go-lan-home。
             for slot in 0..4 {
                 rules.insert(
-                    insert_at + slot,
+                    slot,
                     json!({
                         "inbound": [format!("aim-probe-in-{slot}")],
                         "outbound": format!("GO-AIM-PROBE-{slot}")
@@ -3189,25 +3110,47 @@ rules:
             "go-lan-home 严禁 inet4_bind_address（5G 蜂窝下 i/o timeout）"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
-        // 【APP31 任务2】WG 服务端公网 IP 直连豁免规则必须严格位于
-        // route.rules 首位（10.0.0.1/32 → direct），go-lan 回家规则紧随其后，
-        // 先于 853/DoH 拦截、官网直连、block_quic 与 clash_mode/ip_is_private/
-        // 订阅规则，彻底杜绝外层 UDP 误入海外 VLESS 节点（log9.txt ws closed: 1005）。
+        // 【APP36 任务1.1】头部固定顺序：aim-probe-in → DNS 劫持 →
+        // 853/DoH → QUIC → WG 服务端豁免 → go-lan-home，
+        // 且全部先于 clash_mode / ip_is_private。
         assert_eq!(
-            rules[0]["ip_cidr"][0].as_str(),
-            Some("10.0.0.1/32"),
-            "route.rules 首位必须是 WG 服务端公网 IP /32 豁免"
+            rules[0]["inbound"][0].as_str(),
+            Some("aim-probe-in-0"),
+            "route.rules 首位必须是 aim-probe-in-0 探针规则"
         );
-        assert_eq!(
-            rules[0]["outbound"].as_str(),
-            Some("direct"),
-            "WG 服务端豁免规则必须走 direct"
-        );
+        let dns_pos = rules
+            .iter()
+            .position(|r| r.get("protocol").and_then(Value::as_str) == Some("dns"))
+            .expect("必须存在 protocol dns 劫持规则");
+        assert_eq!(dns_pos, 4, "4 条 aim-probe 之后紧跟 protocol dns 劫持");
+        assert_eq!(rules[dns_pos + 1]["port"].as_u64(), Some(53), "缺 port 53 劫持");
+        assert_eq!(rules[dns_pos + 2]["port"].as_u64(), Some(853), "缺 853 拦截");
+        let wg_pos = rules
+            .iter()
+            .position(|r| {
+                r.get("outbound").and_then(Value::as_str) == Some("direct")
+                    && r.get("ip_cidr")
+                        .and_then(Value::as_array)
+                        .map(|c| c.len() == 1 && c[0].as_str() == Some("10.0.0.1/32"))
+                        .unwrap_or(false)
+            })
+            .expect("WG 服务端豁免规则必须存在");
+        assert_eq!(rules[wg_pos]["outbound"].as_str(), Some("direct"));
         let go_lan_first = rules
             .iter()
             .position(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
             .expect("go-lan 回家规则必须存在");
-        assert_eq!(go_lan_first, 1, "go-lan 回家规则必须紧随 WG 服务端豁免规则");
+        assert!(
+            wg_pos < go_lan_first,
+            "WG 服务端豁免必须早于 go-lan 回家规则"
+        );
+        // QUIC 与 853 必须早于 go-lan-home
+        let quic_pos = rules
+            .iter()
+            .position(|r| r.get("network").and_then(Value::as_str) == Some("udp")
+                && r.get("port").and_then(Value::as_u64) == Some(443));
+        assert!(quic_pos.is_some(), "Go Lan 开启时必须注入 QUIC 拦截");
+        assert!(quic_pos.unwrap() < go_lan_first, "QUIC 拦截必须早于 go-lan-home");
         let cidrs: Vec<String> = rules
             .iter()
             .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
@@ -3322,8 +3265,8 @@ rules:
         assert!(tags.contains(&"HK (2)"), "第二个同名节点自动加序号: {tags:?}");
     }
 
-    /// 【APP35 任务2.2】Tun 模式下 tun-in 必须使用 gvisor 协议栈与 MTU 1280，
-    /// 并开启被动嗅探（不改写目标地址）。
+    /// 【APP36 任务1.1】Tun 模式下 tun-in 必须使用 gvisor 协议栈与 MTU 1280，
+    /// 且关闭嗅探（域名嗅探只由 mixed-in 完成）、strict_route 固定 false。
     #[test]
     fn tun_in_locked_gvisor_mtu_1280() {
         let built = build(
@@ -3351,8 +3294,8 @@ rules:
             .expect("tun-in 入站必须存在");
         assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
         assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
-        assert_eq!(tun["sniff"].as_bool(), Some(true));
-        assert_eq!(tun["sniff_override_destination"].as_bool(), Some(false));
+        assert_eq!(tun["sniff"].as_bool(), Some(false), "tun-in 必须关闭嗅探");
+        assert_eq!(tun["strict_route"].as_bool(), Some(false));
     }
 
     /// 【APP33 任务2.1】出站依赖完整性闭环校验：
