@@ -195,6 +195,14 @@ fn is_running(state: &AppState) -> bool {
 /// 若 go_aim_enabled 则执行锁定选择（手动指定优先，否则评级自动）。
 pub fn start_probe(app: AppHandle) {
     let state = app.state::<AppState>();
+    // APP34：Go AIM 未开启时严禁触发全量探测。148 个节点并发真实 HTTP
+    // 探测会在 iOS 扩展进程内瞬间冲顶 50MB Jetsam 硬红线，导致隧道被
+    // 系统强杀（表现为「启动一会儿自动停止」）。手动触发/启动钩子/
+    // 订阅刷新等所有入口都必须先过这道硬闸。
+    if !state.settings.read().go_aim_enabled {
+        tracing::debug!("[go-aim] Go AIM 未开启，跳过全量探测");
+        return;
+    }
     if state.aim_probing.swap(true, Ordering::AcqRel) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         return;
@@ -284,6 +292,8 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
 /// （死节点 unlocked_tags=[] 且 probed=true），绝不遗漏"未检测"状态。
 async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     let api = state.kernel_api();
+    // APP34：移动端扩展进程受 Jetsam 50MB 硬限制，探测规模必须收敛。
+    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
 
     // 1. 读取全量节点列表
     let proxies = api
@@ -292,8 +302,10 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         .map_err(|e| format!("读取节点列表失败: {e}"))?;
     let mut nodes = collect_nodes(&proxies);
 
-    // 2. 全部节点都没有延迟数据 → 先做一次组测速拿基线
-    if !nodes.is_empty() && nodes.iter().all(|(_, d)| d.is_none()) {
+    // 2. 全部节点都没有延迟数据 → 先做一次组测速拿基线。
+    // 移动端严禁全量组测速（同样会一次性打满 148 个节点），直接跳过：
+    // 无历史延迟的节点由 probe_node 内的单节点基线补测覆盖。
+    if !mobile && !nodes.is_empty() && nodes.iter().all(|(_, d)| d.is_none()) {
         tracing::info!("[go-aim] 无历史延迟数据，先执行组基线测速");
         let _ = api
             .group_url_test(
@@ -314,12 +326,18 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     }
     // 有基线延迟的优先探测（延迟从低到高），无延迟的排后（探测循环内逐个补测）
     nodes.sort_by_key(|(_, d)| d.unwrap_or(u64::MAX));
+    // APP34：移动端只探测延迟最优的前 15 个节点，其余留待后续轮次，
+    // 绝不让 148 个节点同时进入内存与并发池。
+    if mobile {
+        nodes.truncate(15);
+    }
 
     // 3. 探针槽位可用性检测（智能回退）：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
     // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
     let slots: Vec<usize> = (0..PROBE_SLOTS)
         .filter(|slot| probe_port_reachable(PROBE_PORT_BASE + *slot as u16))
+        .take(if mobile { 2 } else { PROBE_SLOTS })
         .collect();
     if slots.is_empty() {
         return Err(format!(
@@ -368,15 +386,22 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     probe_node(&api, &client, &nr_client, slot, &name, history_delay).await;
                 done += 1;
                 // 实时缓存 + 推送前端徽章
-                let app_state = app.state::<AppState>();
-                let mut results = app_state.aim_results.write();
-                results.insert(result.node_name.clone(), result.clone());
-                drop(results);
-                drop(app_state);
+                // 注意：写锁 guard 必须严格限制在本作用域内，绝不可跨 await
+                //（parking_lot RwLockWriteGuard 非 Send，JoinSet::spawn 要求 future: Send）
+                {
+                    let app_state = app.state::<AppState>();
+                    let mut results = app_state.aim_results.write();
+                    results.insert(result.node_name.clone(), result.clone());
+                }
                 let _ = app.emit(
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result }),
                 );
+                // APP34：移动端每完成一个节点休眠 200ms，把并发探针压成
+                // 「每批一个」的节奏，避免多槽位同时并发真实 HTTP 请求。
+                if mobile {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
             }
             done
         });

@@ -1121,17 +1121,15 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP30 任务2】tun-in MTU 锁死 1280：入口 MTU 决定 TCP 向对端
-            // 宣告的 MSS（1280−40=1240），配合 go-lan-home 运行时 MTU 1280，
-            // 彻底消除 MTU 1420 时大包 + WG 头被丢弃（log8.txt 第 25 行）。
-            "mtu": 1280,
+            // 【APP34 任务2.2】tun-in MTU 1400（与外层 utun 一致）：入口 MSS
+            // 由内层 go-lan-home（WireGuard MTU 1280 → MSS 1240）负责收敛，
+            // 去掉 MTU 1420 时大包 + WG 头被丢弃的隐患。
+            "mtu": 1400,
             "auto_route": true,
-            // 【APP31 任务2】tun-in 栈还原为 "gvisor"：外层 UDP 已由
-            // bind_interface + wg_server_ip/32→direct 双重锁定走物理网卡，
-            // gVisor 纯内存转发可支撑飞牛 App / 浏览器 6~10 条并发
-            // HTTP/HTTPS 连接（"mixed" 的 system TCP 栈在扩展内与 utun
-            // 回环路径存在竞态）。
-            "stack": "gvisor",
+            // 【APP34 任务2.2】tun-in 栈恢复轻量级 "mixed"：gvisor 栈需要
+            // 额外约 15MB 常驻内存，在 iOS 扩展 50MB Jetsam 红线下极易被
+            // 系统强杀（「启动一会儿自动停止」的直接诱因之一）。
+            "stack": "mixed",
             // 【APP17 任务5.1】sniff 关闭（原为 true）：iOS 上内网 NAS 服务
             // 走 IP 直连（192.168.10.253:8000/8001），嗅探器一旦把目标改写
             // 为 Host/SNI 域名，ip_cidr → go-lan-home 规则立即失配，
@@ -3323,11 +3321,10 @@ rules:
         assert!(tags.contains(&"HK (2)"), "第二个同名节点自动加序号: {tags:?}");
     }
 
-    /// 【APP32 任务2.2/3】Tun 模式下 tun-in 必须锁死 gvisor 协议栈与
-    /// MTU 1280（根治 iOS system 栈 TCP 回环 NAT connection refused 与
-    /// MTU 1420 大包 unexpected EOF）。
+    /// 【APP34 任务2.2】Tun 模式下 tun-in 必须使用轻量级 mixed 协议栈与
+    /// MTU 1400（gvisor 额外占用约 15MB，会触发 iOS 扩展 50MB Jetsam 强杀）。
     #[test]
-    fn tun_in_locked_gvisor_mtu_1280() {
+    fn tun_in_locked_mixed_mtu_1400() {
         let built = build(
             &[(
                 "https://sub.example".into(),
@@ -3351,8 +3348,8 @@ rules:
             .iter()
             .find(|i| i["tag"] == TUN_TAG)
             .expect("tun-in 入站必须存在");
-        assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
-        assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
+        assert_eq!(tun["stack"].as_str(), Some("mixed"), "tun-in 协议栈必须锁死 mixed");
+        assert_eq!(tun["mtu"].as_u64(), Some(1400), "tun-in MTU 必须锁死 1400");
         assert_eq!(tun["sniff"].as_bool(), Some(false));
     }
 

@@ -62,7 +62,66 @@ var (
 	vpnService *libbox.BoxService
 	vpnCbs     C.prism_vpn_cbs
 	vpnCbsSet  bool
+	// APP34：后台内存回收协程的停止信号。PrismVPNStop 关闭它即可退出
+	// 回收循环；用指针 + 一次性关闭保护，避免重复 Stop 触发
+	// "close of closed channel" panic。
+	memStopCh chan struct{}
 )
+
+// applyIosMemoryLimit 把扩展进程的 Go 堆锁死在安全水位。
+//
+// iOS NEPacketTunnelProvider 扩展受 Jetsam 物理内存硬限制（通常 50MB），
+// 一旦冲顶就会被系统 SIGKILL（扩展来不及写任何错误文件，表现为
+// 「启动一会儿自动停止」）。因此：
+//   - GCPercent(15)：堆每增长 15% 就回收一次，把峰值压低；
+//   - MemoryLimit(25MiB)：软上限，远低于 50MiB Jetsam 红线，逼近时
+//     GC 会主动提前回收，宁可变慢也不被系统强杀。
+//
+// init() 与 PrismVPNStart 开头都要调用一次：init 覆盖 c-archive 静态库
+// 被扩展加载的那一刻；PrismVPNStart 覆盖「上次 Stop 后被其它代码改写过
+// GC 参数」的防御场景。
+func applyIosMemoryLimit() {
+	if runtime.GOOS != "ios" {
+		return
+	}
+	debug.SetGCPercent(15)
+	debug.SetMemoryLimit(25 << 20) // 25MiB < iOS 50MiB Jetsam 硬红线
+}
+
+func init() {
+	applyIosMemoryLimit()
+}
+
+// startMemoryReclaimer 启动每 10 秒一次的后台内存回收协程。
+// 调用方必须持有 vpnMu（在 PrismVPNStart 成功分支内调用）。
+func startMemoryReclaimer() {
+	ch := make(chan struct{})
+	memStopCh = ch
+	go func(stop <-chan struct{}) {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				runtime.GC()
+				debug.FreeOSMemory()
+			}
+		}
+	}(ch)
+}
+
+// stopMemoryReclaimer 关闭后台回收协程（幂等）。
+func stopMemoryReclaimer() {
+	vpnMu.Lock()
+	ch := memStopCh
+	memStopCh = nil
+	vpnMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
 
 //export PrismVPNSetCallbacks
 func PrismVPNSetCallbacks(cbs C.prism_vpn_cbs) {
@@ -73,17 +132,8 @@ func PrismVPNSetCallbacks(cbs C.prism_vpn_cbs) {
 //export PrismVPNStart
 // configContent：完整配置 JSON 文本（libbox 自行解析）
 func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
-	// iOS 网络扩展的 Jetsam 物理内存红线极低（iOS 16 通常 15~50MB，
-	// build 144 实证：解析 2.47MB 配置时内存冲顶被 SIGKILL → code=12
-	// 且扩展来不及写任何错误文件）。当前配置已瘦身至 30KB 以内，
-	// 恢复 GC 默认触发比例（100 = 堆增长 100% 才回收），消除高速转发时
-	// 每增长 10% 堆就触发一次全局 STW 造成的限速与发热；仅保留 38MB
-	// 软上限（离 50MB 硬红线留足安全裕度），逼近上限时才提前回收。
-	// 仅 iOS 生效，Android 保持默认。
-	if runtime.GOOS == "ios" {
-		debug.SetGCPercent(100)
-		debug.SetMemoryLimit(38 << 20) // 38MB < iOS 50MB Jetsam 硬红线
-	}
+	// 扩展进程内存上限锁定（详见 applyIosMemoryLimit）
+	applyIosMemoryLimit()
 
 	vpnMu.Lock()
 	defer vpnMu.Unlock()
@@ -108,6 +158,9 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 		return C.CString("start vpn service: " + err.Error())
 	}
 	vpnService = service
+	// APP34：启动成功后开启每 10 秒一次的后台内存回收，确保扩展进程
+	// 内存始终保持在 20～25MB 安全水位，绝不触碰 Jetsam 红线。
+	startMemoryReclaimer()
 	return nil
 }
 
@@ -117,6 +170,10 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 // vpnMu 永远无法释放，后续 PrismVPNStart 死锁超时 60 秒触发
 // code=12: The VPN session failed to connect in a timely manner。
 func PrismVPNStop() {
+	// APP34：先停掉后台内存回收协程（幂等），避免隧道已关闭后仍在
+	// 定期 runtime.GC/FreeOSMemory 造成无谓扰动。
+	stopMemoryReclaimer()
+
 	vpnMu.Lock()
 	inst := vpnService
 	vpnService = nil

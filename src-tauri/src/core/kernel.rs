@@ -1243,7 +1243,7 @@ async fn auto_select_best_proxy(
         }
     }
 
-    // 优先在解锁池内选最低延迟；池为空或全部失败则回退全量最低延迟
+    // 优先在解锁池内选最低延迟；池为空或全部失败则回退
     let mut best: Option<(String, u64)> = if priority.is_empty() {
         None
     } else {
@@ -1253,7 +1253,13 @@ async fn auto_select_best_proxy(
         if !priority.is_empty() {
             tracing::info!("Go AIM 优先池测速全部失败，回退全量节点");
         }
-        best = test_fastest(api, &nodes, TEST_URL, TEST_TIMEOUT_MS).await;
+        // APP34：严禁对全量 148 个节点逐个调用 Clash API 延迟测速——上百个
+        // 并发探测会瞬间把 iOS 扩展进程内存推过 50MB Jetsam 红线，导致
+        // 「启动一会儿自动停止」。改为主进程 TCP 握手轻量测速：
+        // 前 20 个有效节点 / 并发 6 / 单点超时 1000ms，选出最低延迟后由
+        // 下方仅发送 1 次 PUT 切换。
+        let endpoints = collect_node_endpoints(&state.data_dir);
+        best = tcp_select_fastest(&nodes, &endpoints).await;
     }
 
     // 后台静默跑一次 Go AIM 解锁探测；延迟数秒触发以等待内核状态迁移到
@@ -1261,7 +1267,9 @@ async fn auto_select_best_proxy(
     // 【APP25 任务3】重启内核（保存回家配置 / 网络切换热重载）后必须
     // 无条件重跑一次探测：旧逻辑仅在「AIM 未开启」或「优先池为空」时触发，
     // 导致用户已有评级结果且开启 AIM 时，重启后仍沿用旧缓存锁定旧线路。
-    let trigger_probe = pro_unlocked;
+    // 【APP34】但必须严格跟随 Go AIM 开关：关闭时绝不触发全量探测，
+    // 否则 148 节点真实 HTTP 探测会撑爆扩展进程内存。
+    let trigger_probe = go_aim_enabled;
     if trigger_probe {
         let probe_app = app_handle.clone();
         tauri::async_runtime::spawn(async move {
@@ -1379,6 +1387,113 @@ async fn test_fastest(
     let mut best: Option<(String, u64)> = None;
     for task in tasks {
         if let Ok(Some((node, delay))) = task.await {
+            if best.as_ref().is_none_or(|(_, d)| delay < *d) {
+                best = Some((node, delay));
+            }
+        }
+    }
+    best
+}
+
+/// APP34：从已启用订阅的 profile 提取「节点名 → (server, port)」映射。
+///
+/// Clash API `/proxies` 只返回类型/延迟等元数据，不含 server/port；
+/// 想在**主进程**做 TCP 握手测速（不占用 50MB 的扩展进程），必须回源
+/// 订阅缓存解析出真实出口地址。
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) fn collect_node_endpoints(
+    data_dir: &std::path::Path,
+) -> std::collections::HashMap<String, (String, u16)> {
+    use crate::core::config_builder::{is_builtin_non_proxy_tag, is_info_or_ad_node_name};
+    let mut map = std::collections::HashMap::new();
+    for record in crate::core::store::load_subscriptions(data_dir) {
+        if !record.enabled {
+            continue;
+        }
+        let path = crate::core::store::profile_path(data_dir, &record.url);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+            continue;
+        };
+        let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        for p in proxies {
+            let name = crate::core::uri_parser::fix_utf8_mojibake(
+                p.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("");
+            let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+            if name.is_empty() || server.is_empty() || !(2..=65535).contains(&port) {
+                continue;
+            }
+            if is_builtin_non_proxy_tag(&name) || is_info_or_ad_node_name(&name) {
+                continue;
+            }
+            if server.starts_with("127.") || server == "localhost" || server == "0.0.0.0" {
+                continue;
+            }
+            map.entry(name)
+                .or_insert_with(|| (server.to_string(), port as u16));
+        }
+    }
+    map
+}
+
+/// APP34：主进程 TCP 握手测速选点。
+///
+/// 约束（与 iOS 扩展内存隔离）：最多前 20 个有 server/port 的节点、
+/// 并发 6、单点超时 1000ms。返回握手延迟最低者；全部失败返回 None。
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) async fn tcp_select_fastest(
+    nodes: &[String],
+    endpoints: &std::collections::HashMap<String, (String, u16)>,
+) -> Option<(String, u64)> {
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpStream;
+    use tokio::sync::Semaphore;
+
+    const TOP_N: usize = 20;
+    const CONCURRENCY: usize = 6;
+    const TIMEOUT_MS: u64 = 1000;
+
+    let candidates: Vec<(String, String, u16)> = nodes
+        .iter()
+        .filter_map(|n| {
+            endpoints
+                .get(n)
+                .map(|(server, port)| (n.clone(), server.clone(), *port))
+        })
+        .take(TOP_N)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let sem = std::sync::Arc::new(Semaphore::new(CONCURRENCY));
+    let mut set = tokio::task::JoinSet::new();
+    for (name, server, port) in candidates {
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok()?;
+            let start = Instant::now();
+            let connected = tokio::time::timeout(
+                Duration::from_millis(TIMEOUT_MS),
+                TcpStream::connect((server.as_str(), port)),
+            )
+            .await;
+            match connected {
+                Ok(Ok(_stream)) => Some((name, start.elapsed().as_millis() as u64)),
+                _ => None,
+            }
+        });
+    }
+
+    let mut best: Option<(String, u64)> = None;
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some((node, delay))) = res {
             if best.as_ref().is_none_or(|(_, d)| delay < *d) {
                 best = Some((node, delay));
             }

@@ -82,6 +82,9 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
 
     // 启动后自动测速并切换到延迟最低的可用节点（用户随后仍可手动改选）
     // 【APP26 任务2.3】仅当未开启 Go AIM 且用户从未手动点选节点时才自动优选
+    // APP34：移动端由内核启动流程（kernel.rs auto_select_best_proxy）统一
+    // 负责自动选点，这里跳过，避免同一轮启动并发两套测速重复轰击扩展内存。
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     if should_auto_select(state)
         && let Some(group) = state.main_selector.read().clone()
     {
@@ -494,6 +497,8 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
 
     // 与 start_core 一致：重启后自动测速选点（APP26：同样受 Go AIM /
     // 用户手动选点条件约束）
+    // APP34：移动端重启后的选点由 kernel.rs 统一负责，这里跳过避免重复测速。
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     if should_auto_select(state)
         && let Some(group) = state.main_selector.read().clone()
     {
@@ -616,7 +621,8 @@ fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group
             }
         }
         let api = KernelApi::new(&api_addr, &api_secret);
-        match auto_select_fastest(&api, &group).await {
+        let data_dir = app.state::<AppState>().data_dir.clone();
+        match auto_select_fastest(&api, &group, &data_dir).await {
             Ok(Some(best)) => {
                 tracing::info!("auto selected fastest node in [{group}]: {best}");
                 // 通知节点页刷新（当前选中项/延迟已变化）
@@ -630,41 +636,89 @@ fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group
 
 /// 整组测速并选择最优叶子节点；返回被选中的节点名。
 /// direct 延迟最低但无法翻墙，嵌套策略组也不可作为目标，均需排除。
-async fn auto_select_fastest(api: &KernelApi, group: &str) -> anyhow::Result<Option<String>> {
-    const GROUP_TYPES: [&str; 4] = ["Selector", "URLTest", "Fallback", "LoadBalance"];
-
-    let delays = api.group_url_test(group, None, Some(2000), None).await?;
-    let proxies = api.get_proxies().await?;
-    let empty = serde_json::Map::new();
-    let map = proxies
-        .get("proxies")
-        .and_then(|p| p.as_object())
-        .unwrap_or(&empty);
-
-    let best = delays
-        .as_object()
-        .into_iter()
-        .flatten()
-        // 【APP-10 任务2】大小写不敏感 + 中文"直连"统一过滤内置非代理出站
-        .filter(|(name, _)| {
-            !crate::core::config_builder::is_builtin_non_proxy_tag(name.as_str())
-        })
-        .filter(|(name, _)| {
-            let kind = map
-                .get(*name)
-                .and_then(|e| e.get("type"))
-                .and_then(|t| t.as_str())
-                .unwrap_or_default();
-            !GROUP_TYPES.contains(&kind)
-        })
-        .filter_map(|(name, delay)| delay.as_u64().map(|d| (name.clone(), d)))
-        .min_by_key(|(_, d)| *d)
-        .map(|(name, _)| name);
-
-    if let Some(best) = &best {
-        api.select_proxy(group, best).await?;
+///
+/// APP34：移动端严禁整组 Clash API 测速（148 节点并发会瞬间撑爆 iOS
+/// 扩展进程 50MB Jetsam 红线）——改为主进程 TCP 握手轻量测速。
+async fn auto_select_fastest(
+    api: &KernelApi,
+    group: &str,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let endpoints = crate::core::kernel::collect_node_endpoints(data_dir);
+        if endpoints.is_empty() {
+            tracing::warn!("auto select: 无可用节点 server/port，跳过 TCP 测速");
+            return Ok(None);
+        }
+        let proxies = api.get_proxies().await?;
+        let empty = serde_json::Map::new();
+        let map = proxies
+            .get("proxies")
+            .and_then(|p| p.as_object())
+            .unwrap_or(&empty);
+        let members: Vec<String> = map
+            .get(group)
+            .and_then(|g| g.get("all"))
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let candidates: Vec<String> = members
+            .into_iter()
+            .filter(|n| !crate::core::config_builder::is_builtin_non_proxy_tag(n))
+            .filter(|n| map.get(n).map(|i| i.get("all").is_none()).unwrap_or(true))
+            .collect();
+        let best = crate::core::kernel::tcp_select_fastest(&candidates, &endpoints).await;
+        if let Some((name, _)) = &best {
+            // 仅发送 1 次 PUT 切换，避免任何额外重启动作
+            api.select_proxy(group, name).await?;
+        }
+        return Ok(best.map(|(name, _)| name));
     }
-    Ok(best)
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        // 桌面端无需回源订阅缓存（Clash API 整组测速即可）
+        let _ = data_dir;
+        const GROUP_TYPES: [&str; 4] = ["Selector", "URLTest", "Fallback", "LoadBalance"];
+
+        let delays = api.group_url_test(group, None, Some(2000), None).await?;
+        let proxies = api.get_proxies().await?;
+        let empty = serde_json::Map::new();
+        let map = proxies
+            .get("proxies")
+            .and_then(|p| p.as_object())
+            .unwrap_or(&empty);
+
+        let best = delays
+            .as_object()
+            .into_iter()
+            .flatten()
+            // 【APP-10 任务2】大小写不敏感 + 中文"直连"统一过滤内置非代理出站
+            .filter(|(name, _)| {
+                !crate::core::config_builder::is_builtin_non_proxy_tag(name.as_str())
+            })
+            .filter(|(name, _)| {
+                let kind = map
+                    .get(*name)
+                    .and_then(|e| e.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+                !GROUP_TYPES.contains(&kind)
+            })
+            .filter_map(|(name, delay)| delay.as_u64().map(|d| (name.clone(), d)))
+            .min_by_key(|(_, d)| *d)
+            .map(|(name, _)| name);
+
+        if let Some(best) = &best {
+            api.select_proxy(group, best).await?;
+        }
+        Ok(best)
+    }
 }
 
 /// 解析 sing-box 二进制位置，优先级：
@@ -1123,10 +1177,22 @@ pub(crate) async fn refresh_subscription(
     // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
     refresh_providers(state, &url, &text).await;
 
-    // 内核运行中：重建配置重启，新订阅即刻生效
+    // 内核运行中：重建配置重启，新订阅即刻生效。
+    // APP34：移动端 VPN 运行期间严禁「停隧道 + 重启隧道」——iOS 扩展在
+    // 50MB Jetsam 红线内重启必然崩溃（表现为启动 10~15 秒后自动停止）。
+    // 此时只落盘订阅缓存并广播事件，新节点在下次正常启动时生效。
+    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
     if *state.status.read() == CoreStatus::Running {
-        tracing::info!("subscription updated, restarting core");
-        restart_core(app, state).await?;
+        if mobile {
+            tracing::info!("subscription updated, mobile running: skip tunnel restart");
+            crate::core::logger::info(
+                crate::core::logger::MOD_SUB,
+                "移动端 VPN 运行中，订阅缓存已更新，隧道保持不重启（下次启动生效）",
+            );
+        } else {
+            tracing::info!("subscription updated, restarting core");
+            restart_core(app, state).await?;
+        }
     }
 
     Ok(())
@@ -1760,8 +1826,12 @@ pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
 
     crate::core::logger::info(log, "Pro 授权有效，自动开启云端订阅同步并更新节点...");
     let was_running = *state.status.read() == CoreStatus::Running;
+    // APP34：移动端 VPN 运行期间绝不停止隧道——50MB Jetsam 下重启必崩。
+    // 后台同步只更新磁盘/内存中的订阅缓存，正在运行的隧道保持不变。
+    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+    let stop_for_sync = was_running && !mobile;
     let before = crate::core::store::load_subscriptions(&state.data_dir);
-    if was_running {
+    if stop_for_sync {
         let _ = do_stop(&state).await;
     }
 
@@ -1806,8 +1876,8 @@ pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
         );
     }
 
-    // 3. 恢复内核（若同步前在运行）
-    if was_running {
+    // 3. 恢复内核（仅桌面端：移动端本就没有停机，隧道需保持运行）
+    if stop_for_sync {
         let app2 = app.clone();
         let state2 = app2.state::<AppState>();
         let _ = start_core_inner(&app2, &state2).await;
@@ -2351,6 +2421,11 @@ pub async fn set_go_aim_enabled(
 /// 手动触发一轮全量探测（需内核运行中 + 授权激活）
 #[tauri::command]
 pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    // APP34：Go AIM 关闭时严禁执行全量探测——148 节点并发真实 HTTP
+    // 探测会瞬间撑爆 iOS 扩展进程 50MB Jetsam 上限（「启动一会儿自动停止」）。
+    if !state.settings.read().go_aim_enabled {
+        return Ok(false);
+    }
     if !state.is_pro_active() {
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
