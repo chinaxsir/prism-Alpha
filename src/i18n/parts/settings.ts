@@ -49,6 +49,9 @@ const zh: Record<string, string> = {
 
   // ---- 代理内核 ----
   "settings.kernel": "代理内核",
+  "settings.kernelVersion": "内核版本",
+  "settings.runMode.systemProxy": "系统代理",
+  "settings.runMode.tun": "TUN 虚拟网卡",
   "settings.kernelInstalled": "已安装",
   "settings.kernelMissing": "内核文件缺失",
   "settings.kernelReinstall": "请重新安装",
@@ -133,6 +136,9 @@ const en: Record<string, string> = {
   "settings.closeConnsDesc": "Drop existing connections when switching nodes",
 
   "settings.kernel": "Proxy Kernel",
+  "settings.kernelVersion": "Kernel Version",
+  "settings.runMode.systemProxy": "System Proxy",
+  "settings.runMode.tun": "TUN Virtual NIC",
   "settings.kernelInstalled": "Installed",
   "settings.kernelMissing": "Kernel binary missing",
   "settings.kernelReinstall": "Please reinstall",

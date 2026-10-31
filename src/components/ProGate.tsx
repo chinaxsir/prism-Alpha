@@ -27,59 +27,56 @@ const PLAN_LABEL: Record<string, string> = {
   team: "pro.plan.team",
 };
 
-/** APK-3 任务2：激活错误码 → 错误卡片文案（与《软件激活（客户端提示）》1:1 逐字对齐） */
+/** APK-3 任务2：激活错误码 → 错误卡片文案 key（与《软件激活（客户端提示）》1:1 逐字对齐） */
 const LICENSE_ERROR_MAP: Record<
   string,
-  { code: string; title: string; detail: string }
+  { code: string; titleKey: string; detailKey: string }
 > = {
   invalid_input: {
     code: "invalid_input",
-    title: "激活信息不完整或格式不正确",
-    detail: "将客户端更新至最新版本后重试。",
+    titleKey: "pro.err.invalid_input.title",
+    detailKey: "pro.err.invalid_input.detail",
   },
   activation_failed: {
     code: "activation_failed",
-    title: "License Key 与邮箱不匹配，或授权已过期 / 被停用",
-    detail:
-      "核对 Key 与注册邮箱是否一致（建议复制粘贴，注意大小写与空格）；确认订阅未过期。确认无误仍失败时，请通过工单联系我们。",
+    titleKey: "pro.err.activation_failed.title",
+    detailKey: "pro.err.activation_failed.detail",
   },
   seat_limit_reached: {
     code: "seat_limit_reached",
-    title: "设备数已达当前档位上限（试用 1 台 / Pro 3 台 / 买断 5 台）",
-    detail:
-      "登录用户面板，在「设备管理」中解绑不再使用的设备，再用同一 License Key 重新激活。",
+    titleKey: "pro.err.seat_limit_reached.title",
+    detailKey: "pro.err.seat_limit_reached.detail",
   },
   activation_throttled: {
     code: "activation_throttled",
-    title: "短时间内激活失败次数过多，触发安全保护",
-    detail:
-      "按客户端提示的倒计时等待后再试（锁定最长 30 分钟）。期间请勿反复重试，每次失败都会延长锁定时间。",
+    titleKey: "pro.err.activation_throttled.title",
+    detailKey: "pro.err.activation_throttled.detail",
   },
   server_error: {
     code: "server_error",
-    title: "服务器临时异常",
-    detail: "稍后重试；若持续出现，请提交工单。",
+    titleKey: "pro.err.server_error.title",
+    detailKey: "pro.err.server_error.detail",
   },
   // 【APP6 任务4】服务端具体原因精准映射（license.rs map_activation_error）
   invalid_key: {
     code: "invalid_key",
-    title: "授权码 (License Key) 不存在或输入有误",
-    detail: "请核对授权码是否完整、有无多余空格后重试。",
+    titleKey: "pro.err.invalid_key.title",
+    detailKey: "pro.err.invalid_key.detail",
   },
   email_mismatch: {
     code: "email_mismatch",
-    title: "输入的邮箱与该授权码绑定的账户邮箱不一致",
-    detail: "请使用激活该授权码时填写的邮箱。",
+    titleKey: "pro.err.email_mismatch.title",
+    detailKey: "pro.err.email_mismatch.detail",
   },
   license_expired: {
     code: "license_expired",
-    title: "该授权码已到期",
-    detail: "请续费后再重新激活。",
+    titleKey: "pro.err.license_expired.title",
+    detailKey: "pro.err.license_expired.detail",
   },
   license_blocked: {
     code: "license_blocked",
-    title: "该授权码或当前设备已被管理员禁用",
-    detail: "如有疑问请联系客服申诉。",
+    titleKey: "pro.err.license_blocked.title",
+    detailKey: "pro.err.license_blocked.detail",
   },
 };
 
@@ -90,7 +87,7 @@ const LICENSE_ERROR_MAP: Record<
  *  - "err_raw:{服务端原文}"（【APP6 任务4】无法归入已知类别时透传原文） */
 function parseLicenseError(
   message: string
-): { code: string; title: string; detail: string } | null {
+): { code: string; titleKey: string; detailKey: string; rawTitle?: string } | null {
   if (!message) return null;
   const errCode = message.match(/err_code:([a-z_]+)/i);
   const rate = message.match(/rate_limited:\d+:([a-z_]+)/i);
@@ -99,15 +96,16 @@ function parseLicenseError(
     return (
       LICENSE_ERROR_MAP[code] ?? {
         code,
-        title: message.replace(/^err_code:/, ""),
-        detail: "",
+        titleKey: "",
+        detailKey: "",
+        rawTitle: message.replace(/^err_code:/, ""),
       }
     );
   }
   // err_raw 透传：直接展示服务端返回的具体原因（已含 HTTP 状态）
   const raw = message.match(/^err_raw:(.+)$/s);
   if (raw?.[1]) {
-    return { code: "err_raw", title: raw[1].trim(), detail: "" };
+    return { code: "err_raw", titleKey: "", detailKey: "", rawTitle: raw[1].trim() };
   }
   return null;
 }
@@ -241,14 +239,19 @@ export function ActivateProModal({
       // 【APP21 任务1】无论是否命中标准错误码，错误一律渲染到弹窗内错误
       // 卡片（输入框下方 text-red-400 区域），绝不触发顶部全局 Toast 横幅。
       const mapped = parseLicenseError(rawError);
+      const mappedCard = mapped
+        ? {
+            code: mapped.code,
+            title: cleanErrorMsg(mapped.rawTitle ?? t(mapped.titleKey)),
+            detail: mapped.detailKey ? t(mapped.detailKey) : "",
+          }
+        : null;
       setParsedError(
-        mapped
-          ? { ...mapped, title: cleanErrorMsg(mapped.title) }
-          : {
-              code: "activation_failed",
-              title: freshError || t("pro.activateFailed"),
-              detail: wait > 0 ? t("pro.rateLimited", { secs: wait }) : "",
-            }
+        mappedCard ?? {
+          code: "activation_failed",
+          title: freshError || t("pro.activateFailed"),
+          detail: wait > 0 ? t("pro.rateLimited", { secs: wait }) : "",
+        }
       );
     }
   };

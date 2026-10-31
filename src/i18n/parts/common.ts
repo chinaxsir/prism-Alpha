@@ -101,6 +101,12 @@ const zh: Record<string, string> = {
   "logs.cleared": "日志已清空",
   "logs.copied": "日志已复制到剪贴板",
   "logs.exportCopied": "日志全文已复制，并已导出 .log 文件",
+  "logs.exportEmpty": "暂无日志可导出",
+  "logs.exported": "✅ 已复制全部日志",
+  "logs.exportHeader": "================ Prism 诊断日志 ================",
+  "logs.exportTime": "导出时间: {time}",
+  "logs.exportCount": "日志条数: {count}",
+  "logs.exportModule": "模块筛选: {module}",
 
   // ---- Go Lan / Go Cus 操作提示（APP25 任务1：补齐全部缺失键值）----
   "goLan.saved": "Go Lan 配置已保存",
@@ -108,6 +114,50 @@ const zh: Record<string, string> = {
   "goLan.cleared": "Go Lan 配置已清空",
   "goLan.imported": "已自动识别并填入 WireGuard 配置",
   "goLan.invalidConfig": "未识别到有效的 WireGuard 配置",
+
+  // ---- Go Lan 配置弹窗（APP35 任务1） ----
+  "goLan.modalTitle": "Go Lan · 回家内网配置",
+  "goLan.mode.manual": "手动配置 (WireGuard)",
+  "goLan.mode.managed": "托管模式 (Managed)",
+  "goLan.pasteRecognize": "📋 粘贴配置文本 / 链接一键识别",
+  "goLan.pastePlaceholder":
+    "粘贴 [Interface] ... [Peer] ... 全文到此处，松开即刻自动识别填入",
+  "goLan.hintMissingPrivateKey":
+    "已识别到服务器地址，但配置里没找到 PrivateKey = 行，请确认完整复制了 [Interface] 段",
+  "goLan.hintEmptyPaste": "请先将 WireGuard 配置文本长按粘贴到上方输入框中",
+  "goLan.hintInvalidConfig": "未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式",
+  "goLan.recognizedToast": "已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存",
+  "goLan.lanCidrs": "回家内网网段（LAN CIDRs）",
+  "goLan.lanCidrsPlaceholder": "如 10.195.0.0/24, 192.168.1.0/24",
+  "goLan.endpointHost": "服务器地址（Endpoint Host）",
+  "goLan.port": "端口",
+  "goLan.localIp": "本机虚拟地址（Local Address）",
+  "goLan.localIpHint":
+    "支持逗号分隔多个地址：第 1 个写入隧道，其余自动转为 /24 并入回家网段",
+  "goLan.mtu": "MTU",
+  "goLan.privateKey": "客户端私钥（PrivateKey）",
+  "goLan.show": "显示",
+  "goLan.hide": "隐藏",
+  "goLan.peerPublicKey": "服务端公钥（Peer PublicKey）",
+  "goLan.psk": "预共享密钥（PresharedKey，选填）",
+  "goLan.managedServer": "托管服务器",
+  "goLan.deviceCode": "设备识别码",
+  "goLan.syncing": "拉取中...",
+  "goLan.syncNow": "立即拉取家庭节点配置",
+  "goLan.enable": "启用 Go Lan",
+  "goLan.testTitle": "内网连通性检测",
+  "goLan.testPlaceholder": "请输入内网 IP（如 192.168.10.253:8000）",
+  "goLan.clear": "清空配置",
+  "goLan.saving": "保存中...",
+  "goLan.saveConfig": "保存配置",
+  "goLan.errServerRequired": "请填写服务器地址",
+  "goLan.errPrivateKeyRequired": "请填写客户端私钥",
+  "goLan.errPeerKeyRequired": "请填写服务端公钥",
+  "goLan.errNodeUriRequired": "请粘贴回家节点分享链接",
+  "goLan.errLanCidrsRequired": "请填写回家内网网段（如 10.195.0.0/24）",
+  "goLan.saveTimeout": "保存超时，请稍后重试",
+  "goLan.probeReachable": "✅ 可达：{target} · 延迟 {latency} ms",
+  "goLan.probeUnreachable": "❌ 不可达：{target}（连接超时）",
   "goCus.saved": "Go Cus 配置已保存",
   "settings.saved": "设置已保存",
   "logs.goLanPanel": "Go Lan 实时日志",
@@ -191,6 +241,30 @@ const zh: Record<string, string> = {
   "pro.subscribeExpiry": "订阅到期",
   "pro.configured": "已配置",
   "pro.notConfigured": "未配置回家网络 · 点击右侧配置参数",
+
+  // ---- 激活错误卡片（APP35 任务1） ----
+  "pro.err.invalid_input.title": "激活信息不完整或格式不正确",
+  "pro.err.invalid_input.detail": "将客户端更新至最新版本后重试。",
+  "pro.err.activation_failed.title": "License Key 与邮箱不匹配，或授权已过期 / 被停用",
+  "pro.err.activation_failed.detail":
+    "核对 Key 与注册邮箱是否一致（建议复制粘贴，注意大小写与空格）；确认订阅未过期。确认无误仍失败时，请通过工单联系我们。",
+  "pro.err.seat_limit_reached.title":
+    "设备数已达当前档位上限（试用 1 台 / Pro 3 台 / 买断 5 台）",
+  "pro.err.seat_limit_reached.detail":
+    "登录用户面板，在「设备管理」中解绑不再使用的设备，再用同一 License Key 重新激活。",
+  "pro.err.activation_throttled.title": "短时间内激活失败次数过多，触发安全保护",
+  "pro.err.activation_throttled.detail":
+    "按客户端提示的倒计时等待后再试（锁定最长 30 分钟）。期间请勿反复重试，每次失败都会延长锁定时间。",
+  "pro.err.server_error.title": "服务器临时异常",
+  "pro.err.server_error.detail": "稍后重试；若持续出现，请提交工单。",
+  "pro.err.invalid_key.title": "授权码 (License Key) 不存在或输入有误",
+  "pro.err.invalid_key.detail": "请核对授权码是否完整、有无多余空格后重试。",
+  "pro.err.email_mismatch.title": "输入的邮箱与该授权码绑定的账户邮箱不一致",
+  "pro.err.email_mismatch.detail": "请使用激活该授权码时填写的邮箱。",
+  "pro.err.license_expired.title": "该授权码已到期",
+  "pro.err.license_expired.detail": "请续费后再重新激活。",
+  "pro.err.license_blocked.title": "该授权码或当前设备已被管理员禁用",
+  "pro.err.license_blocked.detail": "如有疑问请联系客服申诉。",
   "pro.modules.goAim": "Go AIM · AI/流媒体智选",
   "pro.modules.goLan": "Go Lan · 回家内网直通",
   "pro.modules.goCus": "Go Cus · 覆写/改写/脚本",
@@ -305,7 +379,7 @@ const en: Record<string, string> = {
   "engine.goLan": "Go Lan",
   "engine.goCus": "Go Cus",
   "engine.goAimTag": "AI Streaming",
-  "engine.goLanTag": "Home LAN Access",
+  "engine.goLanTag": "Home Intranet",
   "engine.goCusTag": "Rewrite & Scripts",
   "engine.goLanProbe": "Probe",
 
@@ -313,7 +387,7 @@ const en: Record<string, string> = {
   "logs.title": "Runtime Logs",
   "logs.quotaSuffix": "of 512 KB",
   "logs.cardTitle": "Runtime Logs",
-  "logs.cardDesc": "Module & kernel diagnostics with export and cleanup",
+  "logs.cardDesc": "Record module and kernel logs, support export and clear",
   "logs.view": "View Logs",
   "logs.filterAll": "All",
   "logs.filterGoLan": "Go Lan",
@@ -326,10 +400,16 @@ const en: Record<string, string> = {
   "logs.empty": "No logs yet",
   "logs.refresh": "Refresh",
   "logs.export": "Export",
-  "logs.clear": "Clear",
+  "logs.clear": "Clear Logs",
   "logs.cleared": "Logs cleared",
   "logs.copied": "Logs copied to clipboard",
   "logs.exportCopied": "Logs copied to clipboard and exported as .log",
+  "logs.exportEmpty": "No logs to export",
+  "logs.exported": "✅ All logs copied",
+  "logs.exportHeader": "================ Prism Diagnostic Logs ================",
+  "logs.exportTime": "Exported at: {time}",
+  "logs.exportCount": "Entries: {count}",
+  "logs.exportModule": "Module filter: {module}",
 
   // ---- Go Lan / Go Cus toasts (APP25 task 1: fill every missing key) ----
   "goLan.saved": "Go Lan configuration saved",
@@ -337,11 +417,59 @@ const en: Record<string, string> = {
   "goLan.cleared": "Go Lan configuration cleared",
   "goLan.imported": "WireGuard configuration imported",
   "goLan.invalidConfig": "Invalid WireGuard configuration",
+
+  // ---- Go Lan modal (APP35 task 1) ----
+  "goLan.modalTitle": "Go Lan · Home Intranet Config",
+  "goLan.mode.manual": "Manual (WireGuard)",
+  "goLan.mode.managed": "Managed Mode",
+  "goLan.pasteRecognize": "📋 Paste config or link to auto-detect",
+  "goLan.pastePlaceholder":
+    "Paste the full [Interface] ... [Peer] ... config here; it will be detected as soon as you paste",
+  "goLan.hintMissingPrivateKey":
+    "Server address detected, but no PrivateKey = line was found; make sure the [Interface] section is copied in full",
+  "goLan.hintEmptyPaste":
+    "Long-press to paste the WireGuard config text into the box above first",
+  "goLan.hintInvalidConfig":
+    "No valid WireGuard [Interface]/[Peer] config detected, please check the format",
+  "goLan.recognizedToast":
+    "WireGuard config filled in automatically; verify your home LAN subnets and tap Save",
+  "goLan.lanCidrs": "Home LAN Subnets (LAN CIDRs)",
+  "goLan.lanCidrsPlaceholder": "e.g. 10.195.0.0/24, 192.168.1.0/24",
+  "goLan.endpointHost": "Server Address (Endpoint Host)",
+  "goLan.port": "Port",
+  "goLan.localIp": "Local Virtual IP (Local Address)",
+  "goLan.localIpHint":
+    "Comma-separated addresses supported: the first goes into the tunnel, the rest become /24 subnets added to the home LAN list",
+  "goLan.mtu": "MTU",
+  "goLan.privateKey": "Client Private Key",
+  "goLan.show": "Show",
+  "goLan.hide": "Hide",
+  "goLan.peerPublicKey": "Server Public Key",
+  "goLan.psk": "Preshared Key (Optional)",
+  "goLan.managedServer": "Managed Server",
+  "goLan.deviceCode": "Device Code",
+  "goLan.syncing": "Fetching...",
+  "goLan.syncNow": "Fetch Home Node Config",
+  "goLan.enable": "Enable Go Lan",
+  "goLan.testTitle": "Intranet Connectivity Test",
+  "goLan.testPlaceholder": "Enter intranet IP (e.g. 192.168.10.253:8000)",
+  "goLan.clear": "Clear",
+  "goLan.saving": "Saving...",
+  "goLan.saveConfig": "Save",
+  "goLan.errServerRequired": "Please enter the server address",
+  "goLan.errPrivateKeyRequired": "Please enter the client private key",
+  "goLan.errPeerKeyRequired": "Please enter the server public key",
+  "goLan.errNodeUriRequired": "Please paste the home node share link",
+  "goLan.errLanCidrsRequired":
+    "Please enter the home LAN subnets (e.g. 10.195.0.0/24)",
+  "goLan.saveTimeout": "Save timed out, please try again later",
+  "goLan.probeReachable": "✅ Reachable: {target} · Latency {latency} ms",
+  "goLan.probeUnreachable": "❌ Unreachable: {target} (Connection timed out)",
   "goCus.saved": "Go Cus configuration saved",
   "settings.saved": "Settings saved",
   "logs.goLanPanel": "Go Lan Live Logs",
-  "logs.probe": "Probe LAN",
-  "logs.probing": "Probing...",
+  "logs.probe": "Test Intranet",
+  "logs.probing": "Testing...",
   "logs.probeRunning": "Probing home LAN via go-lan-home tunnel...",
   "toast.autoSynced": "Cloud subscriptions auto-synced: {ok}/{fail} updated",
 
@@ -420,6 +548,39 @@ const en: Record<string, string> = {
   "pro.subscribeExpiry": "Expires",
   "pro.configured": "Configured",
   "pro.notConfigured": "Not configured · Tap Config to set up",
+
+  // ---- Activation error cards (APP35 task 1) ----
+  "pro.err.invalid_input.title": "Activation info is incomplete or invalid",
+  "pro.err.invalid_input.detail":
+    "Update the client to the latest version and try again.",
+  "pro.err.activation_failed.title":
+    "License Key and email do not match, or the license is expired / disabled",
+  "pro.err.activation_failed.detail":
+    "Check that the key and registered email match (copy-paste recommended; mind case and spaces) and that the subscription is not expired. If it still fails, contact us via a ticket.",
+  "pro.err.seat_limit_reached.title":
+    "Device limit reached for this plan (Trial 1 / Pro 3 / Lifetime 5)",
+  "pro.err.seat_limit_reached.detail":
+    "Open the user panel, unbind unused devices under Device Management, then reactivate with the same License Key.",
+  "pro.err.activation_throttled.title":
+    "Too many failed activations in a short time, security lock triggered",
+  "pro.err.activation_throttled.detail":
+    "Wait for the countdown shown in the client (the lock lasts up to 30 minutes). Do not retry repeatedly; each failure extends the lock.",
+  "pro.err.server_error.title": "Temporary server error",
+  "pro.err.server_error.detail":
+    "Try again later; submit a ticket if it persists.",
+  "pro.err.invalid_key.title":
+    "License Key does not exist or was entered incorrectly",
+  "pro.err.invalid_key.detail":
+    "Check that the key is complete and has no extra spaces, then retry.",
+  "pro.err.email_mismatch.title":
+    "The email does not match the account bound to this License Key",
+  "pro.err.email_mismatch.detail":
+    "Use the email entered when activating this License Key.",
+  "pro.err.license_expired.title": "This License Key has expired",
+  "pro.err.license_expired.detail": "Renew it and activate again.",
+  "pro.err.license_blocked.title":
+    "This License Key or device has been disabled by the administrator",
+  "pro.err.license_blocked.detail": "Contact support if you need assistance.",
   "pro.modules.goAim": "Go AIM · Smart Unlock",
   "pro.modules.goLan": "Go Lan · Home Intranet",
   "pro.modules.goCus": "Go Cus · Override & Script",

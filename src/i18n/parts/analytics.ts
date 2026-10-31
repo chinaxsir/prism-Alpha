@@ -15,6 +15,8 @@ const zh: Record<string, string> = {
   "analytics.coreNotRunning": "内核未运行",
   "analytics.hitsCount": "{count} 次",
   "analytics.other": "其他",
+  "analytics.displayDomain": "域名",
+  "analytics.displayIp": "IP",
 };
 
 const en: Record<string, string> = {
@@ -30,6 +32,8 @@ const en: Record<string, string> = {
   "analytics.coreNotRunning": "Kernel not running",
   "analytics.hitsCount": "{count} hits",
   "analytics.other": "Other",
+  "analytics.displayDomain": "Domain",
+  "analytics.displayIp": "IP",
 };
 
 export default { zh, en };

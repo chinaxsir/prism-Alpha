@@ -371,7 +371,7 @@ export default function Settings() {
                   iconBg={active ? "bg-accent/10" : "bg-glass"}
                   title={
                     <span className="flex items-center gap-1.5">
-                      {m.title}
+                      {t(`settings.runMode.${m.key}`)}
                       {m.key === "tun" && tunGated && (
                         <Lock size={12} className="text-accent" />
                       )}
@@ -557,7 +557,7 @@ export default function Settings() {
                 className={kernelInfo?.exists ? "text-latency-good" : "text-latency-bad"}
               />
             </RowIcon>
-            <div className="text-sm text-text">内核版本</div>
+            <div className="text-sm text-text">{t("settings.kernelVersion")}</div>
           </div>
           <div className="text-xs font-mono text-text-muted">
             {kernelInfo?.exists && kernelInfo.version

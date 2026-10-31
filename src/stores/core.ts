@@ -72,6 +72,41 @@ export interface AnalyticsSummary {
   rules: Array<[string, AggStat]>;
 }
 
+/** 【APP35 任务3】常见公共 IP 的域名兜底映射（无连接元数据时也能显示域名） */
+const BUILTIN_IP_DOMAIN: Record<string, string> = {
+  "8.8.8.8": "dns.google",
+  "8.8.4.4": "dns.google",
+  "1.1.1.1": "one.one.one.one",
+  "1.0.0.1": "one.one.one.one",
+  "223.5.5.5": "dns.alidns.com",
+};
+
+/** 是否为 IPv4 字面量（用于区分「域名」与「IP」聚合键） */
+export function isIpLiteral(s: string): boolean {
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(s);
+}
+
+/** 【APP35 任务3】把连接的 host ↔ destinationIP 关系累积进全局映射缓存 */
+function collectHostMappings(
+  prevIp: Record<string, string>,
+  prevDomain: Record<string, string>,
+  list: ConnItem[],
+): { ipToDomain: Record<string, string>; domainToIp: Record<string, string> } {
+  let ipToDomain = prevIp;
+  let domainToIp = prevDomain;
+  for (const c of list) {
+    const host = (c.host ?? "").trim();
+    const ip = (c.destinationIP ?? "").trim();
+    if (!host || !ip || host === ip || !isIpLiteral(ip)) continue;
+    if (ipToDomain[ip] === host && domainToIp[host] === ip) continue;
+    if (ipToDomain === prevIp) ipToDomain = { ...prevIp };
+    if (domainToIp === prevDomain) domainToIp = { ...prevDomain };
+    ipToDomain[ip] = host;
+    domainToIp[host] = ip;
+  }
+  return { ipToDomain, domainToIp };
+}
+
 /** 后端运行时快照：一次拉取今日流量、速率、60 秒曲线、连接与分析聚合 */
 export interface RuntimeSnapshot {
   todayBytes: number;
@@ -101,6 +136,10 @@ interface CoreState {
   connections: ConnItem[];
   /** 分析聚合（后端维护，切页与后台不丢） */
   analytics: AnalyticsSummary;
+  /** 【APP35 任务3】IP → 域名 映射缓存（连接元数据 + 公共 DNS 兜底） */
+  ipToDomain: Record<string, string>;
+  /** 【APP35 任务3】域名 → IP 映射缓存（分析页 IP 模式使用） */
+  domainToIp: Record<string, string>;
   settings: UserSettings;
 
   setStatus: (s: CoreStatus) => void;
@@ -163,6 +202,8 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   todayBytes: 0,
   connections: [],
   analytics: { hosts: [], outbounds: [], rules: [] },
+  ipToDomain: { ...BUILTIN_IP_DOMAIN },
+  domainToIp: {},
   sessionTraffic: 0,
   settings: {
     mixedPort: 2080,
@@ -214,7 +255,10 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   },
 
   setTodayBytes: (todayBytes) => set({ todayBytes }),
-  setConnections: (connections) => set({ connections }),
+  setConnections: (connections) => {
+    const { ipToDomain, domainToIp } = get();
+    set({ connections, ...collectHostMappings(ipToDomain, domainToIp, connections) });
+  },
   setAnalytics: (analytics) => set({ analytics }),
 
   applyRuntimeSnapshot: (snap) => {
@@ -222,6 +266,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
     const traffic = snap.trafficHistory60s.length
       ? snap.trafficHistory60s
       : get().traffic;
+    const { ipToDomain, domainToIp } = get();
     set({
       todayBytes: snap.todayBytes,
       upSpeed: snap.upSpeed,
@@ -229,6 +274,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       traffic,
       connections: snap.connections,
       analytics: snap.analyticsSummary,
+      ...collectHostMappings(ipToDomain, domainToIp, snap.connections),
     });
   },
 

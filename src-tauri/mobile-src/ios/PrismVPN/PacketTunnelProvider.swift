@@ -807,6 +807,49 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - OpenTun
 
+    /// 【APP35 任务2.1】读取 sanitize 阶段落盘的回家网段 sidecar
+    private func loadGoLanRouteCidrs() -> [String] {
+        guard let dir = activeWorkDir else { return [] }
+        let url = dir.appendingPathComponent("golan_routes.json")
+        guard let data = try? Data(contentsOf: url),
+              let list = (try? JSONSerialization.jsonObject(with: data)) as? [String]
+        else { return [] }
+        return list.filter { !$0.isEmpty }
+    }
+
+    /// 【APP35 任务4.1】读取「允许局域网连接」状态：Rust config_builder 在
+    /// allow_lan 时把 mixed-in 的 listen 写为 0.0.0.0。
+    private func prismConfigAllowsLan() -> Bool {
+        guard let path = (protocolConfiguration as? NETunnelProviderProtocol)?
+            .providerConfiguration?["config_path"] as? String,
+              !path.isEmpty,
+              let text = try? String(contentsOfFile: path, encoding: .utf8),
+              let data = text.data(using: .utf8),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let inbounds = root["inbounds"] as? [[String: Any]]
+        else { return false }
+        return inbounds.contains {
+            ($0["tag"] as? String) == "mixed-in" && ($0["listen"] as? String) == "0.0.0.0"
+        }
+    }
+
+    /// 【APP35 任务2.1】CIDR → NEIPv4Route（基础路由 + /25 拆分路由，
+    /// 均不带 gatewayAddress），确保 Wi-Fi 下内网请求优先进入 utun。
+    private func makeGoLanRoutes(_ cidrs: [String]) -> [NEIPv4Route] {
+        var routes: [NEIPv4Route] = []
+        for cidr in cidrs {
+            guard let p = parseIPv4Prefix(cidr), p.prefix > 0, p.prefix < 32 else { continue }
+            routes.append(NEIPv4Route(destinationAddress: p.networkAddress, subnetMask: p.subnetMask))
+            let halfPrefix = p.prefix + 1
+            let halfMaskU32: UInt32 = 0xFFFF_FFFF << UInt32(32 - halfPrefix)
+            let halfMask = ipv4String(halfMaskU32)
+            let second = p.net | (UInt32(1) << UInt32(31 - p.prefix))
+            routes.append(NEIPv4Route(destinationAddress: p.networkAddress, subnetMask: halfMask))
+            routes.append(NEIPv4Route(destinationAddress: ipv4String(second), subnetMask: halfMask))
+        }
+        return routes
+    }
+
     fileprivate func openTun(optionsJSON: String) -> Int32 {
         NSLog("[PrismVPN] openTun options: \(optionsJSON)")
         writeHeartbeat("openTun")
@@ -819,11 +862,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP34 任务2.1】外层 utun MTU 恢复 1400（与 tun-in「stack: mixed、
-        // mtu: 1400」对齐，gvisor 已废弃以节省约 15MB 内存）。向内网 NAS
-        // 宣告 TCP MSS 的职责下沉到 go-lan-home（WireGuard mtu=1280 → MSS 1240），
-        // 彻底杜绝 log8.txt 中 MTU 1420 导致的大包断流 unexpected EOF。
-        let mtu: Int32 = 1400
+        // 【APP35 任务2.1】外层 utun MTU 1280（与 tun-in「stack: gvisor、
+        // mtu: 1280」对齐）：gvisor 在用户态完成 TCP 握手并转发，
+        // 25MB 内存上限已验证可长时间稳定运行。
+        let mtu: Int32 = 1280
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -848,12 +890,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses: v4Addresses.map(\.address),
             subnetMasks: v4Addresses.map { subnetMask(prefix: $0.prefix) }
         )
-        // 【APP34 任务2.2】includedRoutes 必须纯净 = [NEIPv4Route.default()]。
-        // log3.txt 实测：仅默认路由时 192.168.10.253:8001 229ms 连通；一旦
-        // 追加自定义网段路由（APP32 方案）iOS 系统路由表优先级被破坏，
-        // 立刻超时。内网可达性由 route.rules 顶部 go-lan-home 规则保证，
-        // 不依赖 NEIPv4Route 子网路由。
-        ipv4.includedRoutes = [NEIPv4Route.default()]
+        // 【APP35 任务2.1】includedRoutes = default() + 回家网段子网路由
+        //（含 /25 拆分，不带 gatewayAddress）。iPhone 在 Wi-Fi 下时，iOS 会
+        // 优先使用更长前缀的系统路由项，确保内网 Web 请求 100% 进入 utun，
+        // 而不是被 Wi-Fi 本地直连旁路。
+        let goLanCidrs = loadGoLanRouteCidrs()
+        var extraRoutes = makeGoLanRoutes(goLanCidrs)
+        // 【APP35 任务4.2】允许局域网连接且当前在 Wi-Fi 时，把本机 Wi-Fi
+        // 所在 /24 网段也纳入 utun 路由（不在 goLanCidrs 中才追加），
+        // 保证同局域网其他设备访问 <本机IP>:2080 的回包从 en0 返回。
+        if prismConfigAllowsLan(),
+           cachedPhysicalIfName.hasPrefix("en"),
+           let wifiIP = localInterfaceIPv4(cachedPhysicalIfName),
+           let localPrefix = parseIPv4Prefix("\(wifiIP)/24") {
+            let localCidr = "\(localPrefix.networkAddress)/24"
+            if !goLanCidrs.contains(localCidr) {
+                extraRoutes.append(contentsOf: makeGoLanRoutes([localCidr]))
+            }
+        }
+        ipv4.includedRoutes = [NEIPv4Route.default()] + extraRoutes
         // 【APP31 任务1】excludedRoutes 排除 WG 服务端公网 IP（/32）：
         // 与 bind_interface + route.rules 顶部豁免构成三重直链锁定，
         // 发往 14.105.65.122 的 UDP 包绝不进 utun。
@@ -868,22 +923,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = v4Excluded
         settings.ipv4Settings = ipv4
 
-        // 【APP34 任务2.2】恢复 NEProxySettings（127.0.0.1:2080 mixed-in）。
-        // iOS Safari/WebKit 使用 NWConnection：未挂载系统 HTTP 代理时，系统
-        // 策略会把访问 192.168.x.x 的请求旁路出 utun（log8.txt 中
-        // connection download closed / operation timed out 的直接原因）。
-        // 挂载后 Safari 的 HTTP/HTTPS 100% 进入 mixed-in → 命中置顶的
-        // go-lan-home 规则 → 与「内网测速」完全相同的 WireGuard 通道。
-        let proxyServer = NEProxyServer(address: "127.0.0.1", port: prismMixedPort)
-        let proxySettings = NEProxySettings()
-        proxySettings.httpEnabled = true
-        proxySettings.httpServer = proxyServer
-        proxySettings.httpsEnabled = true
-        proxySettings.httpsServer = proxyServer
-        proxySettings.excludeSimpleHostnames = false
-        proxySettings.exceptionList = ["127.0.0.1", "localhost", "::1"]
-        settings.proxySettings = proxySettings
-        NSLog("[PrismVPN] proxy enabled -> 127.0.0.1:\(prismMixedPort)")
+        // 【APP35 任务2.1】移除 NEProxySettings：Safari / WebKit 的网页流量
+        // 与远程桌面一样直接走 utun 三层隧道，由 route.rules 置顶的
+        // go-lan-home 规则进入回家 WireGuard 通道；不再依赖 mixed-in 代理，
+        // 避免 NEProxySettings 引发的分层路由旁路问题。
+        settings.proxySettings = nil
+        NSLog("[PrismVPN] proxy settings disabled (direct utun path)")
 
         let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
         if !v6Addresses.isEmpty {
@@ -1256,9 +1301,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let cacheDBURL = workDir.appendingPathComponent("cache.db")
         try? FileManager.default.removeItem(at: cacheDBURL)
 
-        // 【APP31 任务1】物理网卡名以 getifaddrs 扫描为准（不受 utun 是否
-        // 已启动影响），go-lan-home / direct 的 bind_interface 与
-        // route.default_interface 全部以此为准。
+        // 【APP35 任务2.1】物理网卡名以 getifaddrs 扫描为准（不受 utun 是否
+        // 已启动影响），go-lan-home / direct / 各代理节点的 bind_interface
+        // 全部以此为准（不再使用全局 route.default_interface）。
         let physIfName = findPhysicalInterfaceName()
 
         // 1. 修正 inbounds 中的 tun 配置
@@ -1270,25 +1315,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
-                    // 【APP34 任务2.2】tun-in MTU 与 settings.mtu 统一为 1400，
-                    // 栈恢复轻量级 "mixed"：gvisor 栈需要额外约 15MB 常驻
-                    // 内存，在 iOS 扩展 50MB Jetsam 红线下极易被强杀。
-                    // 向内网 NAS 宣告 MSS 的职责由 go-lan-home（WireGuard
-                    // mtu=1280 → MSS 1240）承担。
-                    inbounds[i]["mtu"] = 1400
-                    inbounds[i]["stack"] = "mixed"
-                    // 【APP10 任务2.1】tun-in 严禁 sniff=true：
-                    // sniff 开启时 sing-box 会在 tun-in 收到发往
-                    // 192.168.10.253:80 的包时先在本地伪造 TCP 握手
-                    // （SYN-ACK 代答）并等待客户端发 HTTP 头，造成
-                    // "TUN直连:80 延迟 2502 ms" 假阳性检测，还会干扰
-                    // SMB/SSH/WebSocket 等非 HTTP 内网协议。本 App DNS
-                    // 采用 dns-remote/dns-local 标准解析（非 FakeIP），
-                    // IP 与域名规则直接匹配，关闭 sniff 后访问
-                    // 10.1.8.0/24、192.168.10.0/24 的包零延迟直入
-                    // go-lan-home WireGuard 隧道。
-                    inbounds[i]["sniff"] = false
+                    // 【APP35 任务2.1】tun-in 改回 gvisor 栈并与外层 utun
+                    // MTU 统一为 1280：gvisor 在用户态内存直接完成 Safari
+                    // 的 TCP 三次握手并转发给 go-lan-home，绕开 mixed 栈
+                    // 在 iOS 上触发的 report handshake success:
+                    // connection refused；25MB 内存上限已保证不触发 Jetsam。
+                    inbounds[i]["mtu"] = 1280
+                    inbounds[i]["stack"] = "gvisor"
+                    // 【APP35 任务2.1】开启被动域名嗅探但不改写目标地址：
+                    // 仅供「分析」页提取域名，内网 IP 绝不被嗅探器改写，
+                    // ip_cidr → go-lan-home 规则保持精确匹配。
+                    inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = false
+                    inbounds[i]["sniff_timeout"] = "300ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }
@@ -1327,8 +1366,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             outbounds[i].removeValue(forKey: "bind_interface")
             outbounds[i].removeValue(forKey: "inet4_bind_address")
             outbounds[i].removeValue(forKey: "routing_mark")
-            // 【APP31 任务1】只给 go-lan-home 与 direct 重新注入物理网卡绑定。
-            if !physIfName.isEmpty, tag == "go-lan-home" || t == "direct" {
+            // 【APP35 任务2.1】物理网卡绑定下沉到出站级：go-lan-home、
+            // direct 与全部代理节点各绑定当前活跃物理网卡，替代全局
+            // route.default_interface，避免干扰本地入站监听。
+            if !physIfName.isEmpty,
+               tag == "go-lan-home" || t == "direct" || proxyOutboundTypes.contains(t) {
                 outbounds[i]["bind_interface"] = physIfName
             }
             if t == "dns" {
@@ -1640,7 +1682,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "tag": "mixed-in",
                 "listen": "127.0.0.1",
                 "listen_port": prismMixedPort,
-                "sniff": false
+                "sniff": true,
+                "sniff_override_destination": false,
+                "sniff_timeout": "300ms"
             ])
             root["inbounds"] = mixedInbounds
         }
@@ -1810,17 +1854,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // 4. 修正 route
-        // 【APP31 任务1】显式写入 route.default_interface：物理网卡
-        // （en0 / pdp_ip0）由 findPhysicalInterfaceName() 通过 getifaddrs
-        // 直接扫描得到，go-lan-home 的外层 UDP 51821 由此 100% 从物理网卡
-        // 纯直链发出；auto_detect_interface 保持 false（iOS 无 netlink）。
+        // 【APP35 任务2.1】严禁设置全局 route.default_interface：它会干扰
+        // 本地入站（mixed-in / 探针）的监听与回包路径。物理网卡绑定下沉到
+        // 出站级 bind_interface（go-lan-home / direct / 各代理节点），
+        // auto_detect_interface 保持 false（iOS 无 netlink）。
         var route = (root["route"] as? [String: Any]) ?? [:]
         route["auto_detect_interface"] = false
-        if !physIfName.isEmpty {
-            route["default_interface"] = physIfName
-        } else {
-            route.removeValue(forKey: "default_interface")
-        }
+        route.removeValue(forKey: "default_interface")
         route["final"] = mainProxyTag
 
         var rules = (route["rules"] as? [[String: Any]]) ?? []

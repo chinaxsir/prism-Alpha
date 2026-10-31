@@ -33,8 +33,17 @@ private let managerServerTag = "Prism"
 
 // MARK: - C ABI 入口（供 Rust 调用）
 
+/// 【APP35 任务1】彻底禁用 iOS 摇晃撤销（Undo Typing / Undo Paste）系统弹窗。
+/// UIApplication 状态必须在主线程修改，异步派发避免阻塞 Rust 调用线程。
+private func disableShakeToEdit() {
+    DispatchQueue.main.async {
+        UIApplication.shared.applicationSupportsShakeToEdit = false
+    }
+}
+
 @_cdecl("prism_ios_vpn_start")
 func prismIosVpnStart(_ config: UnsafePointer<CChar>) -> Int32 {
+    disableShakeToEdit()
     let configText = String(cString: config)
 
     // APP-5 任务2：启动前强制做一次覆盖升级检查（Rust setup 已调用过，
@@ -1378,6 +1387,8 @@ final class PrismTunnelController {
     /// 返回 true 表示本次是升级后首次启动且已执行清理。
     @discardableResult
     static func handleUpgradeIfNeededOnLaunch() -> Bool {
+        // 【APP35 任务1】App 每次启动都关闭摇晃撤销（与指纹无关，必须在 guard 之前）
+        disableShakeToEdit()
         let fingerprint = computeInstallFingerprint()
         let defaults = UserDefaults.standard
         let last = defaults.string(forKey: kUpgradeFingerprintKey)

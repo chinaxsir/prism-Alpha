@@ -121,22 +121,28 @@ export default function LogViewerModal({
 
   const kb = (totalBytes / 1024).toFixed(1);
 
+  /** 关闭弹窗：主动失焦，避免 iOS 保留输入框撤销栈 */
+  const closeModal = () => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    onClose();
+  };
+
   /** 【IPA9 任务1.3】iOS WKWebView 不支持 <a download> Blob 下载，且
    *  await 异步之后调用剪贴板会被 iOS 系统拦截。改为在点击瞬间同步
    *  基于已加载 entries 构造导出文本，直接写入剪贴板并调起原生分享。 */
-  const handleExport = () => {
+  const handleExport = async () => {
     if (entries.length === 0) {
-      toast.error("暂无日志可导出");
+      toast.error(t("logs.exportEmpty"));
       return;
     }
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
     const lines: string[] = [];
-    lines.push("================ Prism 诊断日志 ================");
-    lines.push(`导出时间: ${ts}`);
-    lines.push(`日志条数: ${entries.length}`);
-    if (activeModule) lines.push(`模块筛选: ${activeModule}`);
+    lines.push(t("logs.exportHeader"));
+    lines.push(t("logs.exportTime", { time: ts }));
+    lines.push(t("logs.exportCount", { count: entries.length }));
+    if (activeModule) lines.push(t("logs.exportModule", { module: activeModule }));
     lines.push("===============================================");
     lines.push("");
     for (const e of entries) {
@@ -144,25 +150,32 @@ export default function LogViewerModal({
     }
     const exportText = lines.join("\n");
 
-    // 第 1 步：同步写入剪贴板（textarea + execCommand，iOS 100% 成功）
+    // 第 1 步：优先使用异步剪贴板（https / localhost 可用）；
+    // textarea + execCommand 仅作兜底，避免污染 iOS Undo Paste 历史栈
     let copied = false;
     try {
-      const ta = document.createElement("textarea");
-      ta.value = exportText;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      copied = document.execCommand("copy");
-      document.body.removeChild(ta);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(exportText);
+        copied = true;
+      }
     } catch {
       copied = false;
     }
-    // 兜底：navigator.clipboard（桌面端）
-    if (!copied && navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(exportText).catch(() => {});
+    if (!copied) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = exportText;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        copied = false;
+      }
     }
 
     // 第 2 步：iOS 原生分享面板 / 桌面端 Blob 下载
@@ -185,7 +198,7 @@ export default function LogViewerModal({
     // 第 3 步：按钮反馈
     setExporting(true);
     window.setTimeout(() => setExporting(false), 2500);
-    toast.success(t("logs.exportCopied") || "已复制全部日志到剪贴板");
+    toast.success(t("logs.exportCopied"));
   };
 
   /** 【IPA9 任务1.2】清空日志：调用后端 clear_app_logs 后立即把前端
@@ -205,7 +218,7 @@ export default function LogViewerModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
+      onClick={closeModal}
     >
       <div
         className="flex max-h-[82vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-surface"
@@ -222,7 +235,7 @@ export default function LogViewerModal({
               {kb} KB / {t("logs.quotaSuffix")}
             </span>
             <button
-              onClick={onClose}
+              onClick={closeModal}
               className="rounded p-1 text-gray-400 hover:bg-surface-hover hover:text-gray-200"
               aria-label={t("common.close")}
             >
@@ -324,14 +337,14 @@ export default function LogViewerModal({
             </button>
             <div className="flex gap-2">
               <button
-                onClick={handleExport}
+                onClick={() => void handleExport()}
                 className={clsx(
                   "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs text-white hover:opacity-90",
                   exporting ? "bg-emerald-500/90" : "bg-accent",
                 )}
               >
                 <Download size={13} />
-                {exporting ? "✅ 已复制全部日志" : t("logs.export")}
+                {exporting ? t("logs.exported") : t("logs.export")}
               </button>
               <button
                 onClick={() => void handleClear()}

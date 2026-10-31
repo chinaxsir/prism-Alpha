@@ -10,6 +10,7 @@ import {
   saveGoLanSettings,
   syncGoLanManaged,
   testGoLanIp,
+  type GoLanProbeResult,
   type GoLanSettings,
   type WgManualConfig,
 } from "@/api/ipc";
@@ -111,6 +112,9 @@ const cleanInput = (s: string): string => s.replace(INVISIBLE_CHARS, "");
 
 /** 零宽隐形字符（保留空白与换行，供逐行解析使用） */
 const INVISIBLE_ONLY = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
+
+/** 中文字符检测：后端 message 为中文时，英文界面改用结构化字段拼英文 */
+const CJK_RE = /[\u4e00-\u9fff]/;
 
 /** 【APP21 任务3.1】解析 WireGuard Local Address（支持逗号/分号/中文标点/
  *  换行/空白分隔）：
@@ -259,7 +263,7 @@ interface Props {
 }
 
 export default function GoLanModal({ open, onClose }: Props) {
-  const { t } = useTranslation();
+  const { t, resolved } = useTranslation();
   const goLanCached = useCoreStore((s) => s.goLanSettings);
   const setGoLanSettings = useCoreStore((s) => s.setGoLanSettings);
   const [form, setForm] = useState<GoLanForm>(() =>
@@ -338,6 +342,24 @@ export default function GoLanModal({ open, onClose }: Props) {
 
   const patch = (p: Partial<GoLanForm>) => setForm((f) => ({ ...f, ...p }));
 
+  /** 关闭弹窗：主动失焦，避免 iOS 保留输入框撤销栈 */
+  const closeModal = () => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    onClose();
+  };
+
+  /** 后端检测结果 message 为中文时，英文界面用结构化字段拼英文展示 */
+  const probeText = (r: GoLanProbeResult): string => {
+    const fallback = r.reachable
+      ? t("goLan.probeReachable", {
+          target: r.targetIp,
+          latency: r.latencyMs ?? 0,
+        })
+      : t("goLan.probeUnreachable", { target: r.targetIp });
+    if (resolved === "en" && CJK_RE.test(r.message ?? "")) return fallback;
+    return r.message || fallback;
+  };
+
   /** 【APP-4 任务4】统一识别入口：严格非空校验——确实解析出
    *  privateKey / peerPublicKey / server 之一才算成功，严禁假阳性提示 */
   const recognizeFromText = (
@@ -354,12 +376,10 @@ export default function GoLanModal({ open, onClose }: Props) {
       // 【APP14 任务1】识别成功但缺 PrivateKey 时给出明确内联提示，
       // 而不是让用户面对「只填了 IP 和 Port」的空白表单不知所措。
       if (!parsed.wgPrivateKey) {
-        setPasteHint(
-          "已识别到服务器地址，但配置里没找到 PrivateKey = 行，请确认完整复制了 [Interface] 段",
-        );
+        setPasteHint(t("goLan.hintMissingPrivateKey"));
       }
       if (!opts?.silent) {
-        toast.success("已自动识别并填入 WireGuard 配置，请确认家里局域网段后点击保存");
+        toast.success(t("goLan.recognizedToast"));
       }
       return true;
     }
@@ -378,11 +398,11 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (text) setPasteBuf(text);
     }
     if (!text.trim()) {
-      setPasteHint("请先将 WireGuard 配置文本长按粘贴到上方输入框中");
+      setPasteHint(t("goLan.hintEmptyPaste"));
       return;
     }
     if (!recognizeFromText(text)) {
-      setPasteHint("未识别到 WireGuard [Interface]/[Peer] 配置，请检查格式");
+      setPasteHint(t("goLan.hintInvalidConfig"));
     }
   };
 
@@ -393,7 +413,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       setLoaded(s);
       setForm(applyGoLanLoaded(s));
       setGoLanSettings(s);
-      toast.success(t("goLan.syncSuccess") || "已拉取家庭节点配置");
+      toast.success(t("goLan.syncSuccess"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -412,8 +432,9 @@ export default function GoLanModal({ open, onClose }: Props) {
     try {
       const r = await testGoLanIp(target);
       setProbeOk(r.reachable);
-      setProbeMsg(r.message);
-      if (r.reachable) toast.success(r.message);
+      const text = probeText(r);
+      setProbeMsg(text);
+      if (r.reachable) toast.success(text);
     } catch (e) {
       setProbeOk(false);
       setProbeMsg(String(e));
@@ -425,14 +446,17 @@ export default function GoLanModal({ open, onClose }: Props) {
   const handleSave = async () => {
     // 必填校验
     if (form.mode === "manual" && form.method === "wg") {
-      if (!form.wgServer.trim()) return toast.error("请填写服务器地址");
-      if (!form.wgPrivateKey.trim()) return toast.error("请填写客户端私钥");
-      if (!form.wgPeerPublicKey.trim()) return toast.error("请填写服务端公钥");
+      if (!form.wgServer.trim()) return toast.error(t("goLan.errServerRequired"));
+      if (!form.wgPrivateKey.trim())
+        return toast.error(t("goLan.errPrivateKeyRequired"));
+      if (!form.wgPeerPublicKey.trim())
+        return toast.error(t("goLan.errPeerKeyRequired"));
     }
     if (form.mode === "manual" && form.method === "uri") {
-      if (!form.nodeUri.trim()) return toast.error("请粘贴回家节点分享链接");
+      if (!form.nodeUri.trim()) return toast.error(t("goLan.errNodeUriRequired"));
     }
-    if (!form.lanCidrs.trim()) return toast.error("请填写回家内网网段（如 10.195.0.0/24）");
+    if (!form.lanCidrs.trim())
+      return toast.error(t("goLan.errLanCidrsRequired"));
 
     setBusy(true);
     try {
@@ -491,7 +515,7 @@ export default function GoLanModal({ open, onClose }: Props) {
       const warnings = await Promise.race([
         saveGoLanSettings(payload),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("保存超时，请稍后重试")), 2500),
+          setTimeout(() => reject(new Error(t("goLan.saveTimeout"))), 2500),
         ),
       ]);
       // 回读最新设置到全局 store（含 enabled 状态）
@@ -500,9 +524,9 @@ export default function GoLanModal({ open, onClose }: Props) {
       if (warnings && warnings.length > 0) {
         toast.error(warnings[0]);
       } else {
-        toast.success(t("goLan.saved") || "Go Lan 配置已保存");
+        toast.success(t("goLan.saved"));
       }
-      onClose();
+      closeModal();
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -515,7 +539,7 @@ export default function GoLanModal({ open, onClose }: Props) {
   return (
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 pb-[calc(env(safe-area-inset-bottom,16px)+16px)]"
-      onClick={onClose}
+      onClick={closeModal}
     >
       {/* 【APP-4 任务4.2】三段式布局：固定头部 / 可滚动中部 / 固定底部，
           底部保存按钮永远完整显示不被屏幕截断 */}
@@ -527,13 +551,13 @@ export default function GoLanModal({ open, onClose }: Props) {
         <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
           <div className="flex items-center gap-2">
             <Home size={16} className="text-accent" />
-            <h3 className="text-sm font-semibold">Go Lan · 回家内网配置</h3>
+            <h3 className="text-sm font-semibold">{t("goLan.modalTitle")}</h3>
           </div>
           {/* 【IPA9 任务2】× 关闭按钮永不禁用：任何时候点击都立即关闭弹窗 */}
           <button
-            onClick={onClose}
+            onClick={closeModal}
             className="rounded p-1 text-gray-400 hover:bg-surface-hover hover:text-gray-200"
-            aria-label="关闭"
+            aria-label={t("common.close")}
           >
             <X size={16} />
           </button>
@@ -555,7 +579,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                   : "text-gray-400 hover:text-gray-200",
               )}
             >
-              {m === "manual" ? "手动配置 (WireGuard)" : "托管模式 (Managed)"}
+              {m === "manual" ? t("goLan.mode.manual") : t("goLan.mode.managed")}
             </button>
           ))}
         </div>
@@ -569,7 +593,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                 className="flex w-full items-center justify-center gap-2 rounded-md bg-accent/20 px-3 py-2 text-xs font-medium text-accent transition-colors hover:bg-accent/30"
               >
                 <ClipboardPaste size={14} />
-                📋 粘贴配置文本 / 链接一键识别
+                {t("goLan.pasteRecognize")}
               </button>
               <textarea
                 value={pasteBuf}
@@ -590,7 +614,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                     recognizeFromText(v, { silent: true });
                   }
                 }}
-                placeholder="粘贴 [Interface] ... [Peer] ... 全文到此处，松开即刻自动识别填入"
+                placeholder={t("goLan.pastePlaceholder")}
                 rows={3}
                 className="mt-2 w-full resize-none rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-[11px] text-gray-300 placeholder-gray-600 focus:border-accent focus:outline-none"
               />
@@ -604,12 +628,12 @@ export default function GoLanModal({ open, onClose }: Props) {
             {/* 回家网段 */}
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                回家内网网段（LAN CIDRs）
+                {t("goLan.lanCidrs")}
               </span>
               <textarea
                 value={form.lanCidrs}
                 onChange={(e) => patch({ lanCidrs: e.target.value })}
-                placeholder="如 10.195.0.0/24, 192.168.1.0/24"
+                placeholder={t("goLan.lanCidrsPlaceholder")}
                 rows={2}
                 className="w-full resize-none rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
               />
@@ -619,7 +643,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             <div className="grid grid-cols-4 gap-2">
               <label className="col-span-3 block">
                 <span className="mb-1 block text-xs text-gray-400">
-                  服务器地址（Endpoint Host）
+                  {t("goLan.endpointHost")}
                 </span>
                 <input
                   value={form.wgServer}
@@ -629,7 +653,9 @@ export default function GoLanModal({ open, onClose }: Props) {
                 />
               </label>
               <label className="block">
-                <span className="mb-1 block text-xs text-gray-400">端口</span>
+                <span className="mb-1 block text-xs text-gray-400">
+                  {t("goLan.port")}
+                </span>
                 <input
                   type="number"
                   value={form.wgServerPort || ""}
@@ -646,7 +672,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             <div className="grid grid-cols-4 gap-2">
               <label className="col-span-3 block">
                 <span className="mb-1 block text-xs text-gray-400">
-                  本机虚拟地址（Local Address）
+                  {t("goLan.localIp")}
                 </span>
                 <input
                   value={form.wgLocalIp}
@@ -655,11 +681,13 @@ export default function GoLanModal({ open, onClose }: Props) {
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
                 <span className="mt-1 block text-[10px] leading-4 text-gray-500">
-                  支持逗号分隔多个地址：第 1 个写入隧道，其余自动转为 /24 并入回家网段
+                  {t("goLan.localIpHint")}
                 </span>
               </label>
               <label className="block">
-                <span className="mb-1 block text-xs text-gray-400">MTU</span>
+                <span className="mb-1 block text-xs text-gray-400">
+                  {t("goLan.mtu")}
+                </span>
                 <input
                   type="number"
                   value={form.wgMtu || ""}
@@ -675,13 +703,13 @@ export default function GoLanModal({ open, onClose }: Props) {
             {/* 私钥 / 公钥 / PSK */}
             <label className="block">
               <span className="mb-1 flex items-center justify-between text-xs text-gray-400">
-                客户端私钥（PrivateKey）
+                {t("goLan.privateKey")}
                 <button
                   type="button"
                   onClick={() => setShowPrivKey((v) => !v)}
                   className="rounded px-1 text-[11px] text-accent hover:underline"
                 >
-                  {showPrivKey ? "隐藏" : "显示"}
+                  {showPrivKey ? t("goLan.hide") : t("goLan.show")}
                 </button>
               </span>
               <input
@@ -693,7 +721,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                服务端公钥（Peer PublicKey）
+                {t("goLan.peerPublicKey")}
               </span>
               <input
                 value={form.wgPeerPublicKey}
@@ -703,7 +731,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                预共享密钥（PresharedKey，选填）
+                {t("goLan.psk")}
               </span>
               <input
                 value={form.wgPreSharedKey}
@@ -717,7 +745,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             {/* 托管模式 */}
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                托管服务器
+                {t("goLan.managedServer")}
               </span>
               <input
                 value={form.managedServer}
@@ -727,7 +755,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                设备识别码
+                {t("goLan.deviceCode")}
               </span>
               <input
                 value={form.deviceCode}
@@ -737,7 +765,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             </label>
             <label className="block">
               <span className="mb-1 block text-xs text-gray-400">
-                回家内网网段（LAN CIDRs）
+                {t("goLan.lanCidrs")}
               </span>
               <textarea
                 value={form.lanCidrs}
@@ -751,14 +779,14 @@ export default function GoLanModal({ open, onClose }: Props) {
               disabled={syncing}
               className="w-full rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
             >
-              {syncing ? "拉取中..." : "立即拉取家庭节点配置"}
+              {syncing ? t("goLan.syncing") : t("goLan.syncNow")}
             </button>
           </>
         )}
 
         {/* 启用开关 */}
         <div className="flex items-center justify-between rounded-lg border border-border bg-surface px-3 py-2">
-          <span className="text-xs text-gray-300">启用 Go Lan</span>
+          <span className="text-xs text-gray-300">{t("goLan.enable")}</span>
           <Switch
             checked={form.enabled}
             onChange={(v) => patch({ enabled: v })}
@@ -769,13 +797,13 @@ export default function GoLanModal({ open, onClose }: Props) {
             就地展示，检测过程实时写入下方 Go Lan 日志面板 */}
         <div className="rounded-lg border border-border bg-surface px-3 py-2">
           <span className="mb-1.5 block text-xs text-gray-400">
-            内网连通性检测
+            {t("goLan.testTitle")}
           </span>
           <div className="flex gap-2">
             <input
               value={probeTarget}
               onChange={(e) => setProbeTarget(e.target.value)}
-              placeholder="如 10.1.8.1 或 192.168.1.1"
+              placeholder={t("goLan.testPlaceholder")}
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 focus:border-accent focus:outline-none"
             />
             <button
@@ -808,17 +836,17 @@ export default function GoLanModal({ open, onClose }: Props) {
           {/* 【IPA9 任务2】取消按钮永不禁用：任何时候点击都立即关闭弹窗，
               防止 saving 状态卡死时用户无法退出 */}
           <button
-            onClick={onClose}
+            onClick={closeModal}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
           >
-            取消
+            {t("common.cancel")}
           </button>
           <button
             onClick={handleSave}
             disabled={busy}
             className="flex-1 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            {busy ? "保存中..." : "保存配置"}
+            {busy ? t("goLan.saving") : t("goLan.saveConfig")}
           </button>
         </div>
       </div>
