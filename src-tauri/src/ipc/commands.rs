@@ -2366,8 +2366,13 @@ pub async fn set_go_aim_enabled(
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
     if enabled && *state.status.read() == CoreStatus::Running {
-        // 内存已有探测结果 → 0ms 立即按评级规则自动锁定最优节点；
-        // 否则启动探测，完成后 apply_selection 会自动选中最佳节点
+        // 【APP39 任务4·时机A】开启瞬间立即锁定「当前延迟最低」节点：
+        // 延迟取自 Clash API /proxies 的 history（与代理页绿色毫秒完全
+        // 一致），无历史时对前 10 个节点 800ms 快测；选中后同步
+        // state.selected_node / settings.json 并广播，仪表盘 1 秒内刷新。
+        let _ = crate::core::go_aim::lock_fastest_now(&app, &state).await;
+        // 内存已有探测结果 → 按评级规则再校准一次；
+        // 否则启动新一轮探测，完成后 apply_selection 自动锁定最佳节点
         let has_results = !state.aim_results.read().is_empty();
         if has_results {
             let _ = crate::core::go_aim::apply_selection(&app, &state).await;

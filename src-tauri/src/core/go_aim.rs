@@ -404,6 +404,25 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result }),
                 );
+                // 【APP39 任务4·时机B】探测过程中实时同步：只要出现延迟更低
+                // 的合格节点，立即刷新全局「当前节点」（仪表盘/代理页 1 秒内
+                // 跟随），无需等全量探测结束。手动指定节点时绝不抢锁。
+                // 探测中的锁定不得断开现有连接：探针 HTTP 请求本身也是内核
+                // 连接，全量断开会让其余槽位的探测立刻失败。
+                {
+                    let app_state = app.state::<AppState>();
+                    let enabled = app_state.settings.read().go_aim_enabled;
+                    let pinned = app_state.settings.read().go_aim_pinned_node.is_some();
+                    if enabled && !pinned && is_running(&app_state) {
+                        let best = pick_best(&app_state.aim_results.read());
+                        if let Some(best) = best {
+                            let current = app_state.aim_locked_node.read().clone();
+                            if current.as_deref() != Some(best.node_name.as_str()) {
+                                let _ = lock_node(&app, &app_state, &best, false).await;
+                            }
+                        }
+                    }
+                }
                 // 【APP37 任务3.2】每完成一个节点（4 槽位并行即每批 4 个）
                 // 休眠 40ms 让出时间片供内存回收，随后继续下一批，
                 // 直到 100% 完成全部节点探测。
@@ -747,21 +766,24 @@ pub async fn apply_selection(app: &AppHandle, state: &AppState) -> Result<Option
         && res.probed
         && res.delay_ms > 0
     {
-        return lock_node(app, state, res).await.map(Some);
+        return lock_node(app, state, res, true).await.map(Some);
     }
 
     let Some(best) = pick_best(&results) else {
         tracing::warn!("[go-aim] 解锁池为空，保持当前节点不变");
         return Ok(None);
     };
-    lock_node(app, state, &best).await.map(Some)
+    lock_node(app, state, &best, true).await.map(Some)
 }
 
-/// 执行锁定：若与当前锁定一致则跳过；否则切主组 + GLOBAL 并广播
+/// 执行锁定：若与当前锁定一致则跳过；否则切主组 + GLOBAL 并广播。
+/// `close_conns`：是否断开现有连接——探测过程中的实时切换必须传 false，
+/// 否则会把其余槽位正在进行的探针 HTTP 连接一并砍断，导致探测误判。
 async fn lock_node(
     app: &AppHandle,
     state: &AppState,
     best: &AimNodeResult,
+    close_conns: bool,
 ) -> Result<String, String> {
     if state.aim_locked_node.read().as_deref() == Some(best.node_name.as_str()) {
         return Ok(best.node_name.clone());
@@ -774,9 +796,24 @@ async fn lock_node(
         let _ = api.select_proxy(tag, &best.node_name).await;
     }
     let _ = api.select_proxy("GLOBAL", &best.node_name).await;
-    let _ = api.close_all_connections().await;
+    if close_conns {
+        let _ = api.close_all_connections().await;
+    }
 
     *state.aim_locked_node.write() = Some(best.node_name.clone());
+    // 【APP39 任务4】同步「当前节点」到全局状态与磁盘：
+    // 仪表盘「当前节点」读的是 settings.selected_node，
+    // 只切内核策略组不写它会导致界面长期停留在旧节点（如 电信-LAX-01）。
+    // 注意：go_aim_pinned_node（用户手动指定）绝不能被自动选点覆盖，
+    // 否则手动模式被永久抹掉（指定节点复活后也无法恢复）。
+    *state.user_manually_selected_node.write() = None;
+    {
+        let mut settings = state.settings.read().clone();
+        settings.selected_node = Some(best.node_name.clone());
+        if let Err(e) = state.save_settings(settings) {
+            tracing::warn!("[go-aim] 保存 selected_node 失败: {e}");
+        }
+    }
     tracing::info!(
         "[go-aim] 已锁定节点「{}」（延迟 {}ms，解锁平台: {}）",
         best.node_name,
@@ -788,41 +825,113 @@ async fn lock_node(
     Ok(best.node_name.clone())
 }
 
-/// 评级选优（纯函数，便于单元测试）。
-/// 分层规则（APP-4 任务3.3）：
-/// - Tier3：7 平台全解锁（unlocked_tags.len() == 7）优先级最高；
-/// - Tier2：AI 与流媒体同时解锁，按解锁平台数降序；
-/// - Tier1：AI 或流媒体任一解锁，按解锁平台数降序；
-/// - Tier0：仅存活（无任何解锁）。
-/// 同层内基线延迟最低者优先。
-fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> {
-    let tier = |r: &AimNodeResult| -> u8 {
-        if r.unlocked_tags.len() == PROBES.len() {
-            3
-        } else if r.ai_unlocked && r.media_unlocked {
-            2
-        } else if r.ai_unlocked || r.media_unlocked {
-            1
-        } else if r.probed && r.delay_ms > 0 {
-            0
-        } else {
-            return 255; // 死节点不参与
+/// 【APP39 任务4·时机A】开启 Go AIM 的瞬间立即锁定「当前延迟最低」节点。
+///
+/// 延迟数据源与「代理」页完全一致：Clash API `/proxies` 每项的
+/// `history` 末条 `delay`（用户在代理列表看到的绿色毫秒数）。
+/// 若没有任何历史延迟（刚启动、尚未测速），对前 10 个真实节点做
+/// 800ms 快速测速后取最低者。选中后经 lock_node 同步
+/// state.selected_node / settings.json 并广播事件，仪表盘 1 秒内刷新。
+pub async fn lock_fastest_now(app: &AppHandle, state: &AppState) -> Option<String> {
+    let api = state.kernel_api();
+    let mut best: Option<(String, u64)> = None;
+
+    if let Ok(proxies) = api.get_proxies().await
+        && let Some(obj) = proxies.get("proxies").and_then(|v| v.as_object())
+    {
+        for (name, info) in obj {
+            // 跳过嵌套策略组（带 all 成员列表）与内置假节点
+            if info.get("all").is_some()
+                || crate::core::config_builder::is_builtin_non_proxy_tag(name)
+            {
+                continue;
+            }
+            let delay = info
+                .get("history")
+                .and_then(|h| h.as_array())
+                .and_then(|a| a.last())
+                .and_then(|e| e.get("delay"))
+                .and_then(|d| d.as_u64())
+                .unwrap_or(0);
+            if delay == 0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, d)| delay < *d) {
+                best = Some((name.clone(), delay));
+            }
         }
+    }
+
+    if best.is_none()
+        && let Ok(proxies) = api.get_proxies().await
+        && let Some(obj) = proxies.get("proxies").and_then(|v| v.as_object())
+    {
+        // 前 10 个真实节点 800ms 快测（滚动并发，避免瞬间占满内存）
+        let candidates: Vec<String> = obj
+            .iter()
+            .filter(|(name, info)| {
+                info.get("all").is_none()
+                    && !crate::core::config_builder::is_builtin_non_proxy_tag(name)
+            })
+            .map(|(name, _)| name.clone())
+            .take(10)
+            .collect();
+        for name in candidates {
+            if let Some(d) = api.test_delay(&name, BASELINE_URL, 800).await
+                && d > 0
+                && best.as_ref().is_none_or(|(_, bd)| d < *bd)
+            {
+                best = Some((name, d));
+            }
+        }
+    }
+
+    let (name, delay) = best?;
+    let res = AimNodeResult {
+        node_name: name.clone(),
+        unlocked_tags: vec![],
+        ai_unlocked: false,
+        media_unlocked: false,
+        score: 0,
+        delay_ms: delay,
+        updated_at: 0,
+        probed: true,
     };
-    let mut pool: Vec<&AimNodeResult> =
-        results.values().filter(|r| tier(r) != 255).collect();
-    if pool.is_empty() {
+    if let Err(e) = lock_node(app, state, &res, true).await {
+        tracing::warn!("[go-aim] 开启瞬间锁定最低延迟节点失败: {e}");
         return None;
     }
-    pool.sort_by(|a, b| {
-        // tier 越大越优（Tier3 全解锁 > Tier2 > Tier1 > Tier0），
-        // 同层解锁平台数多者优先，再按基线延迟升序
-        tier(b)
-            .cmp(&tier(a))
-            .then(b.unlocked_tags.len().cmp(&a.unlocked_tags.len()))
-            .then(a.delay_ms.cmp(&b.delay_ms))
-    });
-    Some(pool[0].clone())
+    Some(name)
+}
+
+/// 评级选优（纯函数，便于单元测试）。
+///
+/// 【APP39 任务4】改为「延迟最低绝对优先」：
+/// - 候选池剔除内置假节点（剩余流量/到期等）与不可达节点（delay_ms == 0）；
+/// - 若存在「已解锁 AI/流媒体 且延迟 < 300ms」的节点，只在这些节点中
+///   选出延迟最低者（既保证解锁能力，又不让 300ms 的高延迟节点压过
+///   40ms 的亚洲节点）；
+/// - 否则直接从所有可达节点中选延迟最低者。
+fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> {
+    let alive: Vec<&AimNodeResult> = results
+        .values()
+        .filter(|r| {
+            r.probed
+                && r.delay_ms > 0
+                && !crate::core::config_builder::is_builtin_non_proxy_tag(&r.node_name)
+        })
+        .collect();
+    if alive.is_empty() {
+        return None;
+    }
+    // 低延迟解锁节点优先（300ms 上限，超出视为「虽解锁但线路太差」）
+    let unlocked_fast: Vec<&AimNodeResult> = alive
+        .iter()
+        .copied()
+        .filter(|r| !r.unlocked_tags.is_empty() && r.delay_ms < 300)
+        .collect();
+    let pool = if unlocked_fast.is_empty() { alive } else { unlocked_fast };
+    pool.into_iter().min_by_key(|r| r.delay_ms).cloned()
 }
 
 // ---------------------------------------------------------------- 故障转移监控
@@ -884,30 +993,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_best_full_unlock_first() {
+    fn test_pick_best_lower_delay_beats_more_tags() {
+        // 【APP39 任务4】延迟最低绝对优先：80ms 节点即使解锁平台更少，
+        // 也必须压过 900ms 的全解锁节点（旧 Tier 评分会让高延迟节点胜出）。
         let mut m = HashMap::new();
-        // 低延迟但只解锁 3 个平台
         m.insert("a".into(), node("a", 80, &["GPT", "NF", "YT"]));
-        // 高延迟但 7 平台全解锁（Tier3）
         m.insert(
             "b".into(),
             node("b", 900, &["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"]),
         );
         let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "b", "全解锁节点（Tier3）应优先于更低延迟的部分解锁节点");
+        assert_eq!(best.node_name, "a", "低延迟解锁节点应优先于高延迟全解锁节点");
     }
 
     #[test]
-    fn test_pick_best_tier2_by_tag_count_then_delay() {
+    fn test_pick_best_unlocked_under_300_lowest_delay() {
+        // 300ms 以内的解锁节点池内取最低延迟；300ms 及以上不参与优先池
         let mut m = HashMap::new();
-        // Tier2（AI+流媒体），解锁 2 个
         m.insert("a".into(), node("a", 120, &["GPT", "NF"]));
-        // Tier2，解锁 3 个
         m.insert("b".into(), node("b", 300, &["GPT", "NF", "YT"]));
-        // Tier1（仅 AI），延迟最低
         m.insert("c".into(), node("c", 90, &["GPT"]));
         let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "b", "Tier2 内解锁平台数多者优先于 Tier1");
+        assert_eq!(best.node_name, "c", "300ms 内解锁节点取最低延迟");
     }
 
     #[test]
@@ -917,6 +1024,16 @@ mod tests {
         m.insert("b".into(), node("b", 90, &["GPT"]));
         let best = pick_best(&m).unwrap();
         assert_eq!(best.node_name, "b");
+    }
+
+    #[test]
+    fn test_pick_best_all_unlocked_slow_falls_back_to_fastest_alive() {
+        // 无「<300ms 解锁节点」时，直接从全部可达节点取最低延迟
+        let mut m = HashMap::new();
+        m.insert("slow_unlocked".into(), node("slow_unlocked", 520, &["GPT", "NF"]));
+        m.insert("fast_plain".into(), node("fast_plain", 40, &[]));
+        let best = pick_best(&m).unwrap();
+        assert_eq!(best.node_name, "fast_plain", "无低延迟解锁节点时取全体最低延迟");
     }
 
     #[test]

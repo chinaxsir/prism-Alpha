@@ -477,14 +477,10 @@ export default function Dashboard() {
       {/* 出站模式快捷切换（规则/全局/直连） */}
       <OutboundModeSwitch />
 
-      {/* Hero 状态卡（Shadowrocket 风格：满宽，左状态右按钮） */}
-      <div
-        className={`rounded-2xl p-5 border transition-colors ${
-          running
-            ? "bg-latency-good/10 border-latency-good/30"
-            : "bg-surface-card border-border"
-        }`}
-      >
+      {/* Hero 状态卡（Shadowrocket 风格：满宽，左状态右按钮）
+          【APP39 任务1】启动前后背景色恒定：严禁随 running 变色，
+          始终 bg-surface-card + border-border，与其余卡片完全一致 */}
+      <div className="rounded-2xl p-5 border bg-surface-card border-border">
         <div className="flex items-center justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">

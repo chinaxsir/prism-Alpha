@@ -207,6 +207,13 @@ pub struct AnalyticsAgg {
     pub outbounds: HashMap<String, AggStat>,
     pub rules: HashMap<String, AggStat>,
     pub last_seen: HashMap<String, (u64, u64)>,
+    /// 【APP39 任务3】按域名聚合（只收录解析出有效域名的连接）
+    pub domains: HashMap<String, AggStat>,
+    /// 【APP39 任务3】按目标 IP 聚合（纯 IP 地址，绝不混入域名）
+    pub ips: HashMap<String, AggStat>,
+    /// 【APP39 任务3】IP → 域名 反向缓存（由 metadata.host 实时填充），
+    /// 供后续同一 IP 的无域名连接补齐域名
+    pub ip_to_domain: HashMap<String, String>,
 }
 
 /// 跨 IPC 共享的全局状态
@@ -418,6 +425,9 @@ impl AppState {
         self.connections_live.write().clear();
         let mut agg = self.analytics.write();
         agg.hosts.clear();
+        agg.domains.clear();
+        agg.ips.clear();
+        agg.ip_to_domain.clear();
         agg.outbounds.clear();
         agg.rules.clear();
         agg.last_seen.clear();
@@ -483,6 +493,11 @@ impl AppState {
         }
         let analytics = serde_json::json!({
             "hosts": top8(&agg.hosts),
+            // 【APP39 任务3】域名视图 / IP 视图两份独立聚合：
+            // domains 只含真实域名（含反向解析与常用 IP 映射补齐），
+            // ips 只含纯 IP 地址，前端切换按钮时数据必然显著不同。
+            "domains": top8(&agg.domains),
+            "ips": top8(&agg.ips),
             "outbounds": top8(&agg.outbounds),
             "rules": top8(&agg.rules),
         });

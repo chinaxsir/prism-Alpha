@@ -292,6 +292,30 @@ fn has_tiny_ms_duration(l: &str) -> bool {
     false
 }
 
+/// 【APP39 任务2.2】客户端正常关闭连接 / 策略拦截预期内的内核日志。
+///
+/// 这些条目并不代表故障，却因包含 error/eof 字样被误判为 ERROR 刷屏：
+/// - `ws closed: 1005|1000`          WebSocket 客户端正常关闭
+/// - `connection download/upload closed: unexpected EOF`  客户端提前断流
+/// - `context canceled` / `use of closed network connection`  主动取消
+/// - `... operation not permitted`   block 出站拦截 QUIC/DoT 的正常返回
+/// - `report handshake success`      握手阶段回环探测失败（gvisor 下已消失）
+fn is_benign_close_line(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    const BENIGN: &[&str] = &[
+        "ws closed: 1005",
+        "ws closed: 1000",
+        "connection download closed: unexpected eof",
+        "connection upload closed: unexpected eof",
+        "context canceled",
+        "use of closed network connection",
+        "listen outbound packet connection: operation not permitted",
+        "open outbound connection: operation not permitted",
+        "report handshake success",
+    ];
+    BENIGN.iter().any(|p| l.contains(p))
+}
+
 fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU64, max_lines: usize) {
     let mut count = 0usize;
     let mut last_key: Option<String> = None;
@@ -302,6 +326,10 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
         }
         // 【APP14 任务4】过滤 NECP 沙盒 EPERM 刷屏噪声
         if is_noise_eperm_line(line) {
+            continue;
+        }
+        // 【APP39 任务2.2】过滤客户端正常关闭/策略拦截的非故障日志
+        if is_benign_close_line(line) {
             continue;
         }
         let module = classify_kernel_line(line);
@@ -607,7 +635,33 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::is_noise_eperm_line;
+    use super::{is_benign_close_line, is_noise_eperm_line};
+
+    /// 【APP39 任务2.2】正常关闭/策略拦截日志必须被识别并丢弃，不再显示 ERROR
+    #[test]
+    fn test_benign_close_filtered() {
+        assert!(is_benign_close_line(
+            "connection download closed: unexpected EOF: io: read/write on closed pipe"
+        ));
+        assert!(is_benign_close_line("websocket: ws closed: 1005"));
+        assert!(is_benign_close_line(
+            "open outbound connection: operation not permitted"
+        ));
+        assert!(is_benign_close_line(
+            "connection: report handshake success: connection refused"
+        ));
+        assert!(is_benign_close_line("context canceled"));
+    }
+
+    /// 真实故障绝不能误伤
+    #[test]
+    fn test_benign_close_not_overfiltered() {
+        assert!(!is_benign_close_line("outbound/vless[HK1]: EOF"));
+        assert!(!is_benign_close_line(
+            "start inbound/tun[tun-in]: create tun: operation not permitted"
+        ));
+        assert!(!is_benign_close_line("go-lan-home: dial udp i/o timeout"));
+    }
 
     /// 【APP14 任务4】NECP 沙盒 EPERM 刷屏噪声必须被识别并丢弃
     #[test]

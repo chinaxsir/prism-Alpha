@@ -65,9 +65,13 @@ export interface AggStat {
   down: number;
 }
 
-/** 分析聚合汇总（主机名 / 出站策略 / 命中规则） */
+/** 分析聚合汇总（主机名 / 域名 / IP / 出站策略 / 命中规则） */
 export interface AnalyticsSummary {
   hosts: Array<[string, AggStat]>;
+  /** 【APP39 任务3】后端按域名独立聚合（只含有效域名） */
+  domains: Array<[string, AggStat]>;
+  /** 【APP39 任务3】后端按目标 IP 独立聚合（只含纯 IP） */
+  ips: Array<[string, AggStat]>;
   outbounds: Array<[string, AggStat]>;
   rules: Array<[string, AggStat]>;
 }
@@ -201,7 +205,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   traffic: [],
   todayBytes: 0,
   connections: [],
-  analytics: { hosts: [], outbounds: [], rules: [] },
+  analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [] },
   ipToDomain: { ...BUILTIN_IP_DOMAIN },
   domainToIp: {},
   sessionTraffic: 0,
@@ -286,7 +290,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       memoryUsage: 0,
       startedAtMs: null,
       connections: [],
-      analytics: { hosts: [], outbounds: [], rules: [] },
+      analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [] },
       sessionTraffic: 0,
     }),
 

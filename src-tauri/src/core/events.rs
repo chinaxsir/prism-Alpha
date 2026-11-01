@@ -262,6 +262,35 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
             accumulate(&mut agg.hosts, host_key, inc_up, inc_down, is_new);
             accumulate(&mut agg.outbounds, outbound_key, inc_up, inc_down, is_new);
             accumulate(&mut agg.rules, rule_key, inc_up, inc_down, is_new);
+
+            // 【APP39 任务3】域名 / IP 双聚合 + IP→域名 反向缓存：
+            // 1) host 为真实域名时立刻写入缓存，后续同 IP 无域名连接可补齐；
+            // 2) ips 严格按目标 IP（纯 IP，绝不混入域名）；
+            // 3) domains 只收录能解析出有效域名的条目。
+            if !conn.host.is_empty()
+                && !is_ip_literal(&conn.host)
+                && is_ip_literal(&conn.destination_ip)
+            {
+                agg.ip_to_domain
+                    .insert(conn.destination_ip.clone(), conn.host.clone());
+            }
+            if !conn.destination_ip.is_empty() && is_ip_literal(&conn.destination_ip) {
+                accumulate(
+                    &mut agg.ips,
+                    conn.destination_ip.clone(),
+                    inc_up,
+                    inc_down,
+                    is_new,
+                );
+            }
+            if let Some(domain) = resolve_domain(
+                &conn.host,
+                &conn.destination_ip,
+                &conn.rule_payload,
+                &agg.ip_to_domain,
+            ) {
+                accumulate(&mut agg.domains, domain, inc_up, inc_down, is_new);
+            }
         }
         agg.last_seen.retain(|id, _| incoming.contains_key(id));
         for (id, conn) in &incoming {
@@ -326,6 +355,68 @@ fn accumulate(map: &mut HashMap<String, AggStat>, key: String, up: u64, down: u6
     entry.down = entry.down.saturating_add(down);
 }
 
+// ---------------------------------------------------------------- 【APP39 任务3】
+
+/// 判断字符串是否为纯 IP 字面量（IPv4 或 IPv6）。
+/// IPv6 允许携带 `%` 区段后缀（如 `fe80::1%en0`）。
+fn is_ip_literal(s: &str) -> bool {
+    let core = s.split('%').next().unwrap_or(s);
+    core.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// 判断规则载荷是否像域名后缀（不含 `/`、含字母、非 IP）。
+fn looks_like_domain_suffix(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && !is_ip_literal(s)
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// 【APP39 任务3】内置常用 IP → 域名映射：没有任何嗅探/规则信息时，
+/// 域名视图也能显示可读名字而不是纯 IP。
+fn builtin_ip_domain(ip: &str) -> Option<&'static str> {
+    match ip {
+        "8.8.8.8" | "8.8.4.4" => Some("dns.google"),
+        "1.1.1.1" | "1.0.0.1" => Some("one.one.one.one"),
+        "223.5.5.5" | "223.6.6.6" => Some("dns.alidns.com"),
+        "119.29.29.29" => Some("dns.pub"),
+        "192.168.10.253" => Some("fnos-nas.lan"),
+        "192.168.10.100" => Some("rdp-pc.lan"),
+        _ => None,
+    }
+}
+
+/// 【APP39 任务3】解析一条连接的有效域名（优先级：
+/// 1. metadata.host（嗅探出的真实域名，非 IP 字面量）
+/// 2. ip_to_domain 反向缓存
+/// 3. rulePayload 域名后缀（如 `youtube.com`）
+/// 4. 内置常用 IP 映射表
+/// 5. 无 → 返回 None（该连接只进 IP 聚合）
+fn resolve_domain(
+    host: &str,
+    destination_ip: &str,
+    rule_payload: &str,
+    cache: &HashMap<String, String>,
+) -> Option<String> {
+    if !host.is_empty() && !is_ip_literal(host) {
+        return Some(host.to_string());
+    }
+    if !destination_ip.is_empty()
+        && let Some(d) = cache.get(destination_ip)
+    {
+        return Some(d.clone());
+    }
+    if looks_like_domain_suffix(rule_payload) {
+        return Some(rule_payload.to_string());
+    }
+    if !destination_ip.is_empty()
+        && let Some(d) = builtin_ip_domain(destination_ip)
+    {
+        return Some(d.to_string());
+    }
+    None
+}
+
 /// 当前时间 HH:MM:SS（不引入 chrono：以 Unix 秒换算，仅用于曲线刻度）
 fn local_hhmmss() -> String {
     let secs = std::time::SystemTime::now()
@@ -334,4 +425,52 @@ fn local_hhmmss() -> String {
         .unwrap_or(0);
     let day = secs % 86400;
     format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{builtin_ip_domain, is_ip_literal, looks_like_domain_suffix, resolve_domain};
+    use std::collections::HashMap;
+
+    /// 【APP39 任务3】域名解析优先级：嗅探 host > 反向缓存 > 规则后缀 > 内置映射
+    #[test]
+    fn test_resolve_domain_priority() {
+        let mut cache = HashMap::new();
+        cache.insert("142.250.199.142".to_string(), "www.youtube.com".to_string());
+
+        // 1. 真实嗅探域名优先
+        assert_eq!(
+            resolve_domain("chatgpt.com", "1.2.3.4", "", &cache).as_deref(),
+            Some("chatgpt.com")
+        );
+        // 2. host 为 IP（无嗅探结果）时走反向缓存
+        assert_eq!(
+            resolve_domain("142.250.199.142", "142.250.199.142", "", &cache).as_deref(),
+            Some("www.youtube.com")
+        );
+        // 3. 缓存未命中时用域名后缀规则载荷
+        assert_eq!(
+            resolve_domain("", "1.2.3.4", "icloud.com", &cache).as_deref(),
+            Some("icloud.com")
+        );
+        // 4. 内置常用 IP 映射
+        assert_eq!(
+            resolve_domain("", "192.168.10.253", "", &cache).as_deref(),
+            Some("fnos-nas.lan")
+        );
+        // 5. 完全无信息 → None（该连接只进 IP 聚合）
+        assert_eq!(resolve_domain("", "203.0.113.9", "", &cache), None);
+    }
+
+    #[test]
+    fn test_ip_literal_and_domain_suffix() {
+        assert!(is_ip_literal("142.250.199.142"));
+        assert!(is_ip_literal("::1"));
+        assert!(!is_ip_literal("www.youtube.com"));
+
+        assert!(looks_like_domain_suffix("youtube.com"));
+        assert!(!looks_like_domain_suffix("10.0.0.0/8"));
+        assert!(!looks_like_domain_suffix("142.250.199.142"));
+        assert_eq!(builtin_ip_domain("119.29.29.29"), Some("dns.pub"));
+    }
 }

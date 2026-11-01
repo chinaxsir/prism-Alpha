@@ -38,40 +38,62 @@ export default function Analytics() {
   const outboundTop: [string, Agg][] = analytics.outbounds as [string, Agg][];
   const ruleTop: [string, Agg][] = analytics.rules as [string, Agg][];
 
-  // 【APP35 任务3】把聚合 key 归一为 (domain, ip) 二元组，再按显示模式聚合
-  const hostRows = analytics.hosts.map(([key, agg]) => {
-    const keyIsIp = isIpLiteral(key);
-    if (keyIsIp) {
-      return { domain: ipToDomain[key] ?? key, ip: key, agg } as HostRow;
+  // 【APP39 任务3】后端已分别维护「域名」与「IP」两套独立聚合：
+  // - 域名视图：analytics.domains（只含有效域名，副标题显示关联 IP）
+  // - IP 视图：analytics.ips（只含纯 IP，绝不混入域名）
+  // 这样点击切换按钮时列表内容会在两种视图间发生显著变化，
+  // 不再出现「切了没反应」（旧版 host 字段同时存 IP 导致两视图相同）。
+  const mapLegacyRows = (): [string, Agg, string?][] => {
+    const hostRows = analytics.hosts.map(([key, agg]) => {
+      const keyIsIp = isIpLiteral(key);
+      if (keyIsIp) {
+        return { domain: ipToDomain[key] ?? key, ip: key, agg } as HostRow;
+      }
+      return { domain: key, ip: domainToIp[key] ?? "", agg } as HostRow;
+    });
+    const groupedHosts = new Map<string, { key: string; sub?: string; agg: Agg }>();
+    for (const row of hostRows) {
+      const groupKey = hostDisplayMode === "ip" ? row.ip || row.domain : row.domain;
+      const sub =
+        hostDisplayMode === "domain"
+          ? row.ip && row.ip !== row.domain
+            ? row.ip
+            : undefined
+          : row.domain !== groupKey
+            ? row.domain
+            : undefined;
+      const prev = groupedHosts.get(groupKey);
+      if (prev) {
+        prev.agg = {
+          count: prev.agg.count + row.agg.count,
+          up: prev.agg.up + row.agg.up,
+          down: prev.agg.down + row.agg.down,
+        };
+      } else {
+        groupedHosts.set(groupKey, { key: groupKey, sub, agg: row.agg });
+      }
     }
-    return { domain: key, ip: domainToIp[key] ?? "", agg } as HostRow;
-  });
-  const groupedHosts = new Map<string, { key: string; sub?: string; agg: Agg }>();
-  for (const row of hostRows) {
-    const groupKey = hostDisplayMode === "ip" ? row.ip || row.domain : row.domain;
-    const sub =
-      hostDisplayMode === "domain"
-        ? row.ip && row.ip !== row.domain
-          ? row.ip
-          : undefined
-        : row.domain !== groupKey
-          ? row.domain
-          : undefined;
-    const prev = groupedHosts.get(groupKey);
-    if (prev) {
-      prev.agg = {
-        count: prev.agg.count + row.agg.count,
-        up: prev.agg.up + row.agg.up,
-        down: prev.agg.down + row.agg.down,
-      };
-    } else {
-      groupedHosts.set(groupKey, { key: groupKey, sub, agg: row.agg });
-    }
-  }
-  const hostTop: [string, Agg, string?][] = [...groupedHosts.values()]
-    .sort((a, b) => b.agg.down + b.agg.up - (a.agg.down + a.agg.up))
-    .slice(0, 12)
-    .map(({ key, sub, agg }) => [key, agg, sub] as [string, Agg, string?]);
+    return [...groupedHosts.values()]
+      .sort((a, b) => b.agg.down + b.agg.up - (a.agg.down + a.agg.up))
+      .slice(0, 12)
+      .map(({ key, sub, agg }) => [key, agg, sub] as [string, Agg, string?]);
+  };
+
+  const hostTop: [string, Agg, string?][] = (() => {
+    const rows = hostDisplayMode === "ip" ? analytics.ips : analytics.domains;
+    if (!rows || rows.length === 0) return mapLegacyRows();
+    return rows
+      .slice()
+      .sort((a, b) => b[1].down + b[1].up - (a[1].down + a[1].up))
+      .slice(0, 12)
+      .map(([key, agg]) => {
+        const sub =
+          hostDisplayMode === "ip"
+            ? ipToDomain[key] || undefined
+            : domainToIp[key] || undefined;
+        return [key, agg, sub] as [string, Agg, string?];
+      });
+  })();
 
   // 规则统计：内核规则全集按类型计数（非实时统计，独立查询）
   const [ruleTypes, setRuleTypes] = useState<[string, number][]>([]);
