@@ -3,7 +3,7 @@
  * verify-ios-ready.mjs —— iOS / Android 构建本地硬性预检（1 秒跑完）
  *
  * 11 项检查，任一项不通过立刻 exit(1) + 打印精确原因：
- *   1. UTF-8 BOM 头扫描
+ *   1. 全仓 UTF-8 BOM 扫描 + 关键 JSON 文件原生 JSON.parse 严格校验
  *   2. Rust ios.rs ↔ build.rs ↔ Swift @_cdecl 三方 C ABI 符号对齐
  *   3. Swift 缺失 import 框架自动检测
  *   4. iOS 禁用 macOS 专属 API 扫描
@@ -30,26 +30,63 @@ const pass = (m) => console.log(`✅ ${m}`);
 const reMatchAll = (re, src) => [...src.matchAll(re)].map((m) => m[1]);
 
 // ============================================================
-// 检查 1：UTF-8 BOM 扫描
+// 检查 1：全仓 UTF-8 BOM 扫描 + JSON 严格校验
+// 【APP38 任务2】ERR10 实证：Windows PowerShell Set-Content 改写
+// package.json 会注入 BOM（0xEF 0xBB 0xBF），CI vite build 的
+// JSON.parse 直接 SyntaxError。这里从「6 个定点文件」升级为全仓
+// 文本文件扫描（排除 node_modules/target/dist/.git/gen 等），
+// 并对 package.json / tauri.conf.json / tsconfig.json 做原生
+// JSON.parse 严格校验，确保绝不会在 CI 触发 Unexpected token '﻿'。
 // ============================================================
-console.log('\n--- 检查 1：UTF-8 BOM 扫描 ---');
-const BOM_TARGETS = [
-  'src-tauri/tauri.conf.json',
-  'package.json',
-  'src-tauri/Cargo.toml',
-  'scripts/inject-ios-vpn.rb',
-  'src-tauri/mobile-src/ios/App/PrismTunnelController.swift',
-  'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift',
-];
-for (const rel of BOM_TARGETS) {
-  try {
-    const bytes = readFileSync(resolve(ROOT, rel), null);
-    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-      fail(`${rel} 含有 UTF-8 BOM 头（首字节 0xEF 0xBB 0xBF），必须移除！`);
-    } else {
-      pass(`${rel} 无 BOM`);
+console.log('\n--- 检查 1：全仓 UTF-8 BOM 扫描 + JSON 严格校验 ---');
+const BOM_SCAN_EXTS = new Set([
+  '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.css', '.html',
+  '.rs', '.toml', '.swift', '.go', '.plist', '.yml', '.yaml', '.rb',
+]);
+const BOM_SCAN_EXCLUDE_DIRS = new Set([
+  'node_modules', 'target', 'dist', '.git', 'gen',
+  'license-server', 'license-worker', '.uploads',
+]);
+let bomScanned = 0;
+const bomHits = [];
+(function walkBom(dir) {
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (BOM_SCAN_EXCLUDE_DIRS.has(entry.name)) continue;
+      walkBom(resolve(dir, entry.name));
+      continue;
     }
-  } catch { /* 文件可能不存在，跳过 */ }
+    if (!entry.isFile()) continue;
+    const ext = entry.name.slice(entry.name.lastIndexOf('.')).toLowerCase();
+    if (!BOM_SCAN_EXTS.has(ext)) continue;
+    const file = resolve(dir, entry.name);
+    let bytes;
+    try { bytes = readFileSync(file, null); } catch { continue; }
+    bomScanned++;
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+      bomHits.push(file);
+    }
+  }
+})(ROOT);
+if (bomHits.length === 0) {
+  pass(`全仓 ${bomScanned} 个文本文件均无 BOM`);
+} else {
+  for (const f of bomHits) {
+    fail(`${f.replace(ROOT + '/', '')} 含有 UTF-8 BOM 头（0xEF 0xBB 0xBF），必须用 Node.js 剥离（严禁 PowerShell Set-Content 写文件）！`);
+  }
+}
+// 原生 JSON.parse 严格校验（CI vite build 同款解析路径）
+for (const rel of ['package.json', 'src-tauri/tauri.conf.json', 'tsconfig.json']) {
+  const p = resolve(ROOT, rel);
+  if (!existsSync(p)) continue;
+  try {
+    JSON.parse(readFileSync(p, 'utf8'));
+    pass(`JSON.parse 严格校验通过：${rel}`);
+  } catch (e) {
+    fail(`${rel} JSON.parse 失败：${e.message}（禁止 BOM / 非法字符）`);
+  }
 }
 
 // ============================================================

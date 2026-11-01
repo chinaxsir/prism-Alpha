@@ -1,4 +1,4 @@
-﻿{
+{
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -44,7 +44,7 @@
     }
   },
   "productName": "Prism",
-  "version": "0.3.64",
+  "version": "0.3.65",
   "identifier": "com.prism.proxy",
   "plugins": {},
   "app": {

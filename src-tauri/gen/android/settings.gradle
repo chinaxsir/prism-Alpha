@@ -1,0 +1,10 @@
+include ':app'
+
+// APP-4 任务1：tauri.settings.gradle 由 tauri CLI 生成，可能晚于首次
+// Gradle 配置。存在才加载，避免 settings 评估期 'as it does not exist' 失败。
+def tauriSettings = new File(rootDir, 'tauri.settings.gradle')
+if (tauriSettings.exists()) {
+    apply from: tauriSettings
+} else {
+    logger.warn('[prism] tauri.settings.gradle not found yet, skipped (tauri CLI will generate it)')
+}
