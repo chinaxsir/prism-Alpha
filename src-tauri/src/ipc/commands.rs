@@ -991,15 +991,9 @@ pub async fn select_proxy(
             }
         }
     }
-    // 【APP11 任务4.3】用户手动切换节点时，若 Go AIM 正在探测，立即发出
-    // 中止信号：避免探测继续消耗探针槽位、干扰内核日志，并被随后的
-    // 自动锁定覆盖掉用户刚选的节点。
-    if state.aim_probing.load(std::sync::atomic::Ordering::Acquire) {
-        state
-            .aim_abort
-            .store(true, std::sync::atomic::Ordering::Release);
-        tracing::info!("[go-aim] 检测到用户手动切换节点，已发出探测中止信号");
-    }
+    // 【APP37 任务3.2】用户手动切换节点绝不再中止 Go AIM 探测：
+    // 探测循环只响应「Go AIM 开关关闭」与「VPN 停止」两个中止条件，
+    // 自动选点/手动切点导致的 selected_node 变化不再误触中止锁。
     state
         .kernel_api()
         .select_proxy(&group, &name)
@@ -1825,15 +1819,11 @@ pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
     LAST_AUTO_SYNC.store(now, Ordering::Relaxed);
 
     crate::core::logger::info(log, "Pro 授权有效，自动开启云端订阅同步并更新节点...");
-    let was_running = *state.status.read() == CoreStatus::Running;
-    // APP34：移动端 VPN 运行期间绝不停止隧道——50MB Jetsam 下重启必崩。
-    // 后台同步只更新磁盘/内存中的订阅缓存，正在运行的隧道保持不变。
-    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
-    let stop_for_sync = was_running && !mobile;
+    // APP37 任务1.2：VPN 运行期间绝不调用 vpn_stop / vpn_start 重启隧道
+    //（任何平台）：重启会打断在网用户且移动端 50MB Jetsam 下重启必崩。
+    // 后台同步只更新磁盘/内存中的订阅缓存，正在运行的隧道保持不变，
+    // 新节点随下次启动自然生效。
     let before = crate::core::store::load_subscriptions(&state.data_dir);
-    if stop_for_sync {
-        let _ = do_stop(&state).await;
-    }
 
     // 1. 对账云端订阅链接（云端有 → 拉取合并；云端空而本地有 → 上传备份）
     crate::core::sync_links::reconcile(&app).await;
@@ -1874,13 +1864,6 @@ pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
             "subscriptions://auto-synced",
             serde_json::json!({ "ok": ok, "fail": fail }),
         );
-    }
-
-    // 3. 恢复内核（仅桌面端：移动端本就没有停机，隧道需保持运行）
-    if stop_for_sync {
-        let app2 = app.clone();
-        let state2 = app2.state::<AppState>();
-        let _ = start_core_inner(&app2, &state2).await;
     }
 }
 

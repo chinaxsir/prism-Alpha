@@ -902,15 +902,16 @@ impl KernelApi {
         Ok(())
     }
 
-    /// 策略组整组测速：并发（20 路）调用 /proxies/{name}/delay 并汇总为 map。
+    /// 策略组整组测速：逐节点调用 /proxies/{name}/delay 并汇总为 map。
     /// 历史实现直接调用 /group/{name}/delay，但 sing-box 1.11.3 对该端点
     /// 只返回组本身的延迟（非成员 map），导致前端把全部节点标记为超时。
-    /// 改为逐节点测速后，结果可靠且与 Clash API 响应格式一致。
     ///
-    /// build 157 用户方案：串行 51 节点 × 5s 超时实测过慢（>2 分钟），
-    /// 改为 buffer_unordered(32) 并发 + 默认超时 2000ms；app 提供时逐结果
-    /// 推送 `url-test-update` 事件（delay=null 表示失败），前端实时刷新
-    /// 单节点延迟，无需等全部完成
+    /// 【APP37 任务3.1】每批 8 个节点滚动并发（buffer_unordered(8)），
+    /// 单次 Clash API 超时 2200ms，失败回退主进程 TcpStream 握手 1500ms；
+    /// 严禁任何 .take/.truncate 截断，100% 测完全部成员。每节点推送
+    /// `url-test-update`（delay=null 表示失败），每批结束推送
+    /// `proxies://changed` 并让出 30ms 时间片。全部完成后：未开启
+    /// Go AIM 且用户未手动指定节点时，自动选中 delay>0 最低延迟节点。
     pub async fn group_url_test(
         &self,
         name: &str,
@@ -934,25 +935,38 @@ impl KernelApi {
             anyhow::bail!("策略组 '{}' 没有可测速的成员", name);
         }
 
-        let test_url = url.unwrap_or("http://www.gstatic.com/generate_204");
-        // APP 任务4：并发 12 + 单次超时 3000ms（避免 32 并发 TLS 握手阻塞
-        // 手机网络队列）。每个结果完成后立即推送 url-test-update；
-        // 第一轮结束后对失败节点以 6 并发 2500ms 补测一次。
-        let timeout = timeout_ms.unwrap_or(3000).min(3000);
-        let retry_timeout: u64 = 2500;
+        let test_url = url.unwrap_or("http://cp.cloudflare.com/generate_204");
+        // 【APP37 任务3.1】单次超时 2200ms；Clash API 未就绪/404 的节点
+        // 自动回退主进程 TcpStream::connect(server:port) 1500ms 握手测速。
+        let timeout = timeout_ms.unwrap_or(2200).min(2200);
         let group_tag = name.to_string();
+        // TCP 回退所需的「节点名 → (server, port)」映射（回源订阅缓存；
+        // 不占用扩展进程内存）。app 缺失（后台基线测速）时跳过回退。
+        let endpoints = app
+            .map(|a| {
+                let st = a.state::<crate::core::state::AppState>();
+                collect_node_endpoints(&st.data_dir)
+            })
+            .unwrap_or_default();
 
         use futures_util::StreamExt;
-        const TEST_CONCURRENCY: usize = 12;
-        let first_results: Vec<(String, Option<u64>)> = futures_util::stream::iter(members.clone())
+        // 【APP37 任务3.1】每批 8 个节点滚动并发：既 100% 测完全部节点，
+        // 又绝不撑爆 iOS 扩展内存（严禁任何 .take/.truncate 截断）。
+        const BATCH_SIZE: usize = 8;
+        let mut map = serde_json::Map::new();
+        for batch in members.chunks(BATCH_SIZE) {
+            let batch_results: Vec<(String, Option<u64>)> = futures_util::stream::iter(
+                batch.iter().cloned(),
+            )
             .map(|member| {
                 let endpoint = format!("{}/proxies/{}/delay", self.base, member);
                 let req = self.client.get(&endpoint).query(&[
                     ("url", test_url.to_string()),
                     ("timeout", timeout.to_string()),
                 ]);
-                let app = app.map(|a| a.clone());
+                let app = app.cloned();
                 let group_tag = group_tag.clone();
+                let endpoints = &endpoints;
                 async move {
                     let delay = match req.send().await {
                         Ok(resp) if resp.status().is_success() => resp
@@ -969,6 +983,16 @@ impl KernelApi {
                             None
                         }
                     };
+                    // Clash API 失败/未就绪 → 主进程 TCP 握手 1500ms 回退
+                    let delay = match delay {
+                        Some(d) => Some(d),
+                        None => match endpoints.get(&member) {
+                            Some((server, port)) => {
+                                tcp_handshake_delay_ms(server, *port, 1500).await
+                            }
+                            None => None,
+                        },
+                    };
                     if let Some(app) = app {
                         let _ = app.emit(
                             "url-test-update",
@@ -982,71 +1006,64 @@ impl KernelApi {
                     (member, delay)
                 }
             })
-            .buffer_unordered(TEST_CONCURRENCY)
+            .buffer_unordered(BATCH_SIZE)
             .collect::<Vec<_>>()
             .await;
-
-        // 第一轮失败节点 → 以 6 并发 2500ms 补测一次（100% 收口）
-        let retry_members: Vec<String> = first_results
-            .iter()
-            .filter_map(|(m, d)| if d.is_none() { Some(m.clone()) } else { None })
-            .collect();
-
-        let retry_results: Vec<(String, Option<u64>)> = if retry_members.is_empty() {
-            vec![]
-        } else {
-            futures_util::stream::iter(retry_members)
-                .map(|member| {
-                    let endpoint = format!("{}/proxies/{}/delay", self.base, member);
-                    let req = self.client.get(&endpoint).query(&[
-                        ("url", test_url.to_string()),
-                        ("timeout", retry_timeout.to_string()),
-                    ]);
-                    let app = app.map(|a| a.clone());
-                    let group_tag = group_tag.clone();
-                    async move {
-                        let delay = match req.send().await {
-                            Ok(resp) if resp.status().is_success() => resp
-                                .json::<serde_json::Value>()
-                                .await
-                                .ok()
-                                .and_then(|j| j.get("delay").and_then(|d| d.as_u64())),
-                            Ok(resp) => {
-                                tracing::warn!("delay retry {}: HTTP {}", member, resp.status());
-                                None
-                            }
-                            Err(e) => {
-                                tracing::warn!("delay retry {}: {}", member, e);
-                                None
-                            }
-                        };
-                        if let Some(app) = app {
-                            let _ = app.emit(
-                                "url-test-update",
-                                serde_json::json!({
-                                    "group": group_tag,
-                                    "name": member,
-                                    "delay": delay,
-                                }),
-                            );
-                        }
-                        (member, delay)
-                    }
-                })
-                .buffer_unordered(6)
-                .collect::<Vec<_>>()
-                .await
-        };
-
-        let mut map = serde_json::Map::new();
-        for (member, delay) in &first_results {
-            if let Some(d) = delay {
-                map.insert(member.clone(), serde_json::json!(d));
+            for (member, delay) in &batch_results {
+                if let Some(d) = delay {
+                    map.insert(member.clone(), serde_json::json!(d));
+                }
             }
+            // 每完成一批：批次事件让节点页立即整体刷新本批延迟数字，
+            // 随后让出 30ms 时间片供内存回收，继续下一批。
+            if let Some(app) = app {
+                let _ = app.emit("proxies://changed", ());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
-        for (member, delay) in &retry_results {
-            if let Some(d) = delay {
-                map.insert(member.clone(), serde_json::json!(d));
+
+        // 3. 【APP37 任务3.1】全部测速完成后：未开启 Go AIM 且用户未手动
+        //    指定节点时，自动选中实测 delay > 0 且延迟最低的节点
+        //    （排除内置出站与嵌套策略组）。
+        if let Some(app) = app {
+            let (aim_on, manual) = {
+                let st = app.state::<crate::core::state::AppState>();
+                (
+                    st.settings.read().go_aim_enabled,
+                    st.user_manually_selected_node.read().is_some(),
+                )
+            };
+            if !aim_on && !manual {
+                // 嵌套策略组（含 all 成员列表的项）不可选中，一并排除
+                let nested: std::collections::HashSet<String> = self
+                    .get_proxies()
+                    .await
+                    .ok()
+                    .and_then(|p| {
+                        p.get("proxies").and_then(|v| v.as_object()).map(|obj| {
+                            obj.iter()
+                                .filter(|(_, v)| v.get("all").is_some())
+                                .map(|(k, _)| k.clone())
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                let best = map
+                    .iter()
+                    .filter_map(|(name, v)| v.as_u64().map(|d| (name.clone(), d)))
+                    .filter(|(name, d)| {
+                        *d > 0
+                            && !crate::core::config_builder::is_builtin_non_proxy_tag(name)
+                            && !nested.contains(name)
+                    })
+                    .min_by_key(|(_, d)| *d);
+                if let Some((best_node, best_delay)) = best {
+                    tracing::info!("[url_test] APP37 自动选点：{best_node}（{best_delay}ms）");
+                    let _ = self.select_proxy(&group_tag, &best_node).await;
+                    let _ = self.select_proxy("GLOBAL", &best_node).await;
+                    let _ = self.close_all_connections().await;
+                    let _ = app.emit("proxies://changed", serde_json::json!({}));
+                }
             }
         }
         Ok(serde_json::Value::Object(map))
@@ -1400,7 +1417,8 @@ async fn test_fastest(
 /// Clash API `/proxies` 只返回类型/延迟等元数据，不含 server/port；
 /// 想在**主进程**做 TCP 握手测速（不占用 50MB 的扩展进程），必须回源
 /// 订阅缓存解析出真实出口地址。
-#[cfg(any(target_os = "ios", target_os = "android"))]
+/// 【APP37 任务3】全平台可用：go_aim 快筛与整组测速的 Clash API
+/// 失败回退（TcpStream::connect 握手）在桌面端同样需要。
 pub(crate) fn collect_node_endpoints(
     data_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, (String, u16)> {
@@ -1442,10 +1460,26 @@ pub(crate) fn collect_node_endpoints(
     map
 }
 
+/// 【APP37 任务3】主进程 TCP 握手测速（不占用扩展进程内存），
+/// 超时/失败返回 None。go_aim 快筛回退与整组测速回退共用。
+pub(crate) async fn tcp_handshake_delay_ms(server: &str, port: u16, timeout_ms: u64) -> Option<u64> {
+    use std::time::Instant;
+    let start = Instant::now();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        tokio::net::TcpStream::connect((server, port)),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_millis() as u64),
+        _ => None,
+    }
+}
+
 /// APP34：主进程 TCP 握手测速选点。
 ///
-/// 约束（与 iOS 扩展内存隔离）：最多前 20 个有 server/port 的节点、
-/// 并发 6、单点超时 1000ms。返回握手延迟最低者；全部失败返回 None。
+/// 【APP37 任务3.1】严禁节点数量截断：全部有效节点滚动并发测速
+/// （并发 8、单点超时 1500ms）。返回握手延迟最低者；全部失败返回 None。
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub(crate) async fn tcp_select_fastest(
     nodes: &[String],
@@ -1455,9 +1489,8 @@ pub(crate) async fn tcp_select_fastest(
     use tokio::net::TcpStream;
     use tokio::sync::Semaphore;
 
-    const TOP_N: usize = 20;
-    const CONCURRENCY: usize = 6;
-    const TIMEOUT_MS: u64 = 1000;
+    const CONCURRENCY: usize = 8;
+    const TIMEOUT_MS: u64 = 1500;
 
     let candidates: Vec<(String, String, u16)> = nodes
         .iter()
@@ -1466,7 +1499,6 @@ pub(crate) async fn tcp_select_fastest(
                 .get(n)
                 .map(|(server, port)| (n.clone(), server.clone(), *port))
         })
-        .take(TOP_N)
         .collect();
     if candidates.is_empty() {
         return None;

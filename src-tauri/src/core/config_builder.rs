@@ -1089,12 +1089,12 @@ pub fn build(
         "tag": MIXED_TAG,
         "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
         "listen_port": settings.mixed_port,
-        // 【APP35 任务2.2】开启被动域名嗅探但严禁改写目标地址：
-        // 仅供「分析」页提取域名，内网 IP:8000/8001 仍保持精确的
-        // ip_cidr → go-lan-home 匹配。
-        "sniff": true,
+        // 【APP37 任务2.2】mixed-in 彻底关闭嗅探：sniff 会中断 :8001 端口
+        // 自签名 HTTPS 握手与 WebSocket 流（log8.txt 实证）。域名展示改由
+        // mixed-in 自身 HTTP/SOCKS5 握手头携带的 metadata.host 提供，
+        // 「分析 -> Top 主机名」无需 sniff 即可展示域名。
+        "sniff": false,
         "sniff_override_destination": false,
-        "sniff_timeout": "300ms",
     }));
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
@@ -1119,18 +1119,20 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP35 任务2.2】tun-in MTU 1280（与外层 utun 一致）：
-            // go-lan-home WireGuard 同 MTU，内网大包不再被丢弃。
-            "mtu": 1280,
+            // 【APP37 任务1.2】tun-in MTU 1400：已验证稳定运行 12m04s 的
+            // 水位；过低的 1280 无必要（go-lan-home 出站自身锁死 MTU 1280，
+            // 内网大包在 WireGuard 侧分片）。
+            "mtu": 1400,
             "auto_route": true,
-            // 【APP35 任务2.2】tun-in 使用 gvisor 栈：在用户态内存直接完成
-            // TCP 握手并转发给 go-lan-home，绕开 mixed 栈在 iOS 上的
-            // report handshake success: connection refused；25MB 内存
-            // 上限已保证扩展不触发 Jetsam。
-            "stack": "gvisor",
-            // 【APP36 任务1.1】tun-in 关闭嗅探：域名嗅探统一由 mixed-in 完成，
-            // tun-in 若开启 sniff 会改写内网 IP 目标，破坏 ip_cidr 精确匹配。
+            // 【APP37 任务1.2】tun-in 恢复 lightweight mixed 栈：gvisor
+            // 与 go-lan-home（WireGuard 内置 gvisor）会实例化双份用户态
+            // TCP/IP 协议栈，148 节点下基础内存直接逼近 iOS 扩展 50MB
+            // Jetsam 红线，发起连接/测速即被系统强杀（自动停止）。
+            "stack": "mixed",
+            // 【APP37 任务1.2】tun-in 关闭嗅探且严禁改写目标：sniff 会
+            // 中断内网 :8001 自签名 TLS 握手并破坏 ip_cidr 精确匹配。
             "sniff": false,
+            "sniff_override_destination": false,
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -3265,10 +3267,12 @@ rules:
         assert!(tags.contains(&"HK (2)"), "第二个同名节点自动加序号: {tags:?}");
     }
 
-    /// 【APP36 任务1.1】Tun 模式下 tun-in 必须使用 gvisor 协议栈与 MTU 1280，
-    /// 且关闭嗅探（域名嗅探只由 mixed-in 完成）、strict_route 固定 false。
+    /// 【APP37 任务1.2/4】Tun 模式下 tun-in 必须使用轻量 mixed 协议栈与
+    /// MTU 1400，且关闭嗅探（sniff 会中断内网自签名 TLS 握手）、
+    /// strict_route 固定 false；mixed-in 必须 sniff=false
+    /// （sniff_override_destination=false），域名展示由握手头 metadata.host 提供。
     #[test]
-    fn tun_in_locked_gvisor_mtu_1280() {
+    fn tun_in_locked_mixed_mtu_1400() {
         let built = build(
             &[(
                 "https://sub.example".into(),
@@ -3292,10 +3296,28 @@ rules:
             .iter()
             .find(|i| i["tag"] == TUN_TAG)
             .expect("tun-in 入站必须存在");
-        assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
-        assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
+        assert_eq!(tun["stack"].as_str(), Some("mixed"), "tun-in 协议栈必须锁死 mixed");
+        assert_eq!(tun["mtu"].as_u64(), Some(1400), "tun-in MTU 必须锁死 1400");
         assert_eq!(tun["sniff"].as_bool(), Some(false), "tun-in 必须关闭嗅探");
+        assert_eq!(
+            tun["sniff_override_destination"].as_bool(),
+            Some(false),
+            "tun-in 严禁嗅探改写目标地址"
+        );
         assert_eq!(tun["strict_route"].as_bool(), Some(false));
+
+        let mixed = built.config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == MIXED_TAG)
+            .expect("mixed-in 入站必须存在");
+        assert_eq!(mixed["sniff"].as_bool(), Some(false), "mixed-in 必须关闭嗅探");
+        assert_eq!(
+            mixed["sniff_override_destination"].as_bool(),
+            Some(false),
+            "mixed-in 严禁嗅探改写目标地址"
+        );
     }
 
     /// 【APP33 任务2.1】出站依赖完整性闭环校验：
