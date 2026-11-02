@@ -451,7 +451,7 @@ export default function Settings() {
       {/* Go Lan · 回家网络（Pro 门控）：【APP-5 任务3】与 Dashboard 引擎卡 100% 一致 */}
       <div
         id="go-lan-card"
-        className={`rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3 ${
+        className={`card-sheen rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3 ${
           !proUnlocked ? "opacity-50 select-none" : ""
         }`}
       >
@@ -467,7 +467,13 @@ export default function Settings() {
             {!proUnlocked
               ? t("pro.lockedTap")
               : goLanConfigured
-              ? `${t("pro.configured")}: ${goLanCfg?.wgConfig?.server}:${goLanCfg?.wgConfig?.serverPort} · ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
+              ? `${t("pro.configured")}: ${
+                  (goLanCfg?.profiles ?? [])
+                    .filter((p) => p.enabled)
+                    .map((p) => p.name)
+                    .join(" · ") ||
+                  `${goLanCfg?.wgConfig?.server}:${goLanCfg?.wgConfig?.serverPort} · ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
+                }`
               : t("pro.notConfigured")}
           </div>
         </div>
@@ -729,7 +735,7 @@ function SettingsGroup({
           {desc}
         </p>
       )}
-      <div className="rounded-xl bg-surface-card border border-border overflow-hidden">
+      <div className="card-sheen rounded-xl bg-surface-card border border-border overflow-hidden">
         {children}
       </div>
     </section>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ClipboardPaste, Home, X } from "lucide-react";
+import { ClipboardPaste, Home, Plus, Trash2, X } from "lucide-react";
 import { toast } from "@/components/ui/Toast";
 import Switch from "@/components/ui/Switch";
 import { useCoreStore } from "@/stores/core";
@@ -7,11 +7,15 @@ import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 import {
   getGoLanSettings,
+  getGoLanStatus,
+  normalizeGoLanProfile,
   saveGoLanSettings,
   syncGoLanManaged,
   testGoLanIp,
   type GoLanProbeResult,
+  type GoLanProfile,
   type GoLanSettings,
+  type GoLanStatus,
   type WgManualConfig,
 } from "@/api/ipc";
 
@@ -27,7 +31,12 @@ import {
 type GoLanMethod = "wg" | "uri";
 
 interface GoLanForm {
+  /** 【APP40 任务2】档案标识 / 名称 / 本档案启用状态 */
+  id: string;
+  name: string;
   enabled: boolean;
+  bypassOnLocalLan: boolean;
+  probeTarget: string;
   mode: "manual" | "managed";
   method: GoLanMethod;
   nodeUri: string;
@@ -62,7 +71,11 @@ function deriveGateway(localIp: string): string {
 }
 
 const EMPTY_GO_LAN: GoLanForm = {
+  id: "home",
+  name: "家里",
   enabled: false,
+  bypassOnLocalLan: true,
+  probeTarget: "",
   mode: "manual",
   method: "wg",
   nodeUri: "",
@@ -80,14 +93,56 @@ const EMPTY_GO_LAN: GoLanForm = {
   deviceCode: "",
 };
 
-/// 后端设置 → 本地编辑表单
-function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
-  const wg = s.wgConfig ?? null;
-  const method: GoLanMethod = wg && wg.server ? "wg" : s.nodeUri ? "uri" : "wg";
+/** 网段文本拆分（换行/逗号/分号/空格混输），逐个净化隐形字符 */
+const splitCidrsText = (raw: string): string[] =>
+  raw
+    .split(/[\r\n,;，；\s]+/)
+    .map((l) => cleanInput(l))
+    .filter(Boolean);
+
+/// 【APP40 任务2】把一路档案 + 全局设置填入编辑表单
+function applyProfileToForm(p: GoLanProfile, s: GoLanSettings): GoLanForm {
+  const wg = p.wgConfig ?? null;
+  const method: GoLanMethod = wg && wg.server ? "wg" : p.nodeUri ? "uri" : "wg";
   return {
-    enabled: s.enabled,
+    id: p.id,
+    name: p.name,
+    enabled: p.enabled,
+    bypassOnLocalLan: p.bypassOnLocalLan,
+    // 未保存过检测目标时，用 local_address 推导的网关作为默认值
+    probeTarget: p.probeTarget || deriveGateway(wg?.localIp ?? ""),
     mode: s.mode,
     method,
+    nodeUri: p.nodeUri ?? "",
+    wgServer: wg?.server ?? "",
+    wgServerPort: wg?.serverPort ?? 51820,
+    wgPrivateKey: wg?.privateKey ?? "",
+    wgPeerPublicKey: wg?.peerPublicKey ?? "",
+    wgPreSharedKey: wg?.preSharedKey ?? "",
+    wgLocalIp: wg?.localIp || WG_DEFAULTS.localIp,
+    wgMtu: wg?.mtu || WG_DEFAULTS.mtu,
+    lanCidrs: (p.lanCidrs ?? []).join("\n"),
+    lanDns: s.lanDns ?? "",
+    lanDomains: (s.lanDomains ?? []).join("\n"),
+    managedServer: s.managedServer || MANAGED_SERVER_DEFAULT,
+    deviceCode: s.deviceCode ?? "",
+  };
+}
+
+/// 后端设置 → 本地编辑表单（旧版兼容：无档案时用顶层字段）
+function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
+  if (s.profiles.length > 0) {
+    const active = s.profiles.find((p) => p.id === s.activeProfileId) ?? s.profiles[0];
+    return applyProfileToForm(active, s);
+  }
+  const wg = s.wgConfig ?? null;
+  return {
+    ...EMPTY_GO_LAN,
+    name: s.homeName || "家里",
+    enabled: s.enabled,
+    bypassOnLocalLan: s.bypassOnLocalLan,
+    mode: s.mode,
+    method: wg && wg.server ? "wg" : s.nodeUri ? "uri" : "wg",
     nodeUri: s.nodeUri ?? "",
     wgServer: wg?.server ?? "",
     wgServerPort: wg?.serverPort ?? 51820,
@@ -257,6 +312,43 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
   return out;
 }
 
+/** 【APP40 任务2】编辑表单 → 单路档案（保存/切标签时统一走这里） */
+function formToProfile(f: GoLanForm, prev?: GoLanProfile): GoLanProfile {
+  const localAddr = splitLocalAddresses(f.wgLocalIp);
+  const wgAnyFilled = [
+    f.wgServer,
+    f.wgPrivateKey,
+    f.wgPeerPublicKey,
+    f.wgPreSharedKey,
+  ].some((v) => v.trim() !== "");
+  const wgConfig: WgManualConfig | null =
+    f.mode === "manual" && f.method === "wg" && wgAnyFilled
+      ? {
+          server: cleanInput(f.wgServer),
+          serverPort: f.wgServerPort || 51820,
+          privateKey: cleanInput(f.wgPrivateKey),
+          peerPublicKey: cleanInput(f.wgPeerPublicKey),
+          preSharedKey: cleanInput(f.wgPreSharedKey) || null,
+          localIp: localAddr.addresses.join(", ") || WG_DEFAULTS.localIp,
+          mtu: f.wgMtu || WG_DEFAULTS.mtu,
+        }
+      : null;
+  return {
+    id: f.id,
+    name: f.name.trim() || "内网",
+    enabled: f.enabled,
+    bypassOnLocalLan: f.bypassOnLocalLan,
+    localWifiSsid: prev?.localWifiSsid ?? "",
+    // 【APP15 任务1.1】Local Address 拆分出的附加地址 /24 一并并入回家网段
+    lanCidrs: Array.from(
+      new Set([...splitCidrsText(f.lanCidrs), ...localAddr.cidrs]),
+    ),
+    wgConfig,
+    nodeUri: cleanInput(f.nodeUri),
+    probeTarget: f.probeTarget.trim(),
+  };
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -270,46 +362,87 @@ export default function GoLanModal({ open, onClose }: Props) {
     goLanCached ? applyGoLanLoaded(goLanCached) : EMPTY_GO_LAN,
   );
   const [loaded, setLoaded] = useState<GoLanSettings | null>(goLanCached);
+  // 【APP40 任务2】多路内网档案：profiles 为全部档案，activeId 为当前编辑档案
+  const [profiles, setProfiles] = useState<GoLanProfile[]>(
+    () => goLanCached?.profiles ?? [],
+  );
+  const [activeId, setActiveId] = useState(() => form.id);
+  const [status, setStatus] = useState<GoLanStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [pasteBuf, setPasteBuf] = useState("");
   // 【APP-4 任务4】内联黄色提示（替代遮挡状态栏的顶部 Toast 报错）
   const [pasteHint, setPasteHint] = useState("");
-  // 【APP6 任务2.3】内网连通性检测：默认目标=local_address 推导的网关
-  // 【IPA9 任务3】用户输入的检测 IP 持久化到 localStorage，下次直接使用
-  const [probeTarget, setProbeTarget] = useState(() => {
-    try {
-      return localStorage.getItem("prism.golan.probe_ip") ?? "";
-    } catch {
-      return "";
-    }
-  });
   const [probing, setProbing] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
   const [probeOk, setProbeOk] = useState<boolean | null>(null);
   // 【APP14 任务1】客户端私钥明文/密文切换，方便核对一键识别是否完整
   const [showPrivKey, setShowPrivKey] = useState(false);
 
-  // 打开时：若用户从未输入过检测 IP，用 local_address 推导的网关初始化
-  useEffect(() => {
-    if (open) {
-      setProbeTarget((prev) => {
-        if (prev) return prev; // 尊重用户已保存的输入
-        const derived = deriveGateway(form.wgLocalIp);
-        return derived;
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  /** 当前档案的运行状态徽章（⚡ 直连中 / 🔒 隧道） */
+  const statusOf = (id: string): GoLanStatus["profiles"][number] | undefined =>
+    status?.profiles.find((p) => p.id === id);
 
-  // 持久化用户输入的检测 IP
-  useEffect(() => {
-    try {
-      if (probeTarget) localStorage.setItem("prism.golan.probe_ip", probeTarget);
-    } catch {
-      /* localStorage 不可用时静默忽略 */
+  /** 把当前表单回写进 profiles（切换标签/保存前调用） */
+  const mergeActiveForm = (list: GoLanProfile[]): GoLanProfile[] =>
+    list.map((p) => (p.id === form.id ? formToProfile(form, p) : p));
+
+  const switchProfile = (id: string) => {
+    if (id === form.id) return;
+    const merged = mergeActiveForm(profiles);
+    setProfiles(merged);
+    const target = merged.find((p) => p.id === id);
+    if (!target) return;
+    setActiveId(id);
+    setForm(applyProfileToForm(target, loaded ?? ({} as GoLanSettings)));
+    setProbeMsg("");
+    setProbeOk(null);
+  };
+
+  const addProfile = () => {
+    const merged = mergeActiveForm(profiles);
+    const id = `p${Date.now().toString(36)}`;
+    const created = normalizeGoLanProfile(
+      {
+        id,
+        name: `内网 ${merged.length + 1}`,
+        enabled: true,
+        bypassOnLocalLan: true,
+        lanCidrs: [],
+        probeTarget: "",
+      },
+      merged.length,
+    );
+    const next = [...merged, created];
+    setProfiles(next);
+    setActiveId(id);
+    setForm(applyProfileToForm(created, loaded ?? ({} as GoLanSettings)));
+    setProbeMsg("");
+    setProbeOk(null);
+  };
+
+  const deleteProfile = () => {
+    if (profiles.length <= 1) {
+      clearAllProfiles();
+      return;
     }
-  }, [probeTarget]);
+    const next = profiles.filter((p) => p.id !== form.id);
+    setProfiles(next);
+    const first = next[0];
+    setActiveId(first.id);
+    setForm(applyProfileToForm(first, loaded ?? ({} as GoLanSettings)));
+    setProbeMsg("");
+    setProbeOk(null);
+  };
+
+  const clearAllProfiles = () => {
+    if (!window.confirm(t("goLan.clearAllConfirm"))) return;
+    setProfiles([]);
+    setActiveId("");
+    setForm({ ...EMPTY_GO_LAN, id: "home", name: "家里", enabled: false });
+    setProbeMsg("");
+    setProbeOk(null);
+  };
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）
   useEffect(() => {
@@ -317,8 +450,42 @@ export default function GoLanModal({ open, onClose }: Props) {
     getGoLanSettings()
       .then((s) => {
         setLoaded(s);
+        let list = s.profiles;
+        if (list.length === 0) {
+          // 旧版单配置兼容：首次进入时合成为一个「家里」档案
+          let legacyProbe = "";
+          try {
+            legacyProbe = localStorage.getItem("prism.golan.probe_ip") ?? "";
+          } catch {
+            legacyProbe = "";
+          }
+          list = [
+            normalizeGoLanProfile(
+              {
+                id: "home",
+                name: s.homeName || "家里",
+                enabled: s.enabled,
+                bypassOnLocalLan: s.bypassOnLocalLan,
+                lanCidrs: s.lanCidrs,
+                wgConfig: s.wgConfig ?? null,
+                nodeUri: s.nodeUri,
+                probeTarget: legacyProbe,
+              },
+              0,
+            ),
+          ];
+        }
+        setProfiles(list);
         setForm(applyGoLanLoaded(s));
+        setActiveId((prev) =>
+          list.some((p) => p.id === prev)
+            ? prev
+            : (list.find((p) => p.id === s.activeProfileId) ?? list[0]).id,
+        );
         setGoLanSettings(s);
+        getGoLanStatus()
+          .then(setStatus)
+          .catch(() => setStatus(null));
       })
       .catch((e) => console.error("load go lan failed:", e));
   }, [open, setGoLanSettings]);
@@ -421,11 +588,19 @@ export default function GoLanModal({ open, onClose }: Props) {
     }
   };
 
-  // 【APP6 任务2.3】内网连通性检测：经 go-lan-home 隧道三路并发穿透探测；
-  // 结果就地展示在输入框正下方（无需顶部 Toast 遮挡页面）
+  // 【APP40 任务1】精准 IP:端口 探测：前端先做格式校验，未输入端口且
+  // 无 http(s):// 前缀时直接内联提示，绝不发起无意义的全端口扫描。
   const handleProbe = async () => {
-    const target = probeTarget.trim();
+    const target = form.probeTarget.trim();
     if (!target) return;
+    const hasScheme = /^https?:\/\//i.test(target);
+    const hostPart = target.replace(/^https?:\/\//i, "").split("/")[0];
+    const hasPort = /:\d+$/.test(hostPart) && !hostPart.startsWith(":");
+    if (!hasScheme && !hasPort) {
+      setProbeOk(false);
+      setProbeMsg(t("goLan.probeMissingPort"));
+      return;
+    }
     setProbing(true);
     setProbeOk(null);
     setProbeMsg(t("logs.probeRunning"));
@@ -444,68 +619,45 @@ export default function GoLanModal({ open, onClose }: Props) {
   };
 
   const handleSave = async () => {
-    // 必填校验
-    if (form.mode === "manual" && form.method === "wg") {
-      if (!form.wgServer.trim()) return toast.error(t("goLan.errServerRequired"));
-      if (!form.wgPrivateKey.trim())
-        return toast.error(t("goLan.errPrivateKeyRequired"));
-      if (!form.wgPeerPublicKey.trim())
-        return toast.error(t("goLan.errPeerKeyRequired"));
+    const current = formToProfile(form, profiles.find((p) => p.id === form.id));
+    // 「一键清空」后无档案：仅在用户重新填写内容时才合成新档案
+    const list =
+      profiles.length > 0
+        ? profiles.map((p) => (p.id === form.id ? current : p))
+        : form.enabled || form.lanCidrs.trim()
+          ? [current]
+          : [];
+    // 必填校验（仅校验当前档案）
+    if (list.length > 0) {
+      if (form.mode === "manual" && form.method === "wg") {
+        if (!form.wgServer.trim()) return toast.error(t("goLan.errServerRequired"));
+        if (!form.wgPrivateKey.trim())
+          return toast.error(t("goLan.errPrivateKeyRequired"));
+        if (!form.wgPeerPublicKey.trim())
+          return toast.error(t("goLan.errPeerKeyRequired"));
+      }
+      if (form.mode === "manual" && form.method === "uri") {
+        if (!form.nodeUri.trim()) return toast.error(t("goLan.errNodeUriRequired"));
+      }
+      if (!form.lanCidrs.trim())
+        return toast.error(t("goLan.errLanCidrsRequired"));
     }
-    if (form.mode === "manual" && form.method === "uri") {
-      if (!form.nodeUri.trim()) return toast.error(t("goLan.errNodeUriRequired"));
-    }
-    if (!form.lanCidrs.trim())
-      return toast.error(t("goLan.errLanCidrsRequired"));
-
     setBusy(true);
     try {
       const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
-      // 【APP21 任务3.1】保存时完整保留「本机虚拟地址」里的全部地址
-      // （英文逗号连接，严禁只取第 1 个）；每个地址的 /24 网段并入回家网段。
-      const localAddr = splitLocalAddresses(form.wgLocalIp);
-      const wgAnyFilled = [
-        form.wgServer,
-        form.wgPrivateKey,
-        form.wgPeerPublicKey,
-        form.wgPreSharedKey,
-      ].some((v) => v.trim() !== "");
-      const wgConfig: WgManualConfig | null =
-        form.mode === "manual" && form.method === "wg" && wgAnyFilled
-          ? {
-              server: cleanInput(form.wgServer),
-              serverPort: form.wgServerPort || 51820,
-              privateKey: cleanInput(form.wgPrivateKey),
-              peerPublicKey: cleanInput(form.wgPeerPublicKey),
-              preSharedKey: cleanInput(form.wgPreSharedKey) || null,
-              localIp:
-                localAddr.addresses.join(", ") || WG_DEFAULTS.localIp,
-              // 前端 UI 保留用户配置值（如 1420）；后端严禁压到 1280，
-              // 低于 1420 的值会被钳制回 1420（匹配家庭 WG 服务端）
-              mtu: form.wgMtu || WG_DEFAULTS.mtu,
-            }
-          : null;
-      // 【IPA9 任务4.1】lanCidrs 解析：先按 /[\r\n,;，；\s]+/ 拆分（支持
-      // 换行、逗号、分号、空格混输），再对每个子串 cleanInput。严禁在
-      // split 之前整体 .replace(/\s/g,"")，否则会把两行拼成
-      // "10.1.8.0/24192.168.10.0/24" 导致第二行网段丢失。
-      const splitCidrs = (raw: string) =>
-        raw
-          .split(/[\r\n,;，；\s]+/)
-          .map((l) => cleanInput(l))
-          .filter(Boolean);
       const payload: GoLanSettings = {
         ...base,
-        enabled: form.enabled,
+        // 顶层旧字段与首个档案保持一致（100% 向下兼容旧版读取方）
+        enabled: list.some((p) => p.enabled),
+        bypassOnLocalLan: form.bypassOnLocalLan,
+        profiles: list,
+        activeProfileId: form.id,
         mode: form.mode,
-        nodeUri: cleanInput(form.nodeUri),
-        wgConfig,
-        // 【APP15 任务1.1】Local Address 拆分出的附加地址 /24 一并并入回家网段
-        lanCidrs: Array.from(
-          new Set([...splitCidrs(form.lanCidrs), ...localAddr.cidrs]),
-        ),
+        nodeUri: current.nodeUri,
+        wgConfig: current.wgConfig ?? null,
+        lanCidrs: current.lanCidrs,
         lanDns: cleanInput(form.lanDns) || null,
-        lanDomains: splitCidrs(form.lanDomains),
+        lanDomains: splitCidrsText(form.lanDomains),
         managedServer: cleanInput(form.managedServer) || MANAGED_SERVER_DEFAULT,
         deviceCode: cleanInput(form.deviceCode),
       };
@@ -518,9 +670,15 @@ export default function GoLanModal({ open, onClose }: Props) {
           setTimeout(() => reject(new Error(t("goLan.saveTimeout"))), 2500),
         ),
       ]);
+      try {
+        if (form.probeTarget) localStorage.setItem("prism.golan.probe_ip", form.probeTarget);
+      } catch {
+        /* localStorage 不可用时静默忽略 */
+      }
       // 回读最新设置到全局 store（含 enabled 状态）
       const fresh = await getGoLanSettings();
       setGoLanSettings(fresh);
+      setStatus(await getGoLanStatus().catch(() => null));
       if (warnings && warnings.length > 0) {
         toast.error(warnings[0]);
       } else {
@@ -565,6 +723,90 @@ export default function GoLanModal({ open, onClose }: Props) {
 
         {/* 可滚动表单区 */}
         <div className="flex-1 space-y-2.5 overflow-y-auto px-4 py-3">
+
+        {/* 【APP40 任务2】内网档案 Tabs（家里 / 公司 / 工作室……） */}
+        <div className="rounded-xl border border-border bg-surface-hover/40 p-2">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[11px] font-medium text-gray-400">
+              {t("goLan.profiles")}
+            </span>
+            <button
+              onClick={clearAllProfiles}
+              className="rounded px-1.5 py-0.5 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
+            >
+              {t("goLan.clearAll")}
+            </button>
+          </div>
+          <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
+            {profiles.map((p) => {
+              const st = statusOf(p.id);
+              const on = p.id === form.id ? form.enabled : p.enabled;
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => switchProfile(p.id)}
+                  className={clsx(
+                    "pressable flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors",
+                    p.id === activeId
+                      ? "border-accent/60 bg-accent/15 text-accent"
+                      : "border-border bg-surface text-gray-400 hover:text-gray-200",
+                  )}
+                >
+                  <span
+                    className={clsx(
+                      "h-1.5 w-1.5 shrink-0 rounded-full",
+                      on ? "bg-emerald-400" : "bg-gray-600",
+                    )}
+                  />
+                  <span className="max-w-[82px] truncate">{p.name}</span>
+                  {st && on && (
+                    <span
+                      className={clsx(
+                        "tabular-nums",
+                        st.state === "direct" ? "text-amber-300" : "text-sky-300",
+                      )}
+                    >
+                      {st.state === "direct"
+                        ? t("goLan.statusDirect")
+                        : t("goLan.statusTunnel")}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+            <button
+              onClick={addProfile}
+              className="flex shrink-0 items-center gap-1 rounded-full border border-dashed border-accent/50 px-2.5 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10"
+            >
+              <Plus size={12} />
+              {t("goLan.addProfile")}
+            </button>
+          </div>
+          {profiles.length === 0 && (
+            <p className="mt-1.5 px-1 text-[11px] text-gray-500">
+              {t("goLan.profilesEmpty")}
+            </p>
+          )}
+        </div>
+
+        {/* 档案名称 + 删除该档案 */}
+        {profiles.length > 0 && (
+          <div className="flex gap-2">
+            <input
+              value={form.name}
+              onChange={(e) => patch({ name: e.target.value })}
+              placeholder={t("goLan.profileNamePlaceholder")}
+              className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
+            />
+            <button
+              onClick={deleteProfile}
+              title={t("goLan.deleteProfile")}
+              className="flex shrink-0 items-center justify-center rounded-md border border-red-500/30 bg-red-500/10 px-2.5 text-red-400 transition-colors hover:bg-red-500/20"
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+        )}
 
         {/* 模式切换 */}
         <div className="flex gap-2 rounded-lg bg-surface-hover p-1 text-xs">
@@ -793,22 +1035,35 @@ export default function GoLanModal({ open, onClose }: Props) {
           />
         </div>
 
-        {/* 【APP6 任务2.3】内网连通性检测：默认目标=推导网关，结果与延迟
-            就地展示，检测过程实时写入下方 Go Lan 日志面板 */}
+        {/* 【APP40 任务2】On-Demand 局域网直连 */}
+        <div className="rounded-lg border border-border bg-surface px-3 py-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-gray-300">{t("goLan.bypassTitle")}</span>
+            <Switch
+              checked={form.bypassOnLocalLan}
+              onChange={(v) => patch({ bypassOnLocalLan: v })}
+            />
+          </div>
+          <p className="mt-1 text-[10px] leading-4 text-gray-500">
+            {t("goLan.bypassHint")}
+          </p>
+        </div>
+
+        {/* 【APP40 任务1】内网服务连通性检测：强制 IP:端口，前端先校验格式 */}
         <div className="rounded-lg border border-border bg-surface px-3 py-2">
           <span className="mb-1.5 block text-xs text-gray-400">
             {t("goLan.testTitle")}
           </span>
           <div className="flex gap-2">
             <input
-              value={probeTarget}
-              onChange={(e) => setProbeTarget(e.target.value)}
+              value={form.probeTarget}
+              onChange={(e) => patch({ probeTarget: e.target.value })}
               placeholder={t("goLan.testPlaceholder")}
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 focus:border-accent focus:outline-none"
             />
             <button
               onClick={handleProbe}
-              disabled={probing || !probeTarget.trim()}
+              disabled={probing || !form.probeTarget.trim()}
               className="shrink-0 rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
             >
               {probing ? t("logs.probing") : t("logs.probe")}
@@ -837,14 +1092,14 @@ export default function GoLanModal({ open, onClose }: Props) {
               防止 saving 状态卡死时用户无法退出 */}
           <button
             onClick={closeModal}
-            className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
+            className="pressable flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
           >
             {t("common.cancel")}
           </button>
           <button
             onClick={handleSave}
             disabled={busy}
-            className="flex-1 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+            className="pressable flex-1 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
             {busy ? t("goLan.saving") : t("goLan.saveConfig")}
           </button>

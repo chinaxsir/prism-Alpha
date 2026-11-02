@@ -88,3 +88,46 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--gray-500) / 0.7);
 }
+
+/* ============================ 【APP40 任务3】商业级细节 ============================ */
+@layer utilities {
+  /* 横向档案 Tabs / 指标条：隐藏滚动条但保留滚动能力 */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* 卡片内高光：右上角柔光渐变，深色下更立体（不遮挡交互） */
+  .card-sheen {
+    position: relative;
+    overflow: hidden;
+  }
+  .card-sheen::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(
+      135deg,
+      rgb(var(--glass) / 0.055) 0%,
+      rgb(var(--glass) / 0) 46%
+    );
+  }
+
+  /* 按压反馈：移动端点击有轻微缩放，避免“点了没反应”的错觉 */
+  .pressable {
+    transition: transform 0.12s ease, opacity 0.12s ease;
+  }
+  .pressable:active {
+    transform: scale(0.97);
+    opacity: 0.92;
+  }
+}
+
+/* 数字统一等宽，仪表盘/延迟/速率切换时不抖动 */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

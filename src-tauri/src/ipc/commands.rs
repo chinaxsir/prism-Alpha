@@ -2461,62 +2461,64 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
     serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
 }
 
-/// 【APP-11 任务1.3】从回家网段推导探测目标网关（取每个 /24 的 .1 地址）。
-fn go_lan_gateway_targets(lan: &crate::core::go_lan::GoLanSettings) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |ip_str: &str| {
-        let parts: Vec<&str> = ip_str.split('.').collect();
-        if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-            let gw = format!("{}.{}.{}.1", parts[0], parts[1], parts[2]);
-            if !out.contains(&gw) {
-                out.push(gw);
+/// 【APP-11 任务1.3 / APP40 任务2】为每路启用档案推导探测目标网关
+/// （取该档案每个 /24 与 WireGuard 虚拟地址的 `.1` 地址），返回 (tag, 网关)。
+fn go_lan_gateway_targets(
+    lan: &crate::core::go_lan::GoLanSettings,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (tag, profile) in crate::core::go_lan::enabled_profiles(lan) {
+        let mut gateways: Vec<String> = Vec::new();
+        let mut push = |ip_str: &str| {
+            let parts: Vec<&str> = ip_str.split('.').collect();
+            if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+                let gw = format!("{}.{}.{}.1", parts[0], parts[1], parts[2]);
+                if !gateways.contains(&gw) {
+                    gateways.push(gw);
+                }
             }
+        };
+        for cidr in crate::core::go_lan::profile_route_cidrs(&profile) {
+            push(cidr.split('/').next().unwrap_or(""));
         }
-    };
-    for cidr in &lan.lan_cidrs {
-        push(cidr.trim().split('/').next().unwrap_or(""));
-    }
-    if let Some(wg) = &lan.wg_config {
-        push(wg.local_ip.trim().split('/').next().unwrap_or(""));
+        if let Some(wg) = &profile.wg_config {
+            push(wg.local_ip.trim().split('/').next().unwrap_or(""));
+        }
+        if let Some(gw) = gateways.into_iter().next() {
+            out.push((tag, gw));
+        }
     }
     out
 }
 
 /// 【APP-11 任务1.3】主动触发 WireGuard 首次握手。
-/// 内核就绪后（延迟 800ms）对 go-lan-home 出站逐个探测家庭网关：
+/// 内核就绪后（延迟 800ms）对每个启用档案的出站各探测一次网关：
 /// 哪怕网关不响应 HTTP，探测包也会穿过隧道，立即在家庭路由器上
 /// 产生 WireGuard 握手与连接记录。
-/// 【APP30 任务3】回家配置保存后主动握手：仅向主网关发起 1 次 Clash API
-/// delay（timeout 1500ms），绝不再对 10.196.0.1 / 10.31.2.1 / 192.168.10.1
-/// 等多个网关逐个发裸 TCP / SOCKS5 握手——log8.txt 第 78~81 行 4 条
-/// `operation timed out (2m7s)` 就是多目标裸探测留下的半开连接。
+/// 【APP30 任务3】每路档案只向主网关发起 1 次 Clash API delay
+/// （timeout 1500ms），绝不再对多个网关逐个发裸 TCP / SOCKS5 握手——
+/// log8.txt 第 78~81 行 4 条 `operation timed out (2m7s)` 就是多目标
+/// 裸探测留下的半开连接。
 fn spawn_go_lan_warmup(
     api_addr: String,
     api_secret: String,
     lan: &crate::core::go_lan::GoLanSettings,
 ) {
-    let gateway = go_lan_gateway_targets(lan).into_iter().next();
-    if api_addr.is_empty() {
+    let targets = go_lan_gateway_targets(lan);
+    if api_addr.is_empty() || targets.is_empty() {
         return;
     }
-    let Some(gw) = gateway else {
-        return;
-    };
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let api = KernelApi::new(&api_addr, &api_secret);
-        // 探测结果不重要（家庭网关多半不开 HTTP），只要 1 次请求触发握手
-        let _ = api
-            .test_delay(
-                crate::core::go_lan::GO_LAN_TAG,
-                &format!("http://{gw}"),
-                1500,
-            )
-            .await;
-        crate::core::logger::info(
-            crate::core::logger::MOD_GO_LAN,
-            &format!("主动握手探测完成，已向家庭网关 {gw} 发送 1 次 Clash API 请求"),
-        );
+        for (tag, gw) in targets {
+            // 探测结果不重要（家庭网关多半不开 HTTP），只要 1 次请求触发握手
+            let _ = api.test_delay(&tag, &format!("http://{gw}"), 1500).await;
+            crate::core::logger::info(
+                crate::core::logger::MOD_GO_LAN,
+                &format!("主动握手探测完成，已向 {tag} 网关 {gw} 发送 1 次 Clash API 请求"),
+            );
+        }
     });
 }
 
@@ -2535,8 +2537,10 @@ pub async fn save_go_lan_settings(
     if !state.is_pro_active() {
         return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
-    let lan: crate::core::go_lan::GoLanSettings =
+    let mut lan: crate::core::go_lan::GoLanSettings =
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
+    // 【APP40 任务2】保存前自动迁移旧版单配置 → 多路档案，并校正档案 id
+    crate::core::go_lan::normalize_go_lan_settings(&mut lan);
     // APP 任务5 后端兜底：未配置完整参数时严禁启用
     if lan.enabled && !crate::core::go_lan::is_configured(&lan) {
         return Err("请先填写完整的回家节点参数与内网网段后再启用 Go Lan".into());
@@ -2548,11 +2552,14 @@ pub async fn save_go_lan_settings(
     // 下次启动 build_config 直接命中缓存拿到最新 IPv4，避免扩展侧系统
     // getaddrinfo 读到旧 DDNS 记录（log8.txt 第 39~44 行
     // ishow.indevs.in 旧 14.105.65.44 / 新 14.105.65.122）。
-    if let Some(server) = lan.wg_config.as_ref().map(|wg| wg.server.clone()) {
-        if !server.trim().is_empty() {
-            std::thread::spawn(move || {
-                let _ = crate::core::go_lan::resolve_endpoint_host_to_ip(&server);
-            });
+    // 【APP40 任务2】逐档案预热（每路内网可能有独立 Endpoint 域名）
+    for (_, profile) in crate::core::go_lan::enabled_profiles(&lan) {
+        if let Some(server) = profile.wg_config.as_ref().map(|wg| wg.server.clone()) {
+            if !server.trim().is_empty() {
+                std::thread::spawn(move || {
+                    let _ = crate::core::go_lan::resolve_endpoint_host_to_ip(&server);
+                });
+            }
         }
     }
 
@@ -2587,6 +2594,86 @@ pub async fn save_go_lan_settings(
         });
     }
     Ok(warnings)
+}
+
+/// 【APP40 任务2】内网档案运行状态（Dashboard / Settings / GoLanModal 徽章数据源）。
+/// 返回每个启用档案的 On-Demand 判定结果：
+/// - `direct`：本机物理局域网命中该档案网段，已跳过 WG 隧道；
+/// - `tunnel`：需要走 WireGuard 隧道；
+/// - iOS 侧由扩展实时判定并写入 `golan_bypass.json` 侧车，主程序读取后保持一致。
+#[tauri::command]
+pub async fn get_go_lan_status(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let lan = state.go_lan.read().clone();
+    let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
+    let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for (tag, profile) in crate::core::go_lan::enabled_profiles(&lan) {
+        let (tunnel, direct) =
+            crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
+        let mut bypassed = direct;
+        if bypassed.is_empty() {
+            if let Some(cidrs) = ios_bypass.iter().find(|(t, _)| t == &tag).map(|(_, c)| c) {
+                bypassed = cidrs.clone();
+            }
+        }
+        let state_str = if bypassed.is_empty() { "tunnel" } else { "direct" };
+        items.push(serde_json::json!({
+            "tag": tag,
+            "id": profile.id,
+            "name": profile.name,
+            "enabled": profile.enabled,
+            "onDemand": profile.bypass_on_local_lan,
+            "state": state_str,
+            "bypassCidrs": bypassed,
+            "tunnelCidrs": tunnel,
+        }));
+    }
+    Ok(serde_json::json!({
+        "profiles": items,
+        "physicalIps": physical.iter().map(|ip| ip.to_string()).collect::<Vec<String>>(),
+    }))
+}
+
+/// iOS 扩展写入的 On-Demand 侧车（`[{"tag": "...", "cidrs": [...]}]`）。
+/// 其他平台恒为空，由 Rust 侧 `detect_physical_lan_ipv4s` 直接判定。
+fn read_ios_bypass_sidecar(
+    work_dir: &std::path::Path,
+) -> Vec<(String, Vec<String>)> {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = work_dir;
+        return Vec::new();
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let path = work_dir.join("golan_bypass.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Vec::new();
+        };
+        value
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let tag = item.get("tag")?.as_str()?.to_string();
+                        let cidrs = item
+                            .get("cidrs")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|c| c.as_str())
+                            .map(str::to_string)
+                            .collect::<Vec<String>>();
+                        Some((tag, cidrs))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Managed 模式：向授权服务器拉取回家节点配置

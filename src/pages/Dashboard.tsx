@@ -38,10 +38,12 @@ import {
   runGoAimProbe,
 
   getGoLanSettings,
+  getGoLanStatus,
   saveGoLanSettings,
   getGoCusSettings,
   saveGoCusSettings,
   isGoLanConfigured,
+  type GoLanStatus,
 } from "@/api/ipc";
 import { useCoreStore, type RunMode, isDummyNodeName } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
@@ -104,6 +106,8 @@ export default function Dashboard() {
   const aim = useCoreStore((s) => s.goAimStatus);
   const lan = useCoreStore((s) => s.goLanSettings);
   const cus = useCoreStore((s) => s.goCusSettings);
+  // 【APP40 任务2】内网档案运行状态（⚡同网段直连 / 🔒隧道）
+  const [lanState, setLanState] = useState<GoLanStatus | null>(null);
 
   const running = status === "running";
   const modeLabel = (m: RunMode) => t(m === "tun" ? "runMode.tun" : "runMode.systemProxy");
@@ -320,6 +324,13 @@ export default function Dashboard() {
     };
   }, []);
 
+  // 【APP40 任务2】Go Lan 档案状态：任一档案启停变化时刷新 ⚡/🔒 徽章
+  useEffect(() => {
+    getGoLanStatus()
+      .then(setLanState)
+      .catch(() => setLanState(null));
+  }, [lan?.enabled, lan?.profiles]);
+
   const toggleAim = async (v: boolean) => {
     try {
       await setGoAimEnabled(v);
@@ -444,13 +455,28 @@ export default function Dashboard() {
   // 【APP23 任务1.2】字段缺失兜底：goLanSettings 任一层为 undefined 时
   // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
   const lanCidrs = lan?.lanCidrs ?? [];
+  // 【APP40 任务2】多档案副标题：已启用: 家里 (⚡同网段直连) · 公司 (🔒隧道已连接)
+  const enabledLanProfiles = (lan?.profiles ?? []).filter((p) => p.enabled);
   const lanStatus =
-    lanCidrs.length > 0
-      ? t("dashboard.lan.configured", {
-          mode: t(lan?.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
-          cidrs: lanCidrs.join(", "),
+    enabledLanProfiles.length > 0
+      ? t("dashboard.lan.profiles", {
+          profiles: enabledLanProfiles
+            .map((p) => {
+              const st = lanState?.profiles.find((x) => x.id === p.id);
+              const badge =
+                st?.state === "direct"
+                  ? t("goLan.statusDirect")
+                  : t("goLan.statusTunnel");
+              return `${p.name} (${badge})`;
+            })
+            .join(" · "),
         })
-      : t("dashboard.lan.unset");
+      : lanCidrs.length > 0
+        ? t("dashboard.lan.configured", {
+            mode: t(lan?.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
+            cidrs: lanCidrs.join(", "),
+          })
+        : t("dashboard.lan.unset");
   const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];
   const cusStatus =
     cus && cus.modules.length > 0
@@ -648,14 +674,14 @@ export default function Dashboard() {
       </div>
 
       {/* 实时速率（合并卡片，左右分布） */}
-      <div className="bg-surface-card rounded-2xl p-5 border border-border">
+      <div className="card-sheen bg-surface-card rounded-2xl p-5 border border-border">
         <div className="grid grid-cols-2 gap-4">
           <div>
             <div className="flex items-center gap-1.5 text-xs text-gray-400">
               <Activity size={13} className="text-latency-good" />
               {t("metric.download")}
             </div>
-            <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono">
+            <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono tracking-tight">
               {running ? formatSpeed(downSpeed) : "—"}
             </div>
           </div>
@@ -664,7 +690,7 @@ export default function Dashboard() {
               <Activity size={13} className="text-accent" />
               {t("metric.upload")}
             </div>
-            <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono">
+            <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono tracking-tight">
               {running ? formatSpeed(upSpeed) : "—"}
             </div>
           </div>
@@ -886,8 +912,8 @@ function EngineCard({
 }) {
   return (
     <div
-      className={`flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border ${
-        locked ? "opacity-50 select-none cursor-not-allowed" : ""
+      className={`card-sheen flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border transition-colors ${
+        locked ? "opacity-50 select-none cursor-not-allowed" : "hover:border-accent/30"
       }`}
     >
       <div className="min-w-0 flex-1">

@@ -215,8 +215,27 @@ export interface WgManualConfig {
   mtu: number;
 }
 
+/** 【APP40 任务2】单路内网档案（家里 / 公司 / 工作室……）。 */
+export interface GoLanProfile {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** 命中本机同网段时跳过隧道，直接走局域网（默认 true） */
+  bypassOnLocalLan: boolean;
+  /** 可选：显式指定的 Wi-Fi SSID（留空按网段智能匹配） */
+  localWifiSsid: string;
+  lanCidrs: string[];
+  wgConfig?: WgManualConfig | null;
+  nodeUri: string;
+  /** 该档案保存的内网检测目标（如 192.168.10.253:8001） */
+  probeTarget: string;
+}
+
 export interface GoLanSettings {
   enabled: boolean;
+  bypassOnLocalLan: boolean;
+  profiles: GoLanProfile[];
+  activeProfileId: string;
   mode: "manual" | "managed";
   nodeUri: string;
   wgConfig?: WgManualConfig | null;
@@ -229,6 +248,22 @@ export interface GoLanSettings {
   homeName?: string | null;
 }
 
+/** 规范化单个档案：字段缺失时给出合法默认值，避免渲染期 undefined 崩溃 */
+export const normalizeGoLanProfile = (raw: Partial<GoLanProfile> | null, index: number): GoLanProfile => {
+  const p = raw ?? {};
+  return {
+    id: typeof p.id === "string" && p.id.trim() ? p.id : `profile${index + 1}`,
+    name: typeof p.name === "string" && p.name.trim() ? p.name : `内网 ${index + 1}`,
+    enabled: p.enabled === true,
+    bypassOnLocalLan: p.bypassOnLocalLan !== false,
+    localWifiSsid: typeof p.localWifiSsid === "string" ? p.localWifiSsid : "",
+    lanCidrs: Array.isArray(p.lanCidrs) ? p.lanCidrs : [],
+    wgConfig: p.wgConfig ?? null,
+    nodeUri: typeof p.nodeUri === "string" ? p.nodeUri : "",
+    probeTarget: typeof p.probeTarget === "string" ? p.probeTarget : "",
+  };
+};
+
 /** 【APP24 任务4.1】后端返回字段缺失兜底：wgConfig 可能为 null、
  *  lanCidrs/lanDomains/nodeUri/deviceCode 等可能因旧配置缺失而为
  *  null/undefined，前端一律规范化为合法默认值，杜绝 React 渲染期
@@ -237,6 +272,9 @@ export const normalizeGoLanSettings = (raw: GoLanSettings | null): GoLanSettings
   const r = raw ?? ({} as GoLanSettings);
   return {
     enabled: r.enabled === true,
+    bypassOnLocalLan: r.bypassOnLocalLan !== false,
+    profiles: Array.isArray(r.profiles) ? r.profiles.map((p, i) => normalizeGoLanProfile(p, i)) : [],
+    activeProfileId: typeof r.activeProfileId === "string" ? r.activeProfileId : "",
     mode: r.mode === "managed" ? "managed" : "manual",
     nodeUri: typeof r.nodeUri === "string" ? r.nodeUri : "",
     wgConfig: r.wgConfig ?? null,
@@ -247,6 +285,29 @@ export const normalizeGoLanSettings = (raw: GoLanSettings | null): GoLanSettings
     deviceCode: typeof r.deviceCode === "string" ? r.deviceCode : "",
     cachedManagedOutbound: r.cachedManagedOutbound ?? null,
     homeName: r.homeName ?? null,
+  };
+};
+
+/** 【APP40 任务2】内网档案运行状态（On-Demand ⚡直连 / 🔒隧道） */
+export interface GoLanProfileStatus {
+  tag: string;
+  id: string;
+  name: string;
+  enabled: boolean;
+  onDemand: boolean;
+  state: "direct" | "tunnel";
+  bypassCidrs: string[];
+  tunnelCidrs: string[];
+}
+export interface GoLanStatus {
+  profiles: GoLanProfileStatus[];
+  physicalIps: string[];
+}
+export const getGoLanStatus = async (): Promise<GoLanStatus> => {
+  const raw = await invoke<GoLanStatus>("get_go_lan_status");
+  return {
+    profiles: Array.isArray(raw?.profiles) ? raw.profiles : [],
+    physicalIps: Array.isArray(raw?.physicalIps) ? raw.physicalIps : [],
   };
 };
 
@@ -287,12 +348,32 @@ export const exportAppLogs = (moduleFilter?: string) =>
   invoke<string>("export_app_logs", { moduleFilter: moduleFilter ?? null });
 
 /** APP 任务5：Go Lan 配置完整性检查（未配置时前端拦截开启操作）
- *  - manual：lanCidrs 非空，且（nodeUri 非空，或 wgConfig 的
- *    server/privateKey/peerPublicKey 均非空）
- *  - managed：deviceCode 非空且 lanCidrs 非空（已成功拉取过配置） */
+ *  - 多档案（APP40）：任一启用档案网段非空，且 manual 下具备 nodeUri/wgConfig
+ *  - 旧版单配置（100% 兼容）：manual 下 lanCidrs 非空且具备 nodeUri/wgConfig；
+ *    managed 下 deviceCode + lanCidrs 非空 */
 export const isGoLanConfigured = (cfg: GoLanSettings): boolean => {
   // 【APP24 任务4.1】字段缺失兜底：任何字段为 null/undefined 时不抛异常
   const lanCidrs = Array.isArray(cfg?.lanCidrs) ? cfg.lanCidrs : [];
+  const profiles = Array.isArray(cfg?.profiles) ? cfg.profiles : [];
+  const hasManualLink = (p: GoLanProfile): boolean => {
+    const wg = p.wgConfig;
+    return (
+      (p.nodeUri ?? "").trim().length > 0 ||
+      (!!wg &&
+        (wg.server ?? "").trim().length > 0 &&
+        (wg.privateKey ?? "").trim().length > 0 &&
+        (wg.peerPublicKey ?? "").trim().length > 0)
+    );
+  };
+  if (profiles.length > 0) {
+    return profiles.some((p) => {
+      if (p.enabled !== true) return false;
+      const cidrs = Array.isArray(p.lanCidrs) ? p.lanCidrs : [];
+      if (cidrs.length === 0) return false;
+      if (cfg.mode === "manual") return hasManualLink(p);
+      return true;
+    });
+  }
   if (cfg.mode === "manual") {
     const hasCidrs = lanCidrs.length > 0;
     const hasUri = (cfg.nodeUri ?? "").trim().length > 0;

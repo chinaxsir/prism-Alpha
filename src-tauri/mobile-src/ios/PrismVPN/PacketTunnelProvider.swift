@@ -48,6 +48,13 @@ private func startSystemPathMonitor() {
     monitor.start(queue: DispatchQueue(label: "com.prism.proxy.pathMonitor", qos: .utility))
 }
 
+/// 【APP40 任务2】内网档案侧车元数据（golan_profiles.json 的单条记录）。
+/// 使用具名结构体而非命名元组（APP16 硬性禁令）。
+private struct GoLanProfileMeta {
+    let bypass: Bool
+    let cidrs: [String]
+}
+
 private struct PhysicalInterface {
     let name: String
     let index: UInt32
@@ -461,43 +468,48 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// 【APP10 任务2.2】向 App Group vpn_trace.log 追加一行 GoLan-Ext 实况
-    /// 日志：扩展进程内真实生效的 go-lan-home 顶层字段与回家路由网段。
+    /// 【APP10 任务2.2 / APP40 任务2】向 App Group vpn_trace.log 追加 GoLan-Ext
+    /// 实况日志：扩展进程内真实生效的每一路 go-lan-* 出站顶层字段与回家网段。
     /// 主 App 运行日志（logger.rs collect_kernel_and_extension_logs）会
-    /// 读取该文件并按 go-lan-home 关键字归类到 GoLan 模块。
+    /// 读取该文件并按 go-lan 关键字归类到 GoLan 模块。
     private func writeGoLanExtLog(_ sanitizedConfig: String) {
         guard let data = sanitizedConfig.data(using: .utf8),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let outbounds = root["outbounds"] as? [[String: Any]],
-              let golan = outbounds.first(where: {
-                  ($0["tag"] as? String) == "go-lan-home"
-              })
+              let outbounds = root["outbounds"] as? [[String: Any]]
         else { return }
-        let server = golan["server"] as? String ?? "?"
-        let port = (golan["server_port"] as? NSNumber)?.intValue
-            ?? (golan["server_port"] as? Int) ?? 0
-        let local = (golan["local_address"] as? [String])?.joined(separator: ",")
-            ?? (golan["local_address"] as? String) ?? "?"
-        var cidrs: [String] = []
-        if let rules = (root["route"] as? [String: Any])?["rules"] as? [[String: Any]] {
-            for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
+        let goLanOutbounds = outbounds.filter {
+            let tag = ($0["tag"] as? String) ?? ""
+            return tag.hasPrefix("go-lan") && ($0["type"] as? String) == "wireguard"
+        }
+        guard !goLanOutbounds.isEmpty else { return }
+        let ts = Int(Date().timeIntervalSince1970)
+        let rules = ((root["route"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        var lines = ""
+        for golan in goLanOutbounds {
+            let tag = golan["tag"] as? String ?? "go-lan-home"
+            let server = golan["server"] as? String ?? "?"
+            let port = (golan["server_port"] as? NSNumber)?.intValue
+                ?? (golan["server_port"] as? Int) ?? 0
+            let local = (golan["local_address"] as? [String])?.joined(separator: ",")
+                ?? (golan["local_address"] as? String) ?? "?"
+            var cidrs: [String] = []
+            for rule in rules where (rule["outbound"] as? String) == tag {
                 for c in (rule["ip_cidr"] as? [String]) ?? [] where !cidrs.contains(c) {
                     cidrs.append(c)
                 }
             }
+            // 【APP31 任务1】日志必须带 bind_if，现场确认外层 UDP 是否锁定物理网卡
+            let bindIf = golan["bind_interface"] as? String ?? "-"
+            lines += "\(ts) INFO [GoLan-Ext] 扩展已加载 \(tag) -> server=\(server):\(port), bind_if=\(bindIf), local=\(local), 路由网段=[\(cidrs.joined(separator: ", "))]\n"
         }
-        let ts = Int(Date().timeIntervalSince1970)
-        // 【APP31 任务1】日志必须带 bind_if，现场确认外层 UDP 是否锁定物理网卡
-        let bindIf = golan["bind_interface"] as? String ?? "-"
-        let line = "\(ts) INFO [GoLan-Ext] 扩展已加载 go-lan-home -> server=\(server):\(port), bind_if=\(bindIf), local=\(local), 路由网段=[\(cidrs.joined(separator: ", "))]\n"
         for dir in sharedDirURLs() {
             let url = dir.appendingPathComponent("vpn_trace.log")
             if let h = try? FileHandle(forWritingTo: url) {
                 h.seekToEndOfFile()
-                h.write(line.data(using: .utf8) ?? Data())
+                h.write(lines.data(using: .utf8) ?? Data())
                 try? h.close()
             } else {
-                try? line.write(to: url, atomically: true, encoding: .utf8)
+                try? lines.write(to: url, atomically: true, encoding: .utf8)
             }
         }
     }
@@ -821,6 +833,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return arr
     }
 
+    /// 【APP40 任务2】读取 Rust 写下的多路档案元数据
+    /// （workDir/golan_profiles.json: [{"tag","name","cidrs","bypassOnLocalLan"}]）。
+    /// 侧车只用于扩展侧 On-Demand 判定，绝不写入内核 JSON。
+    private func loadGoLanProfileMetadata(_ workDir: URL) -> [String: GoLanProfileMeta] {
+        let url = workDir.appendingPathComponent("golan_profiles.json")
+        guard let data = try? Data(contentsOf: url),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { return [:] }
+        var out: [String: GoLanProfileMeta] = [:]
+        for item in arr {
+            guard let tag = item["tag"] as? String, !tag.isEmpty else { continue }
+            let bypass = (item["bypassOnLocalLan"] as? Bool) ?? true
+            let cidrs = (item["cidrs"] as? [String]) ?? []
+            out[tag] = GoLanProfileMeta(bypass: bypass, cidrs: cidrs)
+        }
+        return out
+    }
+
+    /// 【APP40 任务2】On-Demand 直连侧车：本轮被判定为「同局域网直连」的网段
+    /// （workDir/golan_bypass.json: [{"tag","cidrs"}]）。openTun 读取后
+    /// 写入 ipv4Settings.excludedRoutes，让这些网段根本不进入 utun。
+    private func loadGoLanBypassCidrs() -> [String] {
+        guard let workDir = activeWorkDir else { return [] }
+        let url = workDir.appendingPathComponent("golan_bypass.json")
+        guard let data = try? Data(contentsOf: url),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { return [] }
+        var out: [String] = []
+        for item in arr {
+            for cidr in (item["cidrs"] as? [String]) ?? [] where !out.contains(cidr) {
+                out.append(cidr)
+            }
+        }
+        return out
+    }
+
     fileprivate func openTun(optionsJSON: String) -> Int32 {
         NSLog("[PrismVPN] openTun options: \(optionsJSON)")
         writeHeartbeat("openTun")
@@ -909,10 +957,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         ipv4.includedRoutes = included
-        // 【APP39 任务2.1】excludedRoutes 固定为空：go-lan-home 出站的
-        // bind_interface 物理网卡硬绑定 + route.rules 顶部 wgServerIP/32
-        // direct 豁免已构成双重直链锁定，WG 握手包绝不进 utun。
-        ipv4.excludedRoutes = []
+        // 【APP40 任务2】On-Demand 同局域网直连：命中本机 Wi-Fi 网段的
+        // 回家网段写入 excludedRoutes——这些包直接走物理 Wi-Fi，完全不进
+        // utun，既避免 NAS 非对称回包，也省掉一轮 gVisor 转发开销。
+        let bypassCidrs = loadGoLanBypassCidrs()
+        var excluded: [NEIPv4Route] = []
+        for cidrStr in bypassCidrs {
+            guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
+            excluded.append(
+                NEIPv4Route(
+                    destinationAddress: parsed.networkAddress,
+                    subnetMask: parsed.subnetMask
+                )
+            )
+        }
+        ipv4.excludedRoutes = excluded
+        if !excluded.isEmpty {
+            writeExtLog("INFO", "[GoLan-Ext] ⚡ On-Demand 直连网段已写入 excludedRoutes: \(bypassCidrs)")
+        }
         settings.ipv4Settings = ipv4
 
         // 【APP39 任务2.1】移除 NEProxySettings：APP38 实证在 iPhone 上
@@ -1148,32 +1210,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return }
 
-        // 仅当配置里确实存在 go-lan-home WireGuard 出站时才需要探测
+        // 【APP40 任务2】多路内网档案：逐路收集 go-lan-* WireGuard 出站的网关
         let outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        guard let wg = outbounds.first(where: {
-            ($0["tag"] as? String) == "go-lan-home" && ($0["type"] as? String) == "wireguard"
-        }) else { return }
-
-        var gateways: [String] = []
-        func pushGateway(_ ip: String) {
+        var gatewaysByTag: [String: [String]] = [:]
+        func pushGateway(_ ip: String, tag: String) {
             let parts = ip.split(separator: ".")
             guard parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }) else { return }
             let gw = "\(parts[0]).\(parts[1]).\(parts[2]).1"
-            if !gateways.contains(gw) { gateways.append(gw) }
+            var list = gatewaysByTag[tag] ?? []
+            if !list.contains(gw) { list.append(gw) }
+            gatewaysByTag[tag] = list
         }
-        let localAddrs = (wg["local_address"] as? [String])
-            ?? (wg["local_address"] as? String).map { [$0] }
-            ?? []
-        for la in localAddrs {
-            pushGateway(la.split(separator: "/").first.map(String.init) ?? "")
-        }
-        let rules = ((root["route"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
-        for rule in rules where (rule["outbound"] as? String) == "go-lan-home" {
-            for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
-                pushGateway(cidr.split(separator: "/").first.map(String.init) ?? "")
+        for wg in outbounds {
+            guard let tag = wg["tag"] as? String, tag.hasPrefix("go-lan"),
+                  (wg["type"] as? String) == "wireguard"
+            else { continue }
+            let localAddrs = (wg["local_address"] as? [String])
+                ?? (wg["local_address"] as? String).map { [$0] }
+                ?? []
+            for la in localAddrs {
+                pushGateway(la.split(separator: "/").first.map(String.init) ?? "", tag: tag)
             }
         }
-        guard !gateways.isEmpty else { return }
+        let rules = ((root["route"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        for rule in rules {
+            guard let tag = rule["outbound"] as? String, tag.hasPrefix("go-lan") else { continue }
+            for cidr in (rule["ip_cidr"] as? [String]) ?? [] {
+                pushGateway(cidr.split(separator: "/").first.map(String.init) ?? "", tag: tag)
+            }
+        }
+        guard !gatewaysByTag.isEmpty else { return }
 
         // Clash API 地址与密钥（与桌面端 KernelApi.test_delay 一致）
         guard let clashAPI = (root["experimental"] as? [String: Any])?["clash_api"] as? [String: Any],
@@ -1183,75 +1249,79 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let base = controller.hasPrefix("http") ? controller : "http://\(controller)"
 
         vpnQueue.asyncAfter(deadline: .now() + 1.0) {
-            for gw in gateways {
-                var comps = URLComponents(string: "\(base)/proxies/go-lan-home/delay")
-                comps?.queryItems = [
-                    URLQueryItem(name: "url", value: "http://\(gw)"),
-                    URLQueryItem(name: "timeout", value: "1500"),
-                ]
-                guard let url = comps?.url else { continue }
-                var req = URLRequest(url: url, timeoutInterval: 3.5)
-                if let secret = secret, !secret.isEmpty {
-                    req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+            for (tag, gateways) in gatewaysByTag {
+                for gw in gateways {
+                    var comps = URLComponents(string: "\(base)/proxies/\(tag)/delay")
+                    comps?.queryItems = [
+                        URLQueryItem(name: "url", value: "http://\(gw)"),
+                        URLQueryItem(name: "timeout", value: "1500"),
+                    ]
+                    guard let url = comps?.url else { continue }
+                    var req = URLRequest(url: url, timeoutInterval: 3.5)
+                    if let secret = secret, !secret.isEmpty {
+                        req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+                    }
+                    // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
+                    URLSession.shared.dataTask(with: req).resume()
                 }
-                // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
-                URLSession.shared.dataTask(with: req).resume()
             }
-            NSLog("[PrismVPN] [go-lan] 主动握手探测已触发 \(gateways)")
+            NSLog("[PrismVPN] [go-lan] 主动握手探测已触发 \(gatewaysByTag)")
         }
     }
 
     // MARK: - go-lan-home 剥离兜底（APP-8 任务4）
 
-    /// 从配置 JSON 中剥离 go-lan-home WireGuard 出站及其关联引用，
-    /// 用于家庭 DDNS 域名彻底无法解析时的降级启动。
+    /// 从配置 JSON 中剥离全部 go-lan-* WireGuard 出站及其关联引用，
+    /// 用于内网 Endpoint（DDNS 域名）彻底无法解析时的降级启动。
     /// 剥离范围：
-    ///   - outbounds[] 中 tag == "go-lan-home"
-    ///   - route.rules[] 中 outbound == "go-lan-home"
+    ///   - outbounds[] 中 tag 以 "go-lan" 开头的项
+    ///   - route.rules[] 中 outbound 以 "go-lan" 开头的规则
     ///   - route.final / dns.rules[].server / dns.servers[] 中引用
-    ///     go-lan-home 的项（dns-home 服务器 detour 指向 go-lan-home 时移除）
+    ///     dns-home 或 go-lan-* 的项（dns-home detour 指向有关联时移除）
     /// 返回剥离后的 JSON 字符串；若无可剥离内容返回原串。
     private func stripGoLanHome(from configJSON: String) -> String {
         guard let data = configJSON.data(using: .utf8),
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return configJSON }
 
-        let tag = "go-lan-home"
+        func isGoLan(_ tag: String?) -> Bool {
+            (tag ?? "").hasPrefix("go-lan")
+        }
         var changed = false
 
         // 1. outbounds 中移除
         if var outbounds = root["outbounds"] as? [[String: Any]] {
             let before = outbounds.count
-            outbounds.removeAll { ($0["tag"] as? String) == tag }
+            outbounds.removeAll { isGoLan($0["tag"] as? String) }
             if outbounds.count != before {
                 root["outbounds"] = outbounds
                 changed = true
             }
         }
 
-        // 2. route.rules 中移除 outbound == go-lan-home 的规则
+        // 2. route.rules 中移除 outbound 以 go-lan 开头的规则
         if var route = root["route"] as? [String: Any] {
             if var rules = route["rules"] as? [[String: Any]] {
                 let before = rules.count
-                rules.removeAll { ($0["outbound"] as? String) == tag }
+                rules.removeAll { isGoLan($0["outbound"] as? String) }
                 if rules.count != before {
                     route["rules"] = rules
                     changed = true
                 }
             }
-            // route.final 若指向 go-lan-home 则回退为 proxy
-            if (route["final"] as? String) == tag {
+            // route.final 若指向 go-lan-* 则回退为 proxy
+            if isGoLan(route["final"] as? String) {
                 route["final"] = "proxy"
                 changed = true
             }
             root["route"] = route
         }
 
-        // 3. dns：移除 detour 指向 go-lan-home 的 dns-home 服务器，及其规则
+        // 3. dns：移除 detour 指向 go-lan-* 的服务器，及其 dns-home 规则
         if var dns = root["dns"] as? [String: Any] {
             if var servers = dns["servers"] as? [[String: Any]] {
                 let before = servers.count
-                servers.removeAll { ($0["detour"] as? String) == tag }
+                servers.removeAll { isGoLan($0["detour"] as? String) }
                 if servers.count != before {
                     dns["servers"] = servers
                     changed = true
@@ -1337,12 +1407,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var hasDirectOutbound = false
         var firstSelectorTag: String? = nil
         var allRealProxyTags: [String] = []
-        // 【APP31 任务1】go-lan-home 服务端公网 IPv4（如 14.105.65.122），
-        // 用于 route.rules 顶部豁免规则与 excludedRoutes。
-        var wgServerIP = ""
-        // 【APP34】go-lan-home 出站是否存在 / 其本地地址（如 10.196.0.2/24）
+        // 【APP40 任务2】多路内网档案：所有 go-lan-* 出站共用同一套
+        // WireGuard 顶层单节点加固 / 物理网卡绑定逻辑
+        var wgServerIPs: [String] = []
+        // 【APP34】go-lan-* 出站是否存在 / 每路档案的本地地址（如 10.196.0.2/24）
         var hasGoLanOutbound = false
-        var goLanLocalAddr = ""
+        var goLanLocalAddrs: [String: String] = [:]
+        var goLanTags: [String] = []
 
         let proxyOutboundTypes: Set<String> = [
             "vless", "vmess", "trojan", "shadowsocks",
@@ -1367,7 +1438,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // direct 与全部代理节点各绑定当前活跃物理网卡，替代全局
             // route.default_interface，避免干扰本地入站监听。
             if !physIfName.isEmpty,
-               tag == "go-lan-home" || t == "direct" || proxyOutboundTypes.contains(t) {
+               tag.hasPrefix("go-lan") || t == "direct" || proxyOutboundTypes.contains(t) {
                 outbounds[i]["bind_interface"] = physIfName
             }
             if t == "dns" {
@@ -1458,7 +1529,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 //    是访问同网段内网（飞牛 NAS 192.168.10.253）时必须使用的
                 //    同网段源 IP，丢弃会导致跨网段源 IP 回包受阻；
                 // 2) 隧道 MTU 保留用户配置（通常 1420），严禁压到 1280。
-                if tag == "go-lan-home" {
+                if tag.hasPrefix("go-lan") {
                     // 【APP21 任务3.1】保留 local_address 数组中的所有合法
                     // IPv4 CIDR 地址（与官方 WireGuard 客户端 100% 一致：
                     // 访问 192.168.10.x 时内核按最长前缀匹配自动选用同网段
@@ -1555,21 +1626,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                 }
-                // 【APP31 任务1】记录 go-lan-home 服务端公网 IPv4（如
-                // 14.105.65.122），供 route.rules 顶部豁免规则与
-                // ipv4Settings.excludedRoutes 使用。
-                // 【APP34】同时标记 go-lan-home 出站是否存在，供最终路由
-                // 锁定日志输出（hasGoLan）。
-                if tag == "go-lan-home" {
+                // 【APP31 任务1 / APP40 任务2】记录全部 go-lan-* 出站的
+                // 服务端公网 IPv4（如 14.105.65.122），供 route.rules 顶部
+                // 豁免规则与 ipv4Settings.excludedRoutes 使用；同时标记
+                // 回家出站存在性并收集每路档案的本地地址。
+                if tag.hasPrefix("go-lan") {
                     hasGoLanOutbound = true
-                    wgServerIP = (outbounds[i]["server"] as? String) ?? ""
-                    if goLanLocalAddr.isEmpty,
-                       let la = outbounds[i]["local_address"] as? [String],
-                       let first = la.first {
-                        goLanLocalAddr = first
-                    } else if goLanLocalAddr.isEmpty,
-                              let la = outbounds[i]["local_address"] as? String {
-                        goLanLocalAddr = la
+                    if !goLanTags.contains(tag) {
+                        goLanTags.append(tag)
+                    }
+                    if let s = outbounds[i]["server"] as? String, !s.isEmpty,
+                       !wgServerIPs.contains(s) {
+                        wgServerIPs.append(s)
+                    }
+                    if let la = outbounds[i]["local_address"] as? [String],
+                       let first = la.first,
+                       goLanLocalAddrs[tag] == nil {
+                        goLanLocalAddrs[tag] = first
+                    } else if let la = outbounds[i]["local_address"] as? String,
+                              goLanLocalAddrs[tag] == nil {
+                        goLanLocalAddrs[tag] = la
                     }
                 }
             } else if proxyOutboundTypes.contains(t) {
@@ -1890,88 +1966,111 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let finalDnsTag = dnsOutboundTag ?? "dns-out"
         let finalBlockTag = blockOutboundTag ?? "block"
 
-        // Go Lan（回家网络）智能同网段防环回：
-        // 本机 Wi-Fi IP（en*）落在回家网段内时，对应 ip_cidr 规则改走直连，
-        // 避免设备在家时把家庭局域网流量再绕回家庭隧道形成回环。
-        // 豁免：蜂窝（pdp_ip*）出口的 CGNAT 10.x 与常见局域网网段重叠，不参与判定。
-        // 【APP-11B】先对 go-lan-home 规则的 ip_cidr 执行 cleanCIDR，物理剔除
-        // 历史脏缓存中的 \u2060 等隐形字符，避免内核 ParsePrefix 崩溃。
-        for i in rules.indices
-        where (rules[i]["outbound"] as? String) == "go-lan-home" {
-            if let cidrs = rules[i]["ip_cidr"] as? [String] {
-                rules[i]["ip_cidr"] = cidrs.map { cleanCIDR($0) }.filter { !$0.isEmpty }
-            }
-        }
-        if physIfName.hasPrefix("en"), let localIP = localInterfaceIPv4(physIfName) {
-            for i in rules.indices {
-                guard (rules[i]["outbound"] as? String) == "go-lan-home",
-                      let cidrs = rules[i]["ip_cidr"] as? [String]
-                else { continue }
-                if cidrs.contains(where: { ipv4InCidr(localIP, $0) }) {
-                    rules[i]["outbound"] = "direct"
-                }
+        // 【APP40 任务2】多路内网档案（家里 / 公司 / 工作室）：
+        // 1) 先清洗所有 go-lan-* 规则的 ip_cidr（剔除历史缓存中的 \u2060 等
+        //    隐形字符，避免内核 ParsePrefix 崩溃）；
+        // 2) 读取 golan_profiles.json 的 bypassOnLocalLan，结合本机 Wi-Fi
+        //    真实 IPv4，把命中同网段的 CIDR 拆出为 On-Demand 局域网直连；
+        // 3) 其余 CIDR 继续走各自 go-lan-* 隧道。
+        let goLanProfileMeta = loadGoLanProfileMetadata(workDir)
+        let goLanWifiIP: String? = physIfName.hasPrefix("en")
+            ? (localInterfaceIPv4(physIfName) ?? (phyIPv4.isEmpty ? nil : phyIPv4))
+            : nil
+        var goLanTunnelByTag: [String: [String]] = [:]
+        var onDemandBypassCidrs: [String] = []
+        var onDemandBypassByTag: [String: [String]] = [:]
+
+        func classifyGoLanCidr(_ raw: String, tag: String) {
+            let cidr = cleanCIDR(raw)
+            guard !cidr.isEmpty else { return }
+            let bypassEnabled = goLanProfileMeta[tag]?.bypass ?? true
+            if bypassEnabled, let wifi = goLanWifiIP, ipv4InCidr(wifi, cidr) {
+                if !onDemandBypassCidrs.contains(cidr) { onDemandBypassCidrs.append(cidr) }
+                var list = onDemandBypassByTag[tag] ?? []
+                if !list.contains(cidr) { list.append(cidr) }
+                onDemandBypassByTag[tag] = list
+            } else {
+                var list = goLanTunnelByTag[tag] ?? []
+                if !list.contains(cidr) { list.append(cidr) }
+                goLanTunnelByTag[tag] = list
             }
         }
 
+        for i in rules.indices {
+            guard let outTag = rules[i]["outbound"] as? String, outTag.hasPrefix("go-lan"),
+                  let cidrs = rules[i]["ip_cidr"] as? [String]
+            else { continue }
+            for cidr in cidrs { classifyGoLanCidr(cidr, tag: outTag) }
+            rules[i]["ip_cidr"] = []
+        }
+        // 侧车兜底：即使 Rust 侧只下发了域名规则，也保证每路档案网段覆盖
+        for (tag, meta) in goLanProfileMeta {
+            for cidr in meta.cidrs { classifyGoLanCidr(cidr, tag: tag) }
+        }
+        // 【APP34 任务2.1】每路档案的本地地址网段（如 10.196.0.2/24）
+        for (tag, localAddr) in goLanLocalAddrs {
+            if let parsed = parseIPv4Prefix(localAddr), parsed.prefix > 0 {
+                classifyGoLanCidr("\(parsed.networkAddress)/\(parsed.prefix)", tag: tag)
+            }
+        }
+        if !onDemandBypassCidrs.isEmpty {
+            writeExtLog(
+                "INFO",
+                "[GoLan-Ext] ⚡ On-Demand 局域网直连生效（Wi-Fi=\(goLanWifiIP ?? "无")）：\(onDemandBypassCidrs)"
+            )
+        }
+
         // 【APP-9 任务2.1a 黄金优先级】提取 Go Lan 回家规则并提升到
-        // headRules 之后、clash_mode / ip_is_private 之前——无论用户处于
-        // 「规则」「全局」还是「直连」模式，回家流量永远 100% 走 go-lan-home
-        // 隧道，绝不被 clash_mode: global 或 ip_is_private 抢先命中。
+        // aim-probe 之后、clash_mode / ip_is_private 之前——无论用户处于
+        // 「规则」「全局」还是「直连」模式，回家流量永远 100% 走对应
+        // go-lan-* 隧道，绝不被 clash_mode: global 或 ip_is_private 抢先命中。
         var goLanRules: [[String: Any]] = []
         rules.removeAll { rule in
-            if (rule["outbound"] as? String) == "go-lan-home" {
-                goLanRules.append(rule)
-                return true
+            guard let outTag = rule["outbound"] as? String, outTag.hasPrefix("go-lan") else {
+                return false
             }
-            return false
+            // 纯 ip_cidr 规则已按档案统一重建；保留域名等非网段规则
+            if rule["ip_cidr"] != nil { return true }
+            goLanRules.append(rule)
+            return true
         }
-        // 【APP31 任务1】剔除 Rust 侧已注入的 wgServerIP/32 → direct 规则，
-        // 统一由下方按黄金顺序重建（aim-probe-in 之后、go-lan 网段之前）。
-        if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
-            let exemptCidr = "\(wgServerIP)/32"
+        // 【APP31 任务1】剔除 Rust 侧已注入的各档案 wgServerIP/32 → direct
+        // 规则，统一由下方按黄金顺序重建。
+        for serverIP in wgServerIPs where !serverIP.hasPrefix("127.") {
+            let exemptCidr = "\(serverIP)/32"
             rules.removeAll { rule in
                 (rule["outbound"] as? String) == "direct"
                     && (rule["ip_cidr"] as? [String]) == [exemptCidr]
             }
         }
 
-        // 【APP19 任务2 / APP39 任务2.1】把最终生效的回家网段落盘为 sidecar。
-        // openTun 会读取 golan_routes.json 并注入 ipv4Settings.includedRoutes
-        // （默认路由 + 各回家网段，/24、/23 再拆 /25、/24），
-        // 内网 Web 流量因此进入 utun → route.rules 置顶 go-lan-home 直达。
-        // 已因「本机 Wi-Fi 就在该网段」被改判直连的规则不会进入 goLanRules。
+        // 【APP19 任务2 / APP40 任务2】把最终生效的「隧道」回家网段落盘为
+        // sidecar。openTun 读取 golan_routes.json 注入 includedRoutes，
+        // 读取 golan_bypass.json 注入 excludedRoutes（On-Demand 直连）。
         var goLanCidrs: [String] = []
-        for rule in goLanRules {
-            guard let cidrs = rule["ip_cidr"] as? [String] else { continue }
-            for cidr in cidrs where !goLanCidrs.contains(cidr) {
+        for tag in goLanTags {
+            for cidr in goLanTunnelByTag[tag] ?? [] where !goLanCidrs.contains(cidr) {
                 goLanCidrs.append(cidr)
-            }
-        }
-        // 【APP34 任务2.1】go-lan-home 的本地地址网段（如 10.196.0.2/24）也
-        // 必须纳入置顶网段集合：服务端可能只下发域名规则而漏掉本地网段。
-        // 防环回：当本机 Wi-Fi 的 IP 恰好落在该网段（人在家里）时跳过。
-        if !goLanLocalAddr.isEmpty,
-           let parsedLocal = parseIPv4Prefix(goLanLocalAddr),
-           parsedLocal.prefix > 0 {
-            let localCidr = "\(parsedLocal.networkAddress)/\(parsedLocal.prefix)"
-            let loopsBack: Bool = {
-                guard physIfName.hasPrefix("en"),
-                      let wifiIP = localInterfaceIPv4(physIfName)
-                else { return false }
-                return ipv4InCidr(wifiIP, localCidr)
-            }()
-            if !loopsBack && !goLanCidrs.contains(localCidr) {
-                goLanCidrs.insert(localCidr, at: 0)
             }
         }
         let goLanSidecarURL = workDir.appendingPathComponent("golan_routes.json")
         if let sidecarData = try? JSONSerialization.data(withJSONObject: goLanCidrs) {
             try? sidecarData.write(to: goLanSidecarURL)
         }
-        // 【APP31 任务1】WG 服务端公网 IPv4 落盘 sidecar，供 openTun 构造
-        // ipv4Settings.excludedRoutes（wgServerIP/32 不进 utun）。
+        var bypassPayload: [[String: Any]] = []
+        for tag in goLanTags {
+            if let cidrs = onDemandBypassByTag[tag], !cidrs.isEmpty {
+                bypassPayload.append(["tag": tag, "cidrs": cidrs])
+            }
+        }
+        let bypassSidecarURL = workDir.appendingPathComponent("golan_bypass.json")
+        if let bypassData = try? JSONSerialization.data(withJSONObject: bypassPayload) {
+            try? bypassData.write(to: bypassSidecarURL)
+        }
+        // 【APP31 任务1】各档案 WG 服务端公网 IPv4 落盘 sidecar
         let wgServerSidecarURL = workDir.appendingPathComponent("golan_wg_server.txt")
-        try? wgServerIP.write(to: wgServerSidecarURL, atomically: true, encoding: .utf8)
+        try? wgServerIPs.joined(separator: "\n")
+            .write(to: wgServerSidecarURL, atomically: true, encoding: .utf8)
 
         let headRules: [[String: Any]] = [
             ["protocol": ["dns"], "outbound": finalDnsTag],
@@ -2010,32 +2109,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP37 任务2.1】黄金优先级顺序（自上而下）：
+        // 【APP40 任务2】黄金优先级顺序（自上而下）：
         // 1. GO-AIM 探针专用通道（inbound → GO-AIM-PROBE-N，仅匹配本地
         //    127.0.0.1:2083..2086 探针入站）
-        // 2. Go Lan 回家网段（ip_cidr → go-lan-home，无 port / network 限制）
+        // 2. ⚡ On-Demand 局域网直连：命中本机 Wi-Fi 同网段的回家网段
+        //    → direct（不进隧道，避免 NAS 非对称回包）
+        // 3. 每路启用档案的回家网段（ip_cidr → go-lan-{tag}）
         //    ——紧随 aim-probe 之后，在 port: 53、clash_mode: direct、
         //    ip_is_private: true、clash_mode: global 全部之前
-        // 3. WG 服务端公网 IP 直连豁免（wgServerIP/32 → direct）
-        // 4. DNS 劫持（protocol dns / port 53 → dns-out）、853 拦截、
+        // 4. 各档案 WG 服务端公网 IP 直连豁免（serverIP/32 → direct）
+        // 5. DNS 劫持（protocol dns / port 53 → dns-out）、853 拦截、
         //    公共 DNS DoH/DoT 拦截、QUIC 拦截（UDP 443 / protocol quic）
-        // 5. Go Lan 回家域名（domain_suffix → go-lan-home）
-        // 6. 私有地址直连（排除已被第 2 优先级命中的家庭网段）
-        // 7. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
+        // 6. 各档案回家域名（domain_suffix → 对应 go-lan-{tag}）
+        // 7. 私有地址直连（排除已被第 2/3 优先级命中的回家网段）
+        // 8. 运行模式（clash_mode direct/global）与自定义/订阅分流规则
         var finalHead = aimProbeRules
-        finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] != nil })
-        // 【APP34 任务2.1】兜底：用汇总后的 goLanCidrs 再合成一条置顶规则，
-        // 即使原配置只下发了域名规则/或本地地址网段未被写成 ip_cidr，
-        // 内网 IP 也一定能命中 go-lan-home。
-        if hasGoLanOutbound && !goLanCidrs.isEmpty {
+        if !onDemandBypassCidrs.isEmpty {
             finalHead.append([
-                "ip_cidr": goLanCidrs,
-                "outbound": "go-lan-home"
+                "ip_cidr": onDemandBypassCidrs,
+                "outbound": "direct"
             ])
         }
-        if !wgServerIP.isEmpty && !wgServerIP.hasPrefix("127.") {
+        for tag in goLanTags {
+            guard let cidrs = goLanTunnelByTag[tag], !cidrs.isEmpty else { continue }
             finalHead.append([
-                "ip_cidr": ["\(wgServerIP)/32"],
+                "ip_cidr": cidrs,
+                "outbound": tag
+            ])
+        }
+        for serverIP in wgServerIPs where !serverIP.hasPrefix("127.") {
+            finalHead.append([
+                "ip_cidr": ["\(serverIP)/32"],
                 "outbound": "direct"
             ])
         }
@@ -2046,12 +2150,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ])
         rules.insert(contentsOf: finalHead, at: 0)
         route["rules"] = rules
-        // 【APP34 任务2.1】最终路由表锁定日志：确认 go-lan-home 规则已真正
-        // 进入最终 rules 且置顶在 ip_is_private / clash_mode 之前。
+        // 【APP40 任务2】最终路由表锁定日志：确认每路档案网段已真正进入
+        // 最终 rules 且置顶在 ip_is_private / clash_mode 之前。
         writeExtLog(
             "INFO",
-            "[GoLan-Ext] 最终路由表已锁定: hasGoLan=\(hasGoLanOutbound), "
-                + "go-lan-home 置顶网段=\(goLanCidrs), 总规则数=\(rules.count)"
+            "[GoLan-Ext] 最终路由表已锁定: hasGoLan=\(hasGoLanOutbound), tags=\(goLanTags), "
+                + "隧道网段=\(goLanCidrs), ⚡直连网段=\(onDemandBypassCidrs), "
+                + "总规则数=\(rules.count)"
         )
 
         if var geoip = route["geoip"] as? [String: Any], geoip["path"] != nil {

@@ -38,6 +38,11 @@ fn default_mtu() -> u32 {
     1420
 }
 
+/// 【APP40 任务1/2】On-Demand 同局域网自动直连默认开启
+fn default_true() -> bool {
+    true
+}
+
 /// 【APP30 任务2】go-lan-home 运行时隧道 MTU = 1280（不修改用户保存的
 /// `settings.go_lan.wg_config.mtu`，前端仍显示导入值；仅写入内核 JSON）。
 /// log8.txt 实证：MTU 1420 时 gVisor 向飞牛 NAS 宣告 MSS 1380，1420 字节
@@ -71,11 +76,67 @@ pub struct WgManualConfig {
     pub mtu: u32,
 }
 
+/// 【APP40 任务2】单路内网档案（家里 / 公司 / 工作室……）。
+/// 每个 `enabled == true` 的档案在内核中生成独立的 `go-lan-{tag}` 出站。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoLanProfile {
+    /// 唯一标识，如 "home" / "office" / "studio"
+    #[serde(default)]
+    pub id: String,
+    /// 档案名称（展示用）
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    /// 本机连上该内网对应的局域网 Wi-Fi（物理 IP 落在 lan_cidrs 内）时，
+    /// 自动跳过该网段的 WireGuard 隧道，直接走本地局域网。
+    #[serde(default = "default_true")]
+    pub bypass_on_local_lan: bool,
+    /// 可选：显式指定的 Wi-Fi SSID（留空则按 lan_cidrs 同网段智能匹配）
+    #[serde(default)]
+    pub local_wifi_ssid: String,
+    #[serde(default)]
+    pub lan_cidrs: Vec<String>,
+    #[serde(default)]
+    pub wg_config: Option<WgManualConfig>,
+    #[serde(default)]
+    pub node_uri: String,
+    /// 该档案保存的内网检测目标（如 "192.168.10.253:8001"）
+    #[serde(default)]
+    pub probe_target: String,
+}
+
+impl Default for GoLanProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: false,
+            bypass_on_local_lan: true,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: Vec::new(),
+            wg_config: None,
+            node_uri: String::new(),
+            probe_target: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoLanSettings {
     #[serde(default)]
     pub enabled: bool,
+    /// 顶层 On-Demand 开关（旧版兼容；新档案以 profile.bypass_on_local_lan 为准）
+    #[serde(default = "default_true")]
+    pub bypass_on_local_lan: bool,
+    /// 多路内网档案（APP40）。为空时由 normalize_go_lan_settings 从旧字段迁移。
+    #[serde(default)]
+    pub profiles: Vec<GoLanProfile>,
+    /// 当前前端正在查看的档案 id（仅 UI 状态）
+    #[serde(default)]
+    pub active_profile_id: String,
     /// manual | managed
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -112,6 +173,9 @@ impl Default for GoLanSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            bypass_on_local_lan: true,
+            profiles: Vec::new(),
+            active_profile_id: String::new(),
             mode: default_mode(),
             node_uri: String::new(),
             wg_config: None,
@@ -133,7 +197,321 @@ impl GoLanSettings {
             && self.cached_managed_outbound.is_none()
             && self.lan_cidrs.is_empty()
             && self.lan_domains.is_empty()
+            && self.profiles.iter().all(|p| p.is_empty())
     }
+
+    /// 当前所有「启用」的档案（保持声明顺序）。
+    pub fn enabled_profiles(&self) -> Vec<(String, GoLanProfile)> {
+        enabled_profiles(self)
+    }
+}
+
+impl GoLanProfile {
+    pub fn is_empty(&self) -> bool {
+        self.node_uri.is_empty()
+            && self.wg_config.is_none()
+            && self.lan_cidrs.is_empty()
+    }
+
+    /// 单路档案是否配置完整（与前端 isGoLanConfigured 对齐）。
+    pub fn is_configured(&self, mode: &str, device_code: &str) -> bool {
+        if mode == "managed" {
+            return !device_code.trim().is_empty() && !self.lan_cidrs.is_empty();
+        }
+        let has_cidrs = !self.lan_cidrs.is_empty();
+        let has_uri = !self.node_uri.trim().is_empty();
+        let has_wg = self
+            .wg_config
+            .as_ref()
+            .map(|wg| {
+                !wg.server.trim().is_empty()
+                    && !wg.private_key.trim().is_empty()
+                    && !wg.peer_public_key.trim().is_empty()
+            })
+            .unwrap_or(false);
+        has_cidrs && (has_uri || has_wg)
+    }
+}
+
+/// 【APP40 任务2】档案 id 净化（仅保留 ASCII 字母数字 / - / _）
+fn sanitize_profile_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 【APP40 任务2】为每个启用档案分配内核出站 tag：
+/// 第 1 个启用档案恒为 `go-lan-home`（保持旧版完全兼容），
+/// 后续依次为 `go-lan-{id}` / `go-lan-2` / `go-lan-3`（保证唯一）。
+pub fn enabled_profiles(settings: &GoLanSettings) -> Vec<(String, GoLanProfile)> {
+    let mut out: Vec<(String, GoLanProfile)> = Vec::new();
+    if !settings.enabled {
+        return out;
+    }
+    let mut used: Vec<String> = Vec::new();
+    for profile in settings.profiles.iter().filter(|p| p.enabled) {
+        let tag = if out.is_empty() {
+            GO_LAN_TAG.to_string()
+        } else {
+            let id = sanitize_profile_id(&profile.id);
+            let candidate = if !id.is_empty() && id != "home" {
+                format!("go-lan-{id}")
+            } else {
+                format!("go-lan-{}", out.len() + 1)
+            };
+            if used.contains(&candidate) || candidate == GO_LAN_TAG {
+                format!("go-lan-{}", out.len() + 1)
+            } else {
+                candidate
+            }
+        };
+        used.push(tag.clone());
+        out.push((tag, profile.clone()));
+    }
+    out
+}
+
+/// 【APP40 任务2】自动无损迁移旧版单配置 + 校正档案字段。
+/// 当 profiles 为空且顶层存在旧版 wg_config / node_uri / lan_cidrs 时，
+/// 自动生成默认档案「家里」（id = home）。
+pub fn normalize_go_lan_settings(settings: &mut GoLanSettings) {
+    if settings.profiles.is_empty()
+        && (settings.wg_config.is_some()
+            || !settings.node_uri.trim().is_empty()
+            || !settings.lan_cidrs.is_empty()
+            || settings.cached_managed_outbound.is_some())
+    {
+        settings.profiles.push(GoLanProfile {
+            id: "home".into(),
+            name: "家里".into(),
+            enabled: settings.enabled,
+            bypass_on_local_lan: settings.bypass_on_local_lan,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: settings.lan_cidrs.clone(),
+            wg_config: settings.wg_config.clone(),
+            node_uri: settings.node_uri.clone(),
+            probe_target: String::new(),
+        });
+    }
+    // 档案 id 去重 / 补齐（前端旧数据或手改 JSON 的兜底）
+    let mut seen: Vec<String> = Vec::new();
+    for (i, p) in settings.profiles.iter_mut().enumerate() {
+        if p.name.trim().is_empty() {
+            p.name = if p.id.trim().is_empty() {
+                format!("内网 {}", i + 1)
+            } else {
+                p.id.clone()
+            };
+        }
+        let mut id = sanitize_profile_id(&p.id);
+        if id.is_empty() || seen.contains(&id) {
+            id = format!("profile{}", i + 1);
+        }
+        while seen.contains(&id) {
+            id.push('x');
+        }
+        p.id = id.clone();
+        seen.push(id);
+    }
+    if settings.active_profile_id.trim().is_empty() {
+        if let Some(first) = settings.profiles.first() {
+            settings.active_profile_id = first.id.clone();
+        }
+    } else if !settings
+        .profiles
+        .iter()
+        .any(|p| p.id == settings.active_profile_id)
+    {
+        settings.active_profile_id = settings
+            .profiles
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+    }
+}
+
+/// 【APP40 任务2】档案路由网段（含 WG 虚拟子网/多 Local Address 推导出的 /24）。
+pub fn profile_route_cidrs(profile: &GoLanProfile) -> Vec<String> {
+    let local_addr = profile
+        .wg_config
+        .as_ref()
+        .map(|wg| wg.local_ip.as_str())
+        .unwrap_or("");
+    normalize_cidr_list(&profile.lan_cidrs, local_addr)
+}
+
+/// 【APP40 任务2】WireGuard 自身虚拟隧道互联网段（永不参与 On-Demand 直连判定）
+fn profile_virtual_cidrs(profile: &GoLanProfile) -> Vec<String> {
+    let local_addr = profile
+        .wg_config
+        .as_ref()
+        .map(|wg| wg.local_ip.as_str())
+        .unwrap_or("");
+    let (_primary, mut cidrs) = parse_wg_local_addresses(local_addr);
+    if let Some(v) = extract_virtual_subnet(local_addr) {
+        if !cidrs.contains(&v) {
+            cidrs.push(v);
+        }
+    }
+    cidrs
+}
+
+/// 【APP40 任务2】On-Demand 分网段：返回 (走隧道的网段, 命中本地局域网直连的网段)。
+pub fn split_profile_cidrs_for_on_demand(
+    profile: &GoLanProfile,
+    physical_ips: &[std::net::Ipv4Addr],
+) -> (Vec<String>, Vec<String>) {
+    let cidrs = profile_route_cidrs(profile);
+    if !profile.bypass_on_local_lan {
+        return (cidrs, Vec::new());
+    }
+    let virtual_cidrs = profile_virtual_cidrs(profile);
+    let mut tunnel: Vec<String> = Vec::new();
+    let mut direct: Vec<String> = Vec::new();
+    for cidr in cidrs {
+        if virtual_cidrs.contains(&cidr) {
+            tunnel.push(cidr);
+            continue;
+        }
+        let hit = physical_ips
+            .iter()
+            .any(|ip| ipv4_in_any_cidr(*ip, std::slice::from_ref(&cidr)));
+        if hit {
+            direct.push(cidr);
+        } else {
+            tunnel.push(cidr);
+        }
+    }
+    (tunnel, direct)
+}
+
+/// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4。
+/// 过滤 utun / tun / ppp / wg / loopback / 172.19.0.x / 169.254.x.x /
+/// WireGuard 虚拟地址 10.196.0.2。iOS/Android 由各自扩展侧实时判定，
+/// 此处返回空列表（不产生任何探测流量）。
+pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    #[cfg(target_os = "ios")]
+    {
+        return Vec::new();
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut candidates: Vec<std::net::Ipv4Addr> = Vec::new();
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(out) = std::process::Command::new("ipconfig").output() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut in_virtual_adapter = false;
+                for raw in text.lines() {
+                    let line = raw.trim_end_matches('\r');
+                    let trimmed = line.trim();
+                    // 适配器标题行（无缩进、以 ':' 结尾）
+                    if !line.starts_with(char::is_whitespace) && trimmed.ends_with(':') {
+                        let lower = trimmed.to_lowercase();
+                        in_virtual_adapter = [
+                            "wireguard",
+                            "tap",
+                            "tun",
+                            "loopback",
+                            "vethernet",
+                            "hyper-v",
+                            "wsl",
+                            "vmware",
+                            "virtualbox",
+                            "bluetooth",
+                            "蓝牙",
+                        ]
+                        .iter()
+                        .any(|k| lower.contains(k));
+                        continue;
+                    }
+                    if in_virtual_adapter {
+                        continue;
+                    }
+                    if let Some(idx) = line.rfind(':') {
+                        let val = line[idx + 1..].trim();
+                        if let Ok(ip) = val.parse::<std::net::Ipv4Addr>() {
+                            candidates.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        {
+            let output = std::process::Command::new("ifconfig")
+                .output()
+                .or_else(|_| std::process::Command::new("ip").arg("-4").arg("addr").output());
+            if let Ok(out) = output {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut current_virtual = false;
+                for raw in text.lines() {
+                    let line = raw.trim_end_matches('\r');
+                    if !line.starts_with(char::is_whitespace) {
+                        let name = line.split(':').next().unwrap_or("").trim();
+                        current_virtual = [
+                            "utun", "tun", "ppp", "wg", "llw", "awdl", "lo",
+                        ]
+                        .iter()
+                        .any(|k| name.starts_with(k));
+                    }
+                    if current_virtual {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("inet ") {
+                        let ip_s = rest.split_whitespace().next().unwrap_or("");
+                        if let Ok(ip) = ip_s.parse::<std::net::Ipv4Addr>() {
+                            candidates.push(ip);
+                        }
+                    } else if trimmed.starts_with("inet ") {
+                        // `ip -4 addr` 输出：inet 192.168.10.88/24 brd ...
+                        let ip_s = trimmed
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .split('/')
+                            .next()
+                            .unwrap_or("");
+                        if let Ok(ip) = ip_s.parse::<std::net::Ipv4Addr>() {
+                            candidates.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
+        for ip in candidates {
+            let s = ip.to_string();
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                continue;
+            }
+            if s.starts_with("172.19.") || s == "10.196.0.2" {
+                continue;
+            }
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        out
+    }
+}
+
+/// 【APP40 任务2】每个启用档案的运行时元数据（供 iOS 扩展侧 On-Demand 判定 /
+/// 侧车 golan_profiles.json 使用，不写入内核 JSON，避免 unknown field）。
+pub fn profiles_metadata(settings: &GoLanSettings) -> Vec<Value> {
+    enabled_profiles(settings)
+        .into_iter()
+        .map(|(tag, profile)| {
+            json!({
+                "tag": tag,
+                "name": profile.name,
+                "cidrs": profile_route_cidrs(&profile),
+                "bypassOnLocalLan": profile.bypass_on_local_lan,
+            })
+        })
+        .collect()
 }
 
 /// APP 任务5：Go Lan 配置完整性检查（未配置时后端兜底拦截启用）。
@@ -142,6 +520,14 @@ impl GoLanSettings {
 ///   server/private_key/peer_public_key 均非空）
 /// - managed：device_code 非空且 lan_cidrs 非空（已成功拉取过配置）
 pub fn is_configured(lan: &GoLanSettings) -> bool {
+    // 【APP40 任务2】多路档案模式：只要任意「启用」档案配置完整即视为已配置
+    if !lan.profiles.is_empty() {
+        return lan
+            .profiles
+            .iter()
+            .filter(|p| p.enabled)
+            .any(|p| p.is_configured(&lan.mode, &lan.device_code));
+    }
     if lan.mode == "manual" {
         let has_cidrs = !lan.lan_cidrs.is_empty();
         let has_uri = !lan.node_uri.trim().is_empty();
@@ -622,10 +1008,13 @@ pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
 
 pub fn load(data_dir: &std::path::Path) -> GoLanSettings {
     let path = data_dir.join("go_lan.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+    let mut settings = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<GoLanSettings>(&text).unwrap_or_default(),
         Err(_) => GoLanSettings::default(),
-    }
+    };
+    // 【APP40 任务2】旧版单配置自动无损迁移为默认档案「家里」
+    normalize_go_lan_settings(&mut settings);
+    settings
 }
 
 pub fn save(data_dir: &std::path::Path, settings: &GoLanSettings) -> Result<(), String> {
@@ -688,232 +1077,319 @@ pub fn resolve_probe_target(target_ip_raw: Option<&str>, lan: &GoLanSettings) ->
     derive_gateway_from_local_address(local)
 }
 
-/// 【APP18 任务3】单端口探测命中结果。
+/// 【APP40 任务1】单端口探测命中结果（协议 + 延迟）。
 struct PortProbeHit {
-    port: u16,
-    detail: String,
+    scheme: String,
     latency_ms: u64,
 }
 
-/// 【APP36 任务1.3】内网 Web 端口探测列表：优先 HTTPS 8001（飞牛 fnOS），
-/// 再 8000 / 80 / 443。全部走 Clash API delay（内核 ctx 超时即销毁连接），
-/// 严禁对 TUN 建立裸 TCP / SOCKS5 半开连接（log8 中 2m7s 超时的根因）。
-const PROBE_WEB_PORTS: [u16; 4] = [8001, 8000, 80, 443];
+/// 单端口 HTTP/HTTPS 探测窗口（Clash API 与直连均 2500ms）
+const PROBE_PORT_WINDOW_MS: u64 = 2500;
 
-/// 未指定端口时的整体探测窗口（4 个端口并发，单端口 2000ms）
-const PROBE_WINDOW_MS: u64 = 2000;
-
-/// 显式端口（用户输入 `IP:端口`）时的 Clash API 单端口超时
-const PROBE_EXPLICIT_WINDOW_MS: u64 = 2500;
-
-/// 【APP26 任务1.2】Clash API 直驱 go-lan-home 出站延迟测试。
-///
-/// 与本地 HTTP 代理探测的本质区别：请求由 sing-box 内核的 ctx 承载，
-/// `timeout` 到期立即由内核 Close() 并销毁底层连接，绝不会在
-/// go-lan-home 内部残留半开连接（这是 log7.txt 中 2m7s 超时错误的根因）。
-async fn probe_clash_delay(
+/// 【APP40 任务1】经 Clash API 对指定 `go-lan-*` 出站做单协议延迟测试。
+/// 请求由 sing-box 内核 ctx 承载，`timeout` 到期立即由内核 Close() 销毁
+/// 底层连接，绝不会残留半开连接（log7/log8 中 2m7s 超时的根因）。
+async fn probe_clash_delay_for_tag(
+    tag: &str,
     ip: &str,
     port: u16,
+    scheme: &str,
     path: &str,
     api_addr: &str,
     api_secret: &str,
     timeout_ms: u64,
-) -> Result<(String, u64), String> {
+) -> Result<u64, String> {
     if api_addr.is_empty() {
         return Err("Clash API 未就绪".to_string());
     }
     let base = api_addr
         .trim_start_matches("http://")
         .trim_start_matches("https://")
+        .trim_end_matches('/')
         .to_string();
-    let schemes: [&str; 2] = if matches!(port, 443 | 5001) {
-        ["https", "http"]
-    } else {
-        ["http", "https"]
-    };
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(std::time::Duration::from_millis(800))
         .timeout(std::time::Duration::from_millis(timeout_ms + 300))
         .build()
         .map_err(|e| format!("Clash 探测客户端构建失败: {e}"))?;
-    let mut last_err = String::from("Clash API 探测超时");
-    for scheme in schemes {
-        let target = format!("{scheme}://{ip}:{port}{path}");
-        let mut req = client
-            .get(format!("http://{base}/proxies/go-lan-home/delay"))
-            .query(&[("url", target.as_str()), ("timeout", &timeout_ms.to_string())]);
-        if !api_secret.is_empty() {
-            req = req.bearer_auth(api_secret);
-        }
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                // 【APP31 任务3】严格校验：必须 HTTP 200，且 JSON 含
-                // delay > 0，且严禁携带 "message" 错误字段——
-                // log9.txt 中 :5000 / :8001 假阳性正是未校验 message
-                // 字段把内核错误响应当成了成功延迟。
-                if status == 200 {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if v.get("message").is_some() {
-                            last_err = format!("Clash API 返回错误字段: {}", &body[..body.len().min(120)]);
-                            continue;
-                        }
-                        if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
-                            if d > 0 {
-                                return Ok((
-                                    "go-lan-home 实测延迟（Clash API）".to_string(),
-                                    d,
-                                ));
-                            }
-                        }
+    let target = format!("{scheme}://{ip}:{port}{path}");
+    let mut req = client
+        .get(format!("http://{base}/proxies/{tag}/delay"))
+        .query(&[("url", target.as_str()), ("timeout", &timeout_ms.to_string())]);
+    if !api_secret.is_empty() {
+        req = req.bearer_auth(api_secret);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Clash API 请求失败: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if status == 200 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            // 严格校验：必须无 message 错误字段且 delay > 0，
+            // 否则内核错误响应会被误判为成功延迟。
+            if v.get("message").is_none() {
+                if let Some(d) = v.get("delay").and_then(|d| d.as_u64()) {
+                    if d > 0 {
+                        return Ok(d);
                     }
                 }
-                last_err = format!("Clash API HTTP {status}");
             }
-            Err(e) => last_err = format!("Clash API 请求失败: {e}"),
         }
     }
-    Err(last_err)
+    Err(format!("Clash API HTTP {status}"))
 }
 
-/// 【APP36 任务1.3】批量 Web 端口探测：仅走 Clash API delay（内核级超时），
-/// 绝不对 TUN 建立裸 TCP 半开连接。
-async fn probe_port_batch(
-    ports: &[u16],
+/// 【APP40 任务1】应用层直连探测：开启 `danger_accept_invalid_certs`
+/// （忽略内网自签名证书）、禁止重定向、2500ms 超时。
+/// 返回 (状态码, 毫秒)。
+async fn probe_app_layer(
     ip: &str,
+    port: u16,
+    scheme: &str,
+    path: &str,
+) -> Result<(u16, u64), String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_millis(PROBE_PORT_WINDOW_MS))
+        .timeout(std::time::Duration::from_millis(PROBE_PORT_WINDOW_MS))
+        .build()
+        .map_err(|e| format!("探测客户端构建失败: {e}"))?;
+    let url = format!("{scheme}://{ip}:{port}{path}");
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let ms = start.elapsed().as_millis() as u64;
+    // 本地混合代理的 502/504 不算目标真实应答
+    if status == 502 || status == 504 {
+        return Err(format!("代理返回 HTTP {status}"));
+    }
+    Ok((status, ms))
+}
+
+/// 【APP40 任务1】仅对用户指定的唯一端口做一次 TCP 握手兜底
+/// （非 Web 端口如 3389 / 22 / 445），绝不触碰任何其他端口。
+async fn probe_single_port_tcp(ip: &str, port: u16) -> Result<u64, String> {
+    let start = std::time::Instant::now();
+    let fut = tokio::net::TcpStream::connect((ip, port));
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(PROBE_PORT_WINDOW_MS),
+        fut,
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Ok(start.elapsed().as_millis() as u64),
+        Ok(Err(e)) => Err(format!("TCP 连接失败: {e}")),
+        Err(_) => Err("TCP 握手超时".to_string()),
+    }
+}
+
+/// 【APP40 任务1】只在用户指定的唯一 `IP:端口` 上并发探测 HTTPS / HTTP，
+/// 返回识别出的协议与延迟。显式协议优先；裸 `IP:端口` 时 HTTP 有效
+/// 状态码优先（避免向 HTTP 端口发 HTTPS 得到 400 被误判为 HTTPS）。
+async fn probe_web_protocols(
+    ip: &str,
+    port: u16,
+    scheme_hint: Option<&str>,
     path: &str,
     api_addr: &str,
     api_secret: &str,
-    clash_timeout_ms: u64,
+    tag: &str,
 ) -> Result<PortProbeHit, String> {
-    let mut tasks: tokio::task::JoinSet<(u16, Result<(String, u64), String>)> =
+    let schemes: Vec<&str> = match scheme_hint {
+        Some(s) => vec![s],
+        None => vec!["http", "https"],
+    };
+    // 第 1 步：Clash API（经对应 go-lan-* 隧道，内核级超时）
+    let mut tasks: tokio::task::JoinSet<(String, Result<u64, String>)> =
         tokio::task::JoinSet::new();
-    for &p in ports {
-        let ip_owned = ip.to_string();
-        let path_owned = path.to_string();
-        let api_owned = api_addr.to_string();
-        let secret_owned = api_secret.to_string();
+    for scheme in &schemes {
+        let (ip_o, path_o, api_o, secret_o, tag_o) = (
+            ip.to_string(),
+            path.to_string(),
+            api_addr.to_string(),
+            api_secret.to_string(),
+            tag.to_string(),
+        );
+        let scheme_o = scheme.to_string();
         tasks.spawn(async move {
-            let res =
-                probe_clash_delay(&ip_owned, p, &path_owned, &api_owned, &secret_owned, clash_timeout_ms)
-                    .await;
-            (p, res)
+            let res = probe_clash_delay_for_tag(
+                &tag_o,
+                &ip_o,
+                port,
+                &scheme_o,
+                &path_o,
+                &api_o,
+                &secret_o,
+                PROBE_PORT_WINDOW_MS,
+            )
+            .await;
+            (scheme_o, res)
         });
     }
-    let mut last_err = String::from("本批端口全部不可达");
+    let mut last_err = String::from("Clash API 探测超时");
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok((p, Ok((detail, latency_ms)))) => {
+            Ok((scheme, Ok(ms))) => {
                 return Ok(PortProbeHit {
-                    port: p,
-                    detail,
-                    latency_ms,
-                })
+                    scheme: scheme.to_uppercase(),
+                    latency_ms: ms,
+                });
             }
             Ok((_, Err(e))) => last_err = e,
             Err(_) => continue,
         }
     }
+    // 第 2 步：应用层直连智能识别（忽略自签名证书 / 不跟随重定向）
+    let mut direct_tasks: tokio::task::JoinSet<(String, Result<(u16, u64), String>)> =
+        tokio::task::JoinSet::new();
+    for scheme in &schemes {
+        let (ip_o, path_o) = (ip.to_string(), path.to_string());
+        let scheme_o = scheme.to_string();
+        direct_tasks.spawn(async move {
+            let res = probe_app_layer(&ip_o, port, &scheme_o, &path_o).await;
+            (scheme_o, res)
+        });
+    }
+    let mut http_hit: Option<(u64, u16)> = None;
+    let mut https_hit: Option<(u64, u16)> = None;
+    while let Some(joined) = direct_tasks.join_next().await {
+        match joined {
+            Ok((scheme, Ok((status, ms)))) => {
+                // 400 多半是「HTTP 服务收到 HTTPS 请求」，不采纳为 HTTPS
+                if scheme == "https" && status != 400 {
+                    https_hit = Some((ms, status));
+                } else if scheme == "http" {
+                    http_hit = Some((ms, status));
+                }
+            }
+            Ok((_, Err(e))) => last_err = e,
+            Err(_) => continue,
+        }
+    }
+    if scheme_hint.is_none() {
+        // 裸 IP:端口：HTTP 有有效应答优先（兼容 HTTP 端口误发 TLS 的场景）
+        if let Some((ms, _)) = http_hit {
+            return Ok(PortProbeHit {
+                scheme: "HTTP".into(),
+                latency_ms: ms,
+            });
+        }
+    }
+    if let Some((ms, _)) = https_hit.or(http_hit) {
+        return Ok(PortProbeHit {
+            scheme: if https_hit.is_some() { "HTTPS" } else { "HTTP" }.into(),
+            latency_ms: ms,
+        });
+    }
     Err(last_err)
 }
 
-/// 【APP36 任务1.3】探测入口：显式端口只测该端口（Clash API 2500ms）；
-/// 未指定则并发测 4 个 Web 端口（8001 / 8000 / 80 / 443，单端口 2000ms）。
-/// 全链路只使用 Clash API delay，不再做任何裸 TCP / SOCKS5 探测。
-async fn probe_target_ports(
-    ip: &str,
-    explicit_port: Option<u16>,
-    path: &str,
-    api_addr: &str,
-    api_secret: &str,
-) -> Result<PortProbeHit, String> {
-    let total_ms = if explicit_port.is_some() {
-        PROBE_EXPLICIT_WINDOW_MS + 500
-    } else {
-        PROBE_WINDOW_MS
-    };
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(total_ms),
-        probe_target_ports_inner(ip, explicit_port, path, api_addr, api_secret),
-    )
-    .await
-    {
-        Ok(res) => res,
-        Err(_) => Err(format!("隧道探测超时（{total_ms}ms 内无任何端口应答）")),
-    }
+/// 【APP40 任务1】精准检测输入解析结果。
+struct ProbeInput {
+    ip: String,
+    port: u16,
+    /// 显式协议（http / https）；裸 `IP:端口` 为 None
+    scheme: Option<String>,
+    path: String,
 }
 
-async fn probe_target_ports_inner(
-    ip: &str,
-    explicit_port: Option<u16>,
-    path: &str,
-    api_addr: &str,
-    api_secret: &str,
-) -> Result<PortProbeHit, String> {
-    if let Some(p) = explicit_port {
-        let (detail, latency_ms) =
-            probe_clash_delay(ip, p, path, api_addr, api_secret, PROBE_EXPLICIT_WINDOW_MS).await?;
-        return Ok(PortProbeHit {
-            port: p,
-            detail,
-            latency_ms,
-        });
-    }
-    probe_port_batch(
-        &PROBE_WEB_PORTS,
-        ip,
-        path,
-        api_addr,
-        api_secret,
-        PROBE_WINDOW_MS,
-    )
-    .await
-}
+/// 未输入端口时的友好提示（中文 / 英文）。
+const PROBE_MISSING_PORT_MSG: &str =
+    "⚠️ 请输入「IP:端口」格式进行精准检测（例如 192.168.10.253:8001）";
 
-/// 【APP15 任务2】解析用户输入的检测目标，支持纯 IP、`IP:Port` 与
-/// `https://IP:Port/path`、`http://IP:Port/path` 三种写法。
-///
-/// 返回 (ip 字符串, 显式端口)。IPv4 专用（本项目回家网段均为 IPv4）。
-fn parse_probe_target(raw: &str) -> (String, Option<u16>) {
-    // 先剥离不可见字符（零宽空格/Word Joiner 等）与全部空白，再切分分号多目标
-    let no_invisible = strip_invisible_and_non_ascii(raw);
-    let first = no_invisible.split(';').next().unwrap_or("");
-    // 【APP15 任务2】自动剥离协议前缀与路径：
-    // "https://192.168.10.253:8001/" → "192.168.10.253:8001"
-    let host_part = first
-        .strip_prefix("https://")
-        .or_else(|| first.strip_prefix("http://"))
-        .or_else(|| first.strip_prefix("//"))
-        .unwrap_or(first);
-    // 剥路径与 CIDR 掩码
-    let cleaned = host_part.split('/').next().unwrap_or("").to_string();
-    // IPv6 字面量（[::1]:port 形式）本模块不处理，直接返回原文
-    if cleaned.contains('[') {
-        return (cleaned, None);
-    }
-    match cleaned.rsplit_once(':') {
-        Some((host, port_s)) if !host.is_empty() => match port_s.parse::<u16>() {
-            Ok(p) if p > 0 => (host.to_string(), Some(p)),
-            _ => (cleaned, None),
-        },
-        _ => (cleaned, None),
-    }
-}
-
-/// 【APP17 任务5.2】从用户输入中提取 HTTP 请求路径（默认 "/"）。
-/// 支持 http://IP[:Port]/path、https://... 与直接粘贴的 NAS 页面地址。
-fn probe_request_path(raw: &str) -> String {
+/// 【APP40 任务1】严格解析 `IP:端口` / `http(s)://IP:端口/path`：
+/// - 显式 `http://` 未写端口 → 默认 80；显式 `https://` 未写端口 → 443；
+/// - 纯 IP（无端口且无协议头）→ Err(PROBE_MISSING_PORT_MSG)，绝不发起扫描。
+fn parse_probe_input(raw: &str) -> Result<ProbeInput, String> {
     let no_invisible = strip_invisible_and_non_ascii(raw);
     let first = no_invisible.split(';').next().unwrap_or("").trim();
-    let rest = match first.split_once("://") {
-        Some((_scheme, r)) => r,
-        None => first.trim_start_matches("//"),
+    let (scheme, rest) = if let Some(r) = first.strip_prefix("https://") {
+        (Some("https"), r)
+    } else if let Some(r) = first.strip_prefix("http://") {
+        (Some("http"), r)
+    } else {
+        (None, first.trim_start_matches("//"))
     };
-    match rest.split_once('/') {
-        Some((_host, path)) => format!("/{}", path.trim_start_matches('/')),
-        None => "/".to_string(),
+    // 剥离路径与 CIDR 掩码
+    let host_port = rest.split('/').next().unwrap_or("");
+    let (host, port, path) = {
+        let p = match rest.split_once('/') {
+            Some((_, tail)) => format!("/{}", tail.trim_start_matches('/')),
+            None => "/".to_string(),
+        };
+        // IPv6 字面量（[::1]:port）本项目不处理
+        if host_port.contains('[') {
+            return Err("暂不支持 IPv6 目标，请输入 IPv4:端口（如 192.168.10.253:8001）".into());
+        }
+        match host_port.rsplit_once(':') {
+            Some((h, port_s)) if !h.is_empty() => {
+                let parsed = port_s.parse::<u16>().ok().filter(|p| *p > 0);
+                match parsed {
+                    Some(port_num) => (h.to_string(), port_num, p.clone()),
+                    None => {
+                        if let Some(default) = p_scheme_default(scheme) {
+                            (host_port.to_string(), default, p.clone())
+                        } else {
+                            return Err(PROBE_MISSING_PORT_MSG.into());
+                        }
+                    }
+                }
+            }
+            _ => match p_scheme_default(scheme) {
+                Some(default) => (host_port.to_string(), default, p.clone()),
+                None => return Err(PROBE_MISSING_PORT_MSG.into()),
+            },
+        }
+    };
+    if host.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("IP 地址格式无效: {host}"));
+    }
+    Ok(ProbeInput {
+        ip: host,
+        port,
+        scheme: scheme.map(str::to_string),
+        path,
+    })
+}
+
+fn p_scheme_default(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some("http") => Some(80),
+        Some("https") => Some(443),
+        _ => None,
+    }
+}
+
+/// 【APP15 任务2】兼容旧调用：返回 (ip, 显式端口)。
+pub fn parse_probe_target(raw: &str) -> (String, Option<u16>) {
+    match parse_probe_input(raw) {
+        Ok(t) => (t.ip, Some(t.port)),
+        Err(_) => {
+            let no_invisible = strip_invisible_and_non_ascii(raw);
+            let host = no_invisible
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (host, None)
+        }
     }
 }
 
@@ -940,15 +1416,15 @@ fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
     false
 }
 
-/// 【APP11 任务2 / APP17 任务5.2】穿过 go-lan-home 隧道检测内网 IP：
+/// 【APP40 任务1/3】精准 `IP:端口` 智能检测：
 ///
-/// - 网段归属硬校验：target_ip 必须落在已配置的回家网段
-///   （lan_cidrs ∪ local_address 所在 /24）内，否则直接拒绝、绝不发起探测；
-///   同时拒绝探测本机自身的 WireGuard 虚拟 IP；
-/// - 严禁用网关结果顶替目标：reachable 只由 target_ip 本身的真实应答决定；
-/// - **真实字节判据**：只经 Clash API `GET /proxies/go-lan-home/delay` 驱动
-///   内核向目标发一次真实 HTTP GET，以「delay > 0 且无错误字段」为唯一成功
-///   标准；严禁裸 TCP / SOCKS5 探测（APP36 任务1.3）。
+/// - 强制 `IP:端口`（或 `http(s)://IP[:端口]`）：纯 IP 不发起任何扫描，
+///   直接返回友好提示；
+/// - 网段归属硬校验：目标必须落在当前已启用档案的 lan_cidrs 内；
+/// - 拒绝检测本机自身的 WireGuard 虚拟 IP；
+/// - 仅对用户指定的**唯一端口**并发 HTTPS（忽略自签名证书）/ HTTP 探测，
+///   必要时再做一次单端口 TCP 握手兜底，绝不触碰任何其他端口；
+/// - On-Demand 命中本地同网段时，直接走物理网络并返回 ⚡ 提示。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
     api_addr: &str,
@@ -958,42 +1434,41 @@ pub async fn probe_intranet_ip(
     lan: &GoLanSettings,
 ) -> GoLanProbeResult {
     let log = crate::core::logger::MOD_GO_LAN;
-    // 1. 净化输入 + 目标推导（【APP14 任务3】支持 IP 与 IP:Port）
-    let (target_ip, explicit_port) = match target_ip_raw.map(parse_probe_target) {
-        Some((ip, p)) if !ip.is_empty() => (ip, p),
-        _ => match resolve_probe_target(None, lan) {
-            Some(gw) => (gw, None),
-            None => {
-                crate::core::logger::warn(
-                    log,
-                    "未提供检测目标且无法从 local_address 推导网关，请手动输入内网 IP（如 10.1.8.1）",
-                );
-                return GoLanProbeResult {
-                    reachable: false,
-                    target_ip: String::new(),
-                    latency_ms: None,
-                    message: "请输入有效的内网 IP 地址（如 10.1.8.1 或 192.168.10.253）".into(),
-                };
-            }
-        },
-    };
-    let target_v4: std::net::Ipv4Addr = match target_ip.parse() {
-        Ok(v4) => v4,
-        Err(_) => {
-            crate::core::logger::warn(log, &format!("IP 地址格式无效: {target_ip}"));
+    // 1. 严格解析输入（未带端口 → 直接提示，绝不扫描）
+    let input = match target_ip_raw.map(parse_probe_input) {
+        Some(Ok(input)) => input,
+        Some(Err(msg)) => {
+            crate::core::logger::info(log, &msg);
             return GoLanProbeResult {
                 reachable: false,
-                target_ip: target_ip.clone(),
+                target_ip: target_ip_raw.unwrap_or("").to_string(),
                 latency_ms: None,
-                message: format!("IP 地址格式无效: {target_ip}"),
+                message: msg,
+            };
+        }
+        None => {
+            return GoLanProbeResult {
+                reachable: false,
+                target_ip: String::new(),
+                latency_ms: None,
+                message: PROBE_MISSING_PORT_MSG.into(),
             };
         }
     };
-    // 【APP17 任务5.2】提取请求路径（用户可直接粘贴 NAS 页面地址）
-    let req_path = target_ip_raw
-        .map(probe_request_path)
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "/".to_string());
+    let target_ip = input.ip.clone();
+    let target_v4: std::net::Ipv4Addr = match target_ip.parse() {
+        Ok(v4) => v4,
+        Err(_) => {
+            let message = format!("IP 地址格式无效: {target_ip}");
+            crate::core::logger::warn(log, &message);
+            return GoLanProbeResult {
+                reachable: false,
+                target_ip,
+                latency_ms: None,
+                message,
+            };
+        }
+    };
 
     // 2. 运行前置
     if !is_running {
@@ -1014,97 +1489,231 @@ pub async fn probe_intranet_ip(
             message: "Go Lan 尚未开启，请先打开 Go Lan 开关".into(),
         };
     }
+    let mut profiles = enabled_profiles(lan);
+    if profiles.is_empty()
+        && lan.enabled
+        && (lan.wg_config.is_some()
+            || !lan.node_uri.trim().is_empty()
+            || !lan.lan_cidrs.is_empty())
+    {
+        // 旧版单配置兜底（尚未执行 normalize_go_lan_settings 的调用方）
+        profiles.push((
+            GO_LAN_TAG.to_string(),
+            GoLanProfile {
+                id: "home".into(),
+                name: "家里".into(),
+                enabled: true,
+                bypass_on_local_lan: lan.bypass_on_local_lan,
+                local_wifi_ssid: String::new(),
+                lan_cidrs: lan.lan_cidrs.clone(),
+                wg_config: lan.wg_config.clone(),
+                node_uri: lan.node_uri.clone(),
+                probe_target: String::new(),
+            },
+        ));
+    }
+    if profiles.is_empty() {
+        crate::core::logger::warn(log, "没有任何已启用的内网档案，跳过内网检测");
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip.clone(),
+            latency_ms: None,
+            message: "没有已启用的内网档案，请先在 Go Lan 中启用一路内网".into(),
+        };
+    }
 
-    // 3. 铁律 1：网段归属硬校验（不在回家网段内直接拒绝）
-    let local_addr = lan
-        .wg_config
-        .as_ref()
-        .map(|wg| wg.local_ip.as_str())
-        .unwrap_or("");
-    let wg_gateway = derive_gateway_from_local_address(local_addr);
-    // 【APP21 任务3.1】本机隧道 IP 可能不止 1 个（逗号分隔的多虚拟地址，
-    // 如 10.196.0.2/32 + 192.168.10.222/24），全部纳入「不能检测自身」判定
-    let self_ips: Vec<String> = parse_all_wg_local_addresses(local_addr)
-        .0
+    // 3. 本机虚拟 IP 不得作为检测目标
+    let self_ips: Vec<String> = profiles
         .iter()
-        .map(|a| a.split('/').next().unwrap_or("").to_string())
+        .flat_map(|(_, p)| {
+            let local_addr = p
+                .wg_config
+                .as_ref()
+                .map(|wg| wg.local_ip.as_str())
+                .unwrap_or("");
+            parse_all_wg_local_addresses(local_addr)
+                .0
+                .into_iter()
+                .map(|a| a.split('/').next().unwrap_or("").to_string())
+                .collect::<Vec<String>>()
+        })
         .filter(|s| !s.is_empty())
         .collect();
-    let allow_cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
-
     if self_ips.iter().any(|s| s == &target_ip) {
-        let self_ip = target_ip.clone();
-        let hint = wg_gateway.clone().unwrap_or_else(|| "10.1.8.1".into());
         let msg = format!(
-            "不能检测本机自身的虚拟 IP ({self_ip})，请输入对端网关 (如 {hint}) 或家里内网设备 IP (如 192.168.10.253)"
+            "不能检测本机自身的虚拟 IP ({target_ip})，请输入内网设备 IP（如 192.168.10.253:8001）"
         );
         crate::core::logger::warn(log, &msg);
         return GoLanProbeResult {
             reachable: false,
-            target_ip: target_ip.clone(),
-            latency_ms: None,
-            message: msg,
-        };
-    }
-    if !ipv4_in_any_cidr(target_v4, &allow_cidrs) {
-        let cidrs_str = allow_cidrs.join(", ");
-        let msg = format!(
-            "❌ 目标 IP {target_ip} 不在已配置的回家网段 [{cidrs_str}] 内，不会经过 Go Lan 隧道"
-        );
-        crate::core::logger::warn(log, &msg);
-        return GoLanProbeResult {
-            reachable: false,
-            target_ip: target_ip.clone(),
+            target_ip,
             latency_ms: None,
             message: msg,
         };
     }
 
+    // 4. 找到目标所属的档案 + 是否触发 On-Demand 同局域网直连
+    let physical_ips = detect_physical_lan_ipv4s();
+    let owner = profiles.iter().find_map(|(tag, profile)| {
+        let cidrs = profile_route_cidrs(profile);
+        if !ipv4_in_any_cidr(target_v4, &cidrs) {
+            return None;
+        }
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(profile, &physical_ips);
+        let bypassed = direct
+            .iter()
+            .any(|c| ipv4_in_any_cidr(target_v4, std::slice::from_ref(c)));
+        Some((tag.clone(), profile.clone(), tunnel, direct, bypassed))
+    });
+    let Some((tag, profile, tunnel, direct, bypassed)) = owner else {
+        let all_cidrs: Vec<String> = profiles
+            .iter()
+            .flat_map(|(_, p)| profile_route_cidrs(p))
+            .collect();
+        let msg = format!(
+            "❌ 目标 IP {target_ip} 不在已启用的内网网段 [{}] 内，不会经过 Go Lan 隧道",
+            all_cidrs.join(", ")
+        );
+        crate::core::logger::warn(log, &msg);
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip,
+            latency_ms: None,
+            message: msg,
+        };
+    };
+    if bypassed {
+        crate::core::logger::info(
+            log,
+            &format!(
+                "⚡ On-Demand 智能直连已触发：档案「{}」命中本机局域网 {:?}，跳过 WG 隧道（网段 {:?}，其余隧道 {:?}）",
+                profile.name, physical_ips, direct, tunnel
+            ),
+        );
+    }
+
+    let scheme_hint = input.scheme.as_deref();
     crate::core::logger::info(
         log,
         &format!(
-            "正在通过 go-lan-home 隧道检测内网目标: {}{} ...",
-            target_ip,
-            explicit_port.map(|p| format!(":{p}")).unwrap_or_default()
+            "正在检测内网目标: {target_ip}:{}{}（出站 {tag}）...",
+            input.port,
+            scheme_hint.map(|s| format!(" [{s}]")).unwrap_or_default()
         ),
     );
 
-    // 4. 【APP36 任务1.3】只经 Clash API delay 探测（内核级超时，无半开连接）；
-    // 提示信息 100% 针对用户输入的 target_ip。
-    match probe_target_ports(&target_ip, explicit_port, &req_path, api_addr, api_secret)
-    .await
-    {
+    // 5. 探测：On-Demand 直连 → 仅直连；否则 Clash API → 直连 → 单端口 TCP
+    let mut result: Result<PortProbeHit, String> = if bypassed {
+        probe_web_protocols_direct_only(&target_ip, input.port, scheme_hint, &input.path).await
+    } else {
+        probe_web_protocols(
+            &target_ip,
+            input.port,
+            scheme_hint,
+            &input.path,
+            api_addr,
+            api_secret,
+            &tag,
+        )
+        .await
+    };
+    if result.is_err() && !bypassed {
+        // 非 Web 端口（3389 / 22 / 445…）单端口握手兜底，绝不扫描其他端口
+        if let Ok(ms) = probe_single_port_tcp(&target_ip, input.port).await {
+            result = Ok(PortProbeHit {
+                scheme: "TCP".into(),
+                latency_ms: ms,
+            });
+        }
+    }
+    match result {
         Ok(hit) => {
-            crate::core::logger::info(
-                log,
-                &format!(
-                    "✅ 内网检测成功: {target_ip}:{} {}，延迟 {} ms",
-                    hit.port, hit.detail, hit.latency_ms
-                ),
+            let od_note = if bypassed {
+                "（⚡ On-Demand 同局域网直连，已自动跳过隧道）"
+            } else {
+                ""
+            };
+            let msg = format!(
+                "✅ 已连通 {}://{target_ip}:{}{od_note} · 延迟 {} ms",
+                hit.scheme, input.port, hit.latency_ms
             );
+            crate::core::logger::info(log, &msg);
             GoLanProbeResult {
                 reachable: true,
-                target_ip: target_ip.clone(),
+                target_ip,
                 latency_ms: Some(hit.latency_ms),
-                message: format!(
-                    "✅ 已成功到达内网 {target_ip}:{}（{} · {} ms）",
-                    hit.port, hit.detail, hit.latency_ms
-                ),
+                message: msg,
             }
         }
-        Err(e) => {
-            let message = format!(
-                "❌ 未能到达内网 {target_ip}（{e}），请检查该设备是否在线及 WG 服务端转发配置"
+        Err(_) => {
+            let msg = format!(
+                "❌ 未能连通 {target_ip}:{}（连接超时，请确认端口已开放且 WG 路由正常）",
+                input.port
             );
-            crate::core::logger::warn(log, &message);
+            crate::core::logger::warn(log, &msg);
             GoLanProbeResult {
                 reachable: false,
-                target_ip: target_ip.clone(),
+                target_ip,
                 latency_ms: None,
-                message,
+                message: msg,
             }
         }
     }
+}
+
+/// 【APP40 任务3】On-Demand 直连模式下只走物理网络的应用层探测
+/// （目标网段已进入 iOS excludedRoutes，不经过 utun）。
+async fn probe_web_protocols_direct_only(
+    ip: &str,
+    port: u16,
+    scheme_hint: Option<&str>,
+    path: &str,
+) -> Result<PortProbeHit, String> {
+    let schemes: Vec<&str> = match scheme_hint {
+        Some(s) => vec![s],
+        None => vec!["http", "https"],
+    };
+    let mut tasks: tokio::task::JoinSet<(String, Result<(u16, u64), String>)> =
+        tokio::task::JoinSet::new();
+    for scheme in &schemes {
+        let (ip_o, path_o) = (ip.to_string(), path.to_string());
+        let scheme_o = scheme.to_string();
+        tasks.spawn(async move {
+            let res = probe_app_layer(&ip_o, port, &scheme_o, &path_o).await;
+            (scheme_o, res)
+        });
+    }
+    let mut http_hit: Option<u64> = None;
+    let mut https_hit: Option<u64> = None;
+    let mut last_err = String::from("直连探测超时");
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((scheme, Ok((status, ms)))) => {
+                if scheme == "https" && status != 400 {
+                    https_hit = Some(ms);
+                } else if scheme == "http" {
+                    http_hit = Some(ms);
+                }
+            }
+            Ok((_, Err(e))) => last_err = e,
+            Err(_) => continue,
+        }
+    }
+    if scheme_hint.is_none() {
+        if let Some(ms) = http_hit {
+            return Ok(PortProbeHit {
+                scheme: "HTTP".into(),
+                latency_ms: ms,
+            });
+        }
+    }
+    if let Some(ms) = https_hit.or(http_hit) {
+        return Ok(PortProbeHit {
+            scheme: if https_hit.is_some() { "HTTPS" } else { "HTTP" }.into(),
+            latency_ms: ms,
+        });
+    }
+    Err(last_err)
 }
 
 // ---------------------------------------------------------------- 出站构建
@@ -1128,7 +1737,11 @@ pub async fn probe_intranet_ip(
 ///   网卡 IP（如 10.66.92.229）会导致 `dial tcp 10.66.92.229:0->8.8.4.4:853:
 ///   i/o timeout`；改用 `domain_strategy: ipv4_only` + 扩展侧
 ///   prism_protect_socket 绑定物理网卡即可保证纯 IPv4 Socket 不被 EPERM。
-fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<Value> {
+fn wg_outbound_value(
+    wg: &WgManualConfig,
+    warnings: &mut Vec<String>,
+    tag: &str,
+) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
     // APP-8 任务2：预解析 WireGuard 对端域名为 IP——内核 post-start 阶段
@@ -1151,7 +1764,7 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     let local_addrs_log = local_addrs.join(", ");
     let mut outbound = json!({
         "type": "wireguard",
-        "tag": GO_LAN_TAG,
+        "tag": tag,
         "server": server,
         "server_port": wg.server_port,
         "peer_public_key": peer_public_key,
@@ -1180,7 +1793,7 @@ fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>) -> Option<
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(
-            "已构建 go-lan-home 顶层单节点出站: {}:{}（隧道地址 {local_addrs_log}，运行时 MTU 1280 / MSS 1240）",
+            "已构建 {tag} 顶层单节点出站: {}:{}（隧道地址 {local_addrs_log}，运行时 MTU 1280 / MSS 1240）",
             outbound["server"].as_str().unwrap_or("?"),
             wg.server_port
         ),
@@ -1231,8 +1844,56 @@ fn normalize_wg_outbound_to_single_node(outbound: &mut Value) {
     }
 }
 
-/// 构建回家出站；配置无效返回 (None, 警告)
+/// 【APP40 任务2】构建全部启用档案的出站（每个档案一个独立 WireGuard 出站）。
+pub fn build_outbounds(lan: &GoLanSettings) -> (Vec<Value>, Vec<String>) {
+    let mut outbounds: Vec<Value> = Vec::new();
+    let mut warnings = Vec::new();
+    if !lan.enabled {
+        return (outbounds, warnings);
+    }
+    let profiles = enabled_profiles(lan);
+    if profiles.is_empty() {
+        // 旧版兜底（尚未 normalize 的单配置）
+        let mut legacy = lan.clone();
+        legacy.enabled = true;
+        let (ob, mut w) = build_outbound_with_tag(&legacy, GO_LAN_TAG);
+        warnings.append(&mut w);
+        if let Some(ob) = ob {
+            outbounds.push(ob);
+        }
+        return (outbounds, warnings);
+    }
+    for (i, (tag, profile)) in profiles.iter().enumerate() {
+        let temp = GoLanSettings {
+            enabled: true,
+            node_uri: profile.node_uri.clone(),
+            wg_config: profile.wg_config.clone(),
+            lan_cidrs: profile.lan_cidrs.clone(),
+            // Managed 模式：授权服务器下发的缓存出站挂到第 1 个启用档案
+            cached_managed_outbound: if i == 0 {
+                lan.cached_managed_outbound.clone()
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        let (ob, mut w) = build_outbound_with_tag(&temp, tag);
+        warnings.append(&mut w);
+        if let Some(ob) = ob {
+            outbounds.push(ob);
+        }
+    }
+    (outbounds, warnings)
+}
+
+/// 兼容旧接口：返回第一个启用档案的出站。
 pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
+    let (mut outbounds, warnings) = build_outbounds(lan);
+    (outbounds.drain(..).next(), warnings)
+}
+
+/// 构建单个回家出站（指定 tag）；配置无效返回 (None, 警告)
+pub fn build_outbound_with_tag(lan: &GoLanSettings, tag: &str) -> (Option<Value>, Vec<String>) {
     let mut warnings = Vec::new();
     if !lan.enabled {
         return (None, warnings);
@@ -1240,7 +1901,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
     // 1. 手动 WireGuard：密钥一律先规范化校验，无效必填密钥 → 不注入
     if let Some(wg) = &lan.wg_config {
         if !wg.server.trim().is_empty() {
-            if let Some(outbound) = wg_outbound_value(wg, &mut warnings) {
+            if let Some(outbound) = wg_outbound_value(wg, &mut warnings, tag) {
                 return (Some(outbound), warnings);
             }
             if normalize_wg_key(&wg.private_key).is_none()
@@ -1263,7 +1924,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
         if uri.starts_with("wireguard://") || uri.starts_with("wg://") {
             match parse_wireguard_uri(uri) {
                 Ok(wg) => {
-                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings) {
+                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings, tag) {
                         return (Some(outbound), warnings);
                     }
                 }
@@ -1272,7 +1933,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
         } else if uri.contains("[Interface]") {
             match parse_wireguard_conf(uri) {
                 Ok(wg) => {
-                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings) {
+                    if let Some(outbound) = wg_outbound_value(&wg, &mut warnings, tag) {
                         return (Some(outbound), warnings);
                     }
                 }
@@ -1286,7 +1947,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
                             if let Some(w) = warn {
                                 warnings.push(w);
                             }
-                            outbound["tag"] = json!(GO_LAN_TAG);
+                            outbound["tag"] = json!(tag);
                             return (Some(outbound), warnings);
                         }
                         None => warnings.push("回家链接节点类型不受支持或密钥无效，已忽略".into()),
@@ -1324,7 +1985,7 @@ pub fn build_outbound(lan: &GoLanSettings) -> (Option<Value>, Vec<String>) {
                     }
                 }
             }
-            outbound["tag"] = json!(GO_LAN_TAG);
+            outbound["tag"] = json!(tag);
             return (Some(outbound), warnings);
         }
     }
@@ -1516,47 +2177,111 @@ fn network_of_v4(ip: std::net::Ipv4Addr, mask: u8) -> String {
     format!("{}/{mask}", std::net::Ipv4Addr::from(bits & net_mask))
 }
 
-/// 合成回家路由规则（domain_suffix + ip_cidr → go-lan-home）。
+/// 【APP40 任务2】合成全部启用档案的回家路由规则：
+/// - 最顶部先插入 On-Demand 命中本机局域网的 `direct` 规则；
+/// - 随后每个启用档案一条 `ip_cidr → go-lan-{tag}`（按档案顺序）。
 /// 这些规则必须插在 `geosite: private` / `ip_is_private -> direct` 之前。
-/// 【APP-10 任务1.2】自动将 WireGuard 虚拟子网（从 local_ip 推导 /24）
-/// 并入 ip_cidr 规则，确保用户能直接访问虚拟网关（如 10.8.0.1）。
 pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String>) {
     let mut rules = Vec::new();
     let mut warnings = Vec::new();
     if !lan.enabled {
         return (rules, warnings);
     }
-    let domains: Vec<String> = lan
-        .lan_domains
-        .iter()
-        // 【APP-11B】剔除 \u2060 等隐形字符
-        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect();
-    // 【APP-11 任务1.1】统一走 normalize_cidr_list：单 IP 自动补 /32 + /24，
-    // 主机位非零 CIDR 归一化为网络前缀，并自动并入 WireGuard 虚拟子网
-    let local_addr = lan
-        .wg_config
-        .as_ref()
-        .map(|wg| wg.local_ip.as_str())
-        .unwrap_or("");
-    for raw in &lan.lan_cidrs {
-        // 【APP-11B】清洗后仍无法解析才告警（隐形字符会被自动剔除，不误报）
-        if sanitize_ip_prefix(raw, 24).is_none() && !strip_invisible_and_non_ascii(raw).is_empty()
-        {
-            warnings.push(format!("无效网段「{}」已忽略", raw.trim()));
+    let profiles = enabled_profiles(lan);
+    if profiles.is_empty() {
+        // 旧版兜底（尚未 normalize 的单配置）
+        let legacy_profile = GoLanProfile {
+            id: "home".into(),
+            name: "家里".into(),
+            enabled: true,
+            bypass_on_local_lan: lan.bypass_on_local_lan,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: lan.lan_cidrs.clone(),
+            wg_config: lan.wg_config.clone(),
+            node_uri: lan.node_uri.clone(),
+            probe_target: String::new(),
+        };
+        let (tunnel, direct) =
+            split_profile_cidrs_for_on_demand(&legacy_profile, &detect_physical_lan_ipv4s());
+        if !direct.is_empty() {
+            rules.push(json!({ "ip_cidr": direct, "outbound": "direct" }));
+        }
+        if !tunnel.is_empty() {
+            rules.push(json!({ "ip_cidr": tunnel, "outbound": GO_LAN_TAG }));
+        }
+        for raw in &lan.lan_cidrs {
+            if sanitize_ip_prefix(raw, 24).is_none()
+                && !strip_invisible_and_non_ascii(raw).is_empty()
+            {
+                warnings.push(format!("无效网段「{}」已忽略", raw.trim()));
+            }
+        }
+        let domains = cleaned_lan_domains(lan);
+        if !domains.is_empty() {
+            rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
+        }
+        return (rules, warnings);
+    }
+
+    let physical_ips = detect_physical_lan_ipv4s();
+    let mut bypassed: Vec<String> = Vec::new();
+    let mut per_tunnel: Vec<(String, Vec<String>)> = Vec::new();
+    for (tag, profile) in &profiles {
+        for raw in &profile.lan_cidrs {
+            if sanitize_ip_prefix(raw, 24).is_none()
+                && !strip_invisible_and_non_ascii(raw).is_empty()
+            {
+                warnings.push(format!(
+                    "档案「{}」无效网段「{}」已忽略",
+                    profile.name,
+                    raw.trim()
+                ));
+            }
+        }
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(profile, &physical_ips);
+        if !direct.is_empty() {
+            if !physical_ips.is_empty() {
+                crate::core::logger::info(
+                    crate::core::logger::MOD_GO_LAN,
+                    &format!(
+                        "⚡ On-Demand 智能直连已触发：检测到本机处于局域网 {:?}，档案「{}」已自动跳过 WG 隧道改走局域网直连（网段: {:?}）",
+                        physical_ips, profile.name, direct
+                    ),
+                );
+            }
+            for c in direct {
+                if !bypassed.contains(&c) {
+                    bypassed.push(c);
+                }
+            }
+        }
+        if !tunnel.is_empty() {
+            per_tunnel.push((tag.clone(), tunnel));
         }
     }
-    let cidrs = normalize_cidr_list(&lan.lan_cidrs, local_addr);
-    // 【APP30 任务2】ip_cidr 规则严格第一（先于 clash_mode / ip_is_private
-    // / 域名规则与其余分流），回家流量在任何模式下 100% 走 go-lan-home。
-    if !cidrs.is_empty() {
-        rules.push(json!({ "ip_cidr": cidrs, "outbound": GO_LAN_TAG }));
+    // ① On-Demand 直连规则严格第一（先于所有 go-lan 隧道与代理规则）
+    if !bypassed.is_empty() {
+        rules.push(json!({ "ip_cidr": bypassed, "outbound": "direct" }));
     }
+    // ② 每路内网隧道：独立 ip_cidr → go-lan-{tag}
+    for (tag, cidrs) in per_tunnel {
+        rules.push(json!({ "ip_cidr": cidrs, "outbound": tag }));
+    }
+    // ③ 内网域名后缀统一走第一个启用档案（go-lan-home）
+    let domains = cleaned_lan_domains(lan);
     if !domains.is_empty() {
         rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
     }
     (rules, warnings)
+}
+
+/// 【APP40 任务2】清洗全局内网域名后缀
+fn cleaned_lan_domains(lan: &GoLanSettings) -> Vec<String> {
+    lan.lan_domains
+        .iter()
+        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
 }
 
 /// 从 WireGuard local_ip（如 "10.8.0.2/24" 或 "10.0.0.2/32"）提取虚拟子网 /24。
@@ -1697,6 +2422,13 @@ pub async fn sync_managed(app: &AppHandle) -> Result<GoLanSettings, String> {
         }
     }
     lan.enabled = true;
+    // 【APP40 任务2】Managed 下发结果同步到内网档案，并执行旧数据迁移
+    if let Some(first) = lan.profiles.first_mut() {
+        first.node_uri = lan.node_uri.clone();
+        first.lan_cidrs = lan.lan_cidrs.clone();
+        first.enabled = true;
+    }
+    normalize_go_lan_settings(&mut lan);
     save(&data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
     Ok(lan)
@@ -1735,10 +2467,10 @@ mod tests {
             ..Default::default()
         };
         // 192.168.0.1 不在 [10.1.8.0/24, 192.168.10.0/24] 内 → 直接拒绝，不发起探测
-        let r = probe_intranet_ip(Some("192.168.0.1"), "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("192.168.0.1:8001"), "", "", true, true, &lan).await;
         assert!(!r.reachable, "网段外 IP 必须拒绝: {r:?}");
         assert!(
-            r.message.contains("不在已配置的回家网段"),
+            r.message.contains("不在已启用的内网网段"),
             "错误消息应说明网段不匹配: {}",
             r.message
         );
@@ -1761,7 +2493,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = probe_intranet_ip(Some("10.1.8.2"), "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("10.1.8.2:8001"), "", "", true, true, &lan).await;
         assert!(!r.reachable, "本机虚拟 IP 必须拒绝: {r:?}");
         assert!(
             r.message.contains("本机自身"),
@@ -1782,32 +2514,27 @@ mod tests {
         assert!(!ipv4_in_any_cidr("192.168.11.1".parse().unwrap(), &cidrs));
     }
 
-    /// 【APP14 任务3】检测目标支持 `IP` 与 `IP:Port` 两种写法
+    /// 【APP40 任务1】检测目标严格支持 `IP:端口`；协议头缺省端口按 80/443。
     #[test]
     fn test_parse_probe_target() {
-        assert_eq!(
-            parse_probe_target("10.1.8.1"),
-            ("10.1.8.1".to_string(), None)
-        );
+        // 纯 IP（无端口）→ 不再隐式扫描，交由 parse_probe_input 返回友好提示，
+        // 兼容接口 parse_probe_target 只回传 IP、端口 None
+        assert_eq!(parse_probe_target("10.1.8.1"), ("10.1.8.1".to_string(), None));
         assert_eq!(
             parse_probe_target("192.168.10.100:5000"),
             ("192.168.10.100".to_string(), Some(5000))
         );
-        // 带不可见字符 / 前后空白 / 掩码时仍能正确解析
+        // 带不可见字符 / 前后空白时仍能正确解析
         assert_eq!(
-            parse_probe_target(" 10.1.8.2\u{200b}/24 "),
-            ("10.1.8.2".to_string(), None)
+            parse_probe_target(" 192.168.10.253:8001\u{200b} "),
+            ("192.168.10.253".to_string(), Some(8001))
         );
-        assert_eq!(
-            parse_probe_target("10.1.8.1:8080/24"),
-            ("10.1.8.1".to_string(), Some(8080))
-        );
-        // 端口非法时降级为纯 IP 检测
+        // 端口非法时降级为纯 IP 检测（兼容旧接口行为）
         assert_eq!(
             parse_probe_target("10.1.8.1:abc"),
-            ("10.1.8.1:abc".to_string(), None)
+            ("10.1.8.1".to_string(), None)
         );
-        // 【APP15 任务2】支持 https:// / http:// 完整 URL 输入
+        // 【APP15 任务2/APP40】支持 https:// / http:// 完整 URL 输入
         assert_eq!(
             parse_probe_target("https://192.168.10.253:8001/"),
             ("192.168.10.253".to_string(), Some(8001))
@@ -1816,10 +2543,46 @@ mod tests {
             parse_probe_target("http://192.168.10.253:8000/webman"),
             ("192.168.10.253".to_string(), Some(8000))
         );
+        // 协议头未写端口 → https 默认 443、http 默认 80
         assert_eq!(
             parse_probe_target("https://192.168.10.253"),
-            ("192.168.10.253".to_string(), None)
+            ("192.168.10.253".to_string(), Some(443))
         );
+        assert_eq!(
+            parse_probe_target("http://192.168.10.253"),
+            ("192.168.10.253".to_string(), Some(80))
+        );
+    }
+
+    /// 【APP40 任务1】未输入端口必须返回友好提示，且绝不发起任何端口扫描。
+    #[tokio::test]
+    async fn test_probe_requires_explicit_port() {
+        let lan = GoLanSettings {
+            enabled: true,
+            lan_cidrs: vec!["192.168.10.0/24".into()],
+            wg_config: Some(WgManualConfig {
+                server: "home.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(30),
+                peer_public_key: test_key(31),
+                pre_shared_key: None,
+                local_ip: "10.9.0.2/32".into(),
+                mtu: 1420,
+            }),
+            ..Default::default()
+        };
+        for raw in [None, Some("192.168.10.253"), Some(" 192.168.10.253 ")] {
+            let r = probe_intranet_ip(raw, "", "", true, true, &lan).await;
+            assert!(!r.reachable, "无端口输入必须直接提示: {r:?}");
+            assert!(
+                r.message.contains("IP:端口"),
+                "必须提示用户输入 IP:端口: {}",
+                r.message
+            );
+        }
+        // 显式 IP:端口 才能进入后续流程（此处因内核未运行而提示启动）
+        let r = probe_intranet_ip(Some("192.168.10.253:8001"), "", "", false, true, &lan).await;
+        assert!(r.message.contains("VPN 尚未启动"), "{}", r.message);
     }
 
     #[test]
@@ -1980,6 +2743,7 @@ mod tests {
     fn test_go_lan_route_rules_merges_extra_lan_cidrs() {
         let lan = GoLanSettings {
             enabled: true,
+            bypass_on_local_lan: false,
             lan_cidrs: vec![],
             wg_config: Some(WgManualConfig {
                 server: "home.example.com".into(),
@@ -2196,6 +2960,7 @@ mod tests {
         // config_builder 负责将其插在 geosite: private 之前（见 config_builder 测试）。
         let lan = GoLanSettings {
             enabled: true,
+            bypass_on_local_lan: false,
             lan_cidrs: vec!["192.168.1.0/24".into()],
             lan_domains: vec!["*.nas.home".into()],
             ..Default::default()
@@ -2204,6 +2969,7 @@ mod tests {
         assert_eq!(rules.len(), 2);
         // 【APP30 任务2】ip_cidr 规则严格第一，域名规则紧随其后
         assert_eq!(rules[0]["ip_cidr"][0], "192.168.1.0/24");
+        assert_eq!(rules[0]["outbound"], GO_LAN_TAG);
         assert_eq!(rules[1]["domain_suffix"][0], "nas.home");
     }
 
@@ -2211,11 +2977,13 @@ mod tests {
     fn test_invalid_cidr_filtered() {
         let lan = GoLanSettings {
             enabled: true,
-            lan_cidrs: vec!["192.168.1.0/24".into(), "bad-cidr".into(), "10.0.0.0/33".into()],
+            bypass_on_local_lan: false,
+            lan_cidrs: vec!["10.77.0.0/24".into(), "bad-cidr".into(), "10.0.0.0/33".into()],
             ..Default::default()
         };
         let (rules, warnings) = go_lan_route_rules(&lan);
-        assert_eq!(rules.len(), 1);
+        let tunnel_rules = rules.iter().filter(|r| r["outbound"] == GO_LAN_TAG).count();
+        assert_eq!(tunnel_rules, 1);
         assert_eq!(warnings.len(), 2);
     }
 
@@ -2361,5 +3129,225 @@ mod tests {
         // 完全非法的输入返回 None（由调用方决定 fallback）
         assert_eq!(sanitize_ip_prefix("not-an-ip", 32), None);
         assert_eq!(sanitize_ip_prefix("", 32), None);
+    }
+
+    // ----------------------------------------------------------------
+    // APP40 任务2：多路内网档案（Profiles）回归测试
+    // --------------------------------------------------------------
+
+    fn sample_wg(seed: u8, local_ip: &str) -> WgManualConfig {
+        WgManualConfig {
+            server: "home.example.com".into(),
+            server_port: 51820,
+            private_key: test_key(seed),
+            peer_public_key: test_key(seed.wrapping_add(1)),
+            pre_shared_key: None,
+            local_ip: local_ip.into(),
+            mtu: 1420,
+        }
+    }
+
+    fn sample_profile(id: &str, name: &str, cidrs: &[&str], local_ip: &str, seed: u8) -> GoLanProfile {
+        GoLanProfile {
+            id: id.into(),
+            name: name.into(),
+            enabled: true,
+            bypass_on_local_lan: true,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+            wg_config: Some(sample_wg(seed, local_ip)),
+            node_uri: String::new(),
+            probe_target: String::new(),
+        }
+    }
+
+    /// 旧版单配置加载后必须自动生成「家里」档案，且不丢任何字段。
+    #[test]
+    fn test_normalize_migrates_legacy_settings() {
+        let mut lan = GoLanSettings {
+            enabled: true,
+            mode: "manual".into(),
+            node_uri: String::new(),
+            wg_config: Some(sample_wg(20, "10.196.0.2/32")),
+            lan_cidrs: vec!["192.168.10.0/24".into()],
+            ..Default::default()
+        };
+        normalize_go_lan_settings(&mut lan);
+        assert_eq!(lan.profiles.len(), 1);
+        let p = &lan.profiles[0];
+        assert_eq!(p.id, "home");
+        assert_eq!(p.name, "家里");
+        assert!(p.enabled);
+        assert!(p.bypass_on_local_lan);
+        assert_eq!(p.lan_cidrs, vec!["192.168.10.0/24".to_string()]);
+        assert_eq!(
+            p.wg_config.as_ref().map(|w| w.server.as_str()),
+            Some("home.example.com")
+        );
+        assert_eq!(lan.active_profile_id, "home");
+
+        // 再次归一化必须幂等（不重复生成档案）
+        normalize_go_lan_settings(&mut lan);
+        assert_eq!(lan.profiles.len(), 1);
+
+        // 空配置不生成任何档案
+        let mut empty = GoLanSettings::default();
+        normalize_go_lan_settings(&mut empty);
+        assert!(empty.profiles.is_empty());
+    }
+
+    /// 档案 id 冲突 / 缺失时必须自动补齐为唯一 id。
+    #[test]
+    fn test_normalize_dedupes_profile_ids() {
+        let mut lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![
+                sample_profile("", "", &["10.1.0.0/24"], "10.9.0.2/32", 40),
+                sample_profile("office", "", &["10.2.0.0/24"], "10.10.0.2/32", 42),
+                sample_profile("office", "公司2", &["10.3.0.0/24"], "10.11.0.2/32", 44),
+            ],
+            ..Default::default()
+        };
+        normalize_go_lan_settings(&mut lan);
+        let ids: Vec<String> = lan.profiles.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids, vec!["profile1", "office", "profile3"]);
+        assert!(!lan.profiles[0].name.trim().is_empty());
+        assert_eq!(lan.active_profile_id, "profile1");
+    }
+
+    /// 多档案启用：首个档案恒为 go-lan-home，其余为 go-lan-{id}。
+    #[test]
+    fn test_multi_profiles_outbounds_and_rules() {
+        let lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![
+                GoLanProfile {
+                    bypass_on_local_lan: false,
+                    ..sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 50)
+                },
+                GoLanProfile {
+                    bypass_on_local_lan: false,
+                    ..sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 52)
+                },
+                // 未启用档案绝不生成出站/规则
+                GoLanProfile {
+                    enabled: false,
+                    ..sample_profile("studio", "工作室", &["10.20.0.0/24"], "10.198.0.2/32", 54)
+                },
+            ],
+            lan_domains: vec!["*.nas.home".into()],
+            ..Default::default()
+        };
+        let (outbounds, warnings) = build_outbounds(&lan);
+        assert!(warnings.is_empty(), "合法多档案不应产生警告: {warnings:?}");
+        assert_eq!(outbounds.len(), 2);
+        assert_eq!(outbounds[0]["tag"], GO_LAN_TAG);
+        assert_eq!(outbounds[1]["tag"], "go-lan-office");
+        for ob in &outbounds {
+            assert_eq!(ob["type"], "wireguard");
+            assert_eq!(ob["mtu"].as_u64(), Some(GO_LAN_RUNTIME_MTU as u64));
+            // 【APP40 任务2】多 Local Address 必须完整保留
+            assert!(
+                ob["local_address"].as_array().is_some_and(|a| !a.is_empty()),
+                "local_address 不得为空"
+            );
+        }
+        let tags: Vec<String> = enabled_profiles(&lan).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(tags, vec![GO_LAN_TAG.to_string(), "go-lan-office".to_string()]);
+
+        // 规则：每个启用档案一条 ip_cidr → 对应 tag
+        let (rules, _) = go_lan_route_rules(&lan);
+        let tunnel: Vec<(String, String)> = rules
+            .iter()
+            .filter_map(|r| {
+                let out = r.get("outbound")?.as_str()?.to_string();
+                let first = r.get("ip_cidr")?.as_array()?.first()?.as_str()?.to_string();
+                Some((out, first))
+            })
+            .collect();
+        assert!(tunnel.contains(&(GO_LAN_TAG.to_string(), "192.168.10.0/24".to_string())));
+        assert!(tunnel.contains(&("go-lan-office".to_string(), "10.8.0.0/24".to_string())));
+        assert!(
+            !tunnel.iter().any(|(t, _)| t == "go-lan-studio"),
+            "未启用档案不得生成规则: {tunnel:?}"
+        );
+    }
+
+    /// On-Demand：本机物理 IP 落在「家里」网段时直连，公司网段仍走隧道。
+    #[test]
+    fn test_split_profile_cidrs_on_demand() {
+        let home = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 60);
+        let office = sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 62);
+        let physical: Vec<std::net::Ipv4Addr> =
+            vec!["192.168.10.88".parse().unwrap()];
+
+        // 家里：命中同网段 → 直连，隧道内仅保留 WG 虚拟子网
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(&home, &physical);
+        assert!(direct.contains(&"192.168.10.0/24".to_string()), "{direct:?}");
+        assert!(
+            !tunnel.contains(&"192.168.10.0/24".to_string()),
+            "命中本机局域网必须退出隧道: {tunnel:?}"
+        );
+        assert!(tunnel.contains(&"10.196.0.0/24".to_string()), "{tunnel:?}");
+        assert!(
+            !direct.contains(&"10.196.0.0/24".to_string()),
+            "WG 虚拟子网永不直连: {direct:?}"
+        );
+
+        // 公司：不在本机局域网 → 全部走隧道
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(&office, &physical);
+        assert!(direct.is_empty());
+        assert!(tunnel.contains(&"10.8.0.0/24".to_string()));
+
+        // 蜂窝网络（无物理局域网 IP）→ 恢复全部走隧道
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(&home, &[]);
+        assert!(direct.is_empty());
+        assert!(tunnel.contains(&"192.168.10.0/24".to_string()));
+
+        // 关闭 On-Demand 时即使命中同网段也必须走隧道
+        let mut disabled = home.clone();
+        disabled.bypass_on_local_lan = false;
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(&disabled, &physical);
+        assert!(direct.is_empty());
+        assert!(tunnel.contains(&"192.168.10.0/24".to_string()));
+    }
+
+    /// 多档案运行时元数据（供 iOS 扩展侧车 golan_profiles.json）。
+    #[test]
+    fn test_profiles_metadata() {
+        let lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![
+                GoLanProfile {
+                    local_wifi_ssid: "Home-5G".into(),
+                    ..sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 70)
+                },
+                GoLanProfile {
+                    bypass_on_local_lan: false,
+                    ..sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 72)
+                },
+            ],
+            ..Default::default()
+        };
+        let meta = profiles_metadata(&lan);
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0]["tag"], GO_LAN_TAG);
+        assert_eq!(meta[0]["name"], "家里");
+        assert_eq!(meta[0]["bypassOnLocalLan"], true);
+        assert!(
+            meta[0]["cidrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c.as_str() == Some("192.168.10.0/24")),
+            "cidrs 必须包含 lan 网段: {meta:?}"
+        );
+        assert_eq!(meta[1]["tag"], "go-lan-office");
+        assert_eq!(meta[1]["bypassOnLocalLan"], false);
+
+        // 未启用时不产生任何元数据
+        let mut off = lan.clone();
+        off.enabled = false;
+        assert!(profiles_metadata(&off).is_empty());
     }
 }

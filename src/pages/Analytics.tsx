@@ -222,7 +222,7 @@ function AggCard({
   const { t } = useTranslation();
   const max = rows.reduce((m, [, a]) => Math.max(m, a.down + a.up), 1);
   return (
-    <div className="bg-surface-card rounded-xl p-5 shadow-md">
+    <div className="card-sheen bg-surface-card rounded-xl p-5 shadow-md">
       <div className="mb-4 flex items-center justify-between gap-3">
         <h2 className="text-base font-semibold flex items-center gap-2">
           {icon}
@@ -236,6 +236,7 @@ function AggCard({
         <div className="space-y-2.5">
           {rows.map(([key, a, sub]) => {
             const total = a.down + a.up;
+            const pct = Math.max((total / max) * 100, 2);
             return (
               <div key={key}>
                 <div className="flex items-center justify-between text-xs mb-1">
@@ -245,14 +246,14 @@ function AggCard({
                       <span className="ml-2 text-[10px] text-gray-500">{sub}</span>
                     ) : null}
                   </span>
-                  <span className="shrink-0 pl-3 text-gray-500 font-mono">
+                  <span className="shrink-0 pl-3 text-gray-500 font-mono tabular-nums">
                     {t("analytics.hitsCount", { count: a.count })} · {formatBytes(total)}
                   </span>
                 </div>
-                <div className="h-1.5 rounded-full bg-glass overflow-hidden">
+                <div className="relative h-1.5 rounded-full bg-glass overflow-hidden">
                   <div
-                    className="h-full bg-accent/70 rounded-full"
-                    style={{ width: `${Math.max((total / max) * 100, 2)}%` }}
+                    className="h-full rounded-full bg-gradient-to-r from-accent/55 via-accent/80 to-accent transition-[width] duration-500 ease-out"
+                    style={{ width: `${pct}%` }}
                   />
                 </div>
               </div>

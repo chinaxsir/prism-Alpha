@@ -17,7 +17,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::state::{OutboundMode, RunMode, UserSettings};
-use crate::core::go_lan::normalize_cidr_list;
 
 const DEFAULT_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
 const TUN_TAG: &str = "tun-in";
@@ -55,6 +54,8 @@ pub fn is_builtin_non_proxy_tag(tag: &str) -> bool {
             // 节点选择器 / GLOBAL 组 / urltest 自动测速组 / 默认兜底路由
             | "GO-LAN-HOME"
     ) || t.to_ascii_uppercase().starts_with("GO-AIM-PROBE")
+        // 【APP40 任务2】多路内网档案：所有 go-lan-* 出站均为内置功能性出站
+        || t.to_ascii_uppercase().starts_with("GO-LAN-")
 }
 
 /// 【APP33 任务1.1】信息展示/广告类假节点名称识别。
@@ -652,33 +653,58 @@ pub fn build(
     // 【APP-9 任务2】Go Lan 规则不立即入列，先缓存到 go_lan_rules，
     // 待 clash_mode 注入前统一插入到「prism.sarl / block_quic 之后、
     // clash_mode 之前」的黄金位置——确保全局/直连模式下回家流量仍走隧道。
-    let (lan_outbound, lan_warnings) = crate::core::go_lan::build_outbound(go_lan_cfg);
+    // 【APP40 任务2】多路内网档案：每个启用档案注入独立 go-lan-* 出站
+    let (lan_outbounds, lan_warnings) = crate::core::go_lan::build_outbounds(go_lan_cfg);
     let (lan_rules, lan_rule_warnings) = crate::core::go_lan::go_lan_route_rules(go_lan_cfg);
     let (lan_dns_server, lan_dns_rule) = crate::core::go_lan::go_lan_dns(go_lan_cfg);
     let mut go_lan_rules: Vec<Value> = Vec::new();
     // 【APP31 任务2】WG 服务端公网 IP 直连豁免（全平台双保险）：任何发往
     // WireGuard 服务端公网 IP 的外层 UDP / 握手包 100% 强制走 direct，
     // 绝不进入海外 VLESS-WebSocket 节点（log9.txt 第 37~42 行
-    // `ws closed: 1005` 的根因）。
-    let mut wg_server_ip: Option<String> = None;
-    if let Some(outbound) = lan_outbound {
-        if let Some(ip) = outbound["server"].as_str() {
-            if ip.parse::<std::net::Ipv4Addr>().is_ok() && !ip.starts_with("127.") {
-                wg_server_ip = Some(ip.to_string());
+    // `ws closed: 1005` 的根因）。多档案时逐一出站收集。
+    let mut wg_server_ips: Vec<String> = Vec::new();
+    if !lan_outbounds.is_empty() {
+        let archive_count = lan_outbounds.len();
+        for outbound in lan_outbounds {
+            if let Some(ip) = outbound["server"].as_str() {
+                if ip.parse::<std::net::Ipv4Addr>().is_ok()
+                    && !ip.starts_with("127.")
+                    && !wg_server_ips.iter().any(|x| x == ip)
+                {
+                    wg_server_ips.push(ip.to_string());
+                }
             }
+            outbounds.push(outbound);
         }
-        outbounds.push(outbound);
         go_lan_rules = lan_rules;
-        // 【APP6 任务1】[GoLan] 模块日志：路由网段注入状态
+        // 【APP6 任务1/APP40 任务2】[GoLan] 模块日志：多档案注入状态
         if !go_lan_rules.is_empty() {
+            let summary: Vec<String> = crate::core::go_lan::enabled_profiles(go_lan_cfg)
+                .into_iter()
+                .map(|(tag, profile)| format!("{} → {tag}", profile.name))
+                .collect();
             crate::core::logger::info(
                 crate::core::logger::MOD_GO_LAN,
                 &format!(
-                    "go-lan-home 出站已注入配置，回家路由规则 {} 条（网段 {}）",
-                    go_lan_rules.len(),
-                    normalize_cidr_list(&go_lan_cfg.lan_cidrs, "").join(", ")
+                    "Go Lan 已注入 {archive_count} 路内网档案（{}），回家路由规则 {} 条（On-Demand 直连已置顶）",
+                    summary.join(" · "),
+                    go_lan_rules.len()
                 ),
             );
+        }
+        // 【APP40 任务2】iOS 扩展侧车：档案元数据（含 bypassOnLocalLan），
+        // 严禁写入内核 JSON（未知字段会触发 decode config FATAL）
+        let profiles_meta = crate::core::go_lan::profiles_metadata(go_lan_cfg);
+        if !profiles_meta.is_empty() {
+            let sidecar = work_dir.join("golan_profiles.json");
+            match serde_json::to_string(&profiles_meta) {
+                Ok(text) => {
+                    if let Err(e) = std::fs::write(&sidecar, text) {
+                        warnings.push(format!("写入 golan_profiles.json 失败: {e}"));
+                    }
+                }
+                Err(e) => warnings.push(format!("序列化 golan_profiles.json 失败: {e}")),
+            }
         }
     }
     warnings.extend(lan_warnings);
@@ -1299,9 +1325,10 @@ pub fn build(
     // ① DNS 劫持（protocol dns / port 53 → dns-out）
     // ② 853 拦截 + 公共 DNS 的 DoH/DoT 直连拦截
     // ③ QUIC 拦截（protocol quic / UDP 443，强制 Safari 走 TCP）
-    // ④ wg_server_ip/32 → direct 豁免
-    // ⑤ ip_cidr: go_lan_cidrs → go-lan-home（必须早于 clash_mode: direct、
-    //    ip_is_private: true、clash_mode: global）
+    // ④ wg_server_ip/32 → direct 豁免（多路档案逐个豁免）
+    // ⑤ ip_cidr: go_lan_cidrs → go-lan-*（必须早于 clash_mode: direct、
+    //    ip_is_private: true、clash_mode: global；On-Demand 直连规则已在
+    //    go_lan_rules 最顶部，因此直接 extend 即可保证优先级）
     // 说明：853 拦截避免 iOS 在隧道就绪前直连 8.8.8.8:853 反复超时刷屏；
     // 公共 DNS 的 DoH/DoT 端点（8.8.8.8 等 443/853）一律 block。
     let mut head_rules: Vec<Value> = vec![
@@ -1320,7 +1347,7 @@ pub fn build(
         head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
         head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
     }
-    if let Some(ip) = &wg_server_ip {
+    for ip in &wg_server_ips {
         head_rules.push(json!({
             "ip_cidr": [format!("{ip}/32")],
             "outbound": "direct"
@@ -3035,6 +3062,10 @@ rules:
     fn go_lan_wireguard_outbound_has_no_top_level_allowed_ips() {
         let lan = crate::core::go_lan::GoLanSettings {
             enabled: true,
+            // 关闭 On-Demand 直连，保证测试机本地局域网 IP 不影响规则断言
+            bypass_on_local_lan: false,
+            profiles: Vec::new(),
+            active_profile_id: String::new(),
             mode: "manual".into(),
             node_uri: String::new(),
             wg_config: Some(crate::core::go_lan::WgManualConfig {
