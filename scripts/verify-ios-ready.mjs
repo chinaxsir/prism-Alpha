@@ -14,14 +14,14 @@
  *   8. Swift 冻结指令（严禁 as! / 命名元组类型声明 + gen 副本字节一致）
  *   9. Rust cargo check（本机 + iOS aarch64-apple-ios 目标）
  *  10. WKWebView 染色防复发（禁 subviews / underPageBackgroundColor / 前后台监听）
- *  11. AppIcon 四角满铺校验（不透明彩色，无白/黑/透明角）
+ *  11. AppIcon 四角满铺校验（纯 Node 内置 PNG 解码，0 第三方依赖）
  */
 
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, delimiter } from 'node:path';
 import { execSync } from 'node:child_process';
-import sharp from 'sharp';
+import { inflateSync } from 'node:zlib';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 let failed = false;
@@ -649,12 +649,17 @@ if (swiftHits.length > 0) {
 // iOS 要求提交的图标为 100% 直角满铺方形（圆角由系统裁切）；四角出现
 // 白色/透明/#0B0E14 深黑时，SpringBoard 拉伸底边会露出黑块或白块。
 // gen/apple 只在 macOS 构建时生成，缺失时回退到仓库内 icons/ios。
+// 【APP41 任务1】彻底移除 sharp（CI 未 npm install 时报
+// ERR_MODULE_NOT_FOUND），改用 Node 内置 zlib 手写 PNG 解码：
+// 零第三方依赖、纯同步、毫秒级，任何干净 CI 环境都能直接跑。
 // ============================================================
 console.log('\n--- 检查 11：AppIcon 四角满铺校验 ---');
 const ICON_DIRS = [
   resolve(ROOT, 'src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset'),
   resolve(ROOT, 'src-tauri/icons/ios'),
 ].filter((d) => existsSync(d));
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_CHANNELS = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
 function badCornerReason(r, g, b, a) {
   if (a < 250) return '透明';
   const mx = Math.max(r, g, b);
@@ -664,6 +669,94 @@ function badCornerReason(r, g, b, a) {
   if (mx - mn < 20) return '灰白';
   return null;
 }
+/// 纯 Node 解码 PNG 四角像素；仅依赖 node:zlib。
+/// 返回 { width, height, corners }（corners 为 [x, y, r, g, b, a]），
+/// 遇到非 8bit / 隔行 / 未知色型等未支持格式返回 null（调用方退化为文件头校验）。
+function decodePngCorners(buf) {
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIG)) return null;
+  let off = 8;
+  let ihdr = null;
+  let palette = null;
+  const tRNS = [];
+  const idat = [];
+  while (off + 8 <= buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.toString('ascii', off + 4, off + 8);
+    const body = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') {
+      ihdr = {
+        width: body.readUInt32BE(0),
+        height: body.readUInt32BE(4),
+        bitDepth: body[8],
+        colorType: body[9],
+        interlace: body[12],
+      };
+    } else if (type === 'IDAT') {
+      idat.push(body);
+    } else if (type === 'PLTE') {
+      palette = body;
+    } else if (type === 'tRNS') {
+      tRNS.push(...body);
+    } else if (type === 'IEND') {
+      break;
+    }
+    off += len + 12;
+  }
+  if (!ihdr || idat.length === 0) return null;
+  const { width, height, bitDepth, colorType, interlace } = ihdr;
+  const ch = PNG_CHANNELS[colorType];
+  if (bitDepth !== 8 || interlace !== 0 || !ch || width <= 0 || height <= 0) return null;
+  if (colorType === 3 && !palette) return null;
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * ch;
+  if (raw.length < height * (stride + 1)) return null;
+  // 逐行反滤波（PNG filter 0~4）；只缓存首尾两行用于四角采样
+  const wantedY = [0, height - 1];
+  const rows = new Map();
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const base = y * (stride + 1);
+    const filter = raw[base];
+    const src = raw.subarray(base + 1, base + 1 + stride);
+    const out = Buffer.alloc(stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= ch ? out[i - ch] : 0;
+      const b = prev[i];
+      const c = i >= ch ? prev[i - ch] : 0;
+      let v = src[i];
+      if (filter === 1) v += a;
+      else if (filter === 2) v += b;
+      else if (filter === 3) v += Math.floor((a + b) / 2);
+      else if (filter === 4) {
+        const p = a + b - c;
+        const pa = Math.abs(p - a);
+        const pb = Math.abs(p - b);
+        const pc = Math.abs(p - c);
+        v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      out[i] = v & 0xff;
+    }
+    if (wantedY.includes(y)) rows.set(y, out);
+    prev = out;
+  }
+  const pixelAt = (x, y) => {
+    const row = rows.get(y);
+    const i = x * ch;
+    if (colorType === 6) return [row[i], row[i + 1], row[i + 2], row[i + 3]];
+    if (colorType === 2) return [row[i], row[i + 1], row[i + 2], 255];
+    if (colorType === 4) return [row[i], row[i], row[i], row[i + 1]];
+    if (colorType === 0) return [row[i], row[i], row[i], tRNS.length ? (row[i] === tRNS[0] ? 0 : 255) : 255];
+    const p = row[i] * 3;
+    return [palette[p], palette[p + 1], palette[p + 2], tRNS.length ? (tRNS[row[i]] ?? 255) : 255];
+  };
+  const corners = [
+    [0, 0],
+    [width - 1, 0],
+    [0, height - 1],
+    [width - 1, height - 1],
+  ].map(([x, y]) => [x, y, ...pixelAt(x, y)]);
+  return { width, height, corners };
+}
 if (ICON_DIRS.length === 0) {
   fail('未找到 AppIcon 图标目录（icons/ios 缺失）');
 } else {
@@ -671,25 +764,25 @@ if (ICON_DIRS.length === 0) {
   let checked = 0;
   for (const dir of ICON_DIRS) {
     for (const file of readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.png'))) {
-      const { data, info } = await sharp(resolve(dir, file))
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-      const ch = info.channels;
-      const corners = [
-        [0, 0],
-        [info.width - 1, 0],
-        [0, info.height - 1],
-        [info.width - 1, info.height - 1],
-      ];
-      for (const [x, y] of corners) {
-        const i = (y * info.width + x) * ch;
-        const reason = badCornerReason(data[i], data[i + 1], data[i + 2], ch >= 4 ? data[i + 3] : 255);
+      const buf = readFileSync(resolve(dir, file));
+      if (buf.length === 0) {
+        badIcons.push(`${file}=空文件`);
+        continue;
+      }
+      if (!buf.subarray(0, 8).equals(PNG_SIG)) {
+        badIcons.push(`${file}=PNG 魔数缺失`);
+        continue;
+      }
+      checked += 1;
+      const decoded = decodePngCorners(buf);
+      if (!decoded) continue; // 未支持格式：已通过魔数 + 非空校验
+      for (const [x, y, r, g, b, a] of decoded.corners) {
+        const reason = badCornerReason(r, g, b, a);
         if (reason) {
           badIcons.push(`${file}(${x},${y})=${reason}`);
           break;
         }
       }
-      checked += 1;
     }
   }
   if (badIcons.length > 0) {
