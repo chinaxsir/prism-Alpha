@@ -66,6 +66,13 @@ const zh: Record<string, string> = {
   "proxies.conn.quickRuleDirect": "直连 DIRECT",
   "proxies.conn.quickRuleProxy": "走节点 PROXY",
   "proxies.conn.quickRuleReject": "拦截 REJECT",
+  "proxies.conn.statUp": "上行",
+  "proxies.conn.statDown": "下行",
+  "proxies.conn.statSpeed": "下行速度",
+  "proxies.conn.statActive": "活跃连接",
+  "proxies.conn.copy": "复制目标地址",
+  "proxies.conn.copied": "目标地址已复制",
+  "proxies.conn.copyFailed": "复制失败（剪贴板不可用）",
   "proxies.conn.ruleAdded": "已添加规则：{rule}",
   "proxies.failover": "节点 {from} 不可用，已自动切换",
 
@@ -82,6 +89,11 @@ const zh: Record<string, string> = {
   "proxies.rules.err.exists": "规则已存在",
   "proxies.rules.effectiveTitle": "生效规则（{count} 条，含内置 / 自定义与订阅）",
   "proxies.rules.empty": "暂无规则（内核未启动）",
+  "proxies.rules.rootHint": "域名类规则会自动提取根域名（如 www.example.com → example.com）",
+  "proxies.rules.pickPolicy": "选择策略",
+  "proxies.rules.searchPolicy": "搜索策略组 / 节点",
+  "proxies.rules.noPolicy": "无匹配策略",
+  "proxies.rules.currentPolicy": "当前",
 
   // ---- Go Cus ----
   "proxies.goCus.tab.modules": "模块",
@@ -212,6 +224,13 @@ const en: Record<string, string> = {
   "proxies.conn.quickRuleProxy": "Via proxy",
   "proxies.conn.quickRuleReject": "Reject",
   "proxies.conn.ruleAdded": "Rule added: {rule}",
+  "proxies.conn.statUp": "Upload",
+  "proxies.conn.statDown": "Download",
+  "proxies.conn.statSpeed": "Download Speed",
+  "proxies.conn.statActive": "Active Connections",
+  "proxies.conn.copy": "Copy target address",
+  "proxies.conn.copied": "Target address copied",
+  "proxies.conn.copyFailed": "Copy failed (clipboard unavailable)",
   "proxies.failover": "Node {from} is unavailable, switched automatically",
 
   // ---- Rules ----
@@ -231,6 +250,12 @@ const en: Record<string, string> = {
   "proxies.rules.effectiveTitle":
     "Effective Rules ({count}, incl. built-in / custom & subscription)",
   "proxies.rules.empty": "No rules (core not started)",
+  "proxies.rules.rootHint":
+    "Domain rules auto-extract the root domain (e.g. www.example.com → example.com)",
+  "proxies.rules.pickPolicy": "Choose Policy",
+  "proxies.rules.searchPolicy": "Search policy group / node",
+  "proxies.rules.noPolicy": "No matching policy",
+  "proxies.rules.currentPolicy": "Current",
 
   // ---- Go Cus ----
   "proxies.goCus.tab.modules": "Modules",

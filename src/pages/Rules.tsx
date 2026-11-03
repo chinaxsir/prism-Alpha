@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 
 import {
   getCustomRules,
@@ -30,6 +30,45 @@ const RULE_TYPES = [
   "GEOSITE",
 ];
 
+/// 【APP42 任务4.2】常见多段公共后缀（两级 TLD）。
+/// 不引入 200KB+ 的 PSL 数据，只覆盖国内/海外高频后缀，
+/// 未命中时退化为「最后两段」，满足绝大多数字母级根域提取。
+const MULTI_PART_SUFFIXES = new Set([
+  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+  "co.uk", "org.uk", "me.uk", "com.au", "net.au", "org.au",
+  "co.jp", "or.jp", "ne.jp", "com.br", "com.tw", "com.hk",
+  "co.kr", "com.sg", "com.tr", "co.nz", "co.za", "com.mx",
+]);
+
+/// 从用户输入（完整 URL / 子域名 / 带路径的域名）中提取可注册根域名。
+/// 如 https://www.example.com/path → example.com；a.b.example.co.uk → example.co.uk
+export function extractRootDomain(raw: string): string {
+  let host = raw.trim().toLowerCase();
+  if (!host) return "";
+  // 完整 URL：取 hostname
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(host)) {
+    try {
+      host = new URL(host).hostname;
+    } catch {
+      return raw.trim();
+    }
+  } else {
+    host = host.split("/")[0].split("?")[0];
+  }
+  host = host.replace(/^[.]+/, "").replace(/^\*\./, "");
+  // 纯 IP / localhost / 非域名不处理
+  if (/^[\d.]+$/.test(host) || host === "localhost" || !host.includes(".")) {
+    return host;
+  }
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  if (MULTI_PART_SUFFIXES.has(lastTwo) && labels.length >= 3) {
+    return labels.slice(-3).join(".");
+  }
+  return lastTwo;
+}
+
 export default function Rules() {
   const { t } = useTranslation();
   const [rules, setRules] = useState<Rule[]>([]);
@@ -45,6 +84,15 @@ export default function Rules() {
     "direct",
     "block",
   ]);
+  // 【APP42 任务4.2】策略选择器弹窗：点击行末编辑图标或双击行打开
+  const [pickerIndex, setPickerIndex] = useState<number | null>(null);
+  const [pickerQuery, setPickerQuery] = useState("");
+
+  const filteredPolicies = useMemo(() => {
+    const q = pickerQuery.trim().toLowerCase();
+    if (!q) return policyOptions;
+    return policyOptions.filter((p) => p.toLowerCase().includes(q));
+  }, [policyOptions, pickerQuery]);
 
   useEffect(() => {
     loadRules();
@@ -95,7 +143,17 @@ export default function Rules() {
   };
 
   const handleAdd = () => {
-    const p = payload.trim();
+    let p = payload.trim();
+    if (!p) {
+      toast.error(t("proxies.rules.err.emptyPayload"));
+      return;
+    }
+    // 【APP42 任务4.2】域名类规则自动提取根域名：
+    // 用户粘贴 https://www.example.com/path 或 a.b.example.com 时，
+    // 统一落成 example.com，避免同一站点被拆成多条子域规则
+    if (kind === "DOMAIN" || kind === "DOMAIN-SUFFIX") {
+      p = extractRootDomain(p);
+    }
     if (!p) {
       toast.error(t("proxies.rules.err.emptyPayload"));
       return;
@@ -107,6 +165,18 @@ export default function Rules() {
     }
     setPayload("");
     persist([...custom, line]);
+  };
+
+  /// 弹窗内选择策略：替换当前行的第 3 段并整体保存
+  const applyPolicy = (nextPolicy: string) => {
+    if (pickerIndex == null) return;
+    const line = custom[pickerIndex];
+    const parts = line.split(",").map((s) => s.trim());
+    const next = `${parts[0]},${parts[1]},${nextPolicy}`;
+    setPickerIndex(null);
+    setPickerQuery("");
+    if (next === line) return;
+    persist(custom.map((l, i) => (i === pickerIndex ? next : l)));
   };
 
   const move = (index: number, delta: number) => {
@@ -176,6 +246,11 @@ export default function Rules() {
           <p className="text-[11px] text-gray-500 -mt-1">
             {t("proxies.rules.policyHint")}
           </p>
+          {(kind === "DOMAIN" || kind === "DOMAIN-SUFFIX") && (
+            <p className="text-[11px] text-gray-500 -mt-1">
+              {t("proxies.rules.rootHint")}
+            </p>
+          )}
 
           {custom.length > 0 && (
             <div className="mt-4 space-y-1.5 max-h-72 overflow-y-auto pr-1">
@@ -184,6 +259,10 @@ export default function Rules() {
                 return (
                   <div
                     key={`${line}-${index}`}
+                    onDoubleClick={() => {
+                      setPickerIndex(index);
+                      setPickerQuery("");
+                    }}
                     className="flex items-center gap-3 p-2.5 rounded-lg bg-surface-hover"
                   >
                     <span className="w-6 text-right text-[11px] text-gray-600 font-mono">
@@ -199,9 +278,18 @@ export default function Rules() {
                     <span className="flex-1 text-xs font-mono truncate">
                       {parts[1] ?? ""}
                     </span>
-                    <span className="text-[11px] text-accent">
+                    {/* 【APP42 任务4.2】点击策略徽章弹出策略选择器 */}
+                    <button
+                      onClick={() => {
+                        setPickerIndex(index);
+                        setPickerQuery("");
+                      }}
+                      className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-accent hover:bg-surface-card"
+                      title={t("proxies.rules.pickPolicy")}
+                    >
                       → {parts[2] ?? "direct"}
-                    </span>
+                      <Pencil size={10} />
+                    </button>
                     <button
                       onClick={() => move(index, -1)}
                       disabled={saving || index === 0}
@@ -282,6 +370,74 @@ export default function Rules() {
           )}
         </div>
       </ProGate>
+
+      {/* 【APP42 任务4.2】策略选择器：搜索过滤 + 一键应用 */}
+      {pickerIndex != null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => {
+            setPickerIndex(null);
+            setPickerQuery("");
+          }}
+        >
+          <div
+            className="flex max-h-[70vh] w-full max-w-sm flex-col rounded-xl border border-border bg-surface-card p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">
+                {t("proxies.rules.pickPolicy")}
+                <span className="ml-2 font-mono text-[11px] text-gray-500">
+                  {custom[pickerIndex]?.split(",")[1]}
+                </span>
+              </h3>
+              <button
+                onClick={() => {
+                  setPickerIndex(null);
+                  setPickerQuery("");
+                }}
+                className="rounded p-1 text-gray-400 hover:text-gray-100"
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5">
+              <Search size={13} className="text-gray-500" />
+              <input
+                autoFocus
+                value={pickerQuery}
+                onChange={(e) => setPickerQuery(e.target.value)}
+                placeholder={t("proxies.rules.searchPolicy")}
+                className="flex-1 bg-transparent text-sm outline-none"
+              />
+            </div>
+            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+              {filteredPolicies.length === 0 ? (
+                <p className="py-6 text-center text-xs text-gray-500">
+                  {t("proxies.rules.noPolicy")}
+                </p>
+              ) : (
+                filteredPolicies.map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => applyPolicy(p)}
+                    className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-surface-hover ${
+                      p === custom[pickerIndex]?.split(",")[2]?.trim()
+                        ? "text-accent"
+                        : "text-gray-300"
+                    }`}
+                  >
+                    <span className="truncate font-mono">{p}</span>
+                    {p === custom[pickerIndex]?.split(",")[2]?.trim() && (
+                      <span className="text-[10px]">{t("proxies.rules.currentPolicy")}</span>
+                    )}
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

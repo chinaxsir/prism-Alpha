@@ -28,6 +28,9 @@ const zh: Record<string, string> = {
   "sub.disabled": "订阅已停用",
   "sub.enabled": "订阅已启用",
   "sub.deleted": "订阅已删除",
+  "sub.namePlaceholder": "备注名（可选）",
+  "sub.rename": "重命名",
+  "sub.renamed": "备注名已更新",
 };
 
 const en: Record<string, string> = {
@@ -57,6 +60,9 @@ const en: Record<string, string> = {
   "sub.disabled": "Subscription disabled",
   "sub.enabled": "Subscription enabled",
   "sub.deleted": "Subscription deleted",
+  "sub.namePlaceholder": "Name (optional)",
+  "sub.rename": "Rename",
+  "sub.renamed": "Subscription renamed",
 };
 
 export default { zh, en };

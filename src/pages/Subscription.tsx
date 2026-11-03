@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { RefreshCw, Rss, Trash2 } from "lucide-react";
+import { RefreshCw, Rss, Trash2, Pencil, Check, X } from "lucide-react";
 
 import {
   deleteSubscription,
   listSubscriptions,
+  renameSubscription,
   toggleSubscription,
   updateSubscription,
   type SubscriptionRecord,
@@ -39,9 +40,14 @@ export default function Subscription() {
     () => useCoreStore.getState().subscriptions == null,
   );
   const [url, setUrl] = useState("");
+  // 【APP42 任务2.1】可选的订阅备注名（留空则展示机场域名）
+  const [name, setName] = useState("");
   const [adding, setAdding] = useState(false);
   const [updatingUrl, setUpdatingUrl] = useState<string | null>(null);
   const [confirmUrl, setConfirmUrl] = useState<string | null>(null);
+  // 行内重命名：正在编辑的 URL 与草稿值
+  const [editingUrl, setEditingUrl] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState("");
   const unlocked = useProStore((s) => s.unlocked);
 
   const load = useCallback(async () => {
@@ -81,15 +87,32 @@ export default function Subscription() {
     }
     setAdding(true);
     try {
-      await updateSubscription(trimmed);
+      await updateSubscription(trimmed, name.trim() || null);
       toast.success(t("sub.added"));
       setUrl("");
+      setName("");
       await load();
     } catch (e) {
       console.error("add subscription failed:", e);
       toast.error(String(e));
     } finally {
       setAdding(false);
+    }
+  };
+
+  /// 【APP42 任务2.1】行内重命名：本地立即生效，Pro 用户静默上行云端
+  const handleRename = async (record: SubscriptionRecord) => {
+    const next = draftName.trim();
+    setEditingUrl(null);
+    const prev = (record.name ?? "").trim();
+    if (next === prev) return;
+    try {
+      await renameSubscription(record.url, next);
+      toast.success(t("sub.renamed"));
+      await load();
+    } catch (e) {
+      console.error("rename subscription failed:", e);
+      toast.error(String(e));
     }
   };
 
@@ -141,6 +164,14 @@ export default function Subscription() {
         <div className="flex flex-col gap-3 md:flex-row">
           <input
             type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t("sub.namePlaceholder")}
+            maxLength={40}
+            className="w-full md:w-48 px-4 py-2 rounded-lg bg-surface-hover border border-border focus:border-accent outline-none text-sm"
+          />
+          <input
+            type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder={t("sub.urlPlaceholder")}
@@ -182,9 +213,52 @@ export default function Subscription() {
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium">
-                      {displayName(record)}
-                    </span>
+                    {editingUrl === record.url ? (
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          autoFocus
+                          value={draftName}
+                          onChange={(e) => setDraftName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") handleRename(record);
+                            if (e.key === "Escape") setEditingUrl(null);
+                          }}
+                          placeholder={t("sub.namePlaceholder")}
+                          maxLength={40}
+                          className="w-40 rounded-md border border-accent bg-background px-2 py-1 text-sm outline-none"
+                        />
+                        <button
+                          onClick={() => handleRename(record)}
+                          className="rounded p-1 text-latency-good hover:bg-surface-card"
+                          title={t("common.save")}
+                        >
+                          <Check size={13} />
+                        </button>
+                        <button
+                          onClick={() => setEditingUrl(null)}
+                          className="rounded p-1 text-gray-400 hover:bg-surface-card"
+                          title={t("common.cancel")}
+                        >
+                          <X size={13} />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="truncate text-sm font-medium">
+                          {displayName(record)}
+                        </span>
+                        <button
+                          onClick={() => {
+                            setEditingUrl(record.url);
+                            setDraftName(record.name ?? "");
+                          }}
+                          className="shrink-0 rounded p-1 text-gray-500 hover:bg-surface-card hover:text-accent"
+                          title={t("sub.rename")}
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      </>
+                    )}
                     {record.enabled && (
                       <span className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
                         {t("sub.badgeEnabled")}

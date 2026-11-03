@@ -1039,19 +1039,51 @@ pub async fn select_proxy(
 
 /// 下载订阅并写入 profile.yaml。
 /// 兼容两种返回：Clash YAML 明文、base64 包裹的内容。
+/// 【APP42 任务2.1】name 为可选的用户自定义备注名。
 #[tauri::command]
 pub async fn update_subscription(
     url: String,
+    name: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     refresh_subscription(&app, &state, &url).await?;
+    if let Some(n) = name.as_deref() {
+        crate::core::store::set_subscription_name(&state.data_dir, &url, Some(n))
+            .map_err(|e| format!("保存订阅备注名失败: {e}"))?;
+    }
     // Pro/买断：静默上报云端（其他设备下次对账时拉取）
     let app2 = app.clone();
     let url2 = url.clone();
+    let name2 = name.clone();
     tauri::async_runtime::spawn(async move {
-        super::super::core::sync_links::push_link(&app2, &url2, None).await;
+        super::super::core::sync_links::push_link(&app2, &url2, name2).await;
     });
+    Ok(())
+}
+
+/// 【APP42 任务2.1】重命名订阅备注（本地优先：立即落盘 + 广播事件；
+/// Pro 用户同时静默上报云端，其他设备下次对账时同步改名）
+#[tauri::command]
+pub async fn rename_subscription(
+    url: String,
+    name: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let found = crate::core::store::set_subscription_name(&state.data_dir, &url, Some(&name))
+        .map_err(|e| format!("保存订阅备注名失败: {e}"))?;
+    if !found {
+        return Err("订阅记录不存在".into());
+    }
+    let app2 = app.clone();
+    let url2 = url.clone();
+    let name2 = name.clone();
+    tauri::async_runtime::spawn(async move {
+        super::super::core::sync_links::push_link(&app2, &url2, Some(name2)).await;
+    });
+    use tauri::Emitter;
+    let _ = app.emit("subscriptions://changed", ());
     Ok(())
 }
 
@@ -1072,17 +1104,126 @@ pub(crate) async fn refresh_subscription(
         .then(|| state.settings.read().mixed_port);
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let local_proxy: Option<u16> = None;
-    let (mut text, quota) = fetch_remote_text(&url, local_proxy).await?;
+    let (mut text, mut quota) = fetch_remote_text(&url, local_proxy, None).await?;
 
     // base64 包裹：明文不含 YAML/JSON 结构时尝试解码
-    if !text.contains("proxies") && !text.trim_start().starts_with('{') {
-        if let Ok(decoded) = try_decode_base64(&text) {
-            text = decoded;
+    text = prepare_subscription_payload(text)?;
+
+    // 【APP42 任务1.1】首拉解析出 0 个节点（典型：面板按 UA 下发不同格式）
+    // → 用 v2rayN UA 再重试一次，成功则改用重试结果
+    if subscription_real_node_count(&text) == 0 {
+        tracing::warn!("订阅首拉解析出 0 节点，使用 v2rayN UA 重试一次: {url}");
+        let (retry_text, retry_quota) =
+            fetch_remote_text(&url, local_proxy, Some(SUBSCRIPTION_RETRY_UA)).await?;
+        let retry_text = prepare_subscription_payload(retry_text)?;
+        if subscription_real_node_count(&retry_text) > 0 {
+            text = retry_text;
+            quota = retry_quota;
+            tracing::info!("v2rayN UA 重试成功，节点数 {}", subscription_real_node_count(&text));
         }
     }
 
-    // URI 列表订阅（ss:// vmess:// vless:// trojan:// hysteria2:// tuic:// 分享链接）：
-    // 解析为节点并合成 Clash YAML，复用统一 pipeline，不再拒绝
+    // 落盘前校验：防止机场返回 HTML 错误页/限流提示等空内容覆盖本地可用订阅
+    if let Err(e) = crate::core::config_builder::validate_subscription_text(&text) {
+        return Err(e);
+    }
+
+    // 每条订阅独立 profile 文件（多订阅模型），路径由 URL 哈希派生
+    let profile_path = crate::core::store::profile_path(&state.data_dir, &url);
+    if let Some(parent) = profile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| sanitize_err(&e.to_string()))?;
+    }
+    std::fs::write(&profile_path, &text)
+        .map_err(|e| format!("写入订阅文件失败: {}", e))?;
+    tracing::info!("subscription saved to {}", profile_path.display());
+
+    // 持久化订阅记录（机场下发了 subscription-userinfo 则同步流量配额）
+    crate::core::store::upsert_subscription(&state.data_dir, &url)
+        .map_err(|e| format!("保存订阅记录失败: {e}"))?;
+    if let Some(quota) = &quota
+        && let Err(e) = crate::core::store::set_subscription_quota(&state.data_dir, &url, quota)
+    {
+        tracing::warn!("保存订阅流量配额失败: {e}");
+    }
+
+    // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
+    refresh_providers(state, &url, &text).await;
+
+    // 内核运行中：重建配置重启，新订阅即刻生效。
+    // APP34：移动端 VPN 运行期间严禁「停隧道 + 重启隧道」——iOS 扩展在
+    // 50MB Jetsam 红线内重启必然崩溃（表现为启动 10~15 秒后自动停止）。
+    // 此时只落盘订阅缓存并广播事件，新节点在下次正常启动时生效。
+    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+    if *state.status.read() == CoreStatus::Running {
+        if mobile {
+            tracing::info!("subscription updated, mobile running: skip tunnel restart");
+            crate::core::logger::info(
+                crate::core::logger::MOD_SUB,
+                "移动端 VPN 运行中，订阅缓存已更新，隧道保持不重启（下次启动生效）",
+            );
+        } else {
+            tracing::info!("subscription updated, restarting core");
+            restart_core(app, state).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 订阅下载候选 User-Agent（按兼容性从强到弱轮询）：
+/// 【APP42 任务1.1】首位改为 Clash.Meta/mihomo 组合标识：机场面板普遍
+/// 依赖 UA 判定客户端并下发 Clash YAML + subscription-userinfo 配额头；
+/// 只写 clash-verge 会被部分面板识别为旧版 Verge 而返回精简节点。
+/// 1. Clash.Meta/mihomo/Prism/sing-box 组合标识 —— 首选；
+/// 2. v2rayN —— 仅放行 v2ray 客户端 UA 的面板（首拉 0 节点时重试）；
+/// 3. Shadowrocket —— 屏蔽 Clash UA 的面板；
+/// 4. 通用浏览器 —— 只放行浏览器 UA 的兜底。
+const SUBSCRIPTION_UAS: [&str; 4] = [
+    "Clash.Meta/v1.18.3 mihomo/1.18.3 Prism/0.3.69 sing-box/1.11.3",
+    "v2rayN/6.45",
+    "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+];
+
+/// 首拉解析出 0 个节点时用于二次重试的 UA
+const SUBSCRIPTION_RETRY_UA: &str = "v2rayN/6.45";
+
+/// 单次订阅请求总超时。【APP15 任务3.1】12s → 30s：大订阅（数千行 YAML）
+/// 在弱网/CDN 回源慢时 12s 经常读到一半就断开，导致尾部截断的畸形 YAML。
+const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 清洗订阅 URL：剔除首尾空白与零宽/不可见控制字符。
+/// 从微信、网页复制的链接常带入 \u2060（Word Joiner）、\u200B..\u200F、
+/// \uFEFF（BOM）等，直接特征会被 reqwest 判为非法 URL 或触发面板 WAF。
+fn sanitize_subscription_url(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{2060}'
+                    | '\u{FEFF}'
+                    | '\u{00AD}'
+                    | '\u{180E}'
+            ) && !c.is_control()
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 【APP42 任务1.1】订阅内容归一化：
+/// base64 解包 + URI 列表（ss/vmess/vless/trojan/hysteria2/tuic/anytls…）
+/// → 统一 Clash YAML，供后续校验与落盘复用。
+fn prepare_subscription_payload(mut text: String) -> Result<String, String> {
+    // base64 包裹：明文不含 YAML/JSON 结构时尝试解码
+    if !text.contains("proxies") && !text.trim_start().starts_with('{')
+        && let Ok(decoded) = try_decode_base64(&text)
+    {
+        text = decoded;
+    }
+
+    // URI 列表订阅：解析为节点并合成 Clash YAML，复用统一 pipeline
     if crate::core::uri_parser::is_uri_list(&text) {
         let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
         // 机场提示（流量超限/到期等）优先展示，引导用户去机场面板处理
@@ -1144,86 +1285,26 @@ pub(crate) async fn refresh_subscription(
     if !text.contains("proxies") && !text.contains("{") {
         return Err("订阅内容无法识别：既不是 Clash YAML，也不是内核 JSON".into());
     }
-
-    // 落盘前校验：防止机场返回 HTML 错误页/限流提示等空内容覆盖本地可用订阅
-    if let Err(e) = crate::core::config_builder::validate_subscription_text(&text) {
-        return Err(e);
-    }
-
-    // 每条订阅独立 profile 文件（多订阅模型），路径由 URL 哈希派生
-    let profile_path = crate::core::store::profile_path(&state.data_dir, &url);
-    if let Some(parent) = profile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| sanitize_err(&e.to_string()))?;
-    }
-    std::fs::write(&profile_path, &text)
-        .map_err(|e| format!("写入订阅文件失败: {}", e))?;
-    tracing::info!("subscription saved to {}", profile_path.display());
-
-    // 持久化订阅记录（机场下发了 subscription-userinfo 则同步流量配额）
-    crate::core::store::upsert_subscription(&state.data_dir, &url)
-        .map_err(|e| format!("保存订阅记录失败: {e}"))?;
-    if let Some(quota) = &quota
-        && let Err(e) = crate::core::store::set_subscription_quota(&state.data_dir, &url, quota)
-    {
-        tracing::warn!("保存订阅流量配额失败: {e}");
-    }
-
-    // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
-    refresh_providers(state, &url, &text).await;
-
-    // 内核运行中：重建配置重启，新订阅即刻生效。
-    // APP34：移动端 VPN 运行期间严禁「停隧道 + 重启隧道」——iOS 扩展在
-    // 50MB Jetsam 红线内重启必然崩溃（表现为启动 10~15 秒后自动停止）。
-    // 此时只落盘订阅缓存并广播事件，新节点在下次正常启动时生效。
-    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
-    if *state.status.read() == CoreStatus::Running {
-        if mobile {
-            tracing::info!("subscription updated, mobile running: skip tunnel restart");
-            crate::core::logger::info(
-                crate::core::logger::MOD_SUB,
-                "移动端 VPN 运行中，订阅缓存已更新，隧道保持不重启（下次启动生效）",
-            );
-        } else {
-            tracing::info!("subscription updated, restarting core");
-            restart_core(app, state).await?;
-        }
-    }
-
-    Ok(())
+    Ok(text)
 }
 
-/// 订阅下载候选 User-Agent（按兼容性从强到弱轮询）：
-/// 1. clash-verge —— 绝大多数要求 Clash 格式的面板；
-/// 2. Shadowrocket —— 屏蔽 Clash UA 的面板；
-/// 3. 通用浏览器 —— 只放行浏览器 UA 的兜底。
-const SUBSCRIPTION_UAS: [&str; 3] = [
-    "clash-verge/v1.7.7",
-    "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-];
-
-/// 单次订阅请求总超时。【APP15 任务3.1】12s → 30s：大订阅（数千行 YAML）
-/// 在弱网/CDN 回源慢时 12s 经常读到一半就断开，导致尾部截断的畸形 YAML。
-const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// 清洗订阅 URL：剔除首尾空白与零宽/不可见控制字符。
-/// 从微信、网页复制的链接常带入 \u2060（Word Joiner）、\u200B..\u200F、
-/// \uFEFF（BOM）等，直接特征会被 reqwest 判为非法 URL 或触发面板 WAF。
-fn sanitize_subscription_url(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| {
-            !matches!(
-                *c,
-                '\u{200B}'..='\u{200F}'
-                    | '\u{2060}'
-                    | '\u{FEFF}'
-                    | '\u{00AD}'
-                    | '\u{180E}'
-            ) && !c.is_control()
+/// 统计 Clash YAML 中的真实节点数（排除机场提示用的 127.x / localhost 占位节点）
+fn subscription_real_node_count(text: &str) -> usize {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return 0;
+    };
+    value
+        .get("proxies")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter(|p| {
+                    let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("");
+                    !server.is_empty() && !server.starts_with("127.") && server != "localhost"
+                })
+                .count()
         })
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .unwrap_or(0)
 }
 
 /// 下载远程文本（订阅 / proxy-provider 共用）。
@@ -1234,6 +1315,7 @@ fn sanitize_subscription_url(raw: &str) -> String {
 async fn fetch_remote_text(
     url: &str,
     local_proxy: Option<u16>,
+    force_ua: Option<&str>,
 ) -> Result<(String, Option<crate::core::store::SubscriptionQuota>), String> {
     use futures_util::stream::{FuturesUnordered, StreamExt as _};
     use std::time::Instant;
@@ -1278,10 +1360,16 @@ async fn fetch_remote_text(
     };
 
     let mut attempts = FuturesUnordered::new();
-    for ua in SUBSCRIPTION_UAS {
+    // 【APP42 任务1.1】force_ua 非空时只发该 UA（首拉 0 节点的 v2rayN 重试）
+    let uas: Vec<&str> = match force_ua {
+        Some(ua) => vec![ua],
+        None => SUBSCRIPTION_UAS.to_vec(),
+    };
+    for ua in &uas {
         for force_v4 in [false, true] {
             let client = build_client(force_v4, ua)?;
             let target = url.clone();
+            let ua = *ua;
             attempts.push(async move { (force_v4, ua, try_fetch_text(&client, &target).await) });
         }
     }
@@ -1311,10 +1399,10 @@ async fn fetch_remote_text(
     if let Some(port) = local_proxy {
         let proxy = reqwest::Proxy::all(&format!("http://127.0.0.1:{port}"))
             .map_err(|e| format!("配置本地代理失败: {e}"))?;
-        for ua in SUBSCRIPTION_UAS {
+        for ua in &uas {
             let builder = reqwest::Client::builder()
                 .http1_only()
-                .user_agent(ua)
+                .user_agent(*ua)
                 .timeout(SUBSCRIPTION_TIMEOUT)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .danger_accept_invalid_certs(true)
@@ -1483,7 +1571,7 @@ async fn refresh_providers(state: &AppState, sub_url: &str, profile_text: &str) 
         let data_dir = state.data_dir.clone();
         tasks.push(
             async move {
-                match fetch_remote_text(&url, local_proxy).await {
+                match fetch_remote_text(&url, local_proxy, None).await {
                     Ok((text, _)) => {
                         let path =
                             crate::core::store::provider_path(&data_dir, sub_url, &name);

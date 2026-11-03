@@ -936,18 +936,11 @@ impl KernelApi {
         }
 
         let test_url = url.unwrap_or("http://cp.cloudflare.com/generate_204");
-        // 【APP37 任务3.1】单次超时 2200ms；Clash API 未就绪/404 的节点
-        // 自动回退主进程 TcpStream::connect(server:port) 1500ms 握手测速。
+        // 【APP42 任务1.3】单次超时 2200ms；100% 走内核真实出站测速。
+        // 严禁 TcpStream 回退：TUN 开启时主进程 TCP 握手命中 utun 栈，
+        // 会返回 2~4ms 虚假本地回环延迟，导致大量节点显示「绿色极快」实为瘫死。
         let timeout = timeout_ms.unwrap_or(2200).min(2200);
         let group_tag = name.to_string();
-        // TCP 回退所需的「节点名 → (server, port)」映射（回源订阅缓存；
-        // 不占用扩展进程内存）。app 缺失（后台基线测速）时跳过回退。
-        let endpoints = app
-            .map(|a| {
-                let st = a.state::<crate::core::state::AppState>();
-                collect_node_endpoints(&st.data_dir)
-            })
-            .unwrap_or_default();
 
         use futures_util::StreamExt;
         // 【APP37 任务3.1】每批 8 个节点滚动并发：既 100% 测完全部节点，
@@ -959,14 +952,19 @@ impl KernelApi {
                 batch.iter().cloned(),
             )
             .map(|member| {
-                let endpoint = format!("{}/proxies/{}/delay", self.base, member);
+                // 【APP42 任务1.3】节点名含 emoji/空格/中文，路径段必须显式
+                // 百分号编码，否则 reqwest 构建 URL 失败 → 误判节点不可用
+                let endpoint = format!(
+                    "{}/proxies/{}/delay",
+                    self.base,
+                    encode_path_segment(&member)
+                );
                 let req = self.client.get(&endpoint).query(&[
                     ("url", test_url.to_string()),
                     ("timeout", timeout.to_string()),
                 ]);
                 let app = app.cloned();
                 let group_tag = group_tag.clone();
-                let endpoints = &endpoints;
                 async move {
                     let delay = match req.send().await {
                         Ok(resp) if resp.status().is_success() => resp
@@ -982,16 +980,6 @@ impl KernelApi {
                             tracing::warn!("delay test {}: {}", member, e);
                             None
                         }
-                    };
-                    // Clash API 失败/未就绪 → 主进程 TCP 握手 1500ms 回退
-                    let delay = match delay {
-                        Some(d) => Some(d),
-                        None => match endpoints.get(&member) {
-                            Some((server, port)) => {
-                                tcp_handshake_delay_ms(server, *port, 1500).await
-                            }
-                            None => None,
-                        },
                     };
                     if let Some(app) = app {
                         let _ = app.emit(
@@ -1122,7 +1110,11 @@ impl KernelApi {
     pub async fn test_delay(&self, name: &str, url: &str, timeout_ms: u32) -> Option<u64> {
         let resp = self
             .client
-            .get(format!("{}/proxies/{}/delay", self.base, name))
+            .get(format!(
+                "{}/proxies/{}/delay",
+                self.base,
+                encode_path_segment(name)
+            ))
             .query(&[
                 ("url", url.to_string()),
                 ("timeout", timeout_ms.to_string()),
@@ -1460,8 +1452,40 @@ pub(crate) fn collect_node_endpoints(
     map
 }
 
-/// 【APP37 任务3】主进程 TCP 握手测速（不占用扩展进程内存），
-/// 超时/失败返回 None。go_aim 快筛回退与整组测速回退共用。
+/// 【APP42 任务1.3】URL 路径段百分号编码（保留 A-Za-z0-9-._~）。
+/// Clash API 节点名常含 emoji/空格/斜杠/中文，直接拼进 URL 会构建失败。
+pub(crate) fn encode_path_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 【APP42 任务1.3】RFC1918 / 回环 / 链路本地 / IPv6 ULA 判定
+fn is_private_lan_ip(server: &str) -> bool {
+    if let Ok(v4) = server.parse::<std::net::Ipv4Addr>() {
+        return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+    }
+    if let Ok(v6) = server.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback()
+            || v6.is_unicast_link_local()
+            || (v6.segments()[0] & 0xfe00) == 0xfc00;
+    }
+    false
+}
+
+/// 【APP42 任务1.3】主进程 TCP 握手测速（不占用扩展进程内存），
+/// 超时/失败返回 None。
+/// 注意：VPN 未运行时 TUN 不接管流量，此函数仅用于「启动前预选」；
+/// 若握手 < 8ms 且目标不是局域网地址，视为本机劫持/回环假阳性，直接判失败，
+/// 避免用户误以为节点可用。
+#[allow(dead_code)] // iOS 端不使用启动前 TCP 预选（仅桌面/Android 预选路径调用）
 pub(crate) async fn tcp_handshake_delay_ms(server: &str, port: u16, timeout_ms: u64) -> Option<u64> {
     use std::time::Instant;
     let start = Instant::now();
@@ -1471,7 +1495,15 @@ pub(crate) async fn tcp_handshake_delay_ms(server: &str, port: u16, timeout_ms: 
     )
     .await
     {
-        Ok(Ok(_stream)) => Some(start.elapsed().as_millis() as u64),
+        Ok(Ok(_stream)) => {
+            let elapsed = start.elapsed().as_millis() as u64;
+            if elapsed < 8 && !is_private_lan_ip(server) {
+                tracing::warn!("TCP 握手 {server}:{port} 仅 {elapsed}ms，判定为假阳性并丢弃");
+                None
+            } else {
+                Some(elapsed)
+            }
+        }
         _ => None,
     }
 }

@@ -336,6 +336,9 @@ pub(crate) struct ClashNode {
     grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     flow: Option<String>,
+    /// 【APP42 任务1.2】VLESS UDP 编码（Clients 面板常用 packet-encoding: xudp）
+    #[serde(default, rename = "packet-encoding")]
+    packet_encoding: Option<String>,
     #[serde(default, rename = "congestion-controller")]
     congestion_control: Option<String>,
     /// SS 插件 obfs / v2ray-plugin
@@ -401,6 +404,11 @@ struct WsOpts {
     path: Option<String>,
     #[serde(default)]
     headers: Option<std::collections::BTreeMap<String, String>>,
+    /// 【APP42 任务1.2】WS 0-RTT 早数据（CDN 面板常用 2048 + Sec-WebSocket-Protocol）
+    #[serde(default, rename = "max-early-data")]
+    max_early_data: Option<u64>,
+    #[serde(default, rename = "early-data-header-name")]
+    early_data_header_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1243,6 +1251,13 @@ pub fn build(
     if let Some(rule) = lan_dns_rule {
         dns_rules.insert(0, rule);
     }
+    // 【APP42 任务1.3】所有出站域名解析（含节点 server 域名、DoH 域名）
+    // 优先走系统 DNS（dns-direct，detour=direct），避免依赖 dns-remote
+    // 自身出境解析形成「先有鸡还是先有蛋」的循环，导致启动首包超时
+    dns_rules.insert(
+        0,
+        json!({ "outbound": "any", "server": "dns-direct" }),
+    );
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
     // 【APP-11B 任务3】默认锁定纯 UDP/TCP 53 的 223.5.5.5：
@@ -1275,6 +1290,14 @@ pub fn build(
         json!({
             "tag": "dns-local",
             "address": dns_local_addr,
+            "detour": "direct",
+            "strategy": "ipv4_only",
+        }),
+        // 【APP42 任务1.3】节点域名专用直连 DNS：address=local 使用系统解析器，
+        // 不参与 DoH/DoT 出境链路，专供 outbound:any 规则命中
+        json!({
+            "tag": "dns-direct",
+            "address": "local",
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
@@ -1837,8 +1860,21 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
             let mut o = json!({
                 "type": "vless",
                 "uuid": node.uuid.clone().unwrap_or_default(),
+                // 【APP42 任务1.2】xudp：机场面板普遍下发 packet-encoding: xudp，
+                // sing-box 默认空值会导致部分 UDP 应用探测失败
+                "packet_encoding": node
+                    .packet_encoding
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "xudp".into()),
             });
-            if let Some(flow) = &node.flow {
+            // 【APP42 任务1.2】flow 仅对 TCP 生效：ws/grpc/h2 节点携带
+            // xtls-rprx-vision 会被内核拒绝（tls: invalid flow）
+            let network = node.network.as_deref().unwrap_or("tcp");
+            if (network == "tcp" || network.is_empty())
+                && let Some(flow) = &node.flow
+                && !flow.is_empty()
+            {
                 o["flow"] = json!(flow);
             }
             merge(&mut o, &base);
@@ -1856,6 +1892,25 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
             });
             merge(&mut o, &base);
             // Trojan 始终 TLS
+            o["tls"] = tls_block(node);
+            let note = attach_transport(&mut o, node);
+            (o, note)
+        }
+
+        // 【APP42 任务1.2】AnyTLS（sing-box 1.10+ 原生支持）：密码 + 强制 TLS
+        "anytls" => {
+            let password = node.password.clone().unwrap_or_default();
+            if password.is_empty() {
+                return Some((
+                    Value::Null,
+                    Some(format!("节点「{}」anytls 缺少 password，已跳过", node.name)),
+                ));
+            }
+            let mut o = json!({
+                "type": "anytls",
+                "password": password,
+            });
+            merge(&mut o, &base);
             o["tls"] = tls_block(node);
             let note = attach_transport(&mut o, node);
             (o, note)
@@ -2075,18 +2130,27 @@ fn tls_block(node: &ClashNode) -> Value {
     {
         tls["alpn"] = json!(alpn);
     }
-    if let Some(fp) = &node.client_fingerprint
-        && !fp.is_empty()
-    {
+    // 【APP42 任务1.2】uTLS 指纹：显式 client-fingerprint 优先；Reality 节点
+    // 必须带 uTLS（sing-box 侧缺省指纹会导致 Reality 握手失败），缺省补 chrome
+    let reality_pk = node
+        .reality_opts
+        .as_ref()
+        .and_then(|r| r.public_key.as_deref())
+        .filter(|pk| !pk.is_empty());
+    let mut fingerprint = node.client_fingerprint.clone().filter(|f| !f.is_empty());
+    if fingerprint.is_none() && reality_pk.is_some() {
+        fingerprint = Some("chrome".into());
+    }
+    if let Some(fp) = &fingerprint {
         tls["utls"] = json!({ "enabled": true, "fingerprint": fp });
     }
     // Reality：sing-box 字段为 public_key / short_id；缺 public-key 不启用
-    if let Some(reality) = &node.reality_opts
-        && let Some(pk) = &reality.public_key
-        && !pk.is_empty()
-    {
+    if let Some(pk) = reality_pk {
         let mut r = json!({ "enabled": true, "public_key": pk });
-        if let Some(sid) = &reality.short_id
+        if let Some(sid) = node
+            .reality_opts
+            .as_ref()
+            .and_then(|x| x.short_id.as_deref())
             && !sid.is_empty()
         {
             r["short_id"] = json!(sid);
@@ -2107,6 +2171,19 @@ fn build_transport(node: &ClashNode) -> (Option<Value>, Option<String>) {
             });
             if let Some(headers) = node.ws_opts.as_ref().and_then(|w| w.headers.clone()) {
                 transport["headers"] = json!(headers);
+            }
+            // 【APP42 任务1.2】WS 0-RTT 早数据直通
+            if let Some(ws) = &node.ws_opts {
+                if let Some(med) = ws.max_early_data
+                    && med > 0
+                {
+                    transport["max_early_data"] = json!(med);
+                }
+                if let Some(name) = ws.early_data_header_name.as_deref()
+                    && !name.is_empty()
+                {
+                    transport["early_data_header_name"] = json!(name);
+                }
             }
             (Some(transport), None)
         }
@@ -2691,7 +2768,7 @@ rules:
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r.get("outbound").is_some())
+            .find(|r| r["outbound"].is_array())
             .expect("outbound DNS rule must exist");
         let tags: Vec<&str> = outbound_rule["outbound"]
             .as_array()
@@ -3557,5 +3634,123 @@ rules:
         assert!(!is_info_or_ad_node_name("香港 01 | 专线"));
         assert!(!is_info_or_ad_node_name("日本东京-流媒体解锁"));
         assert!(!is_info_or_ad_node_name("新加坡 03 x1.5倍率"));
+    }
+
+    /// 【APP42 任务1.2】VLESS + WS + Reality：
+    /// xudp 编码默认写入、flow 在 ws 传输下必须剔除、uTLS 缺省补 chrome、
+    /// WS 早数据（max-early-data / early-data-header-name）透传
+    #[test]
+    fn vless_ws_reality_normalized() {
+        let clash = r#"
+proxies:
+  - {name: VL-WS, type: vless, server: 1.2.3.4, port: 443, uuid: 11111111-2222-3333-4444-555555555555, network: ws, flow: xtls-rprx-vision, tls: true, sni: cdn.example.com, reality-opts: {public-key: PK, short-id: ab}, ws-opts: {path: /ws, max-early-data: 2048, early-data-header-name: Sec-WebSocket-Protocol}}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [VL-WS]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-vless-ws"),
+            &std::env::temp_dir().join("prism-cb-test-vless-ws/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let node = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "VL-WS")
+            .expect("vless outbound missing");
+        assert_eq!(node["packet_encoding"], "xudp");
+        assert!(node.get("flow").is_none(), "ws 传输不得携带 flow");
+        assert_eq!(node["tls"]["utls"]["fingerprint"], "chrome");
+        assert_eq!(node["tls"]["reality"]["public_key"], "PK");
+        assert_eq!(node["tls"]["reality"]["short_id"], "ab");
+        assert_eq!(node["transport"]["type"], "ws");
+        assert_eq!(node["transport"]["max_early_data"], 2048);
+        assert_eq!(
+            node["transport"]["early_data_header_name"],
+            "Sec-WebSocket-Protocol"
+        );
+    }
+
+    /// 【APP42 任务1.2】AnyTLS 节点构建：password + 强制 TLS + SNI
+    #[test]
+    fn anytls_node_built() {
+        let clash = r#"
+proxies:
+  - {name: AT-01, type: anytls, server: 5.6.7.8, port: 443, password: pw, sni: at.example.com}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [AT-01]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-anytls"),
+            &std::env::temp_dir().join("prism-cb-test-anytls/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let node = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "AT-01")
+            .expect("anytls outbound missing");
+        assert_eq!(node["type"], "anytls");
+        assert_eq!(node["password"], "pw");
+        assert_eq!(node["tls"]["enabled"], true);
+        assert_eq!(node["tls"]["server_name"], "at.example.com");
+    }
+
+    /// 【APP42 任务1.3】DNS 规则首位必须是 outbound:any → dns-direct，
+    /// 且存在 dns-direct（address=local、detour=direct）服务器
+    #[test]
+    fn dns_outbound_rule_first() {
+        let clash = r#"
+proxies:
+  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK1]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-dns"),
+            &std::env::temp_dir().join("prism-cb-test-dns/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let rules = built.config["dns"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["outbound"], "any");
+        assert_eq!(rules[0]["server"], "dns-direct");
+        let servers = built.config["dns"]["servers"].as_array().unwrap();
+        let direct = servers
+            .iter()
+            .find(|s| s["tag"] == "dns-direct")
+            .expect("dns-direct server missing");
+        assert_eq!(direct["address"], "local");
+        assert_eq!(direct["detour"], "direct");
     }
 }

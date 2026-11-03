@@ -454,6 +454,24 @@ pub fn set_subscription_enabled(
     Ok(true)
 }
 
+/// 【APP42 任务2.1】设置订阅备注名（空串/null 视为清除备注）；返回是否存在该记录
+pub fn set_subscription_name(
+    data_dir: &Path,
+    url: &str,
+    name: Option<&str>,
+) -> anyhow::Result<bool> {
+    let mut records = load_subscriptions(data_dir);
+    let Some(record) = records.iter_mut().find(|r| r.url == url) else {
+        return Ok(false);
+    };
+    record.name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| n.chars().take(100).collect());
+    write_subscriptions(data_dir, &records)?;
+    Ok(true)
+}
+
 /// 删除一条订阅记录（按 URL 匹配），返回是否有记录被移除
 pub fn delete_subscription(data_dir: &Path, url: &str) -> anyhow::Result<bool> {
     let mut records = load_subscriptions(data_dir);

@@ -23,6 +23,7 @@ pub fn is_uri_list(text: &str) -> bool {
             || l.starts_with("hysteria://")
             || l.starts_with("hy://")
             || l.starts_with("tuic://")
+            || l.starts_with("anytls://")
             || l.starts_with("socks5://")
             || l.starts_with("socks://")
     })
@@ -45,6 +46,7 @@ pub fn parse_line(line: &str) -> Result<Option<Value>> {
         "hysteria2" | "hy2" => parse_hysteria2(rest)?,
         "hysteria" | "hy" => parse_hysteria(rest)?,
         "tuic" => parse_tuic(rest)?,
+        "anytls" => parse_anytls(rest)?,
         "socks5" | "socks" => parse_socks(rest)?,
         _ => bail!("不支持的协议：{scheme}"),
     };
@@ -592,6 +594,43 @@ fn parse_tuic(rest: &str) -> Result<Value> {
     Ok(node)
 }
 
+/// anytls://password@host:port?sni=...&insecure=1&alpn=h2#name
+fn parse_anytls(rest: &str) -> Result<Value> {
+    let (addr_query, name) = rest.split_once('#').unwrap_or((rest, ""));
+    let (addr, query) = addr_query.split_once('?').unwrap_or((addr_query, ""));
+    let (password, hostport) = addr.rsplit_once('@').context("anytls 缺少 password@host")?;
+    let (server, port) = split_host_port(hostport)?;
+    let name = decode_name(name);
+
+    let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
+    let sni = params.get("sni").cloned().unwrap_or_default();
+    let insecure = params.get("insecure").cloned().unwrap_or_default();
+    let alpn = params.get("alpn").cloned().unwrap_or_default();
+    let fp = params.get("fp").cloned().unwrap_or_default();
+
+    let mut node = json!({
+        "name": name,
+        "type": "anytls",
+        "server": server,
+        "port": port,
+        "password": password,
+        "tls": true,
+    });
+    if !sni.is_empty() {
+        node["sni"] = json!(sni);
+    }
+    if !fp.is_empty() {
+        node["client-fingerprint"] = json!(fp);
+    }
+    if !alpn.is_empty() {
+        node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+    }
+    if insecure == "1" || insecure.eq_ignore_ascii_case("true") {
+        node["skip-cert-verify"] = json!(true);
+    }
+    Ok(node)
+}
+
 /// hysteria://host:port?auth=<password>&peer=<sni>&insecure=1#name
 /// （Hysteria 1 分享链接；与 hysteria2 的密码在 userinfo 不同，这里认证在 query）
 fn parse_hysteria(rest: &str) -> Result<Value> {
@@ -717,6 +756,20 @@ mod tests {
         let node = parse_line(raw).unwrap().unwrap();
         assert_eq!(node["type"], "hysteria");
         assert_eq!(node["password"], "pwd");
+    }
+
+    #[test]
+    fn parses_anytls() {
+        let raw = "anytls://pwd@at.example.com:443?sni=at.example.com&insecure=1&alpn=h2,http/1.1#at-node";
+        let node = parse_line(raw).unwrap().unwrap();
+        assert_eq!(node["type"], "anytls");
+        assert_eq!(node["server"], "at.example.com");
+        assert_eq!(node["port"], 443);
+        assert_eq!(node["password"], "pwd");
+        assert_eq!(node["sni"], "at.example.com");
+        assert_eq!(node["skip-cert-verify"], true);
+        assert_eq!(node["alpn"], json!(["h2", "http/1.1"]));
+        assert_eq!(node["name"], "at-node");
     }
 
     #[test]

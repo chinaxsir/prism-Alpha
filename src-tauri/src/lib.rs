@@ -256,6 +256,7 @@ pub fn run() {
             ipc::commands::set_outbound_mode,
             ipc::commands::select_proxy,
             ipc::commands::update_subscription,
+            ipc::commands::rename_subscription,
             ipc::commands::list_subscriptions,
             ipc::commands::get_cached_proxies,
             ipc::commands::toggle_subscription,

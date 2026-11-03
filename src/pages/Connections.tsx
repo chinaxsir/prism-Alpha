@@ -1,5 +1,16 @@
-import { useMemo, useRef, useState } from "react";
-import { Pause, Play, Trash2, X, XCircle } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
+  Copy,
+  Gauge,
+  Pause,
+  Play,
+  Trash2,
+  X,
+  XCircle,
+} from "lucide-react";
 
 import { closeAllConnections, closeConnection, getCustomRules, saveCustomRules } from "@/api/ipc";
 import { formatBytes } from "@/utils/format";
@@ -70,6 +81,38 @@ export default function Connections() {
       hour12: false,
     });
   };
+
+  // 【APP42 任务4.1】下行实时速度（全局 store，events.rs 每帧推送）
+  const downSpeed = useCoreStore((s) => s.downSpeed);
+  // 会话时长每秒跳动：连接本身不重绘，仅本页 tick 刷新
+  useEffect(() => {
+    const timer = setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const fmtDuration = (start?: string) => {
+    if (!start) return "—";
+    const ms = Date.now() - new Date(start).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return "—";
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+      : `${m}:${String(sec).padStart(2, "0")}`;
+  };
+
+  const copyTarget = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(t("proxies.conn.copied"));
+    } catch {
+      toast.error(t("proxies.conn.copyFailed"));
+    }
+  };
+
+  const activeCount = connections.filter((c) => c.active).length;
 
   const togglePause = () => {
     if (!paused) frozenRef.current = connections;
@@ -144,12 +187,53 @@ export default function Connections() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-400">
-            ↑ {formatBytes(totals.up)} / ↓ {formatBytes(totals.down)}
-          </span>
+    <div className="space-y-5">
+      {/* 【APP42 任务4.1】顶部统计卡：上行 / 下行 / 实时下行速度 / 活跃连接 */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard
+          icon={<ArrowUp size={15} />}
+          label={t("proxies.conn.statUp")}
+          value={formatBytes(totals.up)}
+          tone="text-latency-warn"
+        />
+        <StatCard
+          icon={<ArrowDown size={15} />}
+          label={t("proxies.conn.statDown")}
+          value={formatBytes(totals.down)}
+          tone="text-latency-good"
+        />
+        <StatCard
+          icon={<Gauge size={15} />}
+          label={t("proxies.conn.statSpeed")}
+          value={`${(downSpeed / 1024).toFixed(1)} KB/s`}
+          tone="text-accent"
+        />
+        <StatCard
+          icon={<Activity size={15} />}
+          label={t("proxies.conn.statActive")}
+          value={String(activeCount)}
+          tone="text-gray-200"
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* 筛选器 */}
+        <div className="flex gap-2">
+          {FILTERS.map(({ key, labelKey }) => (
+            <button
+              key={key}
+              onClick={() => setFilter(key)}
+              className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${
+                filter === key
+                  ? "bg-accent text-white"
+                  : "bg-surface-card text-gray-400 hover:text-gray-200"
+              }`}
+            >
+              {t(labelKey)}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
           <button
             onClick={togglePause}
             className="p-2 rounded-lg bg-surface-card hover:bg-surface-hover transition-colors"
@@ -174,115 +258,113 @@ export default function Connections() {
         </div>
       </div>
 
-      {/* 筛选器 */}
-      <div className="flex gap-2">
-        {FILTERS.map(({ key, labelKey }) => (
-          <button
-            key={key}
-            onClick={() => setFilter(key)}
-            className={`px-4 py-1.5 rounded-lg text-sm transition-colors ${
-              filter === key
-                ? "bg-accent text-white"
-                : "bg-surface-card text-gray-400 hover:text-gray-200"
-            }`}
-          >
-            {t(labelKey)}
-          </button>
-        ))}
-      </div>
-
-      {/* 连接表格 */}
-      <div className="bg-surface-card rounded-xl overflow-hidden overflow-x-auto">
-        <table className="w-full text-sm min-w-[800px]">
-          <thead>
-            <tr className="text-left text-xs text-gray-500 border-b border-border">
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.status")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.time")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.protocol")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.source")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.target")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.matchedRule")}</th>
-              <th className="px-4 py-3 font-medium">{t("proxies.conn.outbound")}</th>
-              <th className="px-4 py-3 font-medium text-right">
-                {t("proxies.conn.traffic")}
-              </th>
-              <th className="px-4 py-3 font-medium text-right">
-                {t("proxies.conn.action")}
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td colSpan={9} className="px-4 py-10 text-center text-gray-500">
-                  {paused ? t("proxies.conn.paused") : t("proxies.conn.empty")}
-                </td>
-              </tr>
-            ) : (
-              rows.map((r) => (
-                <tr
-                  key={r.id}
-                  className="border-b border-border last:border-0 hover:bg-surface-hover/50"
-                >
-                  <td className="px-4 py-2.5">
-                    <span
-                      className={`inline-block w-2 h-2 rounded-full ${
-                        r.active ? "bg-latency-good" : "bg-gray-600"
-                      }`}
-                    />
-                  </td>
-                  <td className="px-4 py-2.5 text-gray-400 font-mono text-xs">
-                    {fmtTime(r.start)}
-                  </td>
-                  <td className="px-4 py-2.5 uppercase text-xs">
-                    {r.network || "tcp"}
-                  </td>
-                  <td className="px-4 py-2.5 font-mono text-xs text-gray-400">
-                    {r.sourceIP}:{r.sourcePort}
-                  </td>
-                  <td className="px-4 py-2.5 font-mono text-xs">
-                    <button
-                      onClick={() => {
-                        const host = r.host || r.destinationIP;
-                        if (host) setRuleHost(host);
-                      }}
-                      title={t("proxies.conn.quickRule")}
-                      className="text-left transition-colors hover:text-accent"
-                    >
-                      {r.host || r.destinationIP || t("common.unknown")}
-                      <span className="text-gray-500">:{r.destinationPort}</span>
-                    </button>
-                  </td>
-                  <td className="px-4 py-2.5 text-xs text-gray-300">
-                    {r.rule
-                      ? `${r.rule}${r.rulePayload ? ` · ${r.rulePayload}` : ""}`
-                      : "—"}
-                  </td>
-                  <td className="px-4 py-2.5 text-xs text-accent">
-                    {r.chains?.[0] ?? "DIRECT"}
-                  </td>
-                  <td className="px-4 py-2.5 text-xs text-gray-400 text-right font-mono">
-                    {formatBytes(r.upload)} / {formatBytes(r.download)}
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    {r.active ? (
+      {/* 【APP42 任务4.1】卡片式连接列表 */}
+      {rows.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border bg-surface-card/60 py-12 text-center text-sm text-gray-500">
+          {paused ? t("proxies.conn.paused") : t("proxies.conn.empty")}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((r) => {
+            const host = r.host || r.destinationIP;
+            const target = host
+              ? `${host}${r.destinationPort ? `:${r.destinationPort}` : ""}`
+              : "";
+            const chain = (r.chains ?? []).slice().reverse().join(" → ") || "DIRECT";
+            return (
+              <div
+                key={r.id}
+                className="group rounded-xl border border-border bg-surface-card p-3 transition-colors hover:border-accent/40"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+                          r.active ? "bg-latency-good" : "bg-gray-600"
+                        }`}
+                      />
+                      <span
+                        className="truncate text-sm font-medium"
+                        title={host}
+                      >
+                        {host || t("common.unknown")}
+                      </span>
+                      {target && (
+                        <button
+                          onClick={() => copyTarget(target)}
+                          className="shrink-0 rounded p-0.5 text-gray-600 opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
+                          title={t("proxies.conn.copy")}
+                        >
+                          <Copy size={11} />
+                        </button>
+                      )}
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] text-gray-500">
+                      <span>
+                        {r.destinationIP || "—"}:{r.destinationPort || "—"}
+                      </span>
+                      <span className="text-gray-700">·</span>
+                      <span>
+                        {r.sourceIP}:{r.sourcePort}
+                      </span>
+                      <span className="text-gray-700">·</span>
+                      <span>{fmtTime(r.start)}</span>
+                      <span className="text-gray-700">·</span>
+                      <span>{fmtDuration(r.start)}</span>
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <div className="text-right font-mono text-[11px] tabular-nums">
+                      <div className="text-latency-warn">
+                        ↑ {formatBytes(r.upload)}
+                      </div>
+                      <div className="text-latency-good">
+                        ↓ {formatBytes(r.download)}
+                      </div>
+                    </div>
+                    {r.active && (
                       <button
                         onClick={() => handleClose(r.id)}
-                        className="p-1.5 rounded-md text-gray-500 hover:text-latency-bad hover:bg-surface-hover transition-colors"
+                        className="rounded-md p-1.5 text-gray-500 transition-colors hover:bg-surface-hover hover:text-latency-bad"
                         title={t("proxies.conn.closeThis")}
                       >
                         <X size={14} />
                       </button>
-                    ) : (
-                      <span className="text-gray-700 text-xs">—</span>
                     )}
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+                  </div>
+                </div>
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-border/60 pt-2">
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase ${
+                      (r.network || "tcp") === "udp"
+                        ? "bg-purple-500/15 text-purple-300"
+                        : "bg-sky-500/15 text-sky-300"
+                    }`}
+                  >
+                    {r.network || "tcp"}
+                  </span>
+                  <button
+                    onClick={() => {
+                      const h = r.host || r.destinationIP;
+                      if (h) setRuleHost(h);
+                    }}
+                    title={t("proxies.conn.quickRule")}
+                    className="max-w-[45%] truncate rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:text-accent"
+                  >
+                    {r.rule
+                      ? `${r.rule}${r.rulePayload ? ` · ${r.rulePayload}` : ""}`
+                      : "—"}
+                  </button>
+                  <span className="truncate text-[10px] text-accent">
+                    {chain}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* 快捷分流弹层：为选中连接的目标添加自定义规则 */}
       {ruleHost && (
@@ -323,6 +405,31 @@ export default function Connections() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/// 【APP42 任务4.1】顶部统计卡（大号数字 + 说明）
+function StatCard({
+  icon,
+  label,
+  value,
+  tone,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  tone: string;
+}) {
+  return (
+    <div className="card-sheen rounded-xl border border-border bg-surface-card p-3.5">
+      <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
+        {icon}
+        {label}
+      </div>
+      <div className={`mt-1.5 font-mono text-lg font-semibold tabular-nums ${tone}`}>
+        {value}
+      </div>
     </div>
   );
 }

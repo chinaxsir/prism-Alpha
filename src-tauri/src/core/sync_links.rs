@@ -323,6 +323,52 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
         changed = true;
     }
 
+    // 2.5 【APP42 任务2.2】本地优先对账：内容完整的已有订阅
+    // - 本地有备注名且与云端不一致 → 以本地上行为准（重命名跨设备同步）
+    // - 本地无备注名而云端有 → 采纳云端名（新装设备继承备注）
+    // - 超过 6 小时未更新 → 自动刷新节点（拉取列表即自动更新）
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for idx in 0..cloud.len() {
+        let link = cloud[idx].clone();
+        let Some(local_rec) = super::store::load_subscriptions(&data_dir)
+            .into_iter()
+            .find(|r| r.url == link.url)
+        else {
+            continue;
+        };
+        let local_name = local_rec.name.clone().filter(|n| !n.is_empty());
+        let cloud_name = link.name.clone().filter(|n| !n.is_empty());
+        if local_name.is_none() && cloud_name.is_some() {
+            set_local_name(&data_dir, &link.url, cloud_name.clone());
+        } else if local_name != cloud_name {
+            tracing::info!(
+                "订阅同步：本地上行重命名 {} -> {:?}",
+                link.url,
+                local_name
+            );
+            match api_put_link(&base, &key, &email, &link.url, local_name.as_deref()).await {
+                Ok(updated) => {
+                    cloud[idx] = updated;
+                }
+                Err(e) => log_sync_err("reconcile_rename", e),
+            }
+        }
+        // 云端已有且本地有记录 → 超过 6 小时自动刷新一次节点数据
+        if local_rec.updated_at > 0
+            && local_rec.enabled
+            && now.saturating_sub(local_rec.updated_at) > 6 * 3600
+        {
+            tracing::info!("订阅同步：内容超过 6 小时未更新，自动刷新 {}", link.url);
+            match crate::ipc::commands::refresh_subscription(app, &state, &link.url).await {
+                Ok(()) => {}
+                Err(e) => tracing::warn!("订阅同步：自动刷新失败 {}：{e}", link.url),
+            }
+        }
+    }
+
     // 3. 云端无、本地有、在基线中 → 其他设备已删除，静默删除本地
     for record in &local {
         if cloud_urls.contains(record.url.as_str()) || !mirror_urls.contains(record.url.as_str()) {

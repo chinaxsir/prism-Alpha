@@ -325,10 +325,6 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // 节点（148+ 个）必须 100% 纳入探测队列，由下方 4 槽位滚动并发
     // + 1.5s 快筛保证在不突破扩展内存上限的前提下跑完全程。
 
-    // 【APP37 任务3.2】快筛 TCP 回退所需的「节点名 → (server, port)」映射
-    //（Clash API /proxies 不含 server/port，必须回源订阅缓存）。
-    let endpoints = crate::core::kernel::collect_node_endpoints(&state.data_dir);
-
     // 3. 探针槽位可用性检测：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
     // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
@@ -354,7 +350,6 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     for slot in slots {
         let queue = queue.clone();
         let api = api.clone();
-        let endpoints = Arc::new(endpoints.clone());
         let task_app = app.clone();
         set.spawn(async move {
             let app = task_app;
@@ -390,7 +385,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 let next = queue.lock().await.pop_front();
                 let Some((name, _)) = next else { break };
                 let result =
-                    probe_node(&api, &client, &nr_client, slot, &name, &endpoints).await;
+                    probe_node(&api, &client, &nr_client, slot, &name).await;
                 done += 1;
                 // 实时缓存 + 推送前端徽章
                 // 注意：写锁 guard 必须严格限制在本作用域内，绝不可跨 await
@@ -486,28 +481,15 @@ async fn probe_node(
     nr_client: &reqwest::Client,
     slot: usize,
     name: &str,
-    endpoints: &std::collections::HashMap<String, (String, u16)>,
 ) -> AimNodeResult {
-    // 1. 【APP37 任务3.2】1.5s 极速连通性快筛：Clash API delay
-    //   （cp.cloudflare.com/generate_204，timeout=1500）；API 未就绪或
-    //    节点 404 时回退主进程 TcpStream::connect(server:port) 1200ms。
-    //    仍不通即死节点：直接记为不可达（delay=None、unlocked=[]），
-    //    跳过后续全部平台 HTTP 探测——148 节点总探测时间缩短约 70%，
-    //    无效内存分配减少 80%。
+    // 1. 【APP42 任务1.3】1.5s 极速连通性快筛：只走 Clash API delay
+    //   （cp.cloudflare.com/generate_204，timeout=1500）。TUN 开启时主进程
+    //    TCP 握手会命中 utun 栈返回 2~4ms 假延迟，故彻底移除 TCP 回退。
+    //    API 不通即死节点：直接记为不可达（delay=None、unlocked=[]），
+    //    跳过后续全部平台 HTTP 探测。
     let base_delay = match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
         Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
-        _ => {
-            let tcp_delay = match endpoints.get(name) {
-                Some((server, port)) => {
-                    crate::core::kernel::tcp_handshake_delay_ms(server, *port, 1200).await
-                }
-                None => None,
-            };
-            match tcp_delay {
-                Some(d) => d,
-                None => return dead_result(name),
-            }
-        }
+        _ => return dead_result(name),
     };
 
     // 2. 探针选择器切到该节点（独立组，绝不影响主选择器/GLOBAL）

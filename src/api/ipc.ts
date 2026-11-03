@@ -50,8 +50,12 @@ export const urlTest = (group: string) =>
 export const selectProxy = (group: string, name: string) =>
   invoke("select_proxy", { group, name });
 
-export const updateSubscription = (url: string) =>
-  invoke("update_subscription", { url });
+export const updateSubscription = (url: string, name?: string | null) =>
+  invoke("update_subscription", { url, name: name ?? null });
+
+/** 【APP42 任务2.1】重命名订阅备注（本地立即生效，Pro 用户静默上行云端） */
+export const renameSubscription = (url: string, name: string) =>
+  invoke<void>("rename_subscription", { url, name });
 
 export interface SubscriptionRecord {
   url: string;
