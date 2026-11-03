@@ -7,6 +7,7 @@ import {
   getCoreStatus,
   getProxyGroups,
   getCachedProxies,
+  testCachedProxies,
   selectProxy,
   urlTest,
   getGoAimStatus,
@@ -286,6 +287,33 @@ export default function Proxies() {
 
   const handleTest = async () => {
     if (testing) return;
+    // 【APP44 任务1.3】内核未运行：走 DoH + TCP 真实握手测速（不依赖 Clash API）
+    if (coreStatusRef.current !== "running") {
+      if (nodes.length === 0) {
+        toast.error(t("proxies.err.noNodesToTest"));
+        return;
+      }
+      setTesting(true);
+      setFailed(new Set());
+      try {
+        const res = (await testCachedProxies(3000)) ?? {};
+        const ok = new Set(
+          Object.entries(res)
+            .filter(([, d]) => d > 0)
+            .map(([n]) => n)
+        );
+        setFailed(new Set(nodes.map((n) => n.name).filter((n) => !ok.has(n))));
+        setDelays(
+          Object.fromEntries(Object.entries(res).filter(([, d]) => d > 0))
+        );
+      } catch (e) {
+        console.error("offline delay test failed:", e);
+        toast.error(t("proxies.err.testFailed", { error: String(e) }));
+      } finally {
+        setTesting(false);
+      }
+      return;
+    }
     // 测速前确保拿到最新主选择组名（事件触发时可能尚未同步到 state）
     const groupName = mainSelectorRef.current;
     if (!groupName) {
@@ -536,13 +564,9 @@ export default function Proxies() {
         </div>
         <button
           onClick={handleTest}
-          disabled={testing || coreStatus !== "running"}
+          disabled={testing || nodes.length === 0}
           className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-accent text-white text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          title={
-            coreStatus !== "running"
-              ? t("proxies.speedTestNeedCore")
-              : t("proxies.speedTest")
-          }
+          title={t("proxies.speedTest")}
         >
           <Zap size={13} className={testing ? "animate-pulse" : ""} />
           {testing ? t("proxies.speedTesting") : t("proxies.speedTest")}

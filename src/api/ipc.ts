@@ -156,6 +156,10 @@ export const getCachedProxies = () =>
     "get_cached_proxies"
   );
 
+/// 【APP44 任务1.3】内核未运行时的真实测速（DoH + TCP 握手），返回 name→delay
+export const testCachedProxies = (timeoutMs?: number) =>
+  invoke<Record<string, number>>("test_cached_proxies", { timeoutMs });
+
 export const getSettings = () => invoke<UserSettings>("get_settings");
 export const saveSettings = (settings: UserSettings) =>
   invoke("save_settings", { settings });

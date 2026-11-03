@@ -280,7 +280,7 @@ export default function Settings() {
   return (
     <div className="space-y-5 max-w-3xl">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">{t("settings.title")}</h1>
+        <h1 className="text-[22px] font-bold tracking-tight">{t("settings.title")}</h1>
         <button
           onClick={handleSave}
           className={clsx(

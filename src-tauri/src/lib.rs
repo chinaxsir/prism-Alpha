@@ -259,6 +259,7 @@ pub fn run() {
             ipc::commands::rename_subscription,
             ipc::commands::list_subscriptions,
             ipc::commands::get_cached_proxies,
+            ipc::commands::test_cached_proxies,
             ipc::commands::toggle_subscription,
             ipc::commands::delete_subscription,
             ipc::commands::get_custom_rules,

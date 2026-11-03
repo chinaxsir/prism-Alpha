@@ -11,50 +11,54 @@
 [data-theme="light"] {
   color-scheme: light;
 
-  --surface: 242 244 248; /* #F2F4F8 浅灰底 */
-  --surface-card: 255 255 255; /* #FFFFFF 卡片 */
-  --surface-elevated: 248 250 252; /* #F8FAFC 卡片内嵌层 / 输入框 */
-  --surface-hover: 238 241 246; /* #EEF1F6 悬停 */
-  --border: 15 23 42; /* rgba(15,23,42,.07) */
+  /* 【APP44 任务4】对齐 Surge 浅色：系统分组灰底 + 纯白卡片 + 胶囊浅灰 */
+  --surface: 242 242 247; /* #F2F2F7 */
+  --surface-card: 255 255 255; /* #FFFFFF */
+  --surface-elevated: 239 239 244; /* #EFEFF4 */
+  --surface-hover: 233 233 238; /* #E9E9EE 悬停 */
+  --tabbar: 249 249 249; /* #F9F9F9 底部标签栏 */
+  --border: 60 60 67; /* rgba(60,60,67,.08) */
   --glass: 15 23 42;
-  --accent: 91 106 240; /* #5B6AF0 */
-  --accent-hover: 79 94 226;
+  --accent: 0 122 255; /* #007AFF */
+  --accent-hover: 0 102 214;
 
-  --text: 15 23 42; /* 主文本 #0F172A */
-  --text-secondary: 71 85 105; /* 次级 #475569 */
-  --text-muted: 148 163 184; /* 弱化 #94A3B8 */
+  --text: 0 0 0; /* 纯黑主文本 */
+  --text-secondary: 60 60 67;
+  --text-muted: 108 108 112; /* #6C6C70 */
 
-  --gray-100: 15 23 42; /* #0F172A */
-  --gray-200: 30 41 59;
-  --gray-300: 51 65 85;
-  --gray-400: 100 116 139; /* #64748B */
-  --gray-500: 148 163 184;
-  --gray-600: 203 213 225;
+  --gray-100: 0 0 0;
+  --gray-200: 28 28 30;
+  --gray-300: 60 60 67;
+  --gray-400: 108 108 112;
+  --gray-500: 142 142 147;
+  --gray-600: 174 174 178;
 }
 
 [data-theme="dark"],
 .dark {
   color-scheme: dark;
 
-  --surface: 11 15 25; /* #0B0F19 深空底 */
-  --surface-card: 21 28 44; /* #151C2C 卡片 */
-  --surface-elevated: 28 37 54; /* #1C2536 内嵌层 */
-  --surface-hover: 32 42 61; /* #202A3D 悬停 */
+  /* 【APP44 任务4】对齐 Surge 深色：纯黑底 + 高对比卡片 + 胶囊灰 */
+  --surface: 0 0 0; /* #000000 */
+  --surface-card: 28 28 30; /* #1C1C1E */
+  --surface-elevated: 44 44 46; /* #2C2C2E */
+  --surface-hover: 38 38 41; /* #262629 选中行 */
+  --tabbar: 18 18 18; /* #121212 底部标签栏 */
   --border: 255 255 255;
   --glass: 255 255 255;
-  --accent: 99 102 241; /* #6366f1 */
-  --accent-hover: 129 140 248; /* #818cf8 */
+  --accent: 10 132 255; /* #0A84FF */
+  --accent-hover: 64 156 255;
 
-  --text: 241 245 249; /* #F1F5F9 */
-  --text-secondary: 148 163 184; /* #94A3B8 */
-  --text-muted: 100 116 139; /* #64748B */
+  --text: 255 255 255;
+  --text-secondary: 174 174 178;
+  --text-muted: 142 142 147; /* #8E8E93 */
 
-  --gray-100: 248 250 252;
-  --gray-200: 226 232 240;
-  --gray-300: 203 213 225;
-  --gray-400: 148 163 184;
-  --gray-500: 100 116 139;
-  --gray-600: 71 85 105;
+  --gray-100: 255 255 255;
+  --gray-200: 235 235 240;
+  --gray-300: 200 200 205;
+  --gray-400: 152 152 157;
+  --gray-500: 120 120 125;
+  --gray-600: 90 90 95;
 }
 
 body {

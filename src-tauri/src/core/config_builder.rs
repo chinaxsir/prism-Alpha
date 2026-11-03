@@ -1293,11 +1293,12 @@ pub fn build(
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 【APP42 任务1.3】节点域名专用直连 DNS：address=local 使用系统解析器，
-        // 不参与 DoH/DoT 出境链路，专供 outbound:any 规则命中
+        // 【APP44 任务5】节点域名专用直连 DNS：明文 UDP 53 的 223.5.5.5，
+        // 经 direct 出站 + 扩展侧 default_interface 绑定物理网卡解析，
+        // 不依赖 dns-remote 出境，避免「先解析节点域名才能连节点」的死循环
         json!({
             "tag": "dns-direct",
-            "address": "local",
+            "address": "223.5.5.5",
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
@@ -3750,7 +3751,9 @@ rules:
             .iter()
             .find(|s| s["tag"] == "dns-direct")
             .expect("dns-direct server missing");
-        assert_eq!(direct["address"], "local");
+        // 【APP44 任务5】节点域名直连 DNS 固定 223.5.5.5（明文 UDP 53），
+        // 不再使用 address=local 系统解析器
+        assert_eq!(direct["address"], "223.5.5.5");
         assert_eq!(direct["detour"], "direct");
     }
 }

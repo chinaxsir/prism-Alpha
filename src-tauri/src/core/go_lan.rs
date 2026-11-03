@@ -388,12 +388,59 @@ pub fn split_profile_cidrs_for_on_demand(
 
 /// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4。
 /// 过滤 utun / tun / ppp / wg / loopback / 172.19.0.x / 169.254.x.x /
-/// WireGuard 虚拟地址 10.196.0.2。iOS/Android 由各自扩展侧实时判定，
-/// 此处返回空列表（不产生任何探测流量）。
+/// WireGuard 虚拟地址 10.196.0.2 与 fake-ip 198.18/15。
+/// 【APP44 任务6】iOS 主程序同样经 getifaddrs 枚举（Wi-Fi 优先）。
 pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    // 【APP44 任务6】iOS 主程序不再恒返回空：getifaddrs 枚举 en0（Wi-Fi）/
+    // pdp_ip0（蜂窝），保证设置页「局域网地址」展示真实内网 IP，而不是
+    // 198.18.x.x 的 fake-ip 或 utun 的 10.196.0.2。按 Wi-Fi > 有线 > 蜂窝排序。
     #[cfg(target_os = "ios")]
     {
-        return Vec::new();
+        use std::net::Ipv4Addr;
+        let mut found: Vec<(u8, Ipv4Addr)> = Vec::new();
+        unsafe {
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut head) == 0 {
+                let mut cur = head;
+                while !cur.is_null() {
+                    let ifa = &*cur;
+                    if !ifa.ifa_addr.is_null()
+                        && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET as i32
+                    {
+                        let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                            .to_string_lossy()
+                            .into_owned();
+                        let sin = ifa.ifa_addr as *const libc::sockaddr_in;
+                        let ip = Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
+                        let rank = if name == "en0" {
+                            0
+                        } else if name.starts_with("en") || name.starts_with("eth") {
+                            1
+                        } else if name.starts_with("pdp_ip") {
+                            3
+                        } else {
+                            9
+                        };
+                        if rank < 9 {
+                            found.push((rank, ip));
+                        }
+                    }
+                    cur = ifa.ifa_next;
+                }
+                libc::freeifaddrs(head);
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.octets().cmp(&b.1.octets())));
+        let mut out: Vec<Ipv4Addr> = Vec::new();
+        for (_, ip) in found {
+            if !is_usable_lan_ip(ip) {
+                continue;
+            }
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        return out;
     }
     #[cfg(not(target_os = "ios"))]
     {
@@ -483,11 +530,7 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
         }
         let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
         for ip in candidates {
-            let s = ip.to_string();
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
-                continue;
-            }
-            if s.starts_with("172.19.") || s == "10.196.0.2" {
+            if !is_usable_lan_ip(ip) {
                 continue;
             }
             if !out.contains(&ip) {
@@ -496,6 +539,30 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
         }
         out
     }
+}
+
+/// 【APP44 任务6】判定是否可作为「本机局域网地址」展示 / 用于 On-Demand 判定：
+/// - 排除 loopback / 未指定 / 169.254 链路本地；
+/// - 排除 TUN fake-ip 段 198.18.0.0/15 与容器段 172.19.0.0/16、WG 虚拟地址；
+/// - 只接受私网（10/8、172.16/12、192.168/16）与 CGNAT 100.64/10。
+fn is_usable_lan_ip(ip: std::net::Ipv4Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+        return false;
+    }
+    let o = ip.octets();
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return false;
+    }
+    if o[0] == 172 && o[1] == 19 {
+        return false;
+    }
+    if ip.to_string() == "10.196.0.2" {
+        return false;
+    }
+    o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
 }
 
 /// 【APP40 任务2】每个启用档案的运行时元数据（供 iOS 扩展侧 On-Demand 判定 /
@@ -2512,6 +2579,23 @@ mod tests {
         assert!(!ipv4_in_any_cidr("192.168.0.1".parse().unwrap(), &cidrs));
         assert!(!ipv4_in_any_cidr("8.8.8.8".parse().unwrap(), &cidrs));
         assert!(!ipv4_in_any_cidr("192.168.11.1".parse().unwrap(), &cidrs));
+    }
+
+    /// 【APP44 任务6】局域网地址白名单：FakeIP / TUN / 容器段 / 公网必须拒绝，
+    /// 只保留私网与 CGNAT（否则设置页会展示 198.18.x.x 这类假地址）
+    #[test]
+    fn test_lan_ip_filter() {
+        assert!(!is_usable_lan_ip("198.18.0.1".parse().unwrap()));
+        assert!(!is_usable_lan_ip("198.19.255.1".parse().unwrap()));
+        assert!(!is_usable_lan_ip("172.19.0.1".parse().unwrap()));
+        assert!(!is_usable_lan_ip("10.196.0.2".parse().unwrap()));
+        assert!(!is_usable_lan_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_usable_lan_ip("169.254.1.1".parse().unwrap()));
+        assert!(!is_usable_lan_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_usable_lan_ip("192.168.10.5".parse().unwrap()));
+        assert!(is_usable_lan_ip("10.1.8.23".parse().unwrap()));
+        assert!(is_usable_lan_ip("172.20.0.7".parse().unwrap()));
+        assert!(is_usable_lan_ip("100.64.0.8".parse().unwrap()));
     }
 
     /// 【APP40 任务1】检测目标严格支持 `IP:端口`；协议头缺省端口按 80/443。

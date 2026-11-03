@@ -1954,7 +1954,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // auto_detect_interface 保持 false（iOS 无 netlink）。
         var route = (root["route"] as? [String: Any]) ?? [:]
         route["auto_detect_interface"] = false
-        route.removeValue(forKey: "default_interface")
+        // 【APP44 任务5.2】恢复 route.default_interface 为当前物理网卡
+        // （en0 / pdp_ip0）：某些 DoH / 代理域名解析在 gVisor 下会从 utun
+        // 自身发出形成环回（DNS 解析失败 → 全部节点不可用）。出站级
+        // bind_interface 仍是主通道，这里只让「系统级兜底出站」有明确网卡。
+        if !physIfName.isEmpty {
+            route["default_interface"] = physIfName
+        } else {
+            route.removeValue(forKey: "default_interface")
+        }
         route["final"] = mainProxyTag
 
         var rules = (route["rules"] as? [[String: Any]]) ?? []

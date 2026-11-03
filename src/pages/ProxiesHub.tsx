@@ -42,7 +42,7 @@ export default function ProxiesHub() {
   return (
     <div className="space-y-6">
       {/* 顶部页面标题：保持干净，不放激活按钮（APP-7 任务1） */}
-      <h1 className="text-2xl font-bold">{t("nav.proxies")}</h1>
+      <h1 className="text-[22px] font-bold tracking-tight">{t("nav.proxies")}</h1>
 
       {/* 4 栏分段导航：Pro 专属项在未激活时置灰 + 锁图标 + disabled 静默禁用 */}
       <div className="flex rounded-lg border border-border bg-surface-hover p-1">

@@ -120,7 +120,10 @@ fn split_host_port(s: &str) -> Result<(String, u16)> {
 
 /// 解析 URI 尾部 #fragment 为 name（URL 解码 + UTF-8 字节还原）
 fn decode_name(frag: &str) -> String {
-    let decoded = urlencoding_decode(frag).unwrap_or_else(|| frag.to_string());
+    // 【APP44】先剔除 CR/LF/TAB 等控制空白，机场订阅若用 \r\n 分行且
+    // fragment 后残留 \r，会拼进节点名并参与 Base64/去重判断
+    let cleaned = frag.trim_matches(|c: char| c.is_ascii_whitespace());
+    let decoded = urlencoding_decode(cleaned).unwrap_or_else(|| cleaned.to_string());
     // 【APP-4 任务1】修复 UTF-8 被按 Latin-1/cp1252 逐字节解码导致的乱码：
     // 例如 `%E5%AE%B6%E5%AE%BD%E4%BC%98%E9%80%895`（家宽优选5）被旧代码
     // 按 `byte as char` 逐字节展开为 `å®¶å®½ä¼˜é€‰5`。这里把每个字符
@@ -201,14 +204,35 @@ fn parse_query(q: &str) -> Vec<(String, String)> {
         .filter(|p| !p.is_empty())
         .filter_map(|p| {
             let mut it = p.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or_default();
+            let k = it.next()?.trim();
+            let v = it.next().unwrap_or_default().trim();
             Some((
-                urlencoding_decode(k).unwrap_or_else(|| k.to_string()),
-                urlencoding_decode(v).unwrap_or_else(|| v.to_string()),
+                urlencoding_decode(k).unwrap_or_else(|| k.to_string()).trim().to_string(),
+                urlencoding_decode(v).unwrap_or_else(|| v.to_string()).trim().to_string(),
             ))
         })
         .collect()
+}
+
+/// 【APP44 任务5】自签证书 / 跳过证书校验参数识别。
+/// 各机场/客户端写法五花八门：insecure / allowInsecure / allow_insecure /
+/// skip-cert-verify，取值 1 / true / yes。此前 vless / trojan 完全忽略这些
+/// 参数，自签或 CDN 证书不匹配的节点会 TLS 握手失败而“连不上”。
+fn insecure_flag(params: &std::collections::HashMap<String, String>) -> bool {
+    let truthy = |v: &str| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    };
+    // 参数名大小写在不同机场并不统一（allowInsecure / allowinsecure），
+    // 统一转小写后匹配
+    params.iter().any(|(k, v)| {
+        matches!(
+            k.trim().to_ascii_lowercase().as_str(),
+            "insecure" | "allowinsecure" | "allow_insecure" | "skip-cert-verify" | "skipcertverify"
+        ) && truthy(v)
+    })
 }
 
 // ---------------- 各协议实现 ----------------
@@ -407,7 +431,15 @@ fn parse_vless(rest: &str) -> Result<Value> {
     }
 
     let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
-    let security = params.get("security").cloned().unwrap_or_else(|| "none".into());
+    let security = params
+        .get("security")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "none".into());
+    // 【APP44】部分面板用 tls=1 表示启用 TLS，security 缺省时补齐
+    let tls_by_flag = params
+        .get("tls")
+        .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned()).unwrap_or_default();
     let fp = params.get("fp").cloned().unwrap_or_default();
@@ -450,7 +482,7 @@ fn parse_vless(rest: &str) -> Result<Value> {
     if !flow.is_empty() {
         node["flow"] = json!(flow);
     }
-    if security == "tls" || security == "reality" {
+    if security == "tls" || security == "reality" || security == "xtls" || tls_by_flag {
         node["tls"] = json!(true);
         if !sni.is_empty() {
             node["sni"] = json!(sni);
@@ -464,6 +496,10 @@ fn parse_vless(rest: &str) -> Result<Value> {
     }
     if security == "reality" && !public_key.is_empty() {
         node["reality-opts"] = json!({ "public-key": public_key, "short-id": short_id });
+    }
+    // 【APP44 任务5】自签证书 / allowInsecure 显式放行，避免 TLS 握手失败
+    if insecure_flag(&params) {
+        node["skip-cert-verify"] = json!(true);
     }
 
     Ok(node)
@@ -520,6 +556,11 @@ fn parse_trojan(rest: &str) -> Result<Value> {
         node["network"] = json!("grpc");
         node["grpc-opts"] = json!({ "grpc-service-name": host });
     }
+    // 【APP44 任务5】trojan 默认走 TLS；allowInsecure / insecure 必须落到
+    // skip-cert-verify，否则自签证书节点握手失败（表现为全部节点不可用）
+    if insecure_flag(&params) {
+        node["skip-cert-verify"] = json!(true);
+    }
 
     Ok(node)
 }
@@ -536,7 +577,6 @@ fn parse_hysteria2(rest: &str) -> Result<Value> {
     let sni = params.get("sni").cloned().unwrap_or_default();
     let obfs = params.get("obfs").cloned().unwrap_or_default();
     let obfs_password = params.get("obfs-password").cloned().unwrap_or_default();
-    let insecure = params.get("insecure").cloned().unwrap_or_default();
 
     let mut node = json!({
         "name": name,
@@ -553,7 +593,7 @@ fn parse_hysteria2(rest: &str) -> Result<Value> {
         node["obfs"] = json!("salamander");
         node["obfs-password"] = json!(obfs_password);
     }
-    if insecure == "1" || insecure.eq_ignore_ascii_case("true") {
+    if insecure_flag(&params) {
         node["skip-cert-verify"] = json!(true);
     }
 
@@ -770,6 +810,55 @@ mod tests {
         assert_eq!(node["skip-cert-verify"], true);
         assert_eq!(node["alpn"], json!(["h2", "http/1.1"]));
         assert_eq!(node["name"], "at-node");
+    }
+
+    #[test]
+    fn parses_app44_uri_list_with_crlf_and_insecure() {
+        // 模拟真实机场订阅：1 条提示节点 + 14 条 vless + 4 条 trojan，CRLF 换行
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(
+            "vless://00000000-0000-0000-0000-000000000000@127.0.0.1:443?security=tls#剩余流量 50GB"
+                .to_string(),
+        );
+        for i in 0..14 {
+            let fp = if i % 2 == 0 { "&fp=chrome" } else { "" };
+            lines.push(format!(
+                "vless://11111111-1111-1111-1111-111111111111@v{i}.example.com:443?encryption=none&security=tls&sni=v{i}.example.com&flow=xtls-rprx-vision&type=ws&path=%2Fws&host=v{i}.example.com{fp}&allowInsecure=1#节点 {i}"
+            ));
+        }
+        for i in 0..4 {
+            lines.push(format!(
+                "trojan://pwd{i}@t{i}.example.com:443?security=tls&sni=t{i}.example.com&allowInsecure=1#Trojan-{i}"
+            ));
+        }
+        let (nodes, errors, notice) = parse_lines(&lines.join("\r\n"));
+        assert_eq!(nodes.len(), 18, "应解析 18 个真实节点: {errors:?}");
+        assert!(notice.is_some(), "127.0.0.1 提示节点应转为机场提示");
+        let vless: Vec<_> = nodes.iter().filter(|n| n["type"] == "vless").collect();
+        let trojan: Vec<_> = nodes.iter().filter(|n| n["type"] == "trojan").collect();
+        assert_eq!(vless.len(), 14);
+        assert_eq!(trojan.len(), 4);
+
+        let v0 = vless[0];
+        assert_eq!(v0["server"], "v0.example.com");
+        assert_eq!(v0["port"], 443);
+        assert_eq!(v0["tls"], true);
+        assert_eq!(v0["sni"], "v0.example.com");
+        assert_eq!(v0["client-fingerprint"], "chrome");
+        assert_eq!(v0["skip-cert-verify"], true);
+        assert_eq!(v0["flow"], "xtls-rprx-vision");
+        assert_eq!(v0["network"], "ws");
+        assert_eq!(v0["ws-opts"]["path"], "/ws");
+        // 未显式给 fp 的节点严禁自作主张补 utls 指纹
+        assert!(vless[1].get("client-fingerprint").is_none());
+
+        let t0 = trojan[0];
+        assert_eq!(t0["server"], "t0.example.com");
+        assert_eq!(t0["password"], "pwd0");
+        assert_eq!(t0["sni"], "t0.example.com");
+        // trojan 出站恒走 TLS（config_builder 侧无条件注入 tls 块），
+        // URI 层只需保证 allowInsecure 被识别
+        assert_eq!(t0["skip-cert-verify"], true);
     }
 
     #[test]

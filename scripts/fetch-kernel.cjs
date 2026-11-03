@@ -3,8 +3,9 @@
  * 下载 sing-box 内核并放置为 Tauri sidecar（src-tauri/binaries/，已 gitignore）。
  * 打包后随安装包分发，终端用户无需联网下载内核。
  *
- * 用法: node scripts/fetch-kernel.cjs [--force] [--geo-only]
+ * 用法: node scripts/fetch-kernel.cjs [--force] [--geo-only] [--target <rust-triplet>]
  *   --geo-only  只下载 geoip/geosite 数据库（iOS 内嵌内核场景，无需 sidecar）
+ *   --target    显式指定目标三元组（交叉构建；也可用 TAURI_ENV_TARGET_TRIPLE）
  */
 
 const fs = require("node:fs");
@@ -26,13 +27,64 @@ const TRIPLET_MAP = {
   "aarch64-unknown-linux-gnu": `sing-box-${KERNEL_VERSION}-linux-arm64.tar.gz`,
 };
 
+/** 【APP44 任务1】三元组别名归一化：CI / 本地脚本可能传入 cargo 简写或平台名，
+ *  统一映射到 sing-box 发行包对应的 Rust triple。
+ *  - 关键修复：macOS arm64 主机交叉构建 x86_64 时，绝不按 host 架构下载 */
+const TRIPLET_ALIASES = {
+  "x86_64-pc-windows-gnu": "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-gnu": "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-musl": "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl": "aarch64-unknown-linux-gnu",
+};
+
+function normalizeTriplet(raw) {
+  const key = String(raw || "").trim();
+  if (TRIPLET_ALIASES[key]) return TRIPLET_ALIASES[key];
+  // 裸平台名（macos / darwin / linux / windows）按本机架构补全，避免
+  // 在 Intel Mac 上误下载 arm64 包
+  const arm = process.arch === "arm64" || process.arch === "aarch64";
+  if (key === "macos" || key === "darwin") {
+    return arm ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
+  }
+  if (key === "linux") {
+    return arm ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu";
+  }
+  if (key === "windows") {
+    return arm ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+  }
+  return key;
+}
+
+function explicitTarget() {
+  // 优先级：--triplet / --target 参数 > TAURI_ENV_TARGET_TRIPLE（Tauri v2
+  // 交叉构建时注入）> PRISM_TARGET / CARGO_BUILD_TARGET
+  const argIdx = process.argv.findIndex(
+    (a) => a === "--triplet" || a === "--target",
+  );
+  return (
+    (argIdx !== -1 && process.argv[argIdx + 1]) ||
+    process.env.TAURI_ENV_TARGET_TRIPLE ||
+    process.env.PRISM_TARGET ||
+    process.env.CARGO_BUILD_TARGET ||
+    ""
+  );
+}
+
+function assetForTriplet(triplet) {
+  const asset = TRIPLET_MAP[triplet];
+  if (!asset) {
+    throw new Error(
+      `不支持的目标架构: ${triplet}；支持: ${Object.keys(TRIPLET_MAP).join(", ")}`,
+    );
+  }
+  return asset;
+}
+
 function targetInfo() {
-  const forcedIdx = process.argv.indexOf("--triplet");
-  if (forcedIdx !== -1 && process.argv[forcedIdx + 1]) {
-    const triplet = process.argv[forcedIdx + 1];
-    const asset = TRIPLET_MAP[triplet];
-    if (!asset) throw new Error(`--triplet 不支持: ${triplet}`);
-    return [triplet, asset];
+  const explicit = explicitTarget();
+  if (explicit) {
+    const triplet = normalizeTriplet(explicit);
+    return [triplet, assetForTriplet(triplet)];
   }
   const key = `${process.platform}-${process.arch}`;
   const map = {
@@ -45,7 +97,9 @@ function targetInfo() {
   };
   const triplet = map[key];
   if (!triplet) {
-    throw new Error(`不支持的平台: ${key}，请手动下载 sing-box 放入 src-tauri/binaries/`);
+    throw new Error(
+      `不支持的平台: ${key}，请用 --triplet 指定目标（如 aarch64-apple-darwin）`,
+    );
   }
   return [triplet, TRIPLET_MAP[triplet]];
 }
@@ -139,18 +193,8 @@ function findBinary(dir, exeSuffix) {
   throw new Error(`压缩包内未找到 ${want}`);
 }
 
-async function main() {
-  const force = process.argv.includes("--force");
-  const geoOnly = process.argv.includes("--geo-only");
-
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-
-  // 数据库与内核独立获取：内核已存在时也要保证数据库就位
-  await ensureGeoDbs(force);
-
-  if (geoOnly) return;
-
-  const [triplet, asset] = targetInfo();
+async function ensureKernel(triplet, force) {
+  const asset = assetForTriplet(triplet);
   const exeSuffix = triplet.includes("windows") ? ".exe" : "";
   const target = path.join(OUT_DIR, `sing-box-${triplet}${exeSuffix}`);
 
@@ -174,6 +218,30 @@ async function main() {
   } finally {
     fs.rmSync(stageDir, { recursive: true, force: true });
   }
+}
+
+async function main() {
+  const force = process.argv.includes("--force");
+  const geoOnly = process.argv.includes("--geo-only");
+
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  // 数据库与内核独立获取：内核已存在时也要保证数据库就位
+  await ensureGeoDbs(force);
+
+  if (geoOnly) return;
+
+  const explicit = explicitTarget();
+  // 【APP44 任务1】macOS 未显式指定目标时必须同时产出 arm64 与 x86_64
+  // 两个 sidecar，避免在 Apple Silicon 上交叉构建 x86_64 时报文件不存在
+  if (!explicit && process.platform === "darwin") {
+    await ensureKernel("aarch64-apple-darwin", force);
+    await ensureKernel("x86_64-apple-darwin", force);
+    return;
+  }
+
+  const [triplet] = targetInfo();
+  await ensureKernel(triplet, force);
 }
 
 main().catch((e) => {

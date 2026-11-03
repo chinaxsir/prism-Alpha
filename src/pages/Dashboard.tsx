@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity,
-  Cpu,
-  Gauge,
   Power,
   Globe,
   BarChart3,
@@ -50,7 +48,6 @@ import { useProStore } from "@/stores/pro";
 import { useTranslation } from "@/i18n";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
-import { isMobile } from "@/pro/gating";
 import { toast } from "@/components/ui/Toast";
 import OutboundModeSwitch from "@/components/OutboundModeSwitch";
 import GoLanModal from "@/components/GoLanModal";
@@ -73,7 +70,6 @@ export default function Dashboard() {
   const mode = useCoreStore((s) => s.mode);
   const upSpeed = useCoreStore((s) => s.upSpeed);
   const downSpeed = useCoreStore((s) => s.downSpeed);
-  const memoryUsage = useCoreStore((s) => s.memoryUsage);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
   const startedAtMs = useCoreStore((s) => s.startedAtMs);
   const traffic = useCoreStore((s) => s.traffic);
@@ -85,7 +81,6 @@ export default function Dashboard() {
   const setUptime = useCoreStore((s) => s.setUptime);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const mobile = isMobile();
   const navigate = useNavigate();
 
   // Pro 授权状态（APP-13 任务3：入口常驻，未激活时卡片整体置灰）
@@ -498,7 +493,7 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-5">
-      <h1 className="text-2xl font-bold">{t("dashboard.title")}</h1>
+      <h1 className="text-[22px] font-bold tracking-tight">{t("dashboard.title")}</h1>
 
       {/* 出站模式快捷切换（规则/全局/直连） */}
       <OutboundModeSwitch />
@@ -572,37 +567,29 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* 状态指标行（3 列） */}
-      <div className="grid grid-cols-3 gap-3">
-        <StatChip
-          icon={<Globe size={14} className="text-gray-400" />}
-          label={t("metric.currentNode")}
-          value={
-            running
-              ? currentNode || t("dashboard.noSelection")
-              : currentNode || nodes[0]?.name || "—"
-          }
-          onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
-          wrap
-        />
-        {mobile ? (
+      {/* 【APP44 任务3】状态指标行：当前节点（7/12）＋今日流量（5/12）。
+          删除「运行模式」独立卡片（顶部已连接副标题已展示），信息层级更聚焦 */}
+      <div className="grid grid-cols-12 gap-3">
+        <div className="col-span-12 md:col-span-7">
+          <StatChip
+            icon={<Globe size={14} className="text-gray-400" />}
+            label={t("metric.currentNode")}
+            value={
+              running
+                ? currentNode || t("dashboard.noSelection")
+                : currentNode || nodes[0]?.name || "—"
+            }
+            onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
+            wrap
+          />
+        </div>
+        <div className="col-span-12 md:col-span-5">
           <StatChip
             icon={<BarChart3 size={14} className="text-gray-400" />}
             label={t("metric.todayTraffic")}
             value={running ? formatBytes(todayBytes) : "—"}
           />
-        ) : (
-          <StatChip
-            icon={<Cpu size={14} className="text-gray-400" />}
-            label={t("metric.memoryUsage")}
-            value={running && memoryUsage > 0 ? formatBytes(memoryUsage) : "—"}
-          />
-        )}
-        <StatChip
-          icon={<Gauge size={14} className="text-gray-400" />}
-          label={t("metric.mode")}
-          value={modeLabel(mode)}
-        />
+        </div>
       </div>
 
       {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus）
@@ -859,7 +846,7 @@ function StatChip({
       onClick={onClick}
       role={onClick ? "button" : undefined}
       className={clsx(
-        "bg-surface-card rounded-xl p-3 border border-border",
+        "bg-surface-card rounded-xl p-4 border border-border",
         onClick && "cursor-pointer hover:border-accent/40 transition-colors"
       )}
     >
@@ -869,10 +856,10 @@ function StatChip({
         {icon}
         <span>{label}</span>
       </div>
-      <div className="mt-1 flex items-center gap-0.5 min-w-0">
+      <div className="mt-1.5 flex items-center gap-1 min-w-0">
         <span
           className={clsx(
-            "text-sm font-semibold tabular-nums text-gray-100",
+            "text-xl font-bold tabular-nums text-gray-100",
             wrap
               ? "break-all line-clamp-2 leading-snug"
               : "truncate"

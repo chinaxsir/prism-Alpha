@@ -115,7 +115,7 @@ export default function Analytics() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">{t("analytics.title")}</h1>
+        <h1 className="text-[22px] font-bold tracking-tight">{t("analytics.title")}</h1>
         {!running && (
           <span className="text-xs text-gray-500">{t("analytics.coreNotRunningHint")}</span>
         )}

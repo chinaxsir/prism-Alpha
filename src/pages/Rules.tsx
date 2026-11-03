@@ -55,9 +55,22 @@ export default function Rules() {
   const [pickerQuery, setPickerQuery] = useState("");
   // 【APP43 任务3】从连接 / 分析页选择域名或 IP 批量生成规则
   const [targetPickerOpen, setTargetPickerOpen] = useState(false);
+  // 【APP44】手动添加表单默认折叠，避免三行输入框把规则列表挤到首屏之外
+  const [formOpen, setFormOpen] = useState(false);
   const payloadRef = useRef<HTMLInputElement>(null);
   // 防重入：刷新按钮 / 保存后自动刷新 / 首次加载可能并发，避免重复 IPC
   const loadingRef = useRef(false);
+
+  // 【APP44】隐藏内核内部探测规则（GO-AIM-PROBE）：属于 Pro 自动优选探针，
+  // 对用户没有编辑价值，展示出来只会让规则表看起来杂乱
+  const visibleRules = useMemo(
+    () =>
+      rules.filter((r) => {
+        const target = `${r.proxy ?? ""} ${r.outbound ?? ""}`.toUpperCase();
+        return !target.includes("AIM");
+      }),
+    [rules]
+  );
 
   const filteredPolicies = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
@@ -202,7 +215,10 @@ export default function Rules() {
               </button>
               <button
                 type="button"
-                onClick={() => payloadRef.current?.focus()}
+                onClick={() => {
+                  setFormOpen((v) => !v);
+                  window.setTimeout(() => payloadRef.current?.focus(), 60);
+                }}
                 className="flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover"
               >
                 <Plus size={13} />
@@ -214,55 +230,59 @@ export default function Rules() {
             {t("proxies.rules.customDesc")}
           </p>
 
-          <div className="flex flex-col gap-2 md:flex-row">
-            <select
-              value={kind}
-              onChange={(e) => setKind(e.target.value)}
-              className="rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
-            >
-              {RULE_TYPES.map((rt) => (
-                <option key={rt} value={rt}>
-                  {rt}
-                </option>
-              ))}
-            </select>
-            <input
-              ref={payloadRef}
-              value={payload}
-              onChange={(e) => setPayload(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-              placeholder={t("proxies.rules.payloadPlaceholder")}
-              className="min-w-0 flex-1 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
-            />
-            <input
-              value={policy}
-              onChange={(e) => setPolicy(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-              list="rule-policy-options"
-              placeholder={t("proxies.rules.policyPlaceholder")}
-              className="min-w-0 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent md:w-56"
-            />
-            <datalist id="rule-policy-options">
-              {policyOptions.map((n) => (
-                <option key={n} value={n} />
-              ))}
-            </datalist>
-            <button
-              onClick={handleAdd}
-              disabled={saving}
-              className="flex items-center justify-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm hover:bg-accent-hover disabled:opacity-50"
-            >
-              <Plus size={15} />
-              {t("proxies.rules.add")}
-            </button>
-          </div>
-          <p className="text-[11px] text-gray-500 -mt-1">
-            {t("proxies.rules.policyHint")}
-          </p>
-          {(kind === "DOMAIN" || kind === "DOMAIN-SUFFIX") && (
-            <p className="text-[11px] text-gray-500 -mt-1">
-              {t("proxies.rules.rootHint")}
-            </p>
+          {formOpen && (
+            <>
+              <div className="flex flex-col gap-2 md:flex-row">
+                <select
+                  value={kind}
+                  onChange={(e) => setKind(e.target.value)}
+                  className="rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
+                >
+                  {RULE_TYPES.map((rt) => (
+                    <option key={rt} value={rt}>
+                      {rt}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  ref={payloadRef}
+                  value={payload}
+                  onChange={(e) => setPayload(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+                  placeholder={t("proxies.rules.payloadPlaceholder")}
+                  className="min-w-0 flex-1 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
+                />
+                <input
+                  value={policy}
+                  onChange={(e) => setPolicy(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+                  list="rule-policy-options"
+                  placeholder={t("proxies.rules.policyPlaceholder")}
+                  className="min-w-0 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent md:w-56"
+                />
+                <datalist id="rule-policy-options">
+                  {policyOptions.map((n) => (
+                    <option key={n} value={n} />
+                  ))}
+                </datalist>
+                <button
+                  onClick={handleAdd}
+                  disabled={saving}
+                  className="flex items-center justify-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm hover:bg-accent-hover disabled:opacity-50"
+                >
+                  <Plus size={15} />
+                  {t("proxies.rules.add")}
+                </button>
+              </div>
+              <p className="text-[11px] text-gray-500 -mt-1">
+                {t("proxies.rules.policyHint")}
+              </p>
+              {(kind === "DOMAIN" || kind === "DOMAIN-SUFFIX") && (
+                <p className="text-[11px] text-gray-500 -mt-1">
+                  {t("proxies.rules.rootHint")}
+                </p>
+              )}
+            </>
           )}
 
           {custom.length > 0 && (
@@ -335,7 +355,7 @@ export default function Rules() {
         <div className="bg-surface-card rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-base font-semibold">
-              {t("proxies.rules.effectiveTitle", { count: rules.length })}
+              {t("proxies.rules.effectiveTitle", { count: visibleRules.length })}
             </h2>
             <button
               onClick={loadRules}
@@ -350,13 +370,13 @@ export default function Rules() {
             <div className="flex justify-center py-8">
               <Spinner />
             </div>
-          ) : rules.length === 0 ? (
+          ) : visibleRules.length === 0 ? (
             <p className="text-gray-500 text-sm py-8 text-center">
               {t("proxies.rules.empty")}
             </p>
           ) : (
             <div className="space-y-1.5 max-h-[28rem] overflow-y-auto pr-1">
-              {rules.map((rule, index) => (
+              {visibleRules.map((rule, index) => (
                 <div
                   key={`${rule.type}-${rule.payload}-${index}`}
                   className="flex items-center gap-3 p-2.5 rounded-lg bg-surface-hover"

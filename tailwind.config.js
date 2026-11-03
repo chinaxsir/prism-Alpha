@@ -18,8 +18,9 @@ export default {
           hover: "rgb(var(--accent-hover) / <alpha-value>)",
         },
         // 自适应描边 / 玻璃层（浅色模式自动翻转为深色半透明）
-        border: "rgb(var(--border) / 0.07)",
-        "border-strong": "rgb(var(--border) / 0.14)",
+        border: "rgb(var(--border) / 0.08)",
+        "border-strong": "rgb(var(--border) / 0.16)",
+        tabbar: "rgb(var(--tabbar) / <alpha-value>)",
         glass: "rgb(var(--glass) / 0.05)",
         "glass-strong": "rgb(var(--glass) / 0.10)",
         latency: {

@@ -156,7 +156,7 @@ export default function Subscription() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{t("sub.title")}</h1>
+      <h1 className="text-[22px] font-bold tracking-tight">{t("sub.title")}</h1>
 
       {/* 添加订阅 */}
       <div className="bg-surface-card rounded-xl p-5">

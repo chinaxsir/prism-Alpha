@@ -1742,7 +1742,7 @@ fn count_profile_nodes(text: &str) -> Option<usize> {
 }
 
 /// 节点简表（内核未运行时从订阅缓存读取，供节点页预览）
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedProxyDto {
     pub name: String,
@@ -1759,6 +1759,11 @@ pub struct CachedProxyDto {
 pub async fn get_cached_proxies(
     state: State<'_, AppState>,
 ) -> Result<Vec<CachedProxyDto>, String> {
+    Ok(collect_cached_proxies(&state))
+}
+
+/// 【APP44 任务1.3】内核未运行时从订阅缓存读取节点列表（测速复用同一份解析）
+fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
     let records = crate::core::store::load_subscriptions(&state.data_dir);
     let mut out: Vec<CachedProxyDto> = Vec::new();
     for r in records {
@@ -1845,7 +1850,135 @@ pub async fn get_cached_proxies(
             }
         }
     }
-    Ok(out)
+    out
+}
+
+/// 【APP44 任务1.3】内核未运行时的真实测速：DoH / 系统 DNS 解析节点服务器
+/// 域名 → 过滤 FakeIP 与虚拟网段 → 真实 TCP 握手计时。
+/// 仅在 VPN 未运行时调用（TUN 开启时握手指向 utun，延迟全是假的）。
+#[tauri::command]
+pub async fn test_cached_proxies(
+    timeout_ms: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let nodes = collect_cached_proxies(&state);
+    if nodes.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let timeout = timeout_ms.unwrap_or(3000).clamp(1000, 5000);
+    use futures_util::StreamExt;
+    // 每批 8 个：测完全部节点，同时避免一次性开满 socket
+    const BATCH: usize = 8;
+    let mut map = serde_json::Map::new();
+    for batch in nodes.chunks(BATCH) {
+        let results: Vec<(String, Option<u64>)> =
+            futures_util::stream::iter(batch.iter().cloned())
+                .map(|n| async move {
+                    let delay = measure_offline_node_delay(&n.server, n.port, timeout).await;
+                    (n.name, delay)
+                })
+                .buffer_unordered(BATCH)
+                .collect()
+                .await;
+        for (name, delay) in results {
+            if let Some(d) = delay {
+                map.insert(name, serde_json::json!(d));
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// FakeIP / TUN / WireGuard 虚拟网段判定（测速解析结果必须经此过滤，
+/// 否则 198.18.x.x 会给出 2ms 假延迟）
+fn is_virtual_speedtest_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() {
+                return true;
+            }
+            let o = v4.octets();
+            (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 172 && o[1] == 19)
+                || (o[0] == 10 && o[1] == 196)
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+static SPEEDTEST_DOH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// 解析节点服务器的真实 IPv4：DoH（223.5.5.5）优先，失败回退系统 DNS
+async fn resolve_real_ipv4s(
+    server: &str,
+    port: u16,
+    _timeout_ms: u32,
+) -> Vec<std::net::Ipv4Addr> {
+    if let Ok(ip) = server.trim().parse::<std::net::Ipv4Addr>() {
+        return if is_virtual_speedtest_ip(std::net::IpAddr::V4(ip)) {
+            Vec::new()
+        } else {
+            vec![ip]
+        };
+    }
+    let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
+    let client = SPEEDTEST_DOH_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(2500))
+            .connect_timeout(std::time::Duration::from_millis(1500))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    if let Ok(resp) = client
+        .get("https://223.5.5.5/resolve")
+        .query(&[("name", server), ("type", "A")])
+        .send()
+        .await
+        && let Ok(json) = resp.json::<serde_json::Value>().await
+        && let Some(answers) = json.get("Answer").and_then(|a| a.as_array())
+    {
+        for a in answers {
+            if let Some(ip) = a
+                .get("data")
+                .and_then(|d| d.as_str())
+                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                && !is_virtual_speedtest_ip(std::net::IpAddr::V4(ip))
+                && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    if out.is_empty()
+        && let Ok(addrs) = tokio::net::lookup_host((server, port)).await
+    {
+        for addr in addrs {
+            if let std::net::IpAddr::V4(ip) = addr.ip()
+                && !is_virtual_speedtest_ip(addr.ip())
+                && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+async fn measure_offline_node_delay(server: &str, port: u16, timeout_ms: u32) -> Option<u64> {
+    let ips = resolve_real_ipv4s(server, port, timeout_ms).await;
+    for ip in ips.into_iter().take(4) {
+        let start = std::time::Instant::now();
+        let fut = tokio::net::TcpStream::connect(std::net::SocketAddr::from((ip, port)));
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms as u64),
+            fut,
+        )
+        .await
+        {
+            return Some(start.elapsed().as_millis().max(1) as u64);
+        }
+    }
+    None
 }
 
 /// 获取自定义规则（规则页编辑器；Clash 行格式，顺序即优先级）
@@ -2421,6 +2554,15 @@ pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, 
 /// 设置页「允许局域网连接」开启后展示给其他设备配置代理使用。
 #[tauri::command]
 pub async fn get_lan_ip() -> Result<Option<String>, String> {
+    // 【APP44 任务6】优先取物理网卡的真实内网 IPv4（iOS 同样经 getifaddrs
+    // 枚举 en0/pdp_ip0），避免 VPN 运行中 UDP 探测拿到 utun 的 10.196.0.2
+    // 或 fake-ip 198.18.x.x，设置页展示的「局域网地址」才可被其他设备使用。
+    if let Some(ip) = crate::core::go_lan::detect_physical_lan_ipv4s()
+        .into_iter()
+        .next()
+    {
+        return Ok(Some(ip.to_string()));
+    }
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     // 连接到一个公网地址（不会真实发包），让系统选择最佳出口网卡
