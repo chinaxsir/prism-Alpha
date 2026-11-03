@@ -38,7 +38,7 @@ pub struct AppCheckRequest {
     pub device_id: String,
 }
 
-/// 权威 runtime 感知对象（APP-7 任务2.2 §1.3）
+/// 权威 runtime 感知对象（client-buyout-version-management.md §2）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimePerception {
     #[serde(default)]
@@ -50,6 +50,19 @@ pub struct RuntimePerception {
     pub max_seats: Option<u32>,
     /// true=已绑定, false=已被官网解绑, null=请求未传 device_id（旧版）
     pub device_bound: Option<bool>,
+
+    // ---------- 买断版本范围（client-buyout-version-management.md §2.2）----------
+    /// 官网授权可覆盖的最新主版本号（如 4 表示买断 1~4 都有效）
+    #[serde(default)]
+    pub included_major: Option<u32>,
+    /// 当前 APP 主版本号（客户端按 CARGO_PKG_VERSION 拆）；可由服务端覆盖
+    #[serde(default)]
+    pub current_major: Option<u32>,
+    /// 当前 APP 是否在买断版本范围内：
+    /// - true 或 None → 正常；
+    /// - false → 超出买断范围，Pro 功能受限 + 弹升级引导，但 APP 继续可用。
+    #[serde(default)]
+    pub version_in_scope: Option<bool>,
 }
 
 /// check/heartbeat 响应
@@ -150,8 +163,10 @@ pub fn clear_revoke_reason(data_dir: &std::path::Path) {
 
 // ---------------- apply_runtime：授权级熔断 ----------------
 
-/// 根据权威 runtime 执行授权级熔断（APP-7 任务2.2 §3）。
-/// 与管控级阻断（allowed=false）独立——两者可能同时返回，各做各的事。
+/// 根据权威 runtime 执行授权级熔断 + 买断版本范围降级
+/// （client-runtime-perception.md §3 与 client-buyout-version-management.md §4 合并入口）。
+/// 返回 Some((revoked, message)) 表示发生了授权级动作；买断超出范围（不剥夺授权，
+/// 只弹升级引导）走独立的 buyout_upgrade 标志，由前端区分处理。
 pub fn apply_runtime(
     app: &AppHandle,
     state: &AppState,
@@ -165,6 +180,24 @@ pub fn apply_runtime(
         !runtime.subscription_active && runtime.plan.as_deref() != Some("team");
     let pro_revoked = is_unbound || is_expired || runtime.plan.is_none();
 
+    // ---------- 买断超出版本范围（不剥夺授权，只弹升级引导）----------
+    // 客户端兜底：若服务端没给 version_in_scope，则对比 current_major vs included_major
+    let plan_is_buyout = matches!(runtime.plan.as_deref(), Some("buyout") | Some("team"));
+    let in_scope = runtime.version_in_scope.unwrap_or_else(|| {
+        match (runtime.current_major, runtime.included_major) {
+            (Some(cur), Some(inc)) => cur <= inc,
+            _ => true, // 服务端没给 → 视为在范围内
+        }
+    });
+    let buyout_upgrade_hint = plan_is_buyout && !in_scope;
+
+    if buyout_upgrade_hint {
+        // 买断超出范围：Pro 功能仍可用，但弹一次升级引导；绝不剥夺授权。
+        emit_buyout_upgrade(app, runtime);
+        // 买断用户可能同时有解绑/订阅状态（罕见但可能），但版本范围超出是独立信号，
+        // 只弹引导不降级，让 apply_runtime 继续按下面逻辑处理真正的剥夺。
+    }
+
     if !pro_revoked {
         clear_revoke_reason(data_dir);
         sync_entitlement_from_runtime(state, runtime);
@@ -172,15 +205,12 @@ pub fn apply_runtime(
     }
 
     // IPA-3 任务2：解绑与到期必须是两个互斥的独立原因，严禁混用文案。
-    // 解绑优先判定——设备已不在绑定表时，订阅是否到期都不影响「设备已解绑」
-    // 这一事实，提示必须引导用户去官网重新激活而不是续费。
     let reason = if is_unbound {
         REVOKE_UNBOUND
     } else {
         REVOKE_EXPIRED
     };
     let (zh, en) = revoke_message(reason);
-    // 落盘原因：重启 App 后横幅仍能按 unbound / expired 精准还原
     persist_revoke_reason(data_dir, reason);
 
     let was_active = state
@@ -210,6 +240,35 @@ pub fn apply_runtime(
     }
 
     Some((true, zh.to_string()))
+}
+
+/// 广播 `buyout://upgrade`：买断用户超出版本范围时弹升级引导横幅；
+/// 与 revoked 互斥（版本超出不等于授权剥夺），基础 VPN + Pro 功能全部继续可用。
+pub fn emit_buyout_upgrade(app: &AppHandle, runtime: &RuntimePerception) {
+    let major = runtime.current_major.unwrap_or_else(|| {
+        env!("CARGO_PKG_VERSION")
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    });
+    let included = runtime.included_major.unwrap_or(0);
+    let zh = format!(
+        "您的 Prism 买断授权可覆盖至主版本 v{included}，当前 APP 已升级到 v{major}。Pro 功能继续可用，如需使用后续新版高级特性请前往官网续费。"
+    );
+    let en = format!(
+        "Your buyout covers up to v{included}. You are running v{major}. Pro features remain available. Visit our site to unlock future major versions."
+    );
+    let _ = app.emit(
+        "buyout://upgrade",
+        &serde_json::json!({
+            "current_major": major,
+            "included_major": included,
+            "version_in_scope": runtime.version_in_scope,
+            "zh": zh,
+            "en": en,
+        }),
+    );
 }
 
 // ---------------- 授权剥夺原因（IPA-3 任务2）----------------

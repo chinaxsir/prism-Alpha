@@ -256,6 +256,55 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         &go_cus_cfg,
     )
     .map_err(|e| sanitize_err(&e.to_string()))?;
+
+    // 【APP43 任务2】构建后校验是否存在至少一个「真实叶子节点」：
+    // 排除 direct/reject/block/dns/go-lan-* 内置/系统标签；订阅里全是
+    // info/ad 假节点（"剩余流量 100GB"、"节点名称 | 机场"）或机场占位
+    // 127.0.0.1 时，内核虽能启动但无节点可连——直接给用户明确友好提示，
+    // 不让他看到仪表盘一堆 0ms 或空白。
+    {
+        let real_count = built
+            .config
+            .get("outbounds")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|o| {
+                        let Some(tag) = o.get("tag").and_then(|v| v.as_str()) else {
+                            return false;
+                        };
+                        let Some(otype) = o.get("type").and_then(|v| v.as_str()) else {
+                            return false;
+                        };
+                        if matches!(otype, "direct" | "block" | "dns" | "oracle") {
+                            return false;
+                        }
+                        if tag.starts_with("go-lan")
+                            || tag.starts_with("go-lan-")
+                            || tag == "go-lan"
+                        {
+                            return false;
+                        }
+                        // 系统 DNS / 内置控制器出站
+                        if tag.starts_with("dns-")
+                            || tag == "dns-local"
+                            || tag == "dns-remote"
+                            || tag == "dns-direct"
+                            || tag.starts_with("ctrl-")
+                        {
+                            return false;
+                        }
+                        true
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if real_count == 0 {
+            return Err(
+                "当前订阅未解析到任何可连接的实际节点：可能是机场面板限流、订阅链接已失效，或返回了机场公告页。请在「订阅」页点击更新，成功后再启动内核。".into(),
+            );
+        }
+    }
     for warning in &built.warnings {
         tracing::warn!("config builder: {}", warning);
     }
@@ -531,13 +580,17 @@ async fn resolve_main_selector(api: &KernelApi, final_group: &str) -> Option<Str
     }
 }
 
-/// 【APP26 任务2.3】是否应执行「自动选最低延迟节点」：
-/// 仅当 Go AIM 未开启、且用户从未手动点选节点时成立（用户选择优先）。
+/// 【APP43 任务3】是否应执行「自动整组测速选最优节点」：
+/// 仅当 Go AIM 未开启、内核未运行中、且当前选中节点可能是废节点（手动纠偏后
+/// 会自动触发）——Pro 和非 Pro 均跑，不做「用户是否手动选过节点」的短路；
+/// 用户手动选点只是让 selected_node 立即切到目标节点，但后台整组测速依然跑：
+/// 一方面更新每个节点的实时延迟，另一方面如果所有节点均不可用则选出相对
+/// 最优（哪怕延迟大）自动兜底，避免仪表盘空白。
 fn should_auto_select(state: &AppState) -> bool {
     if state.settings.read().go_aim_enabled {
         return false;
     }
-    state.user_manually_selected_node.read().is_none()
+    true
 }
 
 /// 【APP33 任务3.1】selected_node 自愈：若当前选中节点为「剩余流量」等
@@ -694,25 +747,43 @@ async fn auto_select_fastest(
             .and_then(|p| p.as_object())
             .unwrap_or(&empty);
 
-        let best = delays
-            .as_object()
-            .into_iter()
-            .flatten()
-            // 【APP-10 任务2】大小写不敏感 + 中文"直连"统一过滤内置非代理出站
-            .filter(|(name, _)| {
-                !crate::core::config_builder::is_builtin_non_proxy_tag(name.as_str())
+        let members_all: Vec<String> = map
+            .get(group)
+            .and_then(|g| g.get("all"))
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
             })
-            .filter(|(name, _)| {
+            .unwrap_or_default();
+        let real_leafs: Vec<String> = members_all
+            .into_iter()
+            .filter(|n| !crate::core::config_builder::is_builtin_non_proxy_tag(n.as_str()))
+            .filter(|n| {
                 let kind = map
-                    .get(*name)
+                    .get(n)
                     .and_then(|e| e.get("type"))
                     .and_then(|t| t.as_str())
                     .unwrap_or_default();
                 !GROUP_TYPES.contains(&kind)
             })
+            .collect();
+
+        // 全量跑完，按延迟升序；全部 null 时兜底选第一个真实叶子节点，避免仪表盘空白
+        let mut ranked: Vec<(String, u64)> = delays
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| real_leafs.contains(name))
             .filter_map(|(name, delay)| delay.as_u64().map(|d| (name.clone(), d)))
-            .min_by_key(|(_, d)| *d)
-            .map(|(name, _)| name);
+            .collect();
+        ranked.sort_by_key(|(_, d)| *d);
+
+        let best = ranked
+            .first()
+            .map(|(n, _)| n.clone())
+            .or_else(|| real_leafs.first().cloned());
 
         if let Some(best) = &best {
             api.select_proxy(group, best).await?;
