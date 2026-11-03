@@ -287,7 +287,7 @@ export default function LogViewerModal({
                     <div className="flex items-center gap-1.5">
                       <span
                         className={clsx(
-                          "rounded px-1.5 py-0.5 text-[10px] font-semibold",
+                          "rounded px-1.5 py-0.5 text-[11px] font-semibold",
                           levelColor(e.level),
                         )}
                       >
@@ -295,14 +295,14 @@ export default function LogViewerModal({
                       </span>
                       <span
                         className={clsx(
-                          "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                          "rounded px-1.5 py-0.5 text-[11px] font-medium",
                           moduleBadge(e.module),
                         )}
                       >
                         {e.module}
                       </span>
                     </div>
-                    <span className="shrink-0 font-mono text-[10px] text-gray-500">
+                    <span className="shrink-0 font-mono text-[11px] text-gray-500">
                       {shortTs}
                     </span>
                   </div>

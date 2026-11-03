@@ -922,7 +922,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                   placeholder="10.195.0.2/32"
                   className="w-full rounded-md border border-border bg-surface px-2 py-1.5 font-mono text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
                 />
-                <span className="mt-1 block text-[10px] leading-4 text-gray-500">
+                <span className="mt-1 block text-[11px] leading-4 text-gray-500">
                   {t("goLan.localIpHint")}
                 </span>
               </label>
@@ -1044,7 +1044,7 @@ export default function GoLanModal({ open, onClose }: Props) {
               onChange={(v) => patch({ bypassOnLocalLan: v })}
             />
           </div>
-          <p className="mt-1 text-[10px] leading-4 text-gray-500">
+          <p className="mt-1 text-[11px] leading-4 text-gray-500">
             {t("goLan.bypassHint")}
           </p>
         </div>

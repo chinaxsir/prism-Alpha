@@ -243,7 +243,7 @@ function AggCard({
                   <span className="truncate text-gray-300" title={key}>
                     {key}
                     {sub ? (
-                      <span className="ml-2 text-[10px] text-gray-500">{sub}</span>
+                      <span className="ml-2 text-[11px] text-gray-500">{sub}</span>
                     ) : null}
                   </span>
                   <span className="shrink-0 pl-3 text-gray-500 font-mono tabular-nums">

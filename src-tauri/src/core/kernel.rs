@@ -571,6 +571,49 @@ pub async fn try_reattach_running_kernel(
     true
 }
 
+/// 【APP43 任务2.2】状态自检与自动恢复：主 APP 被用户划掉/系统强杀后，
+/// 系统级 VPN 隧道（iOS NEPacketTunnelProvider）仍在转发流量、状态栏
+/// 仍有 VPN 图标，而重开 APP 时 Rust 侧 AppState 全新初始化为 Stopped。
+/// 每次状态轮询/启动前调用本函数，发现隧道或内核 API 仍在位就直接认领，
+/// 恢复「已连接」状态、计时器与流量统计，用户无需再点启动（也不报错）。
+///
+/// 返回 true 表示当前（或恢复后）处于运行状态。
+pub async fn sync_or_recover_running_vpn(
+    app: &AppHandle,
+    state: &crate::core::state::AppState,
+) -> bool {
+    if *state.status.read() != crate::core::state::CoreStatus::Stopped {
+        return true;
+    }
+    // 探活节流：3s 内只探测一次（前端状态轮询 ~1s/次，避免重复 I/O 与
+    // Swift 侧 loadAllFromPreferences 的 400ms 阻塞被连续触发）。
+    // 失败后下一轮仍会重试，保证「VPN 稍后才起来」也能自动接管。
+    static REATTACH_LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let last = REATTACH_LAST.get_or_init(|| Mutex::new(None));
+    {
+        let guard = last.lock();
+        if let Some(at) = *guard
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            return false;
+        }
+    }
+    // iOS：系统 VPN 会话不在 connected/connecting 时一定没在运行，
+    // 先行短路，避免每次都去读 config.json + 打内核 API。
+    #[cfg(target_os = "ios")]
+    if !crate::platform::ios::vpn_is_connected() {
+        *last.lock() = Some(std::time::Instant::now());
+        return false;
+    }
+    let recovered =
+        try_reattach_running_kernel(app, state).await;
+    *last.lock() = Some(std::time::Instant::now());
+    if recovered {
+        tracing::info!("[Kernel] 检测到系统 VPN 隧道仍在运行，已自动接管并恢复代理连接状态");
+    }
+    recovered
+}
+
 /// 静态校验待应用的配置：sing-box check -c <path>。
 /// 重启前调用——校验失败时旧内核保留，网络不中断。
 /// iOS/Android 上无法 spawn 子进程，改为调用内嵌 FFI 的 PrismKernelCheck（解析+构建后关闭）。
@@ -815,35 +858,53 @@ pub fn current_kernel_pid() -> Option<u32> {
     *pid_store().lock()
 }
 
+/// 【APP43 任务1.1】全进程复用的 HTTP 客户端：
+/// 每次 `KernelApi::new` 都 `Client::builder().build()` 会重新初始化整套
+/// TLS/连接池，切页高频轮询（连接/规则/状态）时不断申请系统资源，是
+/// IPC 响应变慢直至“整机卡死”的重要原因。鉴权头改为逐请求 `bearer_auth`，
+/// 这样同一个客户端可安全复用于不同 secret 的内核实例。
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn shared_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(800))
+            .timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
 /// 内核 API 客户端（与 external-controller 通信）
 #[derive(Clone)]
 pub struct KernelApi {
     base: String,
-    client: reqwest::Client,
+    secret: String,
 }
 
 impl KernelApi {
     pub fn new(api_addr: &str, api_secret: &str) -> Self {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-        if !api_secret.is_empty() {
-            let mut headers = reqwest::header::HeaderMap::new();
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_secret}"))
-            {
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-            }
-            builder = builder.default_headers(headers);
-        }
         Self {
             base: format!("http://{api_addr}"),
-            client: builder.build().expect("failed to build HTTP client"),
+            secret: api_secret.to_string(),
         }
     }
 
-    /// 获取版本信息
+    /// 附加 clash_api 鉴权（secret 为空时不加头）
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.secret.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.secret)
+        }
+    }
+
+    /// 获取版本信息（探活场景，300ms 内必须返回）
     pub async fn get_version(&self) -> Result<serde_json::Value> {
         Ok(self
-            .client
-            .get(format!("{}/version", self.base))
+            .authed(shared_client().get(format!("{}/version", self.base)))
+            .timeout(Duration::from_millis(300))
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -853,8 +914,7 @@ impl KernelApi {
     /// 获取单个代理/策略组详情（含 all 成员列表）
     pub async fn get_proxy(&self, name: &str) -> Result<serde_json::Value> {
         Ok(self
-            .client
-            .get(format!("{}/proxies/{}", self.base, name))
+            .authed(shared_client().get(format!("{}/proxies/{}", self.base, name)))
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -864,8 +924,7 @@ impl KernelApi {
     /// 获取所有代理节点和策略组
     pub async fn get_proxies(&self) -> Result<serde_json::Value> {
         Ok(self
-            .client
-            .get(format!("{}/proxies", self.base))
+            .authed(shared_client().get(format!("{}/proxies", self.base)))
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -876,8 +935,7 @@ impl KernelApi {
     pub async fn select_proxy(&self, group: &str, name: &str) -> Result<()> {
         let url = format!("{}/proxies/{}", self.base, group);
         let resp = self
-            .client
-            .put(&url)
+            .authed(shared_client().put(&url))
             .json(&serde_json::json!({ "name": name }))
             .send()
             .await?;
@@ -891,8 +949,7 @@ impl KernelApi {
     /// sing-box 侧路由行为由 config 内 clash_mode 规则驱动，切换无需重启
     pub async fn patch_mode(&self, mode: &str) -> Result<()> {
         let resp = self
-            .client
-            .patch(format!("{}/configs", self.base))
+            .authed(shared_client().patch(format!("{}/configs", self.base)))
             .json(&serde_json::json!({ "mode": mode }))
             .send()
             .await?;
@@ -959,10 +1016,13 @@ impl KernelApi {
                     self.base,
                     encode_path_segment(&member)
                 );
-                let req = self.client.get(&endpoint).query(&[
-                    ("url", test_url.to_string()),
-                    ("timeout", timeout.to_string()),
-                ]);
+                let req = shared_client()
+                    .get(&endpoint)
+                    .query(&[
+                        ("url", test_url.to_string()),
+                        ("timeout", timeout.to_string()),
+                    ])
+                    .bearer_auth(self.secret.clone());
                 let app = app.cloned();
                 let group_tag = group_tag.clone();
                 async move {
@@ -1060,19 +1120,18 @@ impl KernelApi {
     /// 获取当前规则列表
     pub async fn get_rules(&self) -> Result<serde_json::Value> {
         Ok(self
-            .client
-            .get(format!("{}/rules", self.base))
+            .authed(shared_client().get(format!("{}/rules", self.base)))
             .send()
             .await?
             .json::<serde_json::Value>()
             .await?)
     }
 
-    /// 获取实时连接快照
+    /// 获取实时连接快照（切页高频轮询：严格 800ms 超时，绝不挂起 IPC）
     pub async fn get_connections(&self) -> Result<serde_json::Value> {
         Ok(self
-            .client
-            .get(format!("{}/connections", self.base))
+            .authed(shared_client().get(format!("{}/connections", self.base)))
+            .timeout(Duration::from_millis(800))
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -1083,8 +1142,7 @@ impl KernelApi {
     /// （sing-box 连接 id 为十六进制字符串，可直接拼路径）
     pub async fn close_connection(&self, id: &str) -> Result<()> {
         let resp = self
-            .client
-            .delete(format!("{}/connections/{}", self.base, id))
+            .authed(shared_client().delete(format!("{}/connections/{}", self.base, id)))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -1096,8 +1154,7 @@ impl KernelApi {
     /// 关闭全部连接：DELETE /connections
     pub async fn close_all_connections(&self) -> Result<()> {
         let resp = self
-            .client
-            .delete(format!("{}/connections", self.base))
+            .authed(shared_client().delete(format!("{}/connections", self.base)))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -1109,12 +1166,11 @@ impl KernelApi {
     /// 单节点测延迟：GET /proxies/{name}/delay，返回毫秒数；超时/失败返回 None
     pub async fn test_delay(&self, name: &str, url: &str, timeout_ms: u32) -> Option<u64> {
         let resp = self
-            .client
-            .get(format!(
+            .authed(shared_client().get(format!(
                 "{}/proxies/{}/delay",
                 self.base,
                 encode_path_segment(name)
-            ))
+            )))
             .query(&[
                 ("url", url.to_string()),
                 ("timeout", timeout_ms.to_string()),

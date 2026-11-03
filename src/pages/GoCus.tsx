@@ -493,7 +493,7 @@ export default function GoCus() {
                             {m.name}
                           </h3>
                           <span
-                            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${
                               m.source.startsWith("http")
                                 ? "bg-accent/15 text-accent"
                                 : "bg-glass text-gray-400"
@@ -558,7 +558,7 @@ export default function GoCus() {
                           <p className="text-sm font-semibold tabular-nums text-gray-200">
                             {s.value}
                           </p>
-                          <p className="text-[10px] text-gray-500">{s.label}</p>
+                          <p className="text-[11px] text-gray-500">{s.label}</p>
                         </div>
                       ))}
                     </div>
@@ -594,7 +594,7 @@ export default function GoCus() {
                     className="flex items-center gap-3 rounded-lg bg-surface-hover px-3 py-2"
                   >
                     <span
-                      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${rewriteBadgeClass(r.action)}`}
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${rewriteBadgeClass(r.action)}`}
                     >
                       {r.action}
                     </span>
@@ -612,7 +612,7 @@ export default function GoCus() {
                         → {r.target}
                       </span>
                     )}
-                    <span className="shrink-0 text-[10px] text-gray-600">
+                    <span className="shrink-0 text-[11px] text-gray-600">
                       {r.module}
                     </span>
                   </div>
@@ -766,7 +766,7 @@ export default function GoCus() {
                     className="flex items-center gap-3 rounded-lg bg-surface-hover px-3 py-2"
                   >
                     <span
-                      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${scriptBadgeClass(s.type)}`}
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${scriptBadgeClass(s.type)}`}
                     >
                       {s.type}
                     </span>
@@ -774,7 +774,7 @@ export default function GoCus() {
                       <p className="truncate text-xs text-gray-200">{s.name}</p>
                       {s.pattern && (
                         <p
-                          className="truncate font-mono text-[10px] text-gray-500"
+                          className="truncate font-mono text-[11px] text-gray-500"
                           title={s.pattern}
                         >
                           {s.pattern}
@@ -791,7 +791,7 @@ export default function GoCus() {
                       <Copy size={11} className="shrink-0" />
                       <span className="truncate font-mono">{s.scriptPath}</span>
                     </button>
-                    <span className="shrink-0 text-[10px] text-gray-600">
+                    <span className="shrink-0 text-[11px] text-gray-600">
                       {s.module}
                     </span>
                   </div>

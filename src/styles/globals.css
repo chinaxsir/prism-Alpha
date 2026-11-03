@@ -11,40 +11,50 @@
 [data-theme="light"] {
   color-scheme: light;
 
-  --surface: 244 245 249; /* #F4F5F9 柔和浅灰底 */
-  --surface-card: 255 255 255; /* #FFFFFF 纯白卡片 */
-  --surface-hover: 238 240 246; /* #EEF0F6 */
+  --surface: 242 244 248; /* #F2F4F8 浅灰底 */
+  --surface-card: 255 255 255; /* #FFFFFF 卡片 */
+  --surface-elevated: 248 250 252; /* #F8FAFC 卡片内嵌层 / 输入框 */
+  --surface-hover: 238 241 246; /* #EEF1F6 悬停 */
   --border: 15 23 42; /* rgba(15,23,42,.07) */
   --glass: 15 23 42;
   --accent: 91 106 240; /* #5B6AF0 */
   --accent-hover: 79 94 226;
 
+  --text: 15 23 42; /* 主文本 #0F172A */
+  --text-secondary: 71 85 105; /* 次级 #475569 */
+  --text-muted: 148 163 184; /* 弱化 #94A3B8 */
+
   --gray-100: 15 23 42; /* #0F172A */
   --gray-200: 30 41 59;
   --gray-300: 51 65 85;
   --gray-400: 100 116 139; /* #64748B */
-  --gray-500: 100 116 139;
-  --gray-600: 148 163 184;
+  --gray-500: 148 163 184;
+  --gray-600: 203 213 225;
 }
 
 [data-theme="dark"],
 .dark {
   color-scheme: dark;
 
-  --surface: 18 20 26; /* #12141A */
-  --surface-card: 30 34 45; /* #1E222D */
-  --surface-hover: 37 41 54; /* #252936 */
+  --surface: 11 15 25; /* #0B0F19 深空底 */
+  --surface-card: 21 28 44; /* #151C2C 卡片 */
+  --surface-elevated: 28 37 54; /* #1C2536 内嵌层 */
+  --surface-hover: 32 42 61; /* #202A3D 悬停 */
   --border: 255 255 255;
   --glass: 255 255 255;
   --accent: 99 102 241; /* #6366f1 */
   --accent-hover: 129 140 248; /* #818cf8 */
 
+  --text: 241 245 249; /* #F1F5F9 */
+  --text-secondary: 148 163 184; /* #94A3B8 */
+  --text-muted: 100 116 139; /* #64748B */
+
   --gray-100: 248 250 252;
   --gray-200: 226 232 240;
   --gray-300: 203 213 225;
   --gray-400: 148 163 184;
-  --gray-500: 107 114 128;
-  --gray-600: 75 85 99;
+  --gray-500: 100 116 139;
+  --gray-600: 71 85 105;
 }
 
 body {

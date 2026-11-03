@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { ShieldBan } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -15,6 +15,7 @@ import { useProStore } from "@/stores/pro";
 import { applyTheme, usePrefsStore } from "@/stores/prefs";
 import { resolveLang, useTranslation } from "@/i18n";
 import {
+  getCoreStatus,
   getRuntimeSnapshot,
   getSettings,
   stopCore,
@@ -46,13 +47,31 @@ export default function App() {
     message: string;
   } | null>(null);
 
-  /** 拉取后端运行时快照并写入全局 store（今日流量 / 速率 / 60s 曲线 / 连接 / 分析） */
+  /** 拉取后端运行时快照并写入全局 store（今日流量 / 速率 / 60s 曲线 / 连接 / 分析）。
+   *  【APP43 任务2.2】未运行时先拉一次内核状态：后端会借此检测「系统 VPN 仍在运行」
+   *  并自动接管，重开 APP 无需再点启动即可恢复「已连接」与计时器。
+   *  【APP43 任务1.4】防重入：上一次 IPC 未返回前不叠加新请求，避免慢响应时
+   *  轮询队列堆积把后端 Mutex 压死 → IPC 5s 超时 → 误判掉授权。 */
+  const runtimeBusyRef = useRef(false);
   const refreshRuntime = useCallback(async () => {
+    if (runtimeBusyRef.current) return;
+    runtimeBusyRef.current = true;
     try {
+      const store = useCoreStore.getState();
+      if (store.status !== "running") {
+        const st = await getCoreStatus();
+        store.setStatus(st.status);
+        store.setMode(st.mode);
+        if (st.outboundMode) store.setOutboundMode(st.outboundMode);
+        store.syncStartedAt(st);
+        if (st.status !== "running") return;
+      }
       const snap = await getRuntimeSnapshot();
-      useCoreStore.getState().applyRuntimeSnapshot(snap);
+      store.applyRuntimeSnapshot(snap);
     } catch {
       /* 内核未就绪时静默忽略 */
+    } finally {
+      runtimeBusyRef.current = false;
     }
   }, []);
 
@@ -263,7 +282,9 @@ export default function App() {
     const id = window.setInterval(() => {
       // 隐藏（锁屏/切 App）时不再每 2s 唤醒 JS 线程，彻底静止待机
       if (document.visibilityState !== "visible") return;
-      if (useCoreStore.getState().status === "running") void refreshRuntime();
+      // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
+      // refreshRuntime 会先查状态并触发后端自动接管。
+      void refreshRuntime();
     }, 2000);
     syncForeground();
     document.addEventListener("visibilitychange", syncForeground);

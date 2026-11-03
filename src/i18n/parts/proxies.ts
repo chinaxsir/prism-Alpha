@@ -94,6 +94,21 @@ const zh: Record<string, string> = {
   "proxies.rules.searchPolicy": "搜索策略组 / 节点",
   "proxies.rules.noPolicy": "无匹配策略",
   "proxies.rules.currentPolicy": "当前",
+  "proxies.rules.pickTarget": "从连接/分析选择",
+  "proxies.rules.manualAdd": "手动添加",
+  "proxies.rules.targetTitle": "选择域名 / IP",
+  "proxies.rules.targetDesc":
+    "从最近的连接与分析结果中勾选目标，批量生成自定义规则",
+  "proxies.rules.targetTabDomain": "域名",
+  "proxies.rules.targetTabIp": "IP",
+  "proxies.rules.targetSearch": "搜索域名或 IP",
+  "proxies.rules.targetEmpty": "暂无可用目标（内核未运行或还没有流量）",
+  "proxies.rules.targetPolicy": "命中后的处理方式",
+  "proxies.rules.targetPolicyProxy": "代理",
+  "proxies.rules.targetPolicyDirect": "直连",
+  "proxies.rules.targetPolicyBlock": "拦截",
+  "proxies.rules.targetSelected": "已选 {count} 项",
+  "proxies.rules.targetConfirm": "添加 {count} 条规则",
 
   // ---- Go Cus ----
   "proxies.goCus.tab.modules": "模块",
@@ -256,6 +271,22 @@ const en: Record<string, string> = {
   "proxies.rules.searchPolicy": "Search policy group / node",
   "proxies.rules.noPolicy": "No matching policy",
   "proxies.rules.currentPolicy": "Current",
+  "proxies.rules.pickTarget": "Pick from Connections",
+  "proxies.rules.manualAdd": "Manual add",
+  "proxies.rules.targetTitle": "Select Domain / IP",
+  "proxies.rules.targetDesc":
+    "Pick targets from recent connections and analytics to create custom rules in bulk",
+  "proxies.rules.targetTabDomain": "Domains",
+  "proxies.rules.targetTabIp": "IPs",
+  "proxies.rules.targetSearch": "Search domain or IP",
+  "proxies.rules.targetEmpty":
+    "No targets yet (core not running or no traffic)",
+  "proxies.rules.targetPolicy": "Action when matched",
+  "proxies.rules.targetPolicyProxy": "Proxy",
+  "proxies.rules.targetPolicyDirect": "Direct",
+  "proxies.rules.targetPolicyBlock": "Block",
+  "proxies.rules.targetSelected": "{count} selected",
+  "proxies.rules.targetConfirm": "Add {count} rules",
 
   // ---- Go Cus ----
   "proxies.goCus.tab.modules": "Modules",

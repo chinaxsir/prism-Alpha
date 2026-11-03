@@ -459,7 +459,7 @@ export default function Settings() {
           <div className="flex items-center gap-2">
             <Home className="w-4 h-4 text-accent shrink-0" />
             <span className="font-semibold text-sm text-text">{t("engine.goLan")}</span>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-hover text-text-muted">
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-surface-hover text-text-muted">
               {t("engine.goLanTag")}
             </span>
           </div>
@@ -635,7 +635,7 @@ export default function Settings() {
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 shrink-0 text-amber-400" />
               <span className="text-sm font-semibold text-text">Prism Pro</span>
-              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[11px] font-medium text-emerald-400">
                 {t("pro.status.active")}
               </span>
             </div>

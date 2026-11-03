@@ -14,6 +14,7 @@ import {
 
 import { closeAllConnections, closeConnection, getCustomRules, saveCustomRules } from "@/api/ipc";
 import { formatBytes } from "@/utils/format";
+import { extractRootDomain } from "@/utils/domain";
 import { useTranslation } from "@/i18n";
 import { useCoreStore, type ConnItem } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
@@ -53,13 +54,16 @@ export default function Connections() {
 
   const rows = useMemo(() => {
     const list = paused ? frozenRef.current : connections;
-    return list
+    const filtered = list
       .filter((c) => !hiddenRef.current.has(c.id))
       .filter((c) => {
         if (filter === "all") return true;
         if (filter === "active") return c.active;
         return (c.network || "tcp") === filter;
       });
+    // 【APP43 任务3.3】连接数上百时只挂载前 150 条：筛选/统计仍按全量计算，
+    // 避免一次性渲染数千 DOM 节点导致切页卡顿与内存峰值。
+    return filtered.slice(0, 150);
   }, [connections, filter, paused]);
 
   // 会话时长累计（上行/下行）：当前连接池内所有连接的累计值之和
@@ -154,11 +158,13 @@ export default function Connections() {
   const applyQuickRule = async (action: "DIRECT" | "PROXY" | "REJECT") => {
     const host = ruleHost;
     if (!host) return;
-    // 纯 IP / IPv6 用 IP-CIDR 精确匹配，其余按域名后缀匹配（含子域）
+    // 纯 IP / IPv6 用 IP-CIDR 精确匹配；域名统一折算根域（www.a.com → a.com），
+    // 避免同一站点被拆成多条子域规则（与规则页「从连接/分析选择」口径一致）
     const isIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(":");
+    const target = isIp ? host : extractRootDomain(host);
     const rule = isIp
-      ? `IP-CIDR,${host}${host.includes(":") ? "/128" : "/32"},${action}`
-      : `DOMAIN-SUFFIX,${host},${action}`;
+      ? `IP-CIDR,${target}${host.includes(":") ? "/128" : "/32"},${action}`
+      : `DOMAIN-SUFFIX,${target},${action}`;
     try {
       const existing = await getCustomRules();
       if (!existing.includes(rule)) {
@@ -336,7 +342,7 @@ export default function Connections() {
                 </div>
                 <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-border/60 pt-2">
                   <span
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase ${
+                    className={`rounded px-1.5 py-0.5 text-[11px] font-medium uppercase ${
                       (r.network || "tcp") === "udp"
                         ? "bg-purple-500/15 text-purple-300"
                         : "bg-sky-500/15 text-sky-300"
@@ -350,13 +356,13 @@ export default function Connections() {
                       if (h) setRuleHost(h);
                     }}
                     title={t("proxies.conn.quickRule")}
-                    className="max-w-[45%] truncate rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:text-accent"
+                    className="max-w-[45%] truncate rounded bg-surface-hover px-1.5 py-0.5 text-[11px] text-gray-400 transition-colors hover:text-accent"
                   >
                     {r.rule
                       ? `${r.rule}${r.rulePayload ? ` · ${r.rulePayload}` : ""}`
                       : "—"}
                   </button>
-                  <span className="truncate text-[10px] text-accent">
+                  <span className="truncate text-[11px] text-accent">
                     {chain}
                   </span>
                 </div>

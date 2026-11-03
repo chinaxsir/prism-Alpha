@@ -293,8 +293,50 @@ final class PrismTunnelController {
 
     /// 当前 VPN 连接状态（Rust 经 C ABI prism_ios_vpn_is_connected 轮询，
     /// build 157）：activeManager 未启动时视为 invalid
+    /// 【APP43 任务2.1】主 APP 被划掉后重开，系统隧道可能仍在运行而
+    /// activeManager 还是 nil（只有 start() 才会赋值）。这里先同步补拉
+    /// 一次系统配置，保证 Rust 第一次轮询就能拿到真实状态。
     var currentConnectionStatus: NEVPNStatus {
-        activeManager?.connection.status ?? .invalid
+        if activeManager == nil {
+            syncExistingManagerIfNeeded()
+        }
+        return activeManager?.connection.status ?? .invalid
+    }
+
+    /// 【APP43 任务2.1】同步补拉系统里已存在的 Prism VPN 配置（最多等 400ms）。
+    /// - 找到已连接/连接中的 manager 立即缓存为 activeManager，供状态轮询
+    ///   与 connectedDate 读取；
+    /// - 主线程禁止阻塞等待（loadAllFromPreferences 回调可能与主线程互锁），
+    ///   直接返回，稍后的轮询会再次尝试；
+    /// - recovering 标志防止并发重入导致连续多次 load。
+    private var recoveringManager = false
+    /// 回调跨线程写入的持有盒（避免 Swift 并发检查报「捕获变量被并发修改」）
+    private final class ManagerBox {
+        var manager: NETunnelProviderManager?
+    }
+    private func syncExistingManagerIfNeeded() {
+        if activeManager != nil || recoveringManager || Thread.isMainThread {
+            return
+        }
+        recoveringManager = true
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = ManagerBox()
+        NETunnelProviderManager.loadAllFromPreferences { managers, error in
+            if let error = error {
+                NSLog("[PrismVPN] 冷启动 loadAllFromPreferences 失败: \(PrismTunnelController.describe(error: error))")
+            }
+            let expectedExtID = "com.prism.proxy.PrismVPN"
+            box.manager = (managers ?? []).first { manager in
+                (manager.protocolConfiguration as? NETunnelProviderProtocol)?
+                    .providerBundleIdentifier == expectedExtID
+            }
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + .milliseconds(400))
+        recoveringManager = false
+        guard let manager = box.manager else { return }
+        activeManager = manager
+        NSLog("[PrismVPN] 冷启动检测到系统 VPN 配置，状态=\(manager.connection.status.rawValue)，已缓存 manager")
     }
 
     /// 系统级连接起始时间（IPA-12）：NEVPNConnection.connectedDate 由

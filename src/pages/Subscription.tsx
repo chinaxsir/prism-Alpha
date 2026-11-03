@@ -260,7 +260,7 @@ export default function Subscription() {
                       </>
                     )}
                     {record.enabled && (
-                      <span className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
+                      <span className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-[11px] text-accent">
                         {t("sub.badgeEnabled")}
                       </span>
                     )}

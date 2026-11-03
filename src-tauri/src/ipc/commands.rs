@@ -53,6 +53,13 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     if let Some(block) = state.control_block.read().clone() {
         return Err(block.message);
     }
+    // 【APP43 任务2.2】重开 APP 场景：系统 VPN 隧道其实仍在运行（状态栏有
+    // VPN 图标），用户再点「启动」时绝不重复冷启动报冲突——直接认领并返回成功。
+    if *state.status.read() == CoreStatus::Stopped
+        && crate::core::kernel::sync_or_recover_running_vpn(app, state).await
+    {
+        return Ok(());
+    }
     // 【APP33 任务3.1】启动前纠偏 selected_node：若残留「剩余流量」等假
     // 节点，立即替换为真实节点并落盘，避免仪表盘与内核默认节点不一致。
     ensure_valid_selected_node(state);
@@ -904,16 +911,11 @@ pub async fn get_core_status(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatusDto, String> {
-    // APP-5 任务3：强退重开后首帧即认领后台仍在运行的隧道。
-    // 进程内只尝试一次（reattach_attempted），避免状态轮询反复探测。
-    if *state.status.read() == CoreStatus::Stopped
-        && !state
-            .reattach_attempted
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-    {
-        if crate::core::kernel::try_reattach_running_kernel(&app, state.inner()).await {
-            tracing::info!("[reattach] 状态已恢复为 Running");
-        }
+    // 【APP43 任务2.2】状态自检：VPN 在后台运行（状态栏有图标）时重开 APP，
+    // 每次状态轮询都尝试自动认领存活隧道，恢复「已连接」与计时器；
+    // 内部 3s 节流 + 300ms 探活超时，不会拖慢 IPC。
+    if *state.status.read() == CoreStatus::Stopped {
+        let _ = crate::core::kernel::sync_or_recover_running_vpn(&app, state.inner()).await;
     }
 
     let uptime_secs = state

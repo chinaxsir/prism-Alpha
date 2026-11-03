@@ -625,7 +625,7 @@ export default function Proxies() {
                   </span>
                   {/* 无解锁徽章时保持紧凑单行：协议标签内联显示 */}
                   {unlockedTags.length === 0 && (
-                    <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide bg-glass text-gray-400">
+                    <span className="shrink-0 px-1.5 py-0.5 rounded text-[11px] font-mono uppercase tracking-wide bg-glass text-gray-400">
                       {protocolTag(node.type)}
                     </span>
                   )}
@@ -647,14 +647,14 @@ export default function Proxies() {
                   自然换行，不挤占第一行的名称与延迟；无徽章时不渲染 */}
               {unlockedTags.length > 0 && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-4">
-                  <span className="px-1.5 py-0.5 rounded bg-surface-hover text-[10px] font-mono uppercase tracking-wide text-gray-400">
+                  <span className="px-1.5 py-0.5 rounded bg-surface-hover text-[11px] font-mono uppercase tracking-wide text-gray-400">
                     {protocolTag(node.type)}
                   </span>
                   {unlockedTags.map((tag) => (
                     <span
                       key={tag}
                       className={clsx(
-                        "px-1.5 py-0.5 rounded border text-[10px] font-medium",
+                        "px-1.5 py-0.5 rounded border text-[11px] font-medium",
                         AIM_BADGE_STYLE[tag] ??
                           "bg-glass text-gray-400 border-border"
                       )}

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, Crosshair, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 
 import {
   getCustomRules,
@@ -8,11 +8,16 @@ import {
   saveCustomRules,
 } from "@/api/ipc";
 import ProGate from "@/components/ProGate";
+import RuleTargetPicker from "@/components/RuleTargetPicker";
 import Spinner from "@/components/ui/Spinner";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 import { Feature } from "@/pro/gating";
+import { extractRootDomain } from "@/utils/domain";
 import { ruleTypeClass } from "@/utils/ruleType";
+
+// 兼容旧引用（Connections / 其他地方从本页导入根域提取）
+export { extractRootDomain } from "@/utils/domain";
 
 interface Rule {
   type: string;
@@ -29,45 +34,6 @@ const RULE_TYPES = [
   "GEOIP",
   "GEOSITE",
 ];
-
-/// 【APP42 任务4.2】常见多段公共后缀（两级 TLD）。
-/// 不引入 200KB+ 的 PSL 数据，只覆盖国内/海外高频后缀，
-/// 未命中时退化为「最后两段」，满足绝大多数字母级根域提取。
-const MULTI_PART_SUFFIXES = new Set([
-  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-  "co.uk", "org.uk", "me.uk", "com.au", "net.au", "org.au",
-  "co.jp", "or.jp", "ne.jp", "com.br", "com.tw", "com.hk",
-  "co.kr", "com.sg", "com.tr", "co.nz", "co.za", "com.mx",
-]);
-
-/// 从用户输入（完整 URL / 子域名 / 带路径的域名）中提取可注册根域名。
-/// 如 https://www.example.com/path → example.com；a.b.example.co.uk → example.co.uk
-export function extractRootDomain(raw: string): string {
-  let host = raw.trim().toLowerCase();
-  if (!host) return "";
-  // 完整 URL：取 hostname
-  if (/^[a-z][a-z0-9+.-]*:\/\//.test(host)) {
-    try {
-      host = new URL(host).hostname;
-    } catch {
-      return raw.trim();
-    }
-  } else {
-    host = host.split("/")[0].split("?")[0];
-  }
-  host = host.replace(/^[.]+/, "").replace(/^\*\./, "");
-  // 纯 IP / localhost / 非域名不处理
-  if (/^[\d.]+$/.test(host) || host === "localhost" || !host.includes(".")) {
-    return host;
-  }
-  const labels = host.split(".").filter(Boolean);
-  if (labels.length <= 2) return labels.join(".");
-  const lastTwo = labels.slice(-2).join(".");
-  if (MULTI_PART_SUFFIXES.has(lastTwo) && labels.length >= 3) {
-    return labels.slice(-3).join(".");
-  }
-  return lastTwo;
-}
 
 export default function Rules() {
   const { t } = useTranslation();
@@ -87,6 +53,11 @@ export default function Rules() {
   // 【APP42 任务4.2】策略选择器弹窗：点击行末编辑图标或双击行打开
   const [pickerIndex, setPickerIndex] = useState<number | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
+  // 【APP43 任务3】从连接 / 分析页选择域名或 IP 批量生成规则
+  const [targetPickerOpen, setTargetPickerOpen] = useState(false);
+  const payloadRef = useRef<HTMLInputElement>(null);
+  // 防重入：刷新按钮 / 保存后自动刷新 / 首次加载可能并发，避免重复 IPC
+  const loadingRef = useRef(false);
 
   const filteredPolicies = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
@@ -114,6 +85,8 @@ export default function Rules() {
   }, []);
 
   const loadRules = async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     try {
       const resp = (await getRules()) as { rules?: Rule[] };
@@ -121,6 +94,7 @@ export default function Rules() {
     } catch (e) {
       console.error("load rules failed:", e);
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   };
@@ -190,15 +164,53 @@ export default function Rules() {
   const removeAt = (index: number) =>
     persist(custom.filter((_, i) => i !== index));
 
+  /// 【APP43 任务3】目标选择器确认：批量合并去重后整体保存
+  const handleTargetConfirm = (lines: string[]) => {
+    setTargetPickerOpen(false);
+    const merged = [...custom];
+    let added = 0;
+    for (const line of lines) {
+      if (!merged.includes(line)) {
+        merged.push(line);
+        added += 1;
+      }
+    }
+    if (added === 0) {
+      toast.error(t("proxies.rules.err.exists"));
+      return;
+    }
+    persist(merged);
+  };
+
   return (
     <div className="space-y-6">
       <ProGate feature={Feature.Rules}>
-        {/* 自定义规则编辑器 */}
+        {/* 自定义规则编辑器：标题 + 操作按钮同一行，按钮不再与标题/DOM 重叠 */}
         <div className="bg-surface-card rounded-xl p-5 mb-6">
-          <h2 className="text-base font-semibold mb-1">
-            {t("proxies.rules.customTitle", { count: custom.length })}
-          </h2>
-          <p className="text-xs text-gray-500 mb-4">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <h2 className="text-base font-semibold leading-tight">
+              {t("proxies.rules.customTitle", { count: custom.length })}
+            </h2>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setTargetPickerOpen(true)}
+                className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-xs text-gray-300 hover:border-accent/50 hover:text-gray-100"
+              >
+                <Crosshair size={13} className="text-accent" />
+                {t("proxies.rules.pickTarget")}
+              </button>
+              <button
+                type="button"
+                onClick={() => payloadRef.current?.focus()}
+                className="flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover"
+              >
+                <Plus size={13} />
+                {t("proxies.rules.manualAdd")}
+              </button>
+            </div>
+          </div>
+          <p className="mb-4 mt-1.5 text-xs text-gray-500">
             {t("proxies.rules.customDesc")}
           </p>
 
@@ -215,11 +227,12 @@ export default function Rules() {
               ))}
             </select>
             <input
+              ref={payloadRef}
               value={payload}
               onChange={(e) => setPayload(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               placeholder={t("proxies.rules.payloadPlaceholder")}
-              className="flex-1 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
+              className="min-w-0 flex-1 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
             />
             <input
               value={policy}
@@ -227,7 +240,7 @@ export default function Rules() {
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               list="rule-policy-options"
               placeholder={t("proxies.rules.policyPlaceholder")}
-              className="md:w-56 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent"
+              className="min-w-0 rounded-lg bg-surface-hover border border-border px-3 py-2 text-sm outline-none focus:border-accent md:w-56"
             />
             <datalist id="rule-policy-options">
               {policyOptions.map((n) => (
@@ -371,6 +384,13 @@ export default function Rules() {
         </div>
       </ProGate>
 
+      {/* 【APP43 任务3】从连接 / 分析页选择域名或 IP → 批量生成规则 */}
+      <RuleTargetPicker
+        open={targetPickerOpen}
+        onClose={() => setTargetPickerOpen(false)}
+        onConfirm={handleTargetConfirm}
+      />
+
       {/* 【APP42 任务4.2】策略选择器：搜索过滤 + 一键应用 */}
       {pickerIndex != null && (
         <div
@@ -429,7 +449,7 @@ export default function Rules() {
                   >
                     <span className="truncate font-mono">{p}</span>
                     {p === custom[pickerIndex]?.split(",")[2]?.trim() && (
-                      <span className="text-[10px]">{t("proxies.rules.currentPolicy")}</span>
+                      <span className="text-[11px]">{t("proxies.rules.currentPolicy")}</span>
                     )}
                   </button>
                 ))

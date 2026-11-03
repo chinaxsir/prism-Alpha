@@ -27,6 +27,28 @@ const INACTIVE: Entitlement = {
 /** 可使用 Pro：仅服务端联网校验有效（active）；offline/expired/revoked/inactive 一律锁定 */
 const unlockedOf = (e: Entitlement) => e.status === "active";
 
+/* 【APP43 任务1.3】Pro 激活态的本地镜像：
+   任何 IPC 超时 / 轮询异常 / 切页都绝不允许把已激活的 proUnlocked 重置为 false。
+   只有「用户主动反向激活」或后端明确返回 expired/inactive 才落盘为 false。 */
+const PRO_CACHE_KEY = "prism_pro_active_cache";
+
+function readProCache(): boolean {
+  try {
+    return localStorage.getItem(PRO_CACHE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeProCache(unlocked: boolean) {
+  try {
+    if (unlocked) localStorage.setItem(PRO_CACHE_KEY, "1");
+    else localStorage.removeItem(PRO_CACHE_KEY);
+  } catch {
+    /* 隐私模式/配额写满：忽略，不影响主流程 */
+  }
+}
+
 /** 前端本地到期巡检定时器（5 秒）；后端另有 10 秒巡检做最终收口 */
 let expiryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -54,7 +76,8 @@ interface ProState {
 export const useProStore = create<ProState>((set, get) => ({
   entitlement: INACTIVE,
   ready: false,
-  unlocked: false,
+  // 启动瞬间先读本地镜像：即便后端 IPC 因锁竞争/超时报错，也不会误判掉授权
+  unlocked: readProCache(),
   busy: false,
   error: null,
   revokeReason: null,
@@ -62,9 +85,11 @@ export const useProStore = create<ProState>((set, get) => ({
   init: async () => {
     try {
       const e = await getEntitlement();
-      set({ entitlement: e, unlocked: unlockedOf(e), ready: true });
+      const unlocked = unlockedOf(e);
+      writeProCache(unlocked);
+      set({ entitlement: e, unlocked, ready: true });
       // 重启后按落盘原因还原横幅：解绑 ≠ 到期，严禁统一显示成「已到期」
-      if (!unlockedOf(e)) {
+      if (!unlocked) {
         try {
           const reason = await getRevokeReason();
           if (reason) set({ revokeReason: reason });
@@ -74,6 +99,7 @@ export const useProStore = create<ProState>((set, get) => ({
       }
     } catch (err) {
       console.error("get entitlement failed:", err);
+      // 【APP43】异常兜底：保持原有（含本地镜像）授权态，绝不置 false
       set({ ready: true });
     }
     // 前端本地双重定时器：每 5 秒比对一次到期时间（后端另有 10 秒巡检收口）
@@ -93,6 +119,7 @@ export const useProStore = create<ProState>((set, get) => ({
 
     // 到点：本地立即锁定，再同步后端（后端会把 license.dat 落盘为 expired
     // 并终止 Go AIM / Go Lan / Go Cus 与内核 Pro 路由）
+    writeProCache(false);
     set({
       entitlement: { ...entitlement, status: "expired" },
       unlocked: false,
@@ -108,6 +135,7 @@ export const useProStore = create<ProState>((set, get) => ({
 
   setEntitlement: (e) => {
     const unlocked = unlockedOf(e);
+    writeProCache(unlocked);
     set({
       entitlement: e,
       unlocked,
@@ -131,6 +159,7 @@ export const useProStore = create<ProState>((set, get) => ({
       // 服务端要求「License Key + 注册邮箱」联合校验（两者必填）；
       // 缺项时后端会在本地拦截并返回明确错误，不会发起无效请求。
       const e = await activatePro(licenseKey, email ?? "");
+      writeProCache(unlockedOf(e));
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
       return unlockedOf(e);
     } catch (err) {
@@ -150,8 +179,10 @@ export const useProStore = create<ProState>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const e = await refreshEntitlement();
+      writeProCache(unlockedOf(e));
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
     } catch (err) {
+      // 【APP43】刷新失败（超时/断网）：保留当前授权态，绝不清除 Pro
       set({ busy: false, error: String(err) });
     }
   },
@@ -174,6 +205,7 @@ export const useProStore = create<ProState>((set, get) => ({
     if (core.goCusSettings) {
       core.setGoCusSettings({ ...core.goCusSettings, enabled: false });
     }
+    writeProCache(false);
     set({
       entitlement: INACTIVE,
       unlocked: false,
@@ -181,6 +213,7 @@ export const useProStore = create<ProState>((set, get) => ({
       error: null,
     });
     const e = await deactivatePro();
+    writeProCache(unlockedOf(e));
     set({ entitlement: e, unlocked: unlockedOf(e), error: null });
   },
 }));
