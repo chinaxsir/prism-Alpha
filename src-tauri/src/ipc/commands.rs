@@ -1067,17 +1067,61 @@ pub async fn select_proxy(
     // 【APP37 任务3.2】用户手动切换节点绝不再中止 Go AIM 探测：
     // 探测循环只响应「Go AIM 开关关闭」与「VPN 停止」两个中止条件，
     // 自动选点/手动切点导致的 selected_node 变化不再误触中止锁。
-    state
-        .kernel_api()
-        .select_proxy(&group, &name)
-        .await
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP46 任务1.4】全量同步所有顶层 selector 策略组：
+    // 用户只在「节点页 Proxy 主组」选点，但 GLOBAL、任何 top-level Selector
+    // 组（规则里可能引用）仍然挂着旧节点——一旦规则把流量切到这些组，就会
+    // 回到旧代理！彻底修复：枚举所有 Selector 类型组，逐个 PUT 同步到同一
+    // 节点，任何一组返回 404（节点刚导入、内核还不认识）→ 自动重新生成
+    // config.json + 重启内核（start_core_inner），确保节点 100% 接管。
+    let api = state.kernel_api();
+    let mut had_404 = false;
+    if let Ok(proxies_map) = api.get_proxies().await {
+        if let Some(map) = proxies_map.get("proxies").and_then(|m| m.as_object()) {
+            let mut all_selectors: Vec<String> = Vec::new();
+            for (k, v) in map {
+                let Some(t) = v.get("type").and_then(|t| t.as_str()) else { continue };
+                if t == "Selector"
+                    && !crate::core::config_builder::is_builtin_non_proxy_tag(k)
+                    // 已经切过的组（用户指定 group + GLOBAL）不再切两次
+                    && k != &group
+                    && k != "GLOBAL"
+                {
+                    all_selectors.push(k.clone());
+                }
+            }
+            // 顺序：用户指定 group → GLOBAL → 其余 Selector。
+            // GLOBAL 先于其余组避免被内核默认同步覆盖；用户组最先保证
+            // 主选择器立即生效（仪表盘首帧显示选中节点）。
+            let try_select = async |sel: &str| -> bool {
+                match api.select_proxy(sel, &name).await {
+                    Ok(()) => false,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!("selector '{sel}' 切节点失败: {msg}");
+                        msg.contains("404")
+                    }
+                }
+            };
+            if try_select(&group).await { had_404 = true; }
+            if group != "GLOBAL" && try_select("GLOBAL").await {
+                had_404 = true;
+            }
+            for sel in &all_selectors {
+                if try_select(sel).await { had_404 = true; }
+            }
+        }
+    }
 
-    // 全局模式同步（build 172 方案）：GLOBAL 选择组与主组保持同一节点。
-    // clash_mode global 规则指向独立的 GLOBAL 组，若只切主组，切到
-    // 全局模式后流量会落到 GLOBAL 的默认（第一个）节点——与用户所选脱节
-    if group != "GLOBAL" {
-        let _ = state.kernel_api().select_proxy("GLOBAL", &name).await;
+    // 任何一个 selector 返回 404 → 重新构建 config.json + 重启内核
+    // （内核启动流程会自动把 selected_node 写入所有 selector 默认项）
+    if had_404 && *state.status.read() == crate::core::state::CoreStatus::Running {
+        tracing::info!("触发 vpn reload 以接纳新节点 '{name}'");
+        // 先停再启（do_stop + start_core_inner）
+        let inner = state.inner();
+        let _ = do_stop(inner).await;
+        if let Err(e) = start_core_inner(&app, inner).await {
+            tracing::error!("vpn reload 失败: {e}");
+        }
     }
 
     // Go AIM 手动指定（APP-4 任务3.3）：用户在节点页手动选中节点时，
@@ -2493,10 +2537,61 @@ pub async fn get_traffic_stats(
 
 /// 运行时统计快照：今日流量 / 实时速率 / 60s 曲线 / 活跃连接 / 分析聚合。
 /// 数据由 events.rs 的内核数据流实时维护在 AppState，前端无需轮询内核。
+/// 【APP46 任务4.1】每次拉快照前主动 GET /connections（600ms 硬超时），
+/// 从顶层 downloadTotal/uploadTotal 差分计算实时速率并追加一条 TrafficSample——
+/// 这是 WebSocket 流挂起/事件漏推送时的硬兜底，保证速率永不卡死归零。
 #[tauri::command]
 pub async fn get_runtime_snapshot(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    // 1. 硬兜底差分：GET /connections（600ms 上限）
+    let telemetry = async {
+        let conn_json = state.kernel_api().get_connections().await.ok()?;
+        let total_down = conn_json
+            .get("downloadTotal")
+            .and_then(|v| v.as_u64())
+            .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+        let total_up = conn_json
+            .get("uploadTotal")
+            .and_then(|v| v.as_u64())
+            .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+        Some((total_down, total_up))
+    }
+    .await;
+
+    if let Some((total_down, total_up)) = telemetry {
+        let now = std::time::Instant::now();
+        let mut sample = state.last_traffic_sample.lock();
+        let maybe_speed = if let Some((prev_t, prev_down, prev_up)) = *sample {
+            let dt = now.duration_since(prev_t).as_secs_f64();
+            if dt >= 0.2 && dt <= 10.0 && total_down >= prev_down && total_up >= prev_up {
+                let down = ((total_down - prev_down) as f64 / dt) as u64;
+                let up = ((total_up - prev_up) as f64 / dt) as u64;
+                Some((down, up))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        *sample = Some((now, total_down, total_up));
+        // 追加到 60s 环形队列（最多 60 条，每秒一条）
+        if let Some((down, up)) = maybe_speed {
+            // 不引入 chrono：以 Unix 秒换算 HH:MM:SS（events.rs 同款）
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let day = secs % 86400;
+            let ts = format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60);
+            let mut hist = state.traffic_history.write();
+            hist.push_back(crate::core::state::TrafficSample { time: ts, up, down });
+            while hist.len() > 60 {
+                hist.pop_front();
+            }
+        }
+    }
+
     Ok(state.runtime_snapshot())
 }
 

@@ -13,16 +13,6 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import clsx from "clsx";
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 
 import {
   getCachedProxies,
@@ -72,7 +62,6 @@ export default function Dashboard() {
   const downSpeed = useCoreStore((s) => s.downSpeed);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
   const startedAtMs = useCoreStore((s) => s.startedAtMs);
-  const traffic = useCoreStore((s) => s.traffic);
   // 今日流量：后端持久化基数 + 当前会话内核绝对累计（前后台不间断）
   const todayBytes = useCoreStore((s) => s.todayBytes);
   const setStatus = useCoreStore((s) => s.setStatus);
@@ -682,73 +671,6 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
-      </div>
-
-      {/* 流量曲线图 */}
-      <div className="bg-surface-card rounded-2xl p-5 border border-border">
-        <h2 className="text-sm font-semibold mb-4 text-gray-200">
-          {t("metric.realtimeTraffic")}
-        </h2>
-        <ResponsiveContainer width="100%" height={240}>
-          <LineChart data={traffic} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
-            <CartesianGrid
-              strokeDasharray="3 3"
-              stroke="rgb(var(--border) / 0.15)"
-            />
-            <XAxis
-              dataKey="time"
-              stroke="rgb(var(--gray-500))"
-              fontSize={10}
-              tickLine={false}
-              minTickGap={48}
-            />
-            <YAxis
-              stroke="rgb(var(--gray-500))"
-              fontSize={10}
-              tickLine={false}
-              width={60}
-              tickFormatter={(v) => formatBytes(Number(v))}
-            />
-            <Tooltip
-              contentStyle={{
-                backgroundColor: "rgb(var(--surface-card))",
-                border: "1px solid rgb(var(--border) / 0.15)",
-                borderRadius: 8,
-                fontSize: 12,
-                padding: '8px 12px',
-                color: "rgb(var(--gray-100))",
-              }}
-              labelStyle={{ color: 'rgb(var(--gray-100))' }}
-              itemStyle={{ color: 'rgb(var(--gray-100))' }}
-              formatter={(value, name) => [
-                formatSpeed(Number(value)),
-                name === "down" ? t("metric.download") : t("metric.upload"),
-              ]}
-            />
-            <Legend
-              formatter={(v) =>
-                v === "down" ? t("metric.download") : t("metric.upload")
-              }
-              wrapperStyle={{ paddingTop: '12px', fontSize: 11 }}
-            />
-            <Line
-              type="monotone"
-              dataKey="down"
-              stroke="#22c55e"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              type="monotone"
-              dataKey="up"
-              stroke="rgb(var(--accent))"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
       </div>
 
       {/* 节点选择器弹窗：点击「当前节点」指标卡打开，按延迟从低到高排列 */}

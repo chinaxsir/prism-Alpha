@@ -2154,12 +2154,15 @@ fn build_tls(node: &ClashNode) -> Option<Value> {
     Some(tls_block(node))
 }
 
-/// 节点 SNI 解析顺序：sni → servername → ws Host 头 → server。
-/// 直接用 server（常为 CDN IP）作 SNI 会被对端拒绝（tls: handshake failure）
+/// 节点 SNI 解析顺序：sni → servername → ws Host 头 → server（跳过 IPv4 字面量）。
+/// 【APP46 任务1.1】预解析把 node.server 替换为公网 IPv4 后，绝不能让 IPv4
+/// 回退塞进 tls.server_name（会导致证书 CN 校验失败）。回退链末尾加 IPv4 过滤，
+/// 让 sing-box 在机场未显式配 sni 时自行用域名做 SNI（或不写 server_name）。
 fn node_sni(node: &ClashNode) -> String {
     for cand in [&node.sni, &node.servername] {
         if let Some(s) = cand
             && !s.is_empty()
+            && s.parse::<std::net::IpAddr>().is_err()
         {
             return s.clone();
         }
@@ -2170,10 +2173,15 @@ fn node_sni(node: &ClashNode) -> String {
         .and_then(|w| w.headers.as_ref())
         .and_then(|h| h.get("Host").or_else(|| h.get("host")))
         && !host.is_empty()
+        && host.parse::<std::net::IpAddr>().is_err()
     {
         return host.clone();
     }
-    node.server.clone()
+    // server 只有在仍是域名（非 IPv4 字面量）时才用作 SNI 回退
+    if node.server.parse::<std::net::IpAddr>().is_err() {
+        return node.server.clone();
+    }
+    String::new()
 }
 
 /// 完整 TLS 块：SNI / insecure / alpn / uTLS 指纹（trojan/hy2 等强制 TLS 的节点也用）

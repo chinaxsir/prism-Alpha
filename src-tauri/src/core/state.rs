@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -273,6 +273,11 @@ pub struct AppState {
     // ---- 运行时统计（前后台不间断；内核停止/启动时经 reset_runtime_stats 清空）----
     /// 60 秒实时流量环形队列（最新在尾部）
     pub traffic_history: RwLock<VecDeque<TrafficSample>>,
+    /// 【APP46 任务4.1】/connections 顶层 downloadTotal/uploadTotal 差分基准：
+    /// 每次前端拉 runtime_snapshot 时主动 GET /connections（600ms 超时），
+    /// 若 dt ∈ [0.2s, 10s] 且 total 单调递增，算 down/up speed；任何条件不满足
+    /// 就保留旧值（不回零）。events.rs WebSocket 流继续运行，这里是硬兜底。
+    pub last_traffic_sample: Mutex<Option<(Instant, u64, u64)>>,
     /// 当前活跃连接快照（id → snapshot）
     pub connections_live: RwLock<HashMap<String, ConnSnapshot>>,
     /// 按 host / outbound / rule 聚合的分析数据
@@ -345,6 +350,7 @@ impl AppState {
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
             go_cus: RwLock::new(super::go_cus::load(&data_dir)),
             traffic_history: RwLock::new(VecDeque::new()),
+            last_traffic_sample: Mutex::new(None),
             connections_live: RwLock::new(HashMap::new()),
             analytics: RwLock::new(AnalyticsAgg::default()),
             today_bytes_cache: RwLock::new(0),
