@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, Crosshair, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Crosshair, ListFilter, ListChecks, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 
 import {
   getCustomRules,
@@ -201,7 +201,8 @@ export default function Rules() {
         {/* 自定义规则编辑器：标题 + 操作按钮同一行，按钮不再与标题/DOM 重叠 */}
         <div className="bg-surface-card rounded-xl p-5 mb-6">
           <div className="flex flex-wrap items-start justify-between gap-2">
-            <h2 className="text-base font-semibold leading-tight">
+            <h2 className="flex items-center gap-2 text-[17px] font-bold tracking-tight leading-tight">
+              <ListFilter size={17} className="text-surge-blue" />
               {t("proxies.rules.customTitle", { count: custom.length })}
             </h2>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -354,7 +355,8 @@ export default function Rules() {
         {/* 内核生效规则（只读） */}
         <div className="bg-surface-card rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-base font-semibold">
+            <h2 className="flex items-center gap-2 text-[17px] font-bold tracking-tight">
+              <ListChecks size={17} className="text-surge-green" />
               {t("proxies.rules.effectiveTitle", { count: visibleRules.length })}
             </h2>
             <button

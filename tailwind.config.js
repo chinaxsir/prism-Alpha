@@ -29,6 +29,16 @@ export default {
           bad: "#ef4444",
         },
         ring: "#6366f1",
+        // 【APP45 任务4】Surge 风格模块标题彩色图标（深浅色由 CSS 变量翻转）
+        surge: {
+          blue: "rgb(var(--surge-blue) / <alpha-value>)",
+          green: "rgb(var(--surge-green) / <alpha-value>)",
+          orange: "rgb(var(--surge-orange) / <alpha-value>)",
+          purple: "rgb(var(--surge-purple) / <alpha-value>)",
+          teal: "rgb(var(--surge-teal) / <alpha-value>)",
+          pink: "rgb(var(--surge-pink) / <alpha-value>)",
+          amber: "rgb(var(--surge-amber) / <alpha-value>)",
+        },
         // 【APP43 任务4】显式文本层级（浅色/深色均由变量翻转，禁止硬编码）
         text: {
           DEFAULT: "rgb(var(--text) / <alpha-value>)",

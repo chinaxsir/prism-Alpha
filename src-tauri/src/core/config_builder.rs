@@ -309,7 +309,9 @@ pub(crate) struct ClashNode {
     /// SS 加密方式；VMess 中为 security
     #[serde(default)]
     cipher: Option<String>,
-    #[serde(default)]
+    /// 【APP45 任务2.1】Clash 标准字段为 alterId（camelCase），uri_parser
+    /// 内部产物为 alter_id，二者都兼容
+    #[serde(default, rename = "alterId", alias = "alter_id")]
     alter_id: Option<i64>,
     #[serde(default)]
     network: Option<String>,
@@ -326,7 +328,10 @@ pub(crate) struct ClashNode {
     /// Reality 配置（vless + tls 节点；缺失 public-key 时视为普通 TLS）
     #[serde(default, rename = "reality-opts")]
     reality_opts: Option<RealityOpts>,
-    #[serde(default)]
+    /// 【APP45 任务2.1】Clash 标准字段为 skip-cert-verify（连字符）——
+    /// 此前缺失 rename 导致 YAML 反序列化恒为 None，自签节点（allowInsecure=1）
+    /// 的 tls.insecure 丢失、握手失败（vless+vision / trojan 全部不可用）。
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
     skip_cert_verify: Option<bool>,
     #[serde(default)]
     alpn: Option<Vec<String>>,
@@ -748,6 +753,58 @@ pub fn build(
     warnings.push(
         "已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into(),
     );
+
+    // ---- 【APP45 任务2.2】保险 1：节点域名主进程并发 DoH 预解析 ----
+    // *.the-best-airport.com 等多级动态域名在 iOS 扩展内经系统 DNS 解析会被
+    // utun 自拦截超时；主进程并发 DoH（223.5.5.5/1.12.12.12）解析为真实公网
+    // IPv4 后直接替换节点 server（TLS server_name 独立保存 SNI 不受影响），
+    // 内核 0ms 直连 TCP+TLS 握手。解析失败/超时保留原域名，由内核 dns-direct
+    // （223.5.5.5 detour direct + default_interface 物理网卡）兜底（保险 2）。
+    // 单元测试跳过（不依赖外部网络，也不污染测试断言）。
+    if !cfg!(test) {
+        let mut hosts: Vec<String> = Vec::new();
+        let mut seen_hosts: HashSet<String> = HashSet::new();
+        let mut collect_host = |server: &str| {
+            let h = server.trim();
+            if h.is_empty() || h.parse::<std::net::IpAddr>().is_ok() {
+                return;
+            }
+            if seen_hosts.insert(h.to_ascii_lowercase()) {
+                hosts.push(h.to_string());
+            }
+        };
+        for parsed in &parsed_list {
+            for n in &parsed.profile.proxies {
+                collect_host(&n.server);
+            }
+            for nodes in parsed.provider_nodes.values() {
+                for n in nodes {
+                    collect_host(&n.server);
+                }
+            }
+        }
+        let resolved = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&hosts);
+        if !resolved.is_empty() {
+            let replaced_count = resolved.len();
+            for parsed in &mut parsed_list {
+                for n in &mut parsed.profile.proxies {
+                    if let Some(ip) = resolved.get(&n.server.trim().to_ascii_lowercase()) {
+                        n.server = ip.clone();
+                    }
+                }
+                for nodes in parsed.provider_nodes.values_mut() {
+                    for n in nodes {
+                        if let Some(ip) = resolved.get(&n.server.trim().to_ascii_lowercase()) {
+                            n.server = ip.clone();
+                        }
+                    }
+                }
+            }
+            warnings.push(format!(
+                "节点域名预解析：{replaced_count} 个域名已解析为 IPv4 直连（其余域名由内核 dns-direct 兜底）"
+            ));
+        }
+    }
 
     // ---- 逐订阅产出出站/组/规则 ----
     let mut node_tags: Vec<String> = Vec::new();
@@ -3755,5 +3812,86 @@ rules:
         // 不再使用 address=local 系统解析器
         assert_eq!(direct["address"], "223.5.5.5");
         assert_eq!(direct["detour"], "direct");
+    }
+
+    /// 【APP45 任务2】节点_2.txt 全链路：19 行 URI 订阅（1 行 0.0.0.0 假节点
+    /// + 14 条 vless + 4 条 trojan）→ build：
+    /// 1. 0.0.0.0 假节点被 is_valid_usable_proxy_node 过滤（共 18 个节点出站）；
+    /// 2. vless 保留 flow=xtls-rprx-vision + tls.insecure=true + sni=baidu.com
+    ///    + utls chrome（allowInsecure=1 大小写不敏感）；
+    /// 3. trojan 的 peer=update.microsoft.com 映射 server_name，insecure=true。
+    #[test]
+    fn app45_nodes2_txt_full_chain() {
+        let mut lines: Vec<String> = vec![
+            "trojan://T6PMsakzYbEVs1bPLQtGtHcm@0.0.0.0:43103?peer=0.0.0.0&sni=0.0.0.0#fake-placeholder"
+                .to_string(),
+        ];
+        for i in 1..=14u32 {
+            lines.push(format!(
+                "vless://7c9fb5fa-3c5f-4f48-a8a1-75586bec35b6@hkg{i:02}.example-airport.com:43101?encryption=none&flow=xtls-rprx-vision&security=tls&sni=baidu.com&fp=chrome&allowInsecure=1&type=tcp#HK{i:02}"
+            ));
+        }
+        for i in 1..=4u32 {
+            lines.push(format!(
+                "trojan://T6PMsakzYbEVs1bPLQtGtHcm@us{i}.example-airport.com:4431{i}?allowInsecure=1&peer=update.microsoft.com#US{i}"
+            ));
+        }
+        let text = lines.join("\n");
+        // 真实链路：URI 列表 → uri_parser → 节点 JSON → 合成 Clash YAML → build
+        let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
+        assert!(errors.is_empty(), "19 行必须全部解析成功: {errors:?}");
+        assert!(notice.is_none(), "0.0.0.0 假节点不得被误作机场提示");
+        assert_eq!(nodes.len(), 19, "1 假 + 14 vless + 4 trojan = 19 行");
+        // 假节点：sni=0.0.0.0 必须被清空（APP45 任务2.1）
+        assert_eq!(nodes[0]["server"], "0.0.0.0");
+        assert!(
+            nodes[0].get("sni").is_none(),
+            "sni=0.0.0.0 占位值必须丢弃: {}",
+            nodes[0]
+        );
+        let doc = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
+            .expect("合成 Clash YAML");
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), doc)],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-app45"),
+            &std::env::temp_dir().join("prism-cb-test-app45/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build 成功");
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+        let vless: Vec<_> = outbounds.iter().filter(|o| o["type"] == "vless").collect();
+        let trojan: Vec<_> = outbounds.iter().filter(|o| o["type"] == "trojan").collect();
+        assert_eq!(vless.len(), 14, "14 个 vless 必须全部发射");
+        assert_eq!(trojan.len(), 4, "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan");
+        // 假节点严禁出现在任何出站中
+        assert!(
+            !outbounds
+                .iter()
+                .any(|o| o["server"].as_str() == Some("0.0.0.0")),
+            "0.0.0.0 假节点不得生成出站"
+        );
+
+        let v0 = vless[0];
+        assert_eq!(v0["tls"]["enabled"], true);
+        assert_eq!(v0["tls"]["insecure"], true, "allowInsecure=1 → tls.insecure");
+        assert_eq!(v0["tls"]["server_name"], "baidu.com");
+        assert_eq!(v0["tls"]["utls"]["fingerprint"], "chrome");
+        assert_eq!(v0["flow"], "xtls-rprx-vision");
+        // 节点 server 保留域名（测试环境跳过预解析），SNI 独立保存不受影响
+        assert_eq!(v0["server"], "hkg01.example-airport.com");
+
+        let t0 = trojan[0];
+        assert_eq!(t0["tls"]["insecure"], true, "trojan allowInsecure=1");
+        assert_eq!(
+            t0["tls"]["server_name"], "update.microsoft.com",
+            "trojan peer 参数必须映射为 SNI"
+        );
+        assert_eq!(t0["password"], "T6PMsakzYbEVs1bPLQtGtHcm");
     }
 }

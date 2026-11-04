@@ -32,6 +32,15 @@
   --gray-400: 108 108 112;
   --gray-500: 142 142 147;
   --gray-600: 174 174 178;
+
+  /* 【APP45 任务4】Surge 风格模块标题彩色图标（浅色版） */
+  --surge-blue: 0 122 255; /* #007AFF */
+  --surge-green: 40 205 65; /* #28CD41 */
+  --surge-orange: 255 149 0; /* #FF9500 */
+  --surge-purple: 88 86 214; /* #5856D6 */
+  --surge-teal: 0 199 190; /* #00C7BE */
+  --surge-pink: 255 45 85; /* #FF2D55 */
+  --surge-amber: 230 162 60; /* #E6A23C */
 }
 
 [data-theme="dark"],
@@ -59,6 +68,15 @@
   --gray-400: 152 152 157;
   --gray-500: 120 120 125;
   --gray-600: 90 90 95;
+
+  /* 【APP45 任务4】Surge 风格模块标题彩色图标（深色版，提高亮度） */
+  --surge-blue: 10 132 255; /* #0A84FF */
+  --surge-green: 48 209 88; /* #30D158 */
+  --surge-orange: 255 159 10; /* #FF9F0A */
+  --surge-purple: 94 92 230; /* #5E5CE6 */
+  --surge-teal: 0 199 190; /* #00C7BE */
+  --surge-pink: 255 55 95; /* #FF375F */
+  --surge-amber: 255 179 64; /* #FFB340 */
 }
 
 body {

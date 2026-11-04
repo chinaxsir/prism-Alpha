@@ -441,7 +441,9 @@ fn parse_vless(rest: &str) -> Result<Value> {
         .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
+    // 【APP45 任务2.1】sni/servername/peer 提取非空值，且拒绝 "0.0.0.0" 占位值
     let sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned()).unwrap_or_default();
+    let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
     let fp = params.get("fp").cloned().unwrap_or_default();
     let flow = params.get("flow").cloned().unwrap_or_default();
     let public_key = params.get("pbk").cloned().unwrap_or_default();
@@ -522,7 +524,9 @@ fn parse_trojan(rest: &str) -> Result<Value> {
     }
 
     let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
+    // 【APP45 任务2.1】peer 映射 sni（update.microsoft.com 等伪装域名），拒绝 0.0.0.0
     let sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned()).unwrap_or_default();
+    let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
     let alpn = params.get("alpn").cloned().unwrap_or_default();
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let path = params.get("path").cloned().unwrap_or_default();

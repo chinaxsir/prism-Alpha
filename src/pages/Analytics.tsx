@@ -125,7 +125,7 @@ export default function Analytics() {
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         {/* Top 主机名 */}
         <AggCard
-          icon={<Globe2 size={16} className="text-accent" />}
+          icon={<Globe2 size={17} className="text-surge-orange" />}
           title={t("analytics.hostsTitle")}
           rows={hostTop.map(([k, a, sub]) => [mapKey(k), a, sub] as [string, Agg, string?])}
           empty={t("analytics.emptyConnections")}
@@ -158,7 +158,7 @@ export default function Analytics() {
         />
         {/* 策略分布 */}
         <AggCard
-          icon={<PieChart size={16} className="text-accent" />}
+          icon={<PieChart size={17} className="text-surge-green" />}
           title={t("analytics.outboundTitle")}
           rows={outboundTop}
           empty={t("analytics.emptyConnections")}
@@ -168,8 +168,8 @@ export default function Analytics() {
       {/* 规则统计 */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="bg-surface-card rounded-xl p-5 shadow-md">
-          <h2 className="text-base font-semibold mb-4 flex items-center gap-2">
-            <ListFilter size={16} className="text-accent" />
+          <h2 className="text-[17px] font-bold tracking-tight mb-4 flex items-center gap-2">
+            <ListFilter size={17} className="text-surge-blue" />
             {t("analytics.ruleTypesTitle")}
           </h2>
           {ruleTypes.length === 0 ? (
@@ -190,7 +190,7 @@ export default function Analytics() {
           )}
         </div>
         <AggCard
-          icon={<ListFilter size={16} className="text-accent" />}
+          icon={<ListFilter size={17} className="text-surge-purple" />}
           title={t("analytics.ruleHitsTitle")}
           rows={ruleTop.map(([k, a]) => [mapKey(k), a] as [string, Agg, string?])}
           empty={t("analytics.emptyHits")}
@@ -224,7 +224,7 @@ function AggCard({
   return (
     <div className="card-sheen bg-surface-card rounded-xl p-5 shadow-md">
       <div className="mb-4 flex items-center justify-between gap-3">
-        <h2 className="text-base font-semibold flex items-center gap-2">
+        <h2 className="text-[17px] font-bold tracking-tight flex items-center gap-2">
           {icon}
           {title}
         </h2>

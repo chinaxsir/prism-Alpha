@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
-  Check,
   Lock,
   ShieldAlert,
   ShieldCheck,
@@ -74,7 +73,12 @@ export default function Settings() {
     theme: "system",
     ...useCoreStore.getState().settings,
   }));
-  const [saved, setSaved] = useState(false);
+  // 【APP45 任务3】自动保存提示：任何修改成功持久化后闪烁 1.5s「✓ 已自动保存」
+  const [autoSaved, setAutoSaved] = useState(false);
+  const autoSaveFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const kernelSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 端口草稿：仅 blur/Enter 提交（校验 1024-65535），提交前不回写 form
+  const [portDraft, setPortDraft] = useState<string | null>(null);
   const mobile = isMobile();
   const [showActivate, setShowActivate] = useState(false);
   // 【APP-12 任务2.2/2.3】Go Lan 配置弹窗与 Pro 授权详情弹窗开关
@@ -167,29 +171,57 @@ export default function Settings() {
       .catch((e) => console.error(e));
   }, []);
 
-  const patch = (p: Partial<UserSettings>) => {
-    setForm((f) => ({ ...f, ...p }));
-    setSaved(false);
+  /// 【APP45 任务3】form 实时镜像（避免防抖闭包读取过期 state）
+  const formRef = useRef(form);
+  formRef.current = form;
+
+  const flashAutoSaved = () => {
+    setAutoSaved(true);
+    if (autoSaveFlashTimer.current) clearTimeout(autoSaveFlashTimer.current);
+    autoSaveFlashTimer.current = setTimeout(() => setAutoSaved(false), 1500);
   };
 
-  /// 【APP-11 任务3】开关拨动即刻生效并持久化：
-  /// 同步写本地表单 + 全局 store + 后端 saveSettings（运行中自动热重载），
-  /// 不再依赖右上角「保存」按钮，彻底避免切页后开关回弹/两处状态不一致。
-  const patchSwitch = (p: Partial<UserSettings>) => {
-    const next = { ...form, ...p };
+  /// 立即持久化 + 成功提示
+  const persistSettings = (next: UserSettings) => {
+    saveSettings(next)
+      .then(flashAutoSaved)
+      .catch((e) => toast.error(String(e)));
+  };
+
+  /// 【APP45 任务3】内核网络栈相关（allowLan / mixedPort / ipv6 / blockQuic）：
+  /// 300ms 防抖保存，后端 saveSettings 运行中自动热重载内核
+  const patchKernel = (p: Partial<UserSettings>) => {
+    const next = { ...formRef.current, ...p };
+    formRef.current = next;
     setForm(next);
     useCoreStore.getState().setSettings(next);
-    setSaved(false);
-    saveSettings(next)
-      .then(() => setSaved(true))
-      .catch((e) => toast.error(String(e)));
+    if (kernelSaveTimer.current) clearTimeout(kernelSaveTimer.current);
+    kernelSaveTimer.current = setTimeout(() => persistSettings(next), 300);
+  };
+
+  /// 端口提交：blur / Enter 时校验 1024-65535，非法则还原并提示
+  const commitPort = () => {
+    if (portDraft === null) return;
+    const v = Number(portDraft.trim());
+    if (!Number.isInteger(v) || v < 1024 || v > 65535) {
+      toast.error(t("settings.portInvalid"));
+      setPortDraft(null);
+      return;
+    }
+    setPortDraft(null);
+    if (v !== formRef.current.mixedPort) {
+      patchKernel({ mixedPort: v });
+    }
   };
 
   /// 语言 / 外观：立即生效 + 立即持久化（无需再点「保存」）
   const patchPrefs = (p: Partial<UserSettings>) => {
-    const next = { ...form, ...p };
+    const next = { ...formRef.current, ...p };
+    formRef.current = next;
     setForm(next);
-    saveSettings(next).catch(() => undefined);
+    saveSettings(next)
+      .then(flashAutoSaved)
+      .catch(() => undefined);
   };
 
   const chooseLanguage = (l: Language) => {
@@ -211,7 +243,6 @@ export default function Settings() {
     setRunMode(m);
     setForm((f) => ({ ...f, mode: m }));
     useCoreStore.getState().setMode(m);
-    setSaved(false);
     setModeBusy(true);
     try {
       await setMode(m);
@@ -228,17 +259,6 @@ export default function Settings() {
       toast.error(String(e));
     } finally {
       setModeBusy(false);
-    }
-  };
-
-  const handleSave = async () => {
-    try {
-      await saveSettings(form);
-      // 保存成功即写回全局 store：切页后首帧直出最新设置
-      useCoreStore.getState().setSettings(form);
-      setSaved(true);
-    } catch (e) {
-      console.error("save settings failed:", e);
     }
   };
 
@@ -281,30 +301,23 @@ export default function Settings() {
     <div className="space-y-5 max-w-3xl">
       <div className="flex items-center justify-between">
         <h1 className="text-[22px] font-bold tracking-tight">{t("settings.title")}</h1>
-        <button
-          onClick={handleSave}
+        {/* 【APP45 任务3】全量自动保存：彻底移除右上角「保存」按钮，
+            任何修改即时持久化并闪烁 1.5s 提示 */}
+        <span
           className={clsx(
-            "px-4 py-1.5 rounded-lg text-sm font-medium transition-colors",
-            saved
-              ? "bg-latency-good/20 text-latency-good"
-              : "bg-accent hover:bg-accent-hover text-white"
+            "text-xs text-latency-good font-medium transition-opacity duration-300",
+            autoSaved ? "opacity-100" : "opacity-0",
           )}
         >
-          {saved ? (
-            <span className="flex items-center gap-1">
-              <Check size={14} />
-              {t("common.saved")}
-            </span>
-          ) : (
-            t("common.save")
-          )}
-        </button>
+          {t("settings.autoSaved")}
+        </span>
       </div>
 
       {/* 外观与语言：语言 / 深浅色外观，均可跟随系统 */}
       <SettingsGroup
         title={t("settings.appearance")}
-        icon={<Palette size={14} />}
+        icon={<Palette size={18} />}
+        iconColor="text-surge-pink"
         desc={t("settings.appearanceDesc")}
       >
         <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3 border-b border-border">
@@ -347,7 +360,8 @@ export default function Settings() {
       {!mobile && (
         <SettingsGroup
           title={t("settings.mode")}
-          icon={<Wifi size={14} />}
+          icon={<Wifi size={18} />}
+          iconColor="text-surge-blue"
           desc={t("settings.modeDesc")}
         >
           {runModes.map((m) => {
@@ -399,7 +413,7 @@ export default function Settings() {
       )}
 
       {/* 本地入站 */}
-      <SettingsGroup title={t("settings.inbound")} icon={<Network size={14} />}>
+      <SettingsGroup title={t("settings.inbound")} icon={<Network size={18} />} iconColor="text-surge-teal">
         <div className="flex items-center justify-between overflow-hidden px-3 py-3 border-b border-border">
           <div className="flex items-center gap-3">
             <RowIcon><Network size={16} className="text-gray-400" /></RowIcon>
@@ -410,10 +424,14 @@ export default function Settings() {
           </div>
           <input
             type="number"
-            min={1}
+            min={1024}
             max={65535}
-            value={form.mixedPort}
-            onChange={(e) => patch({ mixedPort: Number(e.target.value) })}
+            value={portDraft ?? String(form.mixedPort)}
+            onChange={(e) => setPortDraft(e.target.value)}
+            onBlur={commitPort}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            }}
             className="w-24 px-3 py-1.5 rounded-lg bg-surface-hover border border-border focus:border-accent outline-none text-sm text-right"
           />
         </div>
@@ -426,7 +444,7 @@ export default function Settings() {
               : t("settings.allowLanDesc")
           }
           checked={form.allowLan}
-          onChange={(v) => patchSwitch({ allowLan: v })}
+          onChange={(v) => patchKernel({ allowLan: v })}
         />
         {!mobile && (
           <ToggleRow
@@ -434,7 +452,7 @@ export default function Settings() {
             title={t("settings.systemProxy")}
             desc={t("settings.systemProxyDesc")}
             checked={form.systemProxy}
-            onChange={(v) => patchSwitch({ systemProxy: v })}
+            onChange={(v) => patchPrefs({ systemProxy: v })}
           />
         )}
         {!mobile && (
@@ -443,7 +461,7 @@ export default function Settings() {
             title={t("settings.autoStart")}
             desc={t("settings.autoStartDesc")}
             checked={form.autoStart}
-            onChange={(v) => patchSwitch({ autoStart: v })}
+            onChange={(v) => patchPrefs({ autoStart: v })}
           />
         )}
       </SettingsGroup>
@@ -457,7 +475,7 @@ export default function Settings() {
       >
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <Home className="w-4 h-4 text-accent shrink-0" />
+            <Home className="w-4 h-4 text-surge-orange shrink-0" />
             <span className="font-semibold text-sm text-text">{t("engine.goLan")}</span>
             <span className="text-[11px] px-1.5 py-0.5 rounded bg-surface-hover text-text-muted">
               {t("engine.goLanTag")}
@@ -498,7 +516,8 @@ export default function Settings() {
       {/* 高级 */}
       <SettingsGroup
         title={t("settings.advanced")}
-        icon={<Sliders size={14} />}
+        icon={<Sliders size={18} />}
+        iconColor="text-surge-green"
         desc={t("settings.advancedDesc")}
       >
         <ToggleRow
@@ -506,29 +525,29 @@ export default function Settings() {
           title={t("settings.ipv6")}
           desc={t("settings.ipv6Desc")}
           checked={form.ipv6 ?? false}
-          onChange={(v) => patchSwitch({ ipv6: v })}
+          onChange={(v) => patchKernel({ ipv6: v })}
         />
         <ToggleRow
           icon={<Blocks size={16} className="text-gray-400" />}
           title={t("settings.blockQuic")}
           desc={t("settings.blockQuicDesc")}
           checked={form.blockQuic ?? false}
-          onChange={(v) => patchSwitch({ blockQuic: v })}
+          onChange={(v) => patchKernel({ blockQuic: v })}
         />
         <ToggleRow
           icon={<RefreshCw size={16} className="text-gray-400" />}
           title={t("settings.closeConns")}
           desc={t("settings.closeConnsDesc")}
           checked={form.closeConnectionsOnSwitch ?? false}
-          onChange={(v) => patchSwitch({ closeConnectionsOnSwitch: v })}
+          onChange={(v) => patchPrefs({ closeConnectionsOnSwitch: v })}
         />
       </SettingsGroup>
 
       {/* 【APP6 任务1.2】诊断与日志：全模块环形日志查看/导出/清空 */}
       <div className="rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-accent/15 flex items-center justify-center shrink-0">
-            <FileTerminal size={16} className="text-accent" />
+          <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
+            <FileTerminal size={16} className="text-surge-purple" />
           </div>
           <div className="min-w-0">
             <div className="font-semibold text-sm text-text">{t("logs.cardTitle")}</div>
@@ -554,7 +573,7 @@ export default function Settings() {
       </div>
 
       {/* 【APP12 任务2】代理内核：干净单行展示，仅显示版本号 vX.Y.Z */}
-      <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={14} />}>
+      <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={18} />} iconColor="text-surge-purple">
         <div className="flex items-center justify-between px-3 py-3">
           <div className="flex items-center gap-3">
             <RowIcon>
@@ -580,8 +599,8 @@ export default function Settings() {
         <div className="rounded-xl bg-surface border border-border p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-lg bg-accent/15 flex items-center justify-center shrink-0">
-                <Sparkles className="w-4 h-4 text-accent" />
+              <div className="w-8 h-8 rounded-lg bg-surge-amber/15 flex items-center justify-center shrink-0">
+                <Sparkles className="w-4 h-4 text-surge-amber" />
               </div>
               <div className="min-w-0">
                 <div className="font-semibold text-sm text-text">Prism Pro</div>
@@ -633,7 +652,7 @@ export default function Settings() {
         >
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4 shrink-0 text-amber-400" />
+              <Sparkles className="h-4 w-4 shrink-0 text-surge-amber" />
               <span className="text-sm font-semibold text-text">Prism Pro</span>
               <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[11px] font-medium text-emerald-400">
                 {t("pro.status.active")}
@@ -709,6 +728,7 @@ function SettingsGroup({
   title,
   desc,
   icon,
+  iconColor,
   headerRight,
   children,
   id,
@@ -716,6 +736,8 @@ function SettingsGroup({
   title: string;
   desc?: string;
   icon?: React.ReactNode;
+  /** 【APP45 任务4】Surge 风格模块标题图标颜色类（如 text-surge-orange） */
+  iconColor?: string;
   headerRight?: React.ReactNode;
   children: React.ReactNode;
   /** DOM 锚点：供其他页面跳转定位（如仪表盘 Go Lan「配置」按钮） */
@@ -723,15 +745,19 @@ function SettingsGroup({
 }) {
   return (
     <section id={id}>
-      <div className="flex items-center justify-between px-3 mb-1.5">
-        <div className="flex items-center gap-1.5 text-xs font-medium text-gray-400 uppercase tracking-wide">
-          {icon}
+      <div className="flex items-center justify-between px-1 mb-2">
+        <div className="flex items-center gap-2 text-[17px] font-bold tracking-tight text-gray-100">
+          {icon && (
+            <span className={clsx("flex items-center", iconColor ?? "text-accent")}>
+              {icon}
+            </span>
+          )}
           <span>{title}</span>
         </div>
         {headerRight}
       </div>
       {desc && (
-        <p className="px-3 mb-1.5 text-[11px] text-gray-500 leading-relaxed">
+        <p className="px-1 mb-1.5 text-[11px] text-gray-500 leading-relaxed">
           {desc}
         </p>
       )}

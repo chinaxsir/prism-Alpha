@@ -263,7 +263,8 @@ export const normalizeGoLanProfile = (raw: Partial<GoLanProfile> | null, index: 
     id: typeof p.id === "string" && p.id.trim() ? p.id : `profile${index + 1}`,
     name: typeof p.name === "string" && p.name.trim() ? p.name : `内网 ${index + 1}`,
     enabled: p.enabled === true,
-    bypassOnLocalLan: p.bypassOnLocalLan !== false,
+    // 【APP45 任务1.1】On-Demand 同网段跳过默认关闭（缺省即 false）
+    bypassOnLocalLan: p.bypassOnLocalLan === true,
     localWifiSsid: typeof p.localWifiSsid === "string" ? p.localWifiSsid : "",
     lanCidrs: Array.isArray(p.lanCidrs) ? p.lanCidrs : [],
     wgConfig: p.wgConfig ?? null,
@@ -280,7 +281,8 @@ export const normalizeGoLanSettings = (raw: GoLanSettings | null): GoLanSettings
   const r = raw ?? ({} as GoLanSettings);
   return {
     enabled: r.enabled === true,
-    bypassOnLocalLan: r.bypassOnLocalLan !== false,
+    // 【APP45 任务1.1】On-Demand 默认关闭，理由同 normalizeGoLanProfile
+    bypassOnLocalLan: r.bypassOnLocalLan === true,
     profiles: Array.isArray(r.profiles) ? r.profiles.map((p, i) => normalizeGoLanProfile(p, i)) : [],
     activeProfileId: typeof r.activeProfileId === "string" ? r.activeProfileId : "",
     mode: r.mode === "managed" ? "managed" : "manual",

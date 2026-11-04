@@ -572,7 +572,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-12 gap-3">
         <div className="col-span-12 md:col-span-7">
           <StatChip
-            icon={<Globe size={14} className="text-gray-400" />}
+            icon={<Globe size={14} className="text-surge-blue" />}
             label={t("metric.currentNode")}
             value={
               running
@@ -585,7 +585,7 @@ export default function Dashboard() {
         </div>
         <div className="col-span-12 md:col-span-5">
           <StatChip
-            icon={<BarChart3 size={14} className="text-gray-400" />}
+            icon={<BarChart3 size={14} className="text-surge-teal" />}
             label={t("metric.todayTraffic")}
             value={running ? formatBytes(todayBytes) : "—"}
           />
@@ -598,7 +598,7 @@ export default function Dashboard() {
           布局跳变，也让用户一眼看清 Pro 到底解锁了什么。 */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
         <EngineCard
-          icon={<Crosshair size={14} className="text-accent" />}
+          icon={<Crosshair size={14} className="text-surge-green" />}
           name={t("engine.goAim")}
           tag={t("engine.goAimTag")}
           status={proUnlocked ? aimStatus : t("pro.lockedTap")}
@@ -621,7 +621,7 @@ export default function Dashboard() {
           }
         />
         <EngineCard
-          icon={<Home size={14} className="text-accent" />}
+          icon={<Home size={14} className="text-surge-orange" />}
           name={t("engine.goLan")}
           tag={t("engine.goLanTag")}
           status={proUnlocked ? lanStatus : t("pro.lockedTap")}
@@ -640,7 +640,7 @@ export default function Dashboard() {
           }
         />
         <EngineCard
-          icon={<Wand2 size={14} className="text-accent" />}
+          icon={<Wand2 size={14} className="text-surge-purple" />}
           name={t("engine.goCus")}
           tag={t("engine.goCusTag")}
           status={proUnlocked ? cusStatus : t("pro.lockedTap")}

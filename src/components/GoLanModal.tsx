@@ -74,7 +74,8 @@ const EMPTY_GO_LAN: GoLanForm = {
   id: "home",
   name: "家里",
   enabled: false,
-  bypassOnLocalLan: true,
+  // 【APP45 任务1.1】On-Demand 默认关闭
+  bypassOnLocalLan: false,
   probeTarget: "",
   mode: "manual",
   method: "wg",
@@ -402,12 +403,13 @@ export default function GoLanModal({ open, onClose }: Props) {
   const addProfile = () => {
     const merged = mergeActiveForm(profiles);
     const id = `p${Date.now().toString(36)}`;
+    // 【APP45 任务1.2】新档案必须 100% 空白：严禁继承上一条隧道的任何字段
     const created = normalizeGoLanProfile(
       {
         id,
         name: `内网 ${merged.length + 1}`,
         enabled: true,
-        bypassOnLocalLan: true,
+        bypassOnLocalLan: false,
         lanCidrs: [],
         probeTarget: "",
       },
@@ -417,6 +419,9 @@ export default function GoLanModal({ open, onClose }: Props) {
     setProfiles(next);
     setActiveId(id);
     setForm(applyProfileToForm(created, loaded ?? ({} as GoLanSettings)));
+    // 同步重置粘贴识别框与检测状态，杜绝残留上一条隧道的任何一个字符
+    setPasteBuf("");
+    setPasteHint("");
     setProbeMsg("");
     setProbeOk(null);
   };
@@ -435,13 +440,38 @@ export default function GoLanModal({ open, onClose }: Props) {
     setProbeOk(null);
   };
 
-  const clearAllProfiles = () => {
+  const clearAllProfiles = async () => {
     if (!window.confirm(t("goLan.clearAllConfirm"))) return;
     setProfiles([]);
     setActiveId("");
     setForm({ ...EMPTY_GO_LAN, id: "home", name: "家里", enabled: false });
+    setPasteBuf("");
+    setPasteHint("");
     setProbeMsg("");
     setProbeOk(null);
+    // 【APP45 任务1.2】清空配置立即持久化到磁盘：档案列表与顶层旧版字段
+    // （wgConfig / lanCidrs / nodeUri）一并清空，严禁后端 normalize 把残留的
+    // 旧顶层配置重新回填进新档案。
+    try {
+      const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
+      await saveGoLanSettings({
+        ...base,
+        enabled: false,
+        bypassOnLocalLan: false,
+        profiles: [],
+        activeProfileId: "",
+        nodeUri: "",
+        wgConfig: null,
+        lanCidrs: [],
+      });
+      const fresh = await getGoLanSettings();
+      setLoaded(fresh);
+      setGoLanSettings(fresh);
+      setStatus(await getGoLanStatus().catch(() => null));
+      toast.success(t("goLan.saved"));
+    } catch (e) {
+      toast.error(String(e));
+    }
   };
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）

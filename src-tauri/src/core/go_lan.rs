@@ -38,11 +38,6 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP40 任务1/2】On-Demand 同局域网自动直连默认开启
-fn default_true() -> bool {
-    true
-}
-
 /// 【APP30 任务2】go-lan-home 运行时隧道 MTU = 1280（不修改用户保存的
 /// `settings.go_lan.wg_config.mtu`，前端仍显示导入值；仅写入内核 JSON）。
 /// log8.txt 实证：MTU 1420 时 gVisor 向飞牛 NAS 宣告 MSS 1380，1420 字节
@@ -91,7 +86,9 @@ pub struct GoLanProfile {
     pub enabled: bool,
     /// 本机连上该内网对应的局域网 Wi-Fi（物理 IP 落在 lan_cidrs 内）时，
     /// 自动跳过该网段的 WireGuard 隧道，直接走本地局域网。
-    #[serde(default = "default_true")]
+    /// 【APP45 任务1.1】默认关闭：常见回家网段（192.168.10.0/24 等）极易与
+    /// 外部 Wi-Fi 网段重合，默认开启会把回家隧道误判为本地直连（0ms/1ms 假象）。
+    #[serde(default)]
     pub bypass_on_local_lan: bool,
     /// 可选：显式指定的 Wi-Fi SSID（留空则按 lan_cidrs 同网段智能匹配）
     #[serde(default)]
@@ -113,7 +110,7 @@ impl Default for GoLanProfile {
             id: String::new(),
             name: String::new(),
             enabled: false,
-            bypass_on_local_lan: true,
+            bypass_on_local_lan: false,
             local_wifi_ssid: String::new(),
             lan_cidrs: Vec::new(),
             wg_config: None,
@@ -129,7 +126,8 @@ pub struct GoLanSettings {
     #[serde(default)]
     pub enabled: bool,
     /// 顶层 On-Demand 开关（旧版兼容；新档案以 profile.bypass_on_local_lan 为准）
-    #[serde(default = "default_true")]
+    /// 【APP45 任务1.1】默认关闭，理由同 GoLanProfile.bypass_on_local_lan。
+    #[serde(default)]
     pub bypass_on_local_lan: bool,
     /// 多路内网档案（APP40）。为空时由 normalize_go_lan_settings 从旧字段迁移。
     #[serde(default)]
@@ -173,7 +171,7 @@ impl Default for GoLanSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            bypass_on_local_lan: true,
+            bypass_on_local_lan: false,
             profiles: Vec::new(),
             active_profile_id: String::new(),
             mode: default_mode(),
@@ -328,6 +326,23 @@ pub fn normalize_go_lan_settings(settings: &mut GoLanSettings) {
             .first()
             .map(|p| p.id.clone())
             .unwrap_or_default();
+    }
+    // 【APP45 任务1.2】profiles 非空时，顶层旧版字段 100% 镜像「第 1 个启用档案」
+    // 的自身状态（供 resolve_probe_target 等旧代码路径读取）；没有任何启用档案
+    // 或档案已清空时，顶层同步置 None / [] / ""。严禁反向回填——用户在前端
+    // 「清空配置」后，绝不允许把顶层残留的旧 wg_config 再复制回档案。
+    if !settings.profiles.is_empty() {
+        if let Some(first_enabled) = settings.profiles.iter().find(|p| p.enabled) {
+            settings.wg_config = first_enabled.wg_config.clone();
+            settings.node_uri = first_enabled.node_uri.clone();
+            settings.lan_cidrs = first_enabled.lan_cidrs.clone();
+            settings.bypass_on_local_lan = first_enabled.bypass_on_local_lan;
+        } else {
+            settings.wg_config = None;
+            settings.node_uri = String::new();
+            settings.lan_cidrs = Vec::new();
+            settings.bypass_on_local_lan = false;
+        }
     }
 }
 
@@ -861,6 +876,112 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------- 【APP45 任务2.2】代理节点域名批量预解析 ----------------
+
+/// 节点域名解析缓存有效期：300 秒（机场节点 IP 相对稳定；WG endpoint
+/// 家庭 DDNS 用另一个 60s 缓存，二者互不干扰）。
+const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn node_host_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 【APP45 任务2.2】并发 DoH 批量解析代理节点域名 → 真实公网 IPv4。
+///
+/// 背景：`hk1.xxx.the-best-airport.com` 等多级动态域名在 iOS
+/// NEPacketTunnelProvider 扩展内经系统 DNS 解析会被 utun 自拦截超时；
+/// 主进程（有正常网络权限）在构建配置前并发 DoH 解析并把节点 server
+/// 替换为真实 IPv4（TLS server_name 已独立保存 SNI，不受影响），内核
+/// 0ms 直接 TCP+TLS 握手。解析失败/超时的域名不在返回表内，调用方保留
+/// 原域名，由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡
+/// 绑定）兜底解析（保险 2）。
+///
+/// 整体在独立工作线程 + current_thread runtime 内并发执行，调用方最多
+/// 阻塞 2600ms；命中 300s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
+/// 私网/fake-ip（198.18/15）等非法解析结果。
+pub(crate) fn doh_resolve_node_hosts_ipv4(
+    hosts: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut todo: Vec<String> = Vec::new();
+    for h in hosts {
+        let key = h.trim().to_ascii_lowercase();
+        if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        // 300s 缓存命中直接用
+        if let Ok(mut c) = node_host_cache().lock() {
+            if let Some((ip, at)) = c.get(&key) {
+                if at.elapsed() < NODE_HOST_CACHE_TTL {
+                    out.insert(key, ip.clone());
+                    continue;
+                }
+                c.remove(&key);
+            }
+        }
+        if !todo.contains(&key) {
+            todo.push(key);
+        }
+    }
+    if todo.is_empty() {
+        return out;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, Option<String>)>>();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(async move {
+                let mut set: tokio::task::JoinSet<(String, Option<String>)> =
+                    tokio::task::JoinSet::new();
+                for host in todo {
+                    set.spawn(async move {
+                        let ip = doh_query_ipv4(&host).await;
+                        (host, ip)
+                    });
+                }
+                let mut done = Vec::new();
+                while let Some(joined) = set.join_next().await {
+                    if let Ok(pair) = joined {
+                        done.push(pair);
+                    }
+                }
+                done
+            }),
+            Err(_) => Vec::new(),
+        };
+        let _ = tx.send(result);
+    });
+    let resolved = rx
+        .recv_timeout(std::time::Duration::from_millis(2600))
+        .unwrap_or_default();
+    for (host, maybe_ip) in resolved {
+        let Some(ip) = maybe_ip else { continue };
+        // 只接受真实公网 IPv4：拒绝环回/0.0.0.0/私网/fake-ip 等污染结果
+        let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        if v4.is_loopback()
+            || v4.is_unspecified()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19)
+        {
+            continue;
+        }
+        if let Ok(mut c) = node_host_cache().lock() {
+            c.insert(host.clone(), (ip.clone(), std::time::Instant::now()));
+        }
+        out.insert(host, ip);
+    }
+    out
 }
 
 /// 从 DoH JSON 的 Answer 数组取第一条 `type == 1` 的合法 IPv4 记录。
@@ -1695,14 +1816,30 @@ pub async fn probe_intranet_ip(
     }
     match result {
         Ok(hit) => {
+            // 【APP45 任务1.1】0ms/1ms 是数据包根本没进 WireGuard 隧道、在本地
+            // 回环或当前外部 Wi-Fi 局域网秒回的假阳性（On-Demand 直连除外）。
+            // 真实穿过 WG 隧道的外网穿透延迟通常在 10ms~300ms。
+            if !bypassed && hit.latency_ms <= 1 {
+                let msg = format!(
+                    "❌ 检测到 {target_ip}:{} 延迟仅 {} ms（疑似本地回环/同网段直连，未穿过「{}」隧道），请检查该内网网段是否与本机当前局域网重合",
+                    input.port, hit.latency_ms, profile.name
+                );
+                crate::core::logger::warn(log, &msg);
+                return GoLanProbeResult {
+                    reachable: false,
+                    target_ip,
+                    latency_ms: None,
+                    message: msg,
+                };
+            }
             let od_note = if bypassed {
                 "（⚡ On-Demand 同局域网直连，已自动跳过隧道）"
             } else {
                 ""
             };
             let msg = format!(
-                "✅ 已连通 {}://{target_ip}:{}{od_note} · 延迟 {} ms",
-                hit.scheme, input.port, hit.latency_ms
+                "✅ 已通过「{}」隧道连通 {}://{target_ip}:{}{od_note} · 延迟 {} ms",
+                profile.name, hit.scheme, input.port, hit.latency_ms
             );
             crate::core::logger::info(log, &msg);
             GoLanProbeResult {
@@ -3262,7 +3399,8 @@ mod tests {
         assert_eq!(p.id, "home");
         assert_eq!(p.name, "家里");
         assert!(p.enabled);
-        assert!(p.bypass_on_local_lan);
+        // 【APP45 任务1.1】On-Demand 默认关闭（避免回家网段被误判本地直连）
+        assert!(!p.bypass_on_local_lan);
         assert_eq!(p.lan_cidrs, vec!["192.168.10.0/24".to_string()]);
         assert_eq!(
             p.wg_config.as_ref().map(|w| w.server.as_str()),
@@ -3433,5 +3571,59 @@ mod tests {
         let mut off = lan.clone();
         off.enabled = false;
         assert!(profiles_metadata(&off).is_empty());
+    }
+
+    /// 【APP45 任务1.2】profiles 非空时顶层镜像第 1 个启用档案；
+    /// 用户清空档案后严禁把顶层残留 wg_config 回填回来。
+    #[test]
+    fn test_normalize_mirrors_first_enabled_and_never_refills() {
+        let mut lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![
+                sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 80),
+                sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 82),
+            ],
+            ..Default::default()
+        };
+        normalize_go_lan_settings(&mut lan);
+        // 顶层镜像第 1 个启用档案（家里）
+        assert_eq!(lan.lan_cidrs, vec!["192.168.10.0/24".to_string()]);
+        assert!(lan.wg_config.is_some(), "顶层应镜像家里 wg_config");
+
+        // 用户清空「家里」档案（wg_config/lan_cidrs/node_uri 全空）
+        lan.profiles[0].wg_config = None;
+        lan.profiles[0].lan_cidrs = Vec::new();
+        lan.profiles[0].node_uri = String::new();
+        normalize_go_lan_settings(&mut lan);
+        // 档案保持空（严禁回填），顶层同步镜像空状态
+        assert!(lan.profiles[0].wg_config.is_none(), "清空后严禁回填");
+        assert!(lan.profiles[0].lan_cidrs.is_empty(), "清空后严禁回填网段");
+        assert!(lan.wg_config.is_none(), "档案已空时顶层同步置 None");
+        assert!(lan.lan_cidrs.is_empty(), "档案已空时顶层同步置 []");
+
+        // 再次 normalize 幂等：依旧不回填
+        normalize_go_lan_settings(&mut lan);
+        assert!(lan.profiles[0].wg_config.is_none());
+
+        // 全部档案禁用 → 顶层同步清空
+        for p in &mut lan.profiles {
+            p.enabled = false;
+        }
+        normalize_go_lan_settings(&mut lan);
+        assert!(lan.wg_config.is_none());
+        assert!(lan.lan_cidrs.is_empty());
+        assert!(!lan.bypass_on_local_lan);
+    }
+
+    /// 【APP45 任务1.1】On-Demand 默认关闭（serde 缺省 + Default 均为 false）。
+    #[test]
+    fn test_bypass_on_local_lan_defaults_false() {
+        assert!(!GoLanProfile::default().bypass_on_local_lan);
+        assert!(!GoLanSettings::default().bypass_on_local_lan);
+        // serde 缺省（旧 JSON 无此字段）→ false
+        let p: GoLanProfile = serde_json::from_str("{}").unwrap();
+        assert!(!p.bypass_on_local_lan);
+        let s: GoLanSettings = serde_json::from_str("{}").unwrap();
+        assert!(!s.bypass_on_local_lan);
     }
 }
