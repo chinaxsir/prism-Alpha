@@ -94,7 +94,9 @@ pub struct UserSettings {
     #[serde(default)]
     pub block_quic: bool,
     /// 手动切换策略后关闭现有连接（让新策略立即生效）
-    #[serde(default)]
+    /// 【APP47 任务3.3】默认 true：切换节点后立即断开旧连接，
+    /// 新选中节点 0 延迟接管全部网页与 App 流量（用户仍可在设置中关闭）。
+    #[serde(default = "default_true")]
     pub close_connections_on_switch: bool,
     /// Go AIM（Pro）：AI/流媒体自动探测锁定开关
     #[serde(default)]
@@ -123,6 +125,11 @@ fn default_system() -> String {
     "system".to_string()
 }
 
+/// 布尔字段默认 true（用于 close_connections_on_switch 等「新行为默认开启」项）
+fn default_true() -> bool {
+    true
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
@@ -139,7 +146,7 @@ impl Default for UserSettings {
             outbound_mode: OutboundMode::Rule,
             ipv6: false,
             block_quic: false,
-            close_connections_on_switch: false,
+            close_connections_on_switch: true,
             go_aim_enabled: false,
             go_aim_pinned_node: None,
             selected_node: None,

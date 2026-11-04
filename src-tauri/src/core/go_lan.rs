@@ -879,11 +879,13 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 }
 
 // ---------------- 【APP45 任务2.2】代理节点域名批量预解析 ----------------
-
-/// 节点域名解析缓存有效期：300 秒（机场节点 IP 相对稳定；WG endpoint
-/// 家庭 DDNS 用另一个 60s 缓存，二者互不干扰）。
+// 【APP47 任务3.2】已停止在 config_builder 调用：节点 server 一律保留订阅原始
+// 域名，由内核 DNS（dns-direct 223.5.5.5 + default_interface）解析，避免机场
+// 轮换 IP / CDN 多落地节点被写死失效。工具函数保留以备后续单独使用。
+#[allow(dead_code)]
 const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+#[allow(dead_code)]
 fn node_host_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
     static CACHE: std::sync::OnceLock<
@@ -905,6 +907,7 @@ fn node_host_cache(
 /// 整体在独立工作线程 + current_thread runtime 内并发执行，调用方最多
 /// 阻塞 2600ms；命中 300s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
 /// 私网/fake-ip（198.18/15）等非法解析结果。
+#[allow(dead_code)]
 pub(crate) fn doh_resolve_node_hosts_ipv4(
     hosts: &[String],
 ) -> std::collections::HashMap<String, String> {

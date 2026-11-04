@@ -81,12 +81,14 @@ function ToastCard({ item }: { item: ToastItem }) {
   return (
     <div
       className={clsx(
-        "flex items-start gap-2 rounded-lg border bg-surface-card px-4 py-3 text-sm shadow-lg transition-all duration-200",
+        "flex items-start gap-2 rounded-lg border px-4 py-3 text-sm shadow-lg transition-all duration-200",
         success
-          ? "border-accent/50"
+          ? "border-accent/50 bg-surface-card"
           : info
-            ? "border-border-strong"
-            : "border-latency-bad/50",
+            ? "border-border-strong bg-surface-card"
+            // 【APP47 任务2.2】错误提示绑定主题色：浅色深红字/浅红底，
+            // 深色亮红字/暗红底，彻底杜绝浅色外观下「白底白字」
+            : "border-[#F87171] bg-[#FEF2F2] dark:border-[#EF4444] dark:bg-[#3B1219]",
         visible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-2"
       )}
     >
@@ -95,10 +97,17 @@ function ToastCard({ item }: { item: ToastItem }) {
       ) : info ? (
         <Info size={16} className="mt-0.5 shrink-0 text-gray-400" />
       ) : (
-        <XCircle size={16} className="mt-0.5 shrink-0 text-latency-bad" />
+        <XCircle size={16} className="mt-0.5 shrink-0 text-[#B91C1C] dark:text-[#FCA5A5]" />
       )}
-      {/* 【APP21 任务1】显式指定浅色文字：防止继承深色文字导致黑底黑字看不见 */}
-      <span className="break-all text-slate-100 font-medium">{item.message}</span>
+      {/* 【APP47 任务2.2】文字颜色跟随主题：错误态高对比深红/亮红，其余用正文色 */}
+      <span
+        className={clsx(
+          "break-all font-semibold",
+          info ? "text-text" : success ? "text-text" : "text-[#B91C1C] dark:text-[#FCA5A5]"
+        )}
+      >
+        {item.message}
+      </span>
     </div>
   );
 }

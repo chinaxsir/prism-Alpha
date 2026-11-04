@@ -44,6 +44,9 @@ export default function Subscription() {
   const [name, setName] = useState("");
   const [adding, setAdding] = useState(false);
   const [updatingUrl, setUpdatingUrl] = useState<string | null>(null);
+  // 【APP47 任务2.2】订阅操作错误：文档流内联高对比横幅（不再用悬浮 Toast
+  // 遮挡下方「添加并更新」按钮，且浅色外观下为深红字/浅红底，绝不白底白字）
+  const [actionError, setActionError] = useState<string | null>(null);
   const [confirmUrl, setConfirmUrl] = useState<string | null>(null);
   // 行内重命名：正在编辑的 URL 与草稿值
   const [editingUrl, setEditingUrl] = useState<string | null>(null);
@@ -77,7 +80,7 @@ export default function Subscription() {
   const handleAdd = async () => {
     const trimmed = url.trim();
     if (!/^https?:\/\/.+/.test(trimmed)) {
-      toast.error(t("sub.invalidUrl"));
+      setActionError(t("sub.invalidUrl"));
       return;
     }
     // 免费版仅支持单订阅：第二条起需要 Pro（全平台门控）
@@ -86,6 +89,7 @@ export default function Subscription() {
       return;
     }
     setAdding(true);
+    setActionError(null);
     try {
       await updateSubscription(trimmed, name.trim() || null);
       toast.success(t("sub.added"));
@@ -94,7 +98,7 @@ export default function Subscription() {
       await load();
     } catch (e) {
       console.error("add subscription failed:", e);
-      toast.error(String(e));
+      setActionError(String(e));
     } finally {
       setAdding(false);
     }
@@ -119,13 +123,14 @@ export default function Subscription() {
   const handleUpdate = async (record: SubscriptionRecord) => {
     if (updatingUrl) return;
     setUpdatingUrl(record.url);
+    setActionError(null);
     try {
       await updateSubscription(record.url);
       toast.success(t("sub.updated"));
       await load();
     } catch (e) {
       console.error("update subscription failed:", e);
-      toast.error(String(e));
+      setActionError(String(e));
     } finally {
       setUpdatingUrl(null);
     }
@@ -158,9 +163,27 @@ export default function Subscription() {
     <div className="space-y-6">
       <h1 className="text-[22px] font-bold tracking-tight">{t("sub.title")}</h1>
 
+      {/* 【APP47 任务2.2】错误横幅：标准文档流、位于「添加订阅」卡片上方，
+          浅色 深红字 #B91C1C + 浅红底 #FEF2F2 + 红框 #F87171；
+          深色 亮红字 #FCA5A5 + 暗红底 #3B1219 + 红框 #EF4444 */}
+      {actionError && (
+        <div className="mb-3 flex items-start gap-2 rounded-xl border px-4 py-3 bg-[#FEF2F2] border-[#F87171] text-[#B91C1C] dark:bg-[#3B1219] dark:border-[#EF4444] dark:text-[#FCA5A5]">
+          <span className="flex-1 text-[14px] font-semibold break-all">
+            {actionError}
+          </span>
+          <button
+            onClick={() => setActionError(null)}
+            className="shrink-0 rounded p-1 text-[#B91C1C] dark:text-[#FCA5A5] hover:opacity-70"
+            title={t("common.cancel")}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* 添加订阅 */}
       <div className="bg-surface-card rounded-xl p-5">
-        <h2 className="text-base font-semibold mb-4">{t("sub.addTitle")}</h2>
+        <h2 className="text-[16px] font-bold text-text mb-4">{t("sub.addTitle")}</h2>
         <div className="flex flex-col gap-3 md:flex-row">
           <input
             type="text"
@@ -177,10 +200,11 @@ export default function Subscription() {
             placeholder={t("sub.urlPlaceholder")}
             className="flex-1 px-4 py-2 rounded-lg bg-surface-hover border border-border focus:border-accent outline-none text-sm"
           />
+          {/* 【APP47 任务2.2】实心高亮皇家蓝主按钮（杜绝发灰浅蓝底配暗字） */}
           <button
             onClick={handleAdd}
             disabled={adding || !url.trim()}
-            className="flex items-center justify-center gap-2 px-6 py-2 rounded-lg bg-accent hover:bg-accent-hover transition-colors text-sm disabled:opacity-50"
+            className="flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-[#007AFF] hover:bg-[#0066DD] transition-colors text-[15px] font-bold text-white shadow-sm disabled:opacity-50"
           >
             {adding && <Spinner size={14} className="text-white" />}
             {adding ? t("sub.adding") : t("sub.addAndUpdate")}
@@ -190,7 +214,7 @@ export default function Subscription() {
 
       {/* 订阅列表 */}
       <div className="bg-surface-card rounded-xl p-5">
-        <h2 className="text-base font-semibold mb-4">
+        <h2 className="text-[16px] font-bold text-text mb-4">
           {t("sub.myList", { count: subs.length })}
         </h2>
 
@@ -244,7 +268,7 @@ export default function Subscription() {
                       </div>
                     ) : (
                       <>
-                        <span className="truncate text-sm font-medium">
+                        <span className="truncate text-[16px] font-bold text-text">
                           {displayName(record)}
                         </span>
                         <button
@@ -334,7 +358,7 @@ export default function Subscription() {
                   <button
                     onClick={() => handleUpdate(record)}
                     disabled={updatingUrl === record.url}
-                    className="flex items-center gap-1.5 rounded-lg bg-surface-card px-3 py-1.5 text-xs text-gray-300 hover:text-gray-100 disabled:opacity-50"
+                    className="flex items-center gap-1.5 rounded-lg bg-[#EEEEF0] dark:bg-[#2C2C2E] px-4 py-1.5 text-[14px] font-bold text-[#000000] dark:text-[#FFFFFF] active:opacity-70 transition-opacity disabled:opacity-50"
                   >
                     {updatingUrl === record.url ? (
                       <Spinner size={12} />
@@ -348,13 +372,13 @@ export default function Subscription() {
                     <>
                       <button
                         onClick={() => handleDelete(record)}
-                        className="rounded-lg bg-latency-bad/20 px-3 py-1.5 text-xs text-latency-bad hover:bg-latency-bad/30"
+                        className="rounded-lg bg-latency-bad/20 px-4 py-1.5 text-[14px] font-bold text-latency-bad hover:bg-latency-bad/30"
                       >
                         {t("sub.confirmDelete")}
                       </button>
                       <button
                         onClick={() => setConfirmUrl(null)}
-                        className="rounded-lg bg-surface-card px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200"
+                        className="rounded-lg bg-[#EEEEF0] dark:bg-[#2C2C2E] px-4 py-1.5 text-[14px] font-bold text-[#000000] dark:text-[#FFFFFF] active:opacity-70 transition-opacity"
                       >
                         {t("common.cancel")}
                       </button>
@@ -362,7 +386,7 @@ export default function Subscription() {
                   ) : (
                     <button
                       onClick={() => setConfirmUrl(record.url)}
-                      className="flex items-center gap-1.5 rounded-lg bg-surface-card px-3 py-1.5 text-xs text-gray-400 hover:text-latency-bad"
+                      className="flex items-center gap-1.5 rounded-lg bg-[#EEEEF0] dark:bg-[#2C2C2E] px-4 py-1.5 text-[14px] font-bold text-[#000000] dark:text-[#FFFFFF] active:opacity-70 transition-opacity hover:text-latency-bad"
                     >
                       <Trash2 size={12} />
                       {t("common.delete")}

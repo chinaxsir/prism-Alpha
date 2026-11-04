@@ -1467,6 +1467,10 @@ async fn test_fastest(
 /// 订阅缓存解析出真实出口地址。
 /// 【APP37 任务3】全平台可用：go_aim 快筛与整组测速的 Clash API
 /// 失败回退（TcpStream::connect 握手）在桌面端同样需要。
+#[cfg_attr(
+    not(any(target_os = "ios", target_os = "android")),
+    allow(dead_code)
+)]
 pub(crate) fn collect_node_endpoints(
     data_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, (String, u16)> {

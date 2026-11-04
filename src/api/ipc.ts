@@ -35,6 +35,8 @@ export interface CoreStatusDto {
   mainSelector?: string | null;
   /** 出站模式（规则/全局/直连） */
   outboundMode?: OutboundMode;
+  /** 【APP47 任务1.2】持久化选中节点名（内核未运行时仪表盘也展示） */
+  selectedNode?: string | null;
 }
 
 export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");

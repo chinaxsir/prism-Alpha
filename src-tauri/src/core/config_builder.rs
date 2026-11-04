@@ -754,57 +754,12 @@ pub fn build(
         "已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into(),
     );
 
-    // ---- 【APP45 任务2.2】保险 1：节点域名主进程并发 DoH 预解析 ----
-    // *.the-best-airport.com 等多级动态域名在 iOS 扩展内经系统 DNS 解析会被
-    // utun 自拦截超时；主进程并发 DoH（223.5.5.5/1.12.12.12）解析为真实公网
-    // IPv4 后直接替换节点 server（TLS server_name 独立保存 SNI 不受影响），
-    // 内核 0ms 直连 TCP+TLS 握手。解析失败/超时保留原域名，由内核 dns-direct
-    // （223.5.5.5 detour direct + default_interface 物理网卡）兜底（保险 2）。
-    // 单元测试跳过（不依赖外部网络，也不污染测试断言）。
-    if !cfg!(test) {
-        let mut hosts: Vec<String> = Vec::new();
-        let mut seen_hosts: HashSet<String> = HashSet::new();
-        let mut collect_host = |server: &str| {
-            let h = server.trim();
-            if h.is_empty() || h.parse::<std::net::IpAddr>().is_ok() {
-                return;
-            }
-            if seen_hosts.insert(h.to_ascii_lowercase()) {
-                hosts.push(h.to_string());
-            }
-        };
-        for parsed in &parsed_list {
-            for n in &parsed.profile.proxies {
-                collect_host(&n.server);
-            }
-            for nodes in parsed.provider_nodes.values() {
-                for n in nodes {
-                    collect_host(&n.server);
-                }
-            }
-        }
-        let resolved = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&hosts);
-        if !resolved.is_empty() {
-            let replaced_count = resolved.len();
-            for parsed in &mut parsed_list {
-                for n in &mut parsed.profile.proxies {
-                    if let Some(ip) = resolved.get(&n.server.trim().to_ascii_lowercase()) {
-                        n.server = ip.clone();
-                    }
-                }
-                for nodes in parsed.provider_nodes.values_mut() {
-                    for n in nodes {
-                        if let Some(ip) = resolved.get(&n.server.trim().to_ascii_lowercase()) {
-                            n.server = ip.clone();
-                        }
-                    }
-                }
-            }
-            warnings.push(format!(
-                "节点域名预解析：{replaced_count} 个域名已解析为 IPv4 直连（其余域名由内核 dns-direct 兜底）"
-            ));
-        }
-    }
+    // 【APP47 任务3.2】删除 APP45 的"节点域名 DoH 预解析替换 IPv4"：
+    // 把节点 server 换成 IP 后，机场轮换 IP / 多落地 CDN 节点会永久失效，
+    // 且部分机场校验 Host/SNI 与源域名一致性。改为：节点 server 100% 保留
+    // 订阅原始域名，由内核 DNS（dns-direct 223.5.5.5 走 direct 出站 +
+    // default_interface 物理网卡）在启动时一次性解析缓存。见 dns 构建段
+    // （dns.enable_hosts / route.default_interface）。
 
     // ---- 逐订阅产出出站/组/规则 ----
     let mut node_tags: Vec<String> = Vec::new();
@@ -967,7 +922,12 @@ pub fn build(
     // 防止 UI 节点列表出现 direct 条目、自动测速把 direct 选为当前节点
     if !node_tags.is_empty() {
         let members = node_tags.clone();
-        let default = node_tags[0].clone();
+        // 【APP47 任务3.3】GLOBAL 默认项与 Proxy 一致：优先用户上次选中的节点
+        let default = settings
+            .selected_node
+            .clone()
+            .filter(|n| members.iter().any(|m| m == n))
+            .unwrap_or_else(|| node_tags[0].clone());
         outbounds.push(json!({
             "type": "selector",
             "tag": "GLOBAL",
@@ -1055,6 +1015,8 @@ pub fn build(
     //    main_selector 会落到只含少量节点的子分组，同样造成节点骤减。
     //    final 非 selector（urltest/叶子）时沿成员链找第一个 selector 兜底。
     let mut main_group_tag: Option<String> = None;
+    // 【APP47 任务3.3】Prism 标准主选择器 tag：所有订阅节点 100% 汇入
+    let mut prism_proxy_tag: Option<String> = None;
     {
         let lookup =
             |tag: &str| outbounds.iter().find(|o| o["tag"].as_str() == Some(tag));
@@ -1080,6 +1042,70 @@ pub fn build(
             };
             current = next;
         }
+    }
+
+    // 【APP47 任务3.3】合并游离节点仍挂到订阅原生主组（保持旧版行为：
+    // 第三方组里的节点不丢失）；路由/DNS 的主组稍后统一切到 Proxy。
+    let attach_group_tag = main_group_tag.clone();
+
+    // 【APP47 任务3.3】Prism 标准主选择器 `Proxy`：所有订阅节点 100% 汇入，
+    // 并作为规则模式下 route.final 与 dns-remote.detour 的唯一出口。
+    //
+    // 背景（节点_3.txt 实测）：第三方订阅把节点拆进「🚀 节点选择 / ♻️ 自动选择 /
+    // 香港节点 …」多层子组，MATCH 常落在某个地区子组；用户在节点页选中的节点
+    // 只改主组，实际流量仍走子组旧节点——「选了节点不生效」。
+    // 修复：建立独立的 Proxy 选择器，规则里所有第三方代理组目标统一改写为
+    // Proxy，最终出口恒为 Proxy → 用户所选节点 100% 接管。go-lan / go-cus /
+    // direct / block / GLOBAL 保持原样（功能性出站与全局模式依赖它们）。
+    if !node_tags.is_empty() {
+        let members = node_tags.clone();
+        let default = settings
+            .selected_node
+            .clone()
+            .filter(|n| members.iter().any(|m| m == n))
+            .unwrap_or_else(|| members[0].clone());
+        // 同名旧组（订阅自带 Proxy 组）先移除，避免 tag 冲突
+        outbounds.retain(|o| o["tag"].as_str() != Some("Proxy"));
+        outbounds.push(json!({
+            "type": "selector",
+            "tag": "Proxy",
+            "outbounds": members,
+            "default": default,
+        }));
+        // 收集所有第三方代理组 tag（selector/urltest），用于规则目标归一化
+        let third_party: HashSet<String> = outbounds
+            .iter()
+            .filter_map(|o| {
+                let tag = o["tag"].as_str()?;
+                let kind = o["type"].as_str().unwrap_or("");
+                if (kind == "selector" || kind == "urltest")
+                    && !matches!(tag, "Proxy" | "GLOBAL")
+                    && !is_builtin_non_proxy_tag(tag)
+                {
+                    Some(tag.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut rewritten = 0usize;
+        for rule in route_rules.iter_mut() {
+            let Some(target) = rule.get("outbound").and_then(Value::as_str) else {
+                continue;
+            };
+            if third_party.contains(target) {
+                rule["outbound"] = json!("Proxy");
+                rewritten += 1;
+            }
+        }
+        if rewritten > 0 {
+            warnings.push(format!(
+                "已把 {rewritten} 条第三方策略组规则出口归一化到 Proxy（确保所选节点 100% 生效）"
+            ));
+        }
+        prism_proxy_tag = Some("Proxy".to_string());
+        // dns-remote 与后续默认主组均指向 Proxy
+        main_group_tag = prism_proxy_tag.clone();
     }
 
     // Go Cus 模块规则中的 PROXY 占位 → 主选择组（无主组时回落 final）
@@ -1121,7 +1147,7 @@ pub fn build(
         warnings.push("Go Cus 边车已配置主组容错回落（边车不可用时自动走节点）".into());
     }
 
-    match main_group_tag {
+    match attach_group_tag {
         Some(ref main_tag) => {
             if let Some(group) =
                 outbounds.iter_mut().find(|o| o["tag"].as_str() == Some(main_tag.as_str()))
@@ -1156,7 +1182,14 @@ pub fn build(
                     })
                     .unwrap_or(false);
                 if !default_valid {
-                    if let Some(first) = node_tags.first() {
+                    // 【APP47 任务3.3】优先回落到用户上次选中的节点
+                    if let Some(pref) = settings
+                        .selected_node
+                        .as_ref()
+                        .filter(|n| merged.iter().any(|m| m == *n))
+                    {
+                        group["default"] = json!(pref);
+                    } else if let Some(first) = node_tags.first() {
                         group["default"] = json!(first);
                     }
                 }
@@ -1476,7 +1509,13 @@ pub fn build(
         "outbounds": outbounds,
         "route": {
             "rules": final_route_rules,
-            "final": final_tag,
+            // 【APP47 任务3.3】规则模式最终出口恒为 Proxy（所有节点汇入、
+            // 用户在节点页所选节点 100% 接管）；全局模式走 GLOBAL，直连走 direct
+            "final": if settings.outbound_mode == OutboundMode::Rule {
+                prism_proxy_tag.clone().unwrap_or_else(|| final_tag.clone())
+            } else {
+                final_tag.clone()
+            },
             // Android（IPA-12 2.5）：必须关闭——auto_detect_interface 经
             // netlink 枚举默认网卡并按名绑定，Android 11+ SELinux 拦截普通
             // 应用的 netlink 操作（permission denied）。出站 socket 保护由
@@ -1582,7 +1621,12 @@ pub fn build(
     Ok(BuiltConfig {
         config,
         warnings,
-        final_group: final_tag,
+        // 【APP47 任务3.3】主选择器恒为 Proxy（规则模式）；全局/直连模式维持原值
+        final_group: if settings.outbound_mode == OutboundMode::Rule {
+            prism_proxy_tag.unwrap_or(final_tag)
+        } else {
+            final_tag
+        },
     })
 }
 
@@ -2636,8 +2680,9 @@ rules:
         );
         // clash_mode 热切换规则置顶（出现在最前两条）
         assert_eq!(&sigs[..2], &["clash_mode", "clash_mode"], "{sigs:?}");
-        // route.final 仍取订阅 MATCH 目标
-        assert_eq!(built.config["route"]["final"].as_str(), Some("节点选择"));
+        // 【APP47 任务3.3】规则模式下 route.final 恒为 Prism 标准主选择器 Proxy
+        // （即使订阅 MATCH 指向第三方组「节点选择」，也已被归一化为 Proxy）
+        assert_eq!(built.config["route"]["final"].as_str(), Some("Proxy"));
     }
 
     /// 回归（DNS 污染改道）：订阅 MATCH 目标的出站链路里不得出现
@@ -3901,5 +3946,152 @@ rules:
             "trojan peer 参数必须映射为 SNI"
         );
         assert_eq!(t0["password"], "T6PMsakzYbEVs1bPLQtGtHcm");
+    }
+
+    /// 【APP47 任务3.2 + 3.3】节点_3.txt（无 fp 的 14 vless + 4 trojan）：
+    /// 1. 0.0.0.0 假节点被过滤，18 个真实节点全部生成出站；
+    /// 2. 未显式 fp 且非 Reality → 严禁注入 utls（修复 h2 ALPN 破坏 TCP 握手）；
+    /// 3. tls.insecure=true，server 保留订阅原始域名；
+    /// 4. DNS 首条规则仍是 outbound:any → dns-direct，dns-remote 经 Proxy 出境；
+    /// 5. 多订阅并存：第三方策略组（🚀 节点选择 / ♻️ 自动选择 / 国外流量）的
+    ///    规则出口全部归一化为 Proxy，路由 final 恒为 Proxy，Proxy 汇总全部节点。
+    #[test]
+    fn app47_nodes3_no_utls_and_multi_sub_proxy_normalized() {
+        let mut lines: Vec<String> = vec![
+            "trojan://T6PMsakzYbEVs1bPLQtGtHcm@0.0.0.0:43103?peer=0.0.0.0&sni=0.0.0.0#fake-placeholder"
+                .to_string(),
+        ];
+        // 与 节点_3.txt 一致：tcp + allowInsecure=1 + sni=baidu.com，且无 fp=
+        for i in 1..=14u32 {
+            lines.push(format!(
+                "vless://6588f867-42b2-44d2-afd4-65227ca09d30@hk{i}.the-best-airport.com:443?allowInsecure=1&encryption=none&flow=xtls-rprx-vision&security=tls&sni=baidu.com&type=tcp#HK{i}"
+            ));
+        }
+        // 与 节点_3.txt 一致：trojan tcp + allowInsecure=1 + peer/sni，无 fp=
+        for i in 1..=4u32 {
+            lines.push(format!(
+                "trojan://6588f867-42b2-44d2-afd4-65227ca09d30@us{i}.the-best-airport.com:443?allowInsecure=1&peer=update.microsoft.com&sni=update.microsoft.com&type=tcp#US{i}"
+            ));
+        }
+        let text = lines.join("\n");
+        let (nodes, errors, _notice) = crate::core::uri_parser::parse_lines(&text);
+        assert!(errors.is_empty(), "19 行必须全部解析成功: {errors:?}");
+        assert_eq!(nodes.len(), 19, "1 假 + 14 vless + 4 trojan = 19 行");
+        let doc_a = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
+            .expect("合成 Clash YAML");
+
+        // 第二个订阅（纯 Clash YAML）：自带第三方策略组与抢占式规则
+        let doc_b = r#"
+proxies:
+  - {name: B-HK, type: ss, server: 9.9.9.9, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 🚀 节点选择, type: select, proxies: [B-HK]}
+  - {name: ♻️ 自动选择, type: url-test, proxies: [B-HK], url: "http://cp.cloudflare.com/generate_204", interval: 300}
+  - {name: 国外流量, type: select, proxies: [🚀 节点选择, B-HK]}
+rules:
+  - DOMAIN-SUFFIX,example.org,🚀 节点选择
+  - MATCH,国外流量
+"#;
+
+        let base = std::env::temp_dir().join("prism-cb-test-app47");
+        let built = build(
+            &[
+                ("https://sub-a.example".into(), "一元机场".into(), doc_a),
+                ("https://sub-b.example".into(), "测试".into(), doc_b.into()),
+            ],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &base,
+            &base.join("kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build 成功");
+
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+        let vless: Vec<_> = outbounds.iter().filter(|o| o["type"] == "vless").collect();
+        let trojan: Vec<_> = outbounds.iter().filter(|o| o["type"] == "trojan").collect();
+        assert_eq!(vless.len(), 14, "14 个 vless 必须全部发射");
+        assert_eq!(trojan.len(), 4, "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan");
+        assert!(
+            !outbounds
+                .iter()
+                .any(|o| o["server"].as_str() == Some("0.0.0.0")),
+            "0.0.0.0 假节点不得生成出站"
+        );
+
+        // 无 fp / 非 Reality → 不得注入 utls；server 保留原始域名
+        for o in &vless {
+            assert!(
+                o.get("utls").is_none() && o["tls"].get("utls").is_none(),
+                "无 fp 的 vless 严禁注入 utls: {o}"
+            );
+            assert_eq!(o["tls"]["enabled"], true);
+            assert_eq!(o["tls"]["insecure"], true);
+            assert_eq!(o["tls"]["server_name"], "baidu.com");
+            assert_eq!(o["flow"], "xtls-rprx-vision");
+            assert!(
+                o["server"].as_str().unwrap_or("").contains(".the-best-airport.com"),
+                "节点 server 必须保留订阅原始域名: {o}"
+            );
+        }
+        for o in &trojan {
+            assert!(
+                o.get("utls").is_none() && o["tls"].get("utls").is_none(),
+                "无 fp 的 trojan 严禁注入 utls: {o}"
+            );
+            assert_eq!(o["tls"]["insecure"], true);
+            assert_eq!(o["tls"]["server_name"], "update.microsoft.com");
+        }
+
+        // DNS：首条 outbound:any → dns-direct，dns-remote 经 Proxy 出境
+        assert_eq!(built.config["dns"]["rules"][0]["outbound"], "any");
+        assert_eq!(built.config["dns"]["rules"][0]["server"], "dns-direct");
+        let dns_servers = built.config["dns"]["servers"].as_array().unwrap();
+        let remote = dns_servers
+            .iter()
+            .find(|s| s["tag"] == "dns-remote")
+            .expect("dns-remote missing");
+        assert_eq!(remote["detour"], "Proxy", "dns-remote 必须经 Proxy 出境");
+
+        // Proxy 汇总全部有效节点（18 + B-HK）
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "Proxy")
+            .expect("Prism 标准主选择器 Proxy 缺失");
+        assert_eq!(proxy["type"], "selector");
+        let members = proxy["outbounds"].as_array().unwrap();
+        assert_eq!(members.len(), 19, "Proxy 必须汇总两个订阅的全部 19 个节点");
+        for name in ["HK1", "US1", "B-HK"] {
+            assert!(
+                members.iter().any(|m| m.as_str() == Some(name)),
+                "Proxy 缺少节点 {name}: {members:?}"
+            );
+        }
+
+        // 路由 final 恒为 Proxy；任何规则出口不得再指向第三方策略组
+        assert_eq!(built.config["route"]["final"].as_str(), Some("Proxy"));
+        assert_eq!(built.final_group, "Proxy");
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        const THIRD_PARTY: [&str; 3] = ["🚀 节点选择", "♻️ 自动选择", "国外流量"];
+        for rule in rules {
+            if let Some(out) = rule.get("outbound").and_then(|v| v.as_str()) {
+                assert!(
+                    !THIRD_PARTY.contains(&out),
+                    "规则出口仍指向第三方策略组 {out}: {rule}"
+                );
+            }
+        }
+        let rewritten: Vec<_> = rules
+            .iter()
+            .filter(|r| r.get("outbound").and_then(|v| v.as_str()) == Some("Proxy"))
+            .collect();
+        assert!(
+            !rewritten.is_empty(),
+            "第三方组规则出口必须被归一化为 Proxy: {rules:?}"
+        );
     }
 }

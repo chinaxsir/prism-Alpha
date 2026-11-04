@@ -348,14 +348,14 @@ export function ActivateProModal({
               {parsedError && (
                 <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 space-y-1.5 text-left">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <code className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 font-mono text-[11px]">
+                    <code className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-700 dark:text-red-300 font-mono text-[11px]">
                       {parsedError.code}
                     </code>
-                    <span className="font-semibold text-xs text-red-200">
+                    <span className="font-semibold text-xs text-red-700 dark:text-red-200">
                       {parsedError.title}
                     </span>
                   </div>
-                  <p className="text-[11px] text-red-200/80 leading-relaxed">
+                  <p className="text-[11px] text-red-700/90 dark:text-red-200/80 leading-relaxed">
                     {parsedError.detail}
                   </p>
                 </div>

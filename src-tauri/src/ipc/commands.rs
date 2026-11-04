@@ -31,6 +31,10 @@ pub struct CoreStatusDto {
     pub main_selector: Option<String>,
     /// 出站模式（规则/全局/直连；Dashboard/Proxies 快捷切换条数据源）
     pub outbound_mode: OutboundMode,
+    /// 【APP47 任务1.2】持久化的选中节点名（settings.selected_node）。
+    /// 内核未运行时 Dashboard「当前节点」卡也展示上次选中的真实节点名，
+    /// 不再显示「—」死状态。
+    pub selected_node: Option<String>,
 }
 
 /// 内核信息（设置页 / 下载向导用）
@@ -935,6 +939,7 @@ pub async fn get_core_status(
         started_at_ms: *state.started_at_ms.read(),
         main_selector: state.main_selector.read().clone(),
         outbound_mode: state.settings.read().outbound_mode,
+        selected_node: state.settings.read().selected_node.clone(),
     })
 }
 
@@ -1287,6 +1292,19 @@ pub(crate) async fn refresh_subscription(
     Ok(())
 }
 
+/// 【APP47 任务3.1】统计订阅内容实际节点数（用于双 UA 择优）。
+/// 机场面板常按 UA 下发不同节点集：v2rayNG UA 拿到的是完整 base64 URI 列表，
+/// Clash.Meta UA 有时只拿到精简 YAML。两个 UA 并发拉取后按节点数取更多者。
+fn count_nodes_in_text(text: &str) -> usize {
+    let prepared = prepare_subscription_payload(text.to_string()).unwrap_or_else(|_| text.to_string());
+    if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&prepared)
+        && let Some(list) = v.get("proxies").and_then(|p| p.as_sequence())
+    {
+        return list.len();
+    }
+    0
+}
+
 /// 订阅下载候选 User-Agent（按兼容性从强到弱轮询）：
 /// 【APP42 任务1.1】首位改为 Clash.Meta/mihomo 组合标识：机场面板普遍
 /// 依赖 UA 判定客户端并下发 Clash YAML + subscription-userinfo 配额头；
@@ -1486,30 +1504,71 @@ async fn fetch_remote_text(
         for force_v4 in [false, true] {
             let client = build_client(force_v4, ua)?;
             let target = url.clone();
-            let ua = *ua;
+            let ua: String = (*ua).to_string();
             attempts.push(async move { (force_v4, ua, try_fetch_text(&client, &target).await) });
         }
     }
 
+    // 【APP47 任务3.1】双 UA 择优：机场按 UA 下发不同节点集（v2rayNG 给完整
+    // base64 URI 列表，Clash.Meta 有时给精简 YAML）。不再"先到先得"，而是让
+    // Clash.Meta 与 v2rayN 两族都产出结果后，按实际节点数取更多者；
+    // 同等节点数时保留先到者。
+    let no_force = force_ua.is_none();
+    let mut best: Option<(String, Option<crate::core::store::SubscriptionQuota>, usize, String)> =
+        None;
+    let mut got_clash = false;
+    let mut got_v2ray = false;
     while let Some((force_v4, ua, result)) = attempts.next().await {
         match result {
             Ok((text, quota)) => {
                 tracing::info!(
                     "fetch succeeded (ua={}, force_v4={force_v4}) in {}ms",
-                    ua.split('/').next().unwrap_or(ua),
+                    ua.split('/').next().unwrap_or(ua.as_str()),
                     fetch_started.elapsed().as_millis()
                 );
-                return Ok((text, quota));
+                let count = count_nodes_in_text(&text);
+                tracing::info!(
+                    "fetch ua={} nodes={count}",
+                    ua.split('/').next().unwrap_or(ua.as_str())
+                );
+                if ua == SUBSCRIPTION_UAS[0] {
+                    got_clash = true;
+                }
+                if ua == SUBSCRIPTION_RETRY_UA {
+                    got_v2ray = true;
+                }
+                match &best {
+                    Some((_, _, best_count, _)) if *best_count >= count => {}
+                    _ => best = Some((text, quota, count, ua)),
+                }
+                if !no_force {
+                    let (text, quota, _, _) = best.unwrap();
+                    return Ok((text, quota));
+                }
+                // 两个核心 UA 族都已产出 → 立即择优，不再等冷门 UA
+                if got_clash && got_v2ray {
+                    break;
+                }
+                // 非核心 UA 先成功时先记下，继续等核心 UA（最多到 attempts 耗尽）
             }
             Err(e) => {
                 last_err = e;
                 tracing::warn!(
                     "fetch direct (ua={}, force_v4={force_v4}) failed at {}ms: {last_err}",
-                    ua.split('/').next().unwrap_or(ua),
+                    ua.split('/').next().unwrap_or(ua.as_str()),
                     fetch_started.elapsed().as_millis()
                 );
             }
         }
+    }
+    if let Some((text, quota, count, ua)) = best {
+        if no_force {
+            tracing::info!(
+                "fetch pick ua={} nodes={count}",
+                ua.split('/').next().unwrap_or(ua.as_str())
+            );
+        }
+        return Ok((text, quota));
     }
 
     // ---- 内核运行中：经本地 mixed 入站转发（同样轮询多 UA）----

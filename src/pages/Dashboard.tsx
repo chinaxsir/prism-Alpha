@@ -80,6 +80,9 @@ export default function Dashboard() {
   // 当前节点状态：主选择组、当前选中节点名、可选节点列表、选择器弹窗
   const [mainSelector, setMainSelector] = useState("");
   const [currentNode, setCurrentNode] = useState("");
+  /// 【APP47 任务1.2】后端持久化的选中节点名：未启动时也直接展示，
+  /// 避免「当前节点」卡出现「—」死状态
+  const [persistedNode, setPersistedNode] = useState("");
   const [nodes, setNodes] = useState<ProxyEntry[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [selecting, setSelecting] = useState(false);
@@ -100,6 +103,7 @@ export default function Dashboard() {
   const loadCurrentNode = async () => {
     try {
       const st = await getCoreStatus();
+      setPersistedNode(st.selectedNode ?? "");
       const group = st.mainSelector ?? "";
       setMainSelector(group);
       if (st.status !== "running" || !group) {
@@ -548,36 +552,62 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 启动/停止错误提示 */}
+      {/* 启动/停止错误提示（【APP47 任务2.2】文档流内联 + 深浅色高对比红字） */}
       {errorMsg && (
-        <div className="rounded-xl p-4 text-sm bg-latency-bad/10 text-red-300 border border-red-500/20">
+        <div className="rounded-xl p-4 text-sm bg-red-500/10 text-red-700 dark:text-red-300 border border-red-500/30">
           <div className="font-semibold mb-1">{t("dashboard.errorTitle")}</div>
-          <div className="text-xs break-all text-red-200">{errorMsg}</div>
+          <div className="text-xs break-all text-red-700/90 dark:text-red-200">{errorMsg}</div>
         </div>
       )}
 
-      {/* 【APP44 任务3】状态指标行：当前节点（7/12）＋今日流量（5/12）。
-          删除「运行模式」独立卡片（顶部已连接副标题已展示），信息层级更聚焦 */}
-      <div className="grid grid-cols-12 gap-3">
-        <div className="col-span-12 md:col-span-7">
-          <StatChip
-            icon={<Globe size={14} className="text-surge-blue" />}
-            label={t("metric.currentNode")}
-            value={
-              running
-                ? currentNode || t("dashboard.noSelection")
-                : currentNode || nodes[0]?.name || "—"
-            }
-            onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
-            wrap
-          />
+      {/* 【APP47 任务1.1】状态指标行强制双列水平并排：禁止任何响应式断点，
+          手机竖屏同样一行两卡（当前节点 1.35fr : 今日流量 1fr） */}
+      <div
+        className="grid grid-cols-2 gap-3"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1.35fr) minmax(0, 1fr)",
+          gap: "12px",
+        }}
+      >
+        <div
+          onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
+          role={nodes.length > 0 ? "button" : undefined}
+          className={clsx(
+            "rounded-[16px] bg-surface-card p-4 border border-border flex flex-col justify-between min-h-[88px] min-w-0",
+            nodes.length > 0 && "cursor-pointer active:opacity-80 transition-opacity"
+          )}
+        >
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Globe size={18} className="shrink-0 text-[#007AFF] dark:text-[#0A84FF]" />
+              <span className="text-[15px] font-bold text-[#007AFF] dark:text-[#0A84FF] whitespace-nowrap">
+                {t("metric.currentNode")}
+              </span>
+            </div>
+            {nodes.length > 0 && (
+              <ChevronRight size={16} className="shrink-0 text-text-muted" />
+            )}
+          </div>
+          {/* 【APP47 任务1.2】未启动也展示持久化的上次选中节点，绝不显示「—」 */}
+          <div
+            className="mt-2 text-[15px] font-bold text-text leading-snug break-all line-clamp-2"
+            title={currentNode || persistedNode || nodes[0]?.name}
+          >
+            {currentNode || persistedNode || nodes[0]?.name || t("dashboard.noSelection")}
+          </div>
         </div>
-        <div className="col-span-12 md:col-span-5">
-          <StatChip
-            icon={<BarChart3 size={14} className="text-surge-teal" />}
-            label={t("metric.todayTraffic")}
-            value={running ? formatBytes(todayBytes) : "—"}
-          />
+
+        <div className="rounded-[16px] bg-surface-card p-4 border border-border flex flex-col justify-between min-h-[88px] min-w-0">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <BarChart3 size={18} className="shrink-0 text-[#00C7BE]" />
+            <span className="text-[15px] font-bold text-[#00C7BE] whitespace-nowrap">
+              {t("metric.todayTraffic")}
+            </span>
+          </div>
+          <div className="mt-2 text-[17px] font-bold tabular-nums text-text leading-snug whitespace-nowrap">
+            {formatBytes(todayBytes || 0)}
+          </div>
         </div>
       </div>
 
@@ -587,7 +617,8 @@ export default function Dashboard() {
           布局跳变，也让用户一眼看清 Pro 到底解锁了什么。 */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
         <EngineCard
-          icon={<Crosshair size={14} className="text-surge-green" />}
+          icon={<Crosshair size={16} className="text-surge-green" />}
+          tone="text-surge-green"
           name={t("engine.goAim")}
           tag={t("engine.goAimTag")}
           status={proUnlocked ? aimStatus : t("pro.lockedTap")}
@@ -610,7 +641,8 @@ export default function Dashboard() {
           }
         />
         <EngineCard
-          icon={<Home size={14} className="text-surge-orange" />}
+          icon={<Home size={16} className="text-surge-orange" />}
+          tone="text-surge-orange"
           name={t("engine.goLan")}
           tag={t("engine.goLanTag")}
           status={proUnlocked ? lanStatus : t("pro.lockedTap")}
@@ -629,7 +661,8 @@ export default function Dashboard() {
           }
         />
         <EngineCard
-          icon={<Wand2 size={14} className="text-surge-purple" />}
+          icon={<Wand2 size={16} className="text-surge-purple" />}
+          tone="text-surge-purple"
           name={t("engine.goCus")}
           tag={t("engine.goCusTag")}
           status={proUnlocked ? cusStatus : t("pro.lockedTap")}
@@ -653,7 +686,7 @@ export default function Dashboard() {
       <div className="card-sheen bg-surface-card rounded-2xl p-5 border border-border">
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <div className="flex items-center gap-1.5 text-xs text-gray-400">
+            <div className="flex items-center gap-1.5 text-xs font-medium text-text-muted">
               <Activity size={13} className="text-latency-good" />
               {t("metric.download")}
             </div>
@@ -749,57 +782,11 @@ export default function Dashboard() {
   );
 }
 
-function StatChip({
-  icon,
-  label,
-  value,
-  onClick,
-  /** APP-4 任务4.1：节点名可长达数十字符——不截断，最多两行完整展示 */
-  wrap = false,
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-  onClick?: () => void;
-  wrap?: boolean;
-}) {
-  return (
-    <div
-      onClick={onClick}
-      role={onClick ? "button" : undefined}
-      className={clsx(
-        "bg-surface-card rounded-xl p-4 border border-border",
-        onClick && "cursor-pointer hover:border-accent/40 transition-colors"
-      )}
-    >
-      {/* 顶部标签行禁止换行（ipa-8：三列窄卡片内「当前节点」不再折行）；
-          右箭头移到第二行数值右侧，保证启动前后顶部布局一致 */}
-      <div className="flex items-center gap-1.5 text-[11px] text-gray-400 whitespace-nowrap">
-        {icon}
-        <span>{label}</span>
-      </div>
-      <div className="mt-1.5 flex items-center gap-1 min-w-0">
-        <span
-          className={clsx(
-            "text-xl font-bold tabular-nums text-gray-100",
-            wrap
-              ? "break-all line-clamp-2 leading-snug"
-              : "truncate"
-          )}
-          title={value}
-        >
-          {value}
-        </span>
-        {onClick && <ChevronRight size={12} className="shrink-0 text-gray-600" />}
-      </div>
-    </div>
-  );
-}
-
 /// Pro 引擎卡（ipa-8）：横向通栏布局——左侧图标+完整标题+功能标签胶囊+一行状态
 /// 副标题，右侧「配置/重测」轻按钮 + Switch；移动端不再因 grid-cols-3 窄卡片截断文字
-/// 【APP-4 任务3】locked=true 时整卡静默置灰禁用（opacity-50 + 无任何点击响应），
+/// 【APP-4 任务3】locked=true 时整卡静默置灰禁用（无任何点击响应），
 /// 不再弹 Toast 或激活弹窗。
+/// 【APP47 任务2.3】锁定时严禁 opacity-50：卡片标题始终保持高饱和彩色 + 19px 加粗。
 function EngineCard({
   icon,
   name,
@@ -809,6 +796,7 @@ function EngineCard({
   onToggle,
   action,
   locked = false,
+  tone,
 }: {
   icon: ReactNode;
   name: string;
@@ -818,27 +806,35 @@ function EngineCard({
   onToggle: (v: boolean) => void;
   action?: ReactNode;
   locked?: boolean;
+  /** 【APP47 任务2.3】模块标题彩色文字类（如 text-surge-green） */
+  tone?: string;
 }) {
   return (
     <div
       className={`card-sheen flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border transition-colors ${
-        locked ? "opacity-50 select-none cursor-not-allowed" : "hover:border-accent/30"
+        // 【APP47 任务2.3】锁定时不再 opacity-50 整体变淡（文字发灰看不清），
+        // 改为保持正常对比度，仅禁用点击与开关
+        locked ? "select-none cursor-not-allowed" : "hover:border-accent/30"
       }`}
     >
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           {icon}
-          <span className="font-semibold text-sm text-gray-100 whitespace-nowrap">
+          <span
+            className={clsx(
+              "text-[19px] font-bold tracking-tight whitespace-nowrap",
+              tone ?? "text-gray-100",
+            )}
+          >
             {name}
           </span>
-          <span className="text-[11px] px-1.5 py-0.5 rounded bg-glass text-gray-400 whitespace-nowrap">
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-glass text-text-muted whitespace-nowrap">
             {tag}
           </span>
         </div>
-        {/* APP-4 任务4.1：状态副标题（含 Go AIM 锁定节点名）不再单行截断，
-            最多两行完整展示——与「当前节点」卡保持同一节点名一致性 */}
+        {/* 【APP47 任务2.3】状态副标题 14px medium 深色正文，最多两行完整展示 */}
         <div
-          className="mt-1 text-xs text-gray-400 break-all line-clamp-2 leading-snug"
+          className="mt-1 text-sm font-medium text-text-muted break-all line-clamp-2 leading-snug"
           title={status}
         >
           {status}
