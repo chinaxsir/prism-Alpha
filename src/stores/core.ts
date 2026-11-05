@@ -126,6 +126,10 @@ export interface AnalyticsSummary {
   rules: Array<[string, AggStat]>;
   /** 【APP49 任务4】按传输协议聚合（TCP / UDP） */
   protocols: Array<[string, AggStat]>;
+  /** 【APP51 任务3】三方分流累计字节（后端按连接 chains 归类 + 差额兜底） */
+  proxyBytes: number;
+  directBytes: number;
+  lanBytes: number;
 }
 
 /** 【APP35 任务3】常见公共 IP 的域名兜底映射（无连接元数据时也能显示域名） */
@@ -257,7 +261,17 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   traffic: [],
   todayBytes: 0,
   connections: [],
-  analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [], protocols: [] },
+  analytics: {
+    hosts: [],
+    domains: [],
+    ips: [],
+    outbounds: [],
+    rules: [],
+    protocols: [],
+    proxyBytes: 0,
+    directBytes: 0,
+    lanBytes: 0,
+  },
   ipToDomain: { ...BUILTIN_IP_DOMAIN },
   domainToIp: {},
   sessionTraffic: 0,
@@ -329,7 +343,13 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       downSpeed: snap.downSpeed,
       traffic,
       connections: snap.connections,
-      analytics: snap.analyticsSummary,
+      analytics: {
+        ...snap.analyticsSummary,
+        // 【APP51 任务3】旧后端/首帧可能缺省，统一兜底为 0，前端永不 undefined
+        proxyBytes: snap.analyticsSummary.proxyBytes ?? 0,
+        directBytes: snap.analyticsSummary.directBytes ?? 0,
+        lanBytes: snap.analyticsSummary.lanBytes ?? 0,
+      },
       ...collectHostMappings(ipToDomain, domainToIp, snap.connections),
     });
   },
@@ -342,7 +362,17 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       memoryUsage: 0,
       startedAtMs: null,
       connections: [],
-      analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [], protocols: [] },
+      analytics: {
+        hosts: [],
+        domains: [],
+        ips: [],
+        outbounds: [],
+        rules: [],
+        protocols: [],
+        proxyBytes: 0,
+        directBytes: 0,
+        lanBytes: 0,
+      },
       sessionTraffic: 0,
     }),
 

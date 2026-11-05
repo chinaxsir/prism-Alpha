@@ -233,6 +233,20 @@ pub struct AnalyticsAgg {
     /// 聚合结构无磁盘缓存，新增字段天然兼容旧数据（启动即空表）
     #[serde(default)]
     pub protocols: HashMap<String, AggStat>,
+    /// 【APP51 任务3】三方分流累计字节（代理 / 直连 / Go Lan）。
+    /// 由连接 chains 分类累加，再用内核 downloadTotal+uploadTotal 的
+    /// 未归类差额按路由模式补入，保证分流占比永远 100%、绝不空表。
+    #[serde(default)]
+    pub proxy_bytes: u64,
+    #[serde(default)]
+    pub direct_bytes: u64,
+    #[serde(default)]
+    pub lan_bytes: u64,
+    /// 【APP51 任务3】上一帧内核累计总量，用于计算未归类差额
+    #[serde(default)]
+    pub last_total_down: u64,
+    #[serde(default)]
+    pub last_total_up: u64,
 }
 
 /// 跨 IPC 共享的全局状态
@@ -284,6 +298,9 @@ pub struct AppState {
     pub aim_locked_node: RwLock<Option<String>>,
     /// Go AIM：监控任务已启动标志（进程内单例）
     pub aim_monitor_started: std::sync::atomic::AtomicBool,
+    /// 【APP51 任务1】Go AIM 探测代数计数器：订阅删除/停用/刷新时 +1，
+    /// 正在运行的探测任务发现代数变化立即中止，杜绝旧节点结果污染缓存
+    pub aim_generation: std::sync::atomic::AtomicU64,
     /// Go Lan：回家网络配置（go_lan.json）
     pub go_lan: RwLock<super::go_lan::GoLanSettings>,
     /// Go Cus：覆写引擎配置（go_cus.json）
@@ -292,11 +309,11 @@ pub struct AppState {
     // ---- 运行时统计（前后台不间断；内核停止/启动时经 reset_runtime_stats 清空）----
     /// 60 秒实时流量环形队列（最新在尾部）
     pub traffic_history: RwLock<VecDeque<TrafficSample>>,
-    /// 【APP46 任务4.1】/connections 顶层 downloadTotal/uploadTotal 差分基准：
-    /// 每次前端拉 runtime_snapshot 时主动 GET /connections（600ms 超时），
-    /// 若 dt ∈ [0.2s, 10s] 且 total 单调递增，算 down/up speed；任何条件不满足
-    /// 就保留旧值（不回零）。events.rs WebSocket 流继续运行，这里是硬兜底。
-    pub last_traffic_sample: Mutex<Option<(Instant, u64, u64)>>,
+    /// 【APP46 任务4.1 / APP51 任务2】/connections 顶层 downloadTotal/uploadTotal
+    /// 差分基准：(采样时刻, 上次下行总量, 上次上行总量, 上次下行速率, 上次上行速率)。
+    /// 每次前端拉 runtime_snapshot 时主动 GET /connections（1500ms 超时），
+    /// dt < 0.15s 直接返回缓存速率；超时则保留上次速率的一半衰减（绝不归零）。
+    pub last_traffic_sample: Mutex<Option<(Instant, u64, u64, u64, u64)>>,
     /// 当前活跃连接快照（id → snapshot）
     pub connections_live: RwLock<HashMap<String, ConnSnapshot>>,
     /// 按 host / outbound / rule 聚合的分析数据
@@ -366,6 +383,7 @@ impl AppState {
             aim_probing: std::sync::atomic::AtomicBool::new(false),
             aim_locked_node: RwLock::new(None),
             aim_monitor_started: std::sync::atomic::AtomicBool::new(false),
+            aim_generation: std::sync::atomic::AtomicU64::new(0),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
             go_cus: RwLock::new(super::go_cus::load(&data_dir)),
             traffic_history: RwLock::new(VecDeque::new()),
@@ -457,6 +475,12 @@ impl AppState {
         agg.rules.clear();
         agg.protocols.clear();
         agg.last_seen.clear();
+        // 【APP51 任务3】分流累计与总量差分基准一并清零
+        agg.proxy_bytes = 0;
+        agg.direct_bytes = 0;
+        agg.lan_bytes = 0;
+        agg.last_total_down = 0;
+        agg.last_total_up = 0;
     }
 
     /// 【APP49 任务4】清空分析聚合（分析页「清空统计」按钮）。
@@ -543,6 +567,11 @@ impl AppState {
             "rules": top8(&agg.rules),
             // 【APP49 任务4】TCP / UDP 协议维度聚合（camelCase 序列化）
             "protocols": top8(&agg.protocols),
+            // 【APP51 任务3】三方分流累计字节：前端据此画三色占比条，
+            // 不再依赖 outbounds 首跳分组，杜绝「暂无流量数据」
+            "proxyBytes": agg.proxy_bytes,
+            "directBytes": agg.direct_bytes,
+            "lanBytes": agg.lan_bytes,
         });
         drop(agg);
 

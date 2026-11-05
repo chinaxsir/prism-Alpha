@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  Activity,
-  ArrowDownUp,
   Globe2,
   ListFilter,
   PieChart,
@@ -56,55 +54,31 @@ export default function Analytics() {
   const mapKey = (k: string) =>
     k === "未知" ? t("common.unknown") : k === "其他" ? t("analytics.other") : k;
 
-  const outboundTop: [string, Agg][] = analytics.outbounds as [string, Agg][];
   const ruleTop: [string, Agg][] = analytics.rules as [string, Agg][];
 
-  // 【APP49 任务4】顶部指标：总流量 / 连接数 / 请求总数（全部由聚合求和）
-  const totals = useMemo(() => {
-    let up = 0;
-    let down = 0;
-    let conn = 0;
-    for (const [, a] of analytics.hosts) {
-      up += a.up;
-      down += a.down;
-      conn += a.count;
-    }
-    let requests = 0;
-    for (const [, a] of analytics.domains) requests += a.count;
-    return { bytes: up + down, conn, requests };
-  }, [analytics.hosts, analytics.domains]);
-
-  // 【APP49 任务4】TCP / UDP 计数（后端按 metadata.network 聚合）
-  const protocolCounts = useMemo(() => {
-    let tcp = 0;
-    let udp = 0;
-    for (const [key, a] of analytics.protocols ?? []) {
-      if (key.toUpperCase() === "TCP") tcp += a.count;
-      else if (key.toUpperCase() === "UDP") udp += a.count;
-    }
-    return { tcp, udp };
-  }, [analytics.protocols]);
-
-  // 【APP49 任务4】分流占比：outbound key 归并为 Proxy / Direct / Go Lan / 其他
+  // 【APP51 任务3】三色分流占比：后端已按连接 chains 归类并做总量差额兜底，
+  // 前端直接消费累计字节（proxy / direct / lan），不再从 outbounds 推测。
   const share = useMemo(() => {
-    const groups = { proxy: 0, direct: 0, goLan: 0, other: 0 };
-    for (const [key, agg] of analytics.outbounds) {
-      const total = agg.down + agg.up;
-      const lower = key.toLowerCase();
-      if (lower.startsWith("go-lan")) groups.goLan += total;
-      else if (lower.includes("direct")) groups.direct += total;
-      else if (lower.includes("proxy") || lower.includes("global") || key.includes("节点选择"))
-        groups.proxy += total;
-      else groups.other += total;
+    let proxy = analytics.proxyBytes ?? 0;
+    let direct = analytics.directBytes ?? 0;
+    let goLan = analytics.lanBytes ?? 0;
+    // 兜底：后端尚未上报分类字节时，按 outbounds 首跳粗略归属（只在极早期生效）
+    if (proxy + direct + goLan === 0) {
+      for (const [key, agg] of analytics.outbounds) {
+        const total = agg.down + agg.up;
+        const lower = key.toLowerCase();
+        if (lower.startsWith("go-lan")) goLan += total;
+        else if (lower.includes("direct")) direct += total;
+        else proxy += total;
+      }
     }
-    const total = groups.proxy + groups.direct + groups.goLan + groups.other;
+    const total = proxy + direct + goLan;
     return [
-      { key: "analytics.shareProxy", value: groups.proxy, color: "bg-accent" },
-      { key: "analytics.shareDirect", value: groups.direct, color: "bg-surge-green" },
-      { key: "analytics.shareGoLan", value: groups.goLan, color: "bg-surge-orange" },
-      { key: "analytics.shareOther", value: groups.other, color: "bg-gray-500" },
+      { key: "analytics.shareProxy", value: proxy, color: "#007AFF" },
+      { key: "analytics.shareDirect", value: direct, color: "#24B414" },
+      { key: "analytics.shareGoLan", value: goLan, color: "#EA7117" },
     ].map((s) => ({ ...s, pct: total > 0 ? (s.value / total) * 100 : 0 }));
-  }, [analytics.outbounds]);
+  }, [analytics.proxyBytes, analytics.directBytes, analytics.lanBytes, analytics.outbounds]);
 
   // 【APP39 任务3】后端已分别维护「域名」与「IP」两套独立聚合：
   // - 域名视图：analytics.domains（只含有效域名，副标题显示关联 IP）
@@ -194,7 +168,17 @@ export default function Analytics() {
   const handleReset = async () => {
     try {
       await resetAnalyticsStats();
-      setAnalytics({ hosts: [], domains: [], ips: [], outbounds: [], rules: [], protocols: [] });
+      setAnalytics({
+        hosts: [],
+        domains: [],
+        ips: [],
+        outbounds: [],
+        rules: [],
+        protocols: [],
+        proxyBytes: 0,
+        directBytes: 0,
+        lanBytes: 0,
+      });
       toast.success(t("analytics.resetDone"));
     } catch (e) {
       console.error("reset analytics failed:", e);
@@ -242,35 +226,7 @@ export default function Analytics() {
         </div>
       </div>
 
-      {/* 【APP49 任务4】顶部指标卡 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatCard
-          icon={<ArrowDownUp size={15} />}
-          label={t("analytics.totalTraffic")}
-          value={formatBytes(totals.bytes)}
-          tone="text-accent"
-        />
-        <StatCard
-          icon={<Activity size={15} />}
-          label={t("analytics.connections")}
-          value={String(totals.conn)}
-          tone="text-gray-200"
-        />
-        <StatCard
-          icon={<Globe2 size={15} />}
-          label={t("analytics.requests")}
-          value={String(totals.requests)}
-          tone="text-surge-blue"
-        />
-        <StatCard
-          icon={<ArrowDownUp size={15} />}
-          label={t("analytics.protocols")}
-          value={`TCP ${protocolCounts.tcp} · UDP ${protocolCounts.udp}`}
-          tone="text-surge-teal"
-        />
-      </div>
-
-      {/* 【APP49 任务4】分流占比堆叠条 */}
+      {/* 【APP51 任务3】分流占比堆叠条（唯一的分流视图，三色三行） */}
       <div className="bg-surface-card rounded-xl p-5 shadow-md">
         <h2 className="text-[17px] font-bold tracking-tight mb-4 flex items-center gap-2">
           <PieChart size={17} className="text-surge-green" />
@@ -285,8 +241,8 @@ export default function Analytics() {
                 s.pct > 0 ? (
                   <div
                     key={s.key}
-                    className={`flex items-center justify-center overflow-hidden whitespace-nowrap text-[11px] font-medium text-white transition-[width] duration-500 ease-out ${s.color}`}
-                    style={{ width: `${s.pct}%` }}
+                    className="flex items-center justify-center overflow-hidden whitespace-nowrap text-[11px] font-medium text-white transition-[width] duration-500 ease-out"
+                    style={{ width: `${s.pct}%`, backgroundColor: s.color }}
                     title={`${t(s.key)} ${s.pct.toFixed(1)}%`}
                   >
                     {s.pct >= 12 ? `${t(s.key)} ${s.pct.toFixed(0)}%` : null}
@@ -297,7 +253,10 @@ export default function Analytics() {
             <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[11px] text-gray-400">
               {share.map((s) => (
                 <div key={s.key} className="flex items-center gap-1.5">
-                  <span className={`inline-block h-2 w-2 rounded-full ${s.color}`} />
+                  <span
+                    className="inline-block h-2 w-2 rounded-full"
+                    style={{ backgroundColor: s.color }}
+                  />
                   {t(s.key)} {s.pct.toFixed(1)}% · {formatBytes(s.value)}
                 </div>
               ))}
@@ -307,7 +266,7 @@ export default function Analytics() {
       </div>
 
       {/* 聚合统计：实时曲线在仪表盘，本页专注聚合 */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 gap-6">
         {/* Top 主机名 */}
         <AggCard
           icon={<Globe2 size={17} className="text-surge-orange" />}
@@ -350,13 +309,6 @@ export default function Analytics() {
               </button>
             </div>
           }
-        />
-        {/* 策略分布 */}
-        <AggCard
-          icon={<PieChart size={17} className="text-surge-green" />}
-          title={t("analytics.outboundTitle")}
-          rows={outboundTop}
-          empty={t("analytics.emptyConnections")}
         />
       </div>
 
@@ -446,31 +398,6 @@ interface HostRow {
   domain: string;
   ip: string;
   agg: Agg;
-}
-
-/// 【APP42 任务4.1】顶部统计卡（大号数字 + 说明），样式对齐连接页
-function StatCard({
-  icon,
-  label,
-  value,
-  tone,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  tone: string;
-}) {
-  return (
-    <div className="card-sheen bg-surface-card rounded-xl p-3.5 shadow-md">
-      <div className="flex items-center gap-1.5 text-[11px] text-gray-500">
-        {icon}
-        {label}
-      </div>
-      <div className={`mt-1.5 font-mono text-lg font-semibold tabular-nums ${tone}`}>
-        {value}
-      </div>
-    </div>
-  );
 }
 
 function AggCard({

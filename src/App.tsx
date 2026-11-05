@@ -62,23 +62,30 @@ export default function App() {
    *  【APP43 任务1.4】防重入：上一次 IPC 未返回前不叠加新请求，避免慢响应时
    *  轮询队列堆积把后端 Mutex 压死 → IPC 5s 超时 → 误判掉授权。 */
   const runtimeBusyRef = useRef(false);
+  // 【APP51 任务2】IPC 硬超时保护：后端异常/内核无响应时 1.8s 内必返回，
+  // 全局定时器不会被单次请求卡死（速率卡死的根因之一）
+  const withIpcTimeout = <T,>(p: Promise<T>, ms = 1800): Promise<T> =>
+    Promise.race([
+      p,
+      new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error("ipc-timeout")), ms)),
+    ]);
   const refreshRuntime = useCallback(async () => {
     if (runtimeBusyRef.current) return;
     runtimeBusyRef.current = true;
     try {
       const store = useCoreStore.getState();
       if (store.status !== "running") {
-        const st = await getCoreStatus();
+        const st = await withIpcTimeout(getCoreStatus());
         store.setStatus(st.status);
         store.setMode(st.mode);
         if (st.outboundMode) store.setOutboundMode(st.outboundMode);
         store.syncStartedAt(st);
         if (st.status !== "running") return;
       }
-      const snap = await getRuntimeSnapshot();
+      const snap = await withIpcTimeout(getRuntimeSnapshot());
       store.applyRuntimeSnapshot(snap);
     } catch {
-      /* 内核未就绪时静默忽略 */
+      /* 内核未就绪/超时：静默忽略，等下一轮 1s 定时器 */
     } finally {
       runtimeBusyRef.current = false;
     }
@@ -318,7 +325,8 @@ export default function App() {
     // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
     // refreshRuntime 会先查状态并触发后端自动接管。
     void refreshRuntime();
-    const id = window.setInterval(() => void refreshRuntime(), 2000);
+    // 【APP51 任务2】全局唯一 1000ms 定时器（可见时），速率与曲线每秒刷新
+    const id = window.setInterval(() => void refreshRuntime(), 1000);
     return () => window.clearInterval(id);
   }, [appVisible, refreshRuntime]);
 

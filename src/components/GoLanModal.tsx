@@ -85,8 +85,10 @@ const EMPTY_GO_LAN: GoLanForm = {
   wgPrivateKey: "",
   wgPeerPublicKey: "",
   wgPreSharedKey: "",
-  wgLocalIp: WG_DEFAULTS.localIp,
-  wgMtu: WG_DEFAULTS.mtu,
+  // 【APP51 任务4】空白档案：本机虚拟地址必须为空，绝不预填 10.0.0.2
+  wgLocalIp: "",
+  // 【APP51 任务4】新档案展示默认 MTU 1380（运行时仍由 go_lan 锁定 1280）
+  wgMtu: 1380,
   lanCidrs: "",
   lanDns: "",
   lanDomains: "",
@@ -120,7 +122,8 @@ function applyProfileToForm(p: GoLanProfile, s: GoLanSettings): GoLanForm {
     wgPrivateKey: wg?.privateKey ?? "",
     wgPeerPublicKey: wg?.peerPublicKey ?? "",
     wgPreSharedKey: wg?.preSharedKey ?? "",
-    wgLocalIp: wg?.localIp || WG_DEFAULTS.localIp,
+    // 【APP51 任务4】严禁回退到默认 10.0.0.2/24：空档案必须显示为空
+    wgLocalIp: wg?.localIp ?? "",
     wgMtu: wg?.mtu || WG_DEFAULTS.mtu,
     lanCidrs: (p.lanCidrs ?? []).join("\n"),
     lanDns: s.lanDns ?? "",
@@ -150,7 +153,8 @@ function applyGoLanLoaded(s: GoLanSettings): GoLanForm {
     wgPrivateKey: wg?.privateKey ?? "",
     wgPeerPublicKey: wg?.peerPublicKey ?? "",
     wgPreSharedKey: wg?.preSharedKey ?? "",
-    wgLocalIp: wg?.localIp || WG_DEFAULTS.localIp,
+    // 【APP51 任务4】空档案本地地址保持空白
+    wgLocalIp: wg?.localIp ?? "",
     wgMtu: wg?.mtu || WG_DEFAULTS.mtu,
     lanCidrs: (s.lanCidrs ?? []).join("\n"),
     lanDns: s.lanDns ?? "",
@@ -316,22 +320,19 @@ function parseWgConf(text: string): Partial<GoLanForm> | null {
 /** 【APP40 任务2】编辑表单 → 单路档案（保存/切标签时统一走这里） */
 function formToProfile(f: GoLanForm, prev?: GoLanProfile): GoLanProfile {
   const localAddr = splitLocalAddresses(f.wgLocalIp);
-  const wgAnyFilled = [
-    f.wgServer,
-    f.wgPrivateKey,
-    f.wgPeerPublicKey,
-    f.wgPreSharedKey,
-  ].some((v) => v.trim() !== "");
+  // 【APP51 任务4】WG 模式即使全空也写入「完整空对象」（server/私钥等为空串、
+  // 端口 51820、MTU 1380），绝不返回 null 让后端回填旧顶层配置。
   const wgConfig: WgManualConfig | null =
-    f.mode === "manual" && f.method === "wg" && wgAnyFilled
+    f.mode === "manual" && f.method === "wg"
       ? {
           server: cleanInput(f.wgServer),
           serverPort: f.wgServerPort || 51820,
           privateKey: cleanInput(f.wgPrivateKey),
           peerPublicKey: cleanInput(f.wgPeerPublicKey),
           preSharedKey: cleanInput(f.wgPreSharedKey) || null,
-          localIp: localAddr.addresses.join(", ") || WG_DEFAULTS.localIp,
-          mtu: f.wgMtu || WG_DEFAULTS.mtu,
+          // 空档案保持空串，严禁默认 10.0.0.2/24
+          localIp: localAddr.addresses.join(", "),
+          mtu: f.wgMtu || 1380,
         }
       : null;
   return {
@@ -377,10 +378,7 @@ export default function GoLanModal({ open, onClose }: Props) {
   const [probing, setProbing] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
   const [probeOk, setProbeOk] = useState<boolean | null>(null);
-  // 【APP50 任务2】iOS WKWebView 静默拦截 window.confirm（恒返回 false），
-  // 改用「二次点击确认」：第一次点击进入确认态（3s 自动复位），第二次才执行
-  const [confirmingClear, setConfirmingClear] = useState(false);
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // 【APP51 任务4】清空 / 删除取消一切二次确认：单击立即执行并落盘
   // 【APP14 任务1】客户端私钥明文/密文切换，方便核对一键识别是否完整
   const [showPrivKey, setShowPrivKey] = useState(false);
 
@@ -404,42 +402,90 @@ export default function GoLanModal({ open, onClose }: Props) {
     setProbeOk(null);
   };
 
-  const addProfile = () => {
+  /** 【APP51 任务4】统一落盘：档案列表 + 全局字段一起保存并回读，
+   *  供新增/删除/清空/开关即时持久化复用（不校验表单，允许空白档案）。 */
+  const persistProfiles = async (
+    list: GoLanProfile[],
+    f: GoLanForm,
+    opts?: { silent?: boolean; successMsg?: string },
+  ) => {
+    const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
+    const active = list.find((p) => p.id === f.id) ?? list[0];
+    const payload: GoLanSettings = {
+      ...base,
+      enabled: list.some((p) => p.enabled),
+      bypassOnLocalLan: f.bypassOnLocalLan,
+      profiles: list,
+      activeProfileId: active?.id ?? "",
+      mode: f.mode,
+      nodeUri: active?.nodeUri ?? "",
+      wgConfig: active?.wgConfig ?? null,
+      lanCidrs: active?.lanCidrs ?? [],
+      lanDns: cleanInput(f.lanDns) || null,
+      lanDomains: splitCidrsText(f.lanDomains),
+      managedServer: cleanInput(f.managedServer) || MANAGED_SERVER_DEFAULT,
+      deviceCode: cleanInput(f.deviceCode),
+    };
+    try {
+      await saveGoLanSettings(payload);
+      const fresh = await getGoLanSettings();
+      setLoaded(fresh);
+      setGoLanSettings(fresh);
+      setStatus(await getGoLanStatus().catch(() => null));
+      if (!opts?.silent) toast.success(opts?.successMsg ?? t("goLan.saved"));
+    } catch (e) {
+      if (!opts?.silent) toast.error(String(e));
+    }
+  };
+
+  /** 【APP51 任务4】空白档案工厂：wgConfig 为完整空对象（端口 51820 / MTU 1380），
+   *  严禁复用任何旧档案字段（normalizeGoLanProfile 不得参与新建）。 */
+  const blankProfile = (id: string, name: string): GoLanProfile => ({
+    id,
+    name,
+    enabled: false,
+    bypassOnLocalLan: false,
+    localWifiSsid: "",
+    lanCidrs: [],
+    nodeUri: "",
+    probeTarget: "",
+    wgConfig: {
+      server: "",
+      serverPort: 51820,
+      privateKey: "",
+      peerPublicKey: "",
+      preSharedKey: null,
+      localIp: "",
+      mtu: 1380,
+    },
+  });
+
+  const addProfile = async () => {
     const merged = mergeActiveForm(profiles);
     const id = `p${Date.now().toString(36)}`;
-    // 【APP45 任务1.2】新档案必须 100% 空白：严禁继承上一条隧道的任何字段
-    const created = normalizeGoLanProfile(
-      {
-        id,
-        name: `内网 ${merged.length + 1}`,
-        enabled: true,
-        bypassOnLocalLan: false,
-        lanCidrs: [],
-        probeTarget: "",
-      },
-      merged.length,
-    );
+    // 【APP51 任务4】新档案 100% 空白，并立即落盘
+    const created = blankProfile(id, `内网 ${merged.length + 1}`);
     const next = [...merged, created];
+    const nextForm = applyProfileToForm(created, loaded ?? ({} as GoLanSettings));
     setProfiles(next);
     setActiveId(id);
-    setForm(applyProfileToForm(created, loaded ?? ({} as GoLanSettings)));
+    setForm(nextForm);
     // 同步重置粘贴识别框与检测状态，杜绝残留上一条隧道的任何一个字符
     setPasteBuf("");
     setPasteHint("");
     setProbeMsg("");
     setProbeOk(null);
+    await persistProfiles(next, nextForm, { silent: true });
   };
 
-  /** 【APP49 任务5】清空当前配置：只清空当前激活 Tab 档案的字段（保留档案
-   *  条目与名称，其他档案不动），并立即调用 save_go_lan_settings 落盘。
-   *  【APP50 任务2】严禁 window.confirm（iOS WKWebView 静默返回 false） */
+  /** 【APP51 任务4】清空当前配置：单击立即执行并落盘（无二次确认）。 */
   const clearCurrentProfile = async () => {
     const clearedForm: GoLanForm = {
       ...EMPTY_GO_LAN,
       id: form.id,
       name: form.name,
       enabled: false,
-      // 【APP50 任务2】清空即真正清空：隧道地址留空、MTU 回到运行时值 1380
+      // 清空即真正清空：隧道地址留空、MTU 1380（运行时仍锁 1280）
       wgLocalIp: "",
       wgMtu: 1380,
       // 全局字段（局域网 DNS / 域名后缀 / 托管参数 / 模式）不属于单档案，保持原值
@@ -460,78 +506,42 @@ export default function GoLanModal({ open, onClose }: Props) {
     setPasteHint("");
     setProbeMsg("");
     setProbeOk(null);
-    try {
-      const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
-      await saveGoLanSettings({
-        ...base,
-        enabled: nextProfiles.some((p) => p.enabled),
-        bypassOnLocalLan: clearedForm.bypassOnLocalLan,
-        profiles: nextProfiles,
-        activeProfileId: form.id,
-        // 顶层旧版字段与被清空档案对齐，防止旧读取方拿到残留配置
-        nodeUri: clearedProfile.nodeUri,
-        wgConfig: clearedProfile.wgConfig ?? null,
-        lanCidrs: clearedProfile.lanCidrs,
-      });
-      const fresh = await getGoLanSettings();
-      setLoaded(fresh);
-      setGoLanSettings(fresh);
-      setStatus(await getGoLanStatus().catch(() => null));
-      toast.success(t("goLan.cleared"));
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      setConfirmingClear(false);
-    }
+    await persistProfiles(nextProfiles, clearedForm, {
+      successMsg: t("goLan.cleared"),
+    });
   };
 
-  const deleteProfile = () => {
-    setConfirmingDelete(false);
-    if (profiles.length <= 1) {
-      clearAllProfiles();
-      return;
+  /** 【APP51 任务4】删除内网：单击立即删除并落盘；删光后自动生成一个空白默认档案 */
+  const deleteProfile = async () => {
+    let next = profiles.filter((p) => p.id !== form.id);
+    if (next.length === 0) {
+      const fallback = blankProfile("home", "家里");
+      next = [fallback];
     }
-    const next = profiles.filter((p) => p.id !== form.id);
+    const target = next[0];
+    const nextForm = applyProfileToForm(target, loaded ?? ({} as GoLanSettings));
     setProfiles(next);
-    const first = next[0];
-    setActiveId(first.id);
-    setForm(applyProfileToForm(first, loaded ?? ({} as GoLanSettings)));
-    setProbeMsg("");
-    setProbeOk(null);
-  };
-
-  const clearAllProfiles = async () => {
-    // 【APP50 任务2】严禁 window.confirm（iOS WKWebView 静默返回 false）
-    setProfiles([]);
-    setActiveId("");
-    setForm({ ...EMPTY_GO_LAN, id: "home", name: "家里", enabled: false });
+    setActiveId(target.id);
+    setForm(nextForm);
     setPasteBuf("");
     setPasteHint("");
     setProbeMsg("");
     setProbeOk(null);
-    // 【APP45 任务1.2】清空配置立即持久化到磁盘：档案列表与顶层旧版字段
-    // （wgConfig / lanCidrs / nodeUri）一并清空，严禁后端 normalize 把残留的
-    // 旧顶层配置重新回填进新档案。
-    try {
-      const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
-      await saveGoLanSettings({
-        ...base,
-        enabled: false,
-        bypassOnLocalLan: false,
-        profiles: [],
-        activeProfileId: "",
-        nodeUri: "",
-        wgConfig: null,
-        lanCidrs: [],
-      });
-      const fresh = await getGoLanSettings();
-      setLoaded(fresh);
-      setGoLanSettings(fresh);
-      setStatus(await getGoLanStatus().catch(() => null));
-      toast.success(t("goLan.saved"));
-    } catch (e) {
-      toast.error(String(e));
-    }
+    await persistProfiles(next, nextForm, { successMsg: t("goLan.saved") });
+  };
+
+  /** 【APP51 任务4】开关 0ms 乐观切换 + 自动落盘（启用 / On-Demand 共用） */
+  const patchAndSave = (p: Partial<GoLanForm>) => {
+    const nextForm = { ...form, ...p };
+    setForm(nextForm);
+    const nextProfiles =
+      profiles.length > 0
+        ? profiles.map((pr) =>
+            pr.id === form.id ? formToProfile(nextForm, pr) : pr,
+          )
+        : [formToProfile(nextForm)];
+    setProfiles(nextProfiles);
+    void persistProfiles(nextProfiles, nextForm, { silent: true });
   };
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）
@@ -814,25 +824,12 @@ export default function GoLanModal({ open, onClose }: Props) {
             <span className="text-[11px] font-medium text-gray-400">
               {t("goLan.profiles")}
             </span>
-            {/* 【APP50 任务2】二次点击确认（iOS WKWebView 无 window.confirm） */}
+            {/* 【APP51 任务4】单击即清空并落盘，无二次确认 */}
             <button
-              onClick={() => {
-                if (!confirmingClear) {
-                  setConfirmingClear(true);
-                  window.setTimeout(() => setConfirmingClear(false), 3000);
-                  return;
-                }
-                void clearCurrentProfile();
-              }}
-              className={`rounded px-1.5 py-0.5 text-[11px] transition-colors ${
-                confirmingClear
-                  ? "bg-red-500/20 font-bold text-red-400 ring-1 ring-red-500/40"
-                  : "text-red-400 hover:bg-red-500/10"
-              }`}
+              onClick={() => void clearCurrentProfile()}
+              className="rounded px-1.5 py-0.5 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
             >
-              {confirmingClear
-                ? t("goLan.confirmClearAgain")
-                : t("goLan.clearCurrent")}
+              {t("goLan.clearCurrent")}
             </button>
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
@@ -896,22 +893,11 @@ export default function GoLanModal({ open, onClose }: Props) {
               placeholder={t("goLan.profileNamePlaceholder")}
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
             />
-            {/* 【APP50 任务2】二次点击确认（iOS WKWebView 无 window.confirm） */}
+            {/* 【APP51 任务4】单击即删除并落盘，无二次确认 */}
             <button
-              onClick={() => {
-                if (!confirmingDelete) {
-                  setConfirmingDelete(true);
-                  window.setTimeout(() => setConfirmingDelete(false), 3000);
-                  return;
-                }
-                deleteProfile();
-              }}
+              onClick={() => void deleteProfile()}
               title={t("goLan.deleteProfile")}
-              className={`flex shrink-0 items-center justify-center rounded-md border px-2.5 transition-colors ${
-                confirmingDelete
-                  ? "border-red-400 bg-red-500/30 text-red-300"
-                  : "border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20"
-              }`}
+              className="flex shrink-0 items-center justify-center rounded-md border border-red-500/30 bg-red-500/10 px-2.5 text-red-400 transition-colors hover:bg-red-500/20"
             >
               <Trash2 size={14} />
             </button>
@@ -1141,7 +1127,7 @@ export default function GoLanModal({ open, onClose }: Props) {
           <span className="text-xs text-gray-300">{t("goLan.enable")}</span>
           <Switch
             checked={form.enabled}
-            onChange={(v) => patch({ enabled: v })}
+            onChange={(v) => patchAndSave({ enabled: v })}
           />
         </div>
 
@@ -1154,7 +1140,7 @@ export default function GoLanModal({ open, onClose }: Props) {
             </span>
             <Switch
               checked={form.bypassOnLocalLan}
-              onChange={(v) => patch({ bypassOnLocalLan: v })}
+              onChange={(v) => patchAndSave({ bypassOnLocalLan: v })}
             />
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-gray-500">

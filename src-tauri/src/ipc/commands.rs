@@ -1317,6 +1317,9 @@ pub(crate) async fn refresh_subscription(
     // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
     refresh_providers(state, &url, &text).await;
 
+    // 【APP51 任务1】订阅刷新后第一时间清理失效节点缓存并中止旧探测任务
+    purge_disabled_or_deleted_subscription_nodes(state);
+
     // 内核运行中：重建配置重启，新订阅即刻生效。
     // APP34：移动端 VPN 运行期间严禁「停隧道 + 重启隧道」——iOS 扩展在
     // 50MB Jetsam 红线内重启必然崩溃（表现为启动 10~15 秒后自动停止）。
@@ -2100,6 +2103,68 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
     out
 }
 
+/// 【APP51 任务1】选中节点失效回退：仍有效则原样保留，失效/为空取第一个可用节点。
+fn fallback_selected_node(selected: Option<&str>, valid_names: &[String]) -> Option<String> {
+    if let Some(sel) = selected
+        && valid_names.iter().any(|v| v == sel)
+    {
+        return Some(sel.to_string());
+    }
+    valid_names.first().cloned()
+}
+
+/// 【APP51 任务1】订阅删除 / 停用 / 刷新后的统一清理：
+/// 1. aim_generation +1，正在进行的 Go AIM 探测发现代数变化立即中止；
+/// 2. 清空已失效节点（不存在于当前启用订阅）的 aim_results 与 aim_locked_node；
+/// 3. 选中节点 / 手动指定节点若已失效，重置为当前可用节点中的第一个，并落盘。
+/// 必须在订阅变更的第一时间调用（重启内核之前），杜绝旧节点继续被锁定。
+pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    let valid_names: Vec<String> = collect_cached_proxies(state)
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    let valid: std::collections::HashSet<&str> =
+        valid_names.iter().map(|s| s.as_str()).collect();
+    // 代数自增：旧探测任务立即失效
+    state.aim_generation.fetch_add(1, Ordering::AcqRel);
+
+    // 1) 清除失效节点的探测缓存
+    {
+        let mut results = state.aim_results.write();
+        results.retain(|name, _| valid.contains(name.as_str()));
+    }
+    // 2) 锁定的节点已失效 → 清空，交由后续探测/自动选点重建
+    {
+        let mut locked = state.aim_locked_node.write();
+        if locked
+            .as_deref()
+            .is_some_and(|n| !valid.contains(n))
+        {
+            *locked = None;
+        }
+    }
+    // 3) 选中节点 / 手动指定节点失效 → 重置为当前第一个可用节点并落盘
+    let mut settings = state.settings.read().clone();
+    let mut changed = false;
+    let next_selected = fallback_selected_node(settings.selected_node.as_deref(), &valid_names);
+    if next_selected != settings.selected_node {
+        settings.selected_node = next_selected;
+        changed = true;
+    }
+    if let Some(pinned) = settings.go_aim_pinned_node.clone()
+        && !valid.contains(pinned.as_str())
+    {
+        settings.go_aim_pinned_node = None;
+        changed = true;
+    }
+    if changed {
+        let _ = state.save_settings(settings);
+        let _ = state.app_handle.emit("settings://changed", ());
+        let _ = state.app_handle.emit("proxies://changed", ());
+    }
+}
+
 /// 【APP44 任务1.3】内核未运行时的真实测速：DoH / 系统 DNS 解析节点服务器
 /// 域名 → 过滤 FakeIP 与虚拟网段 → 真实 TCP 握手计时。
 /// 仅在 VPN 未运行时调用（TUN 开启时握手指向 utun，延迟全是假的）。
@@ -2112,10 +2177,10 @@ pub async fn test_cached_proxies(
     if nodes.is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    let timeout = timeout_ms.unwrap_or(3000).clamp(1000, 5000);
+    // 【APP51 任务1】严格 1500ms 超时 + 32 路并发滚动测速（测完全部启用节点）
+    let timeout = timeout_ms.unwrap_or(1500).clamp(800, 3000);
     use futures_util::StreamExt;
-    // 每批 8 个：测完全部节点，同时避免一次性开满 socket
-    const BATCH: usize = 8;
+    const BATCH: usize = 32;
     let mut map = serde_json::Map::new();
     for batch in nodes.chunks(BATCH) {
         let results: Vec<(String, Option<u64>)> =
@@ -2303,6 +2368,8 @@ pub async fn toggle_subscription(
     if !found {
         return Err("订阅记录不存在".into());
     }
+    // 【APP51 任务1】订阅启停第一时间清理失效节点并中止旧探测
+    purge_disabled_or_deleted_subscription_nodes(&state);
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
     }
@@ -2328,6 +2395,8 @@ pub async fn delete_subscription(
         .map_err(|e| format!("删除订阅失败: {e}"))?;
     if removed {
         std::fs::remove_file(crate::core::store::profile_path(&state.data_dir, &url)).ok();
+        // 【APP51 任务1】删除订阅后立即清理其全部节点缓存与失效选中节点
+        purge_disabled_or_deleted_subscription_nodes(&state);
         // Pro/买断：静默上报云端删除（其他设备下次对账时同步删除）
         let app2 = app.clone();
         let url2 = url.clone();
@@ -2804,14 +2873,15 @@ pub async fn get_traffic_stats(
 
 /// 运行时统计快照：今日流量 / 实时速率 / 60s 曲线 / 活跃连接 / 分析聚合。
 /// 数据由 events.rs 的内核数据流实时维护在 AppState，前端无需轮询内核。
-/// 【APP46 任务4.1】每次拉快照前主动 GET /connections（600ms 硬超时），
-/// 从顶层 downloadTotal/uploadTotal 差分计算实时速率并追加一条 TrafficSample——
-/// 这是 WebSocket 流挂起/事件漏推送时的硬兜底，保证速率永不卡死归零。
+/// 【APP51 任务2】每次拉快照无条件 GET /connections（1500ms 硬超时）：
+/// - HTTP 200 → 内核确实存活，若状态误报 Stopped/Error 立即自愈为 Running；
+/// - dt < 0.15s → 直接沿用缓存的上下行速率（严禁 0,0 闪一下）；
+/// - 超时/失败 → 保留上次速率的一半衰减，曲线不断档、绝不空白。
 #[tauri::command]
 pub async fn get_runtime_snapshot(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // 1. 硬兜底差分：GET /connections（600ms 上限）
+    // 1. 无条件探测：内核 API 可访问即视为运行中（修复「内核未运行」误报）
     let telemetry = async {
         let conn_json = state.kernel_api().get_connections().await.ok()?;
         let total_down = conn_json
@@ -2826,36 +2896,67 @@ pub async fn get_runtime_snapshot(
     }
     .await;
 
+    // 仅当处于 Stopped/Error 且内核 API 正常应答时自愈，避免干扰启动/停止中间态
+    if telemetry.is_some() {
+        let current = *state.status.read();
+        if matches!(current, CoreStatus::Stopped | CoreStatus::Error) {
+            let _ = state.transition(CoreStatus::Starting);
+            let _ = state.transition(CoreStatus::Running);
+        }
+    }
+
+    let mut display: Option<(u64, u64)> = None;
     if let Some((total_down, total_up)) = telemetry {
         let now = std::time::Instant::now();
         let mut sample = state.last_traffic_sample.lock();
-        let maybe_speed = if let Some((prev_t, prev_down, prev_up)) = *sample {
-            let dt = now.duration_since(prev_t).as_secs_f64();
-            if dt >= 0.2 && dt <= 10.0 && total_down >= prev_down && total_up >= prev_up {
-                let down = ((total_down - prev_down) as f64 / dt) as u64;
-                let up = ((total_up - prev_up) as f64 / dt) as u64;
-                Some((down, up))
-            } else {
-                None
+        let (speed_down, speed_up) = match *sample {
+            Some((prev_t, prev_down, prev_up, last_down, last_up)) => {
+                let dt = now.duration_since(prev_t).as_secs_f64();
+                if dt < 0.15 {
+                    // 高频重复调用：沿用缓存，绝不返回 0,0
+                    (last_down, last_up)
+                } else if dt <= 10.0 && total_down >= prev_down && total_up >= prev_up {
+                    (
+                        ((total_down - prev_down) as f64 / dt) as u64,
+                        ((total_up - prev_up) as f64 / dt) as u64,
+                    )
+                } else if dt <= 10.0 {
+                    // 内核重启导致总量归零：本轮真实速率为 0
+                    (0, 0)
+                } else {
+                    // 间隔过长（休眠/挂起）：沿用缓存避免瞬时尖峰
+                    (last_down, last_up)
+                }
             }
-        } else {
-            None
+            None => (0, 0),
         };
-        *sample = Some((now, total_down, total_up));
-        // 追加到 60s 环形队列（最多 60 条，每秒一条）
-        if let Some((down, up)) = maybe_speed {
-            // 不引入 chrono：以 Unix 秒换算 HH:MM:SS（events.rs 同款）
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let day = secs % 86400;
-            let ts = format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60);
-            let mut hist = state.traffic_history.write();
-            hist.push_back(crate::core::state::TrafficSample { time: ts, up, down });
-            while hist.len() > 60 {
-                hist.pop_front();
-            }
+        *sample = Some((now, total_down, total_up, speed_down, speed_up));
+        drop(sample);
+        display = Some((speed_down, speed_up));
+    } else {
+        // 探测失败：保留上次速率的一半衰减（不归零、不空白）
+        let mut sample = state.last_traffic_sample.lock();
+        if let Some((t, d, u, last_down, last_up)) = *sample {
+            let decay_down = last_down / 2;
+            let decay_up = last_up / 2;
+            *sample = Some((t, d, u, decay_down, decay_up));
+            display = Some((decay_down, decay_up));
+        }
+    }
+
+    // 2. 追加一条 60s 环形队列样本（每秒一条）
+    if let Some((down, up)) = display {
+        // 不引入 chrono：以 Unix 秒换算 HH:MM:SS（events.rs 同款）
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let day = secs % 86400;
+        let ts = format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60);
+        let mut hist = state.traffic_history.write();
+        hist.push_back(crate::core::state::TrafficSample { time: ts, up, down });
+        while hist.len() > 60 {
+            hist.pop_front();
         }
     }
 
@@ -3046,20 +3147,32 @@ pub async fn set_go_aim_enabled(
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
     if enabled && *state.status.read() == CoreStatus::Running {
-        // 【APP39 任务4·时机A】开启瞬间立即锁定「当前延迟最低」节点：
-        // 延迟取自 Clash API /proxies 的 history（与代理页绿色毫秒完全
-        // 一致），无历史时对前 10 个节点 800ms 快测；选中后同步
-        // state.selected_node / settings.json 并广播，仪表盘 1 秒内刷新。
-        let _ = crate::core::go_aim::lock_fastest_now(&app, &state).await;
-        // 内存已有探测结果 → 按评级规则再校准一次；
-        // 否则启动新一轮探测，完成后 apply_selection 自动锁定最佳节点
-        let has_results = !state.aim_results.read().is_empty();
-        if has_results {
-            let _ = crate::core::go_aim::apply_selection(&app, &state).await;
-        } else {
-            crate::core::go_aim::spawn_monitor(app.clone());
-            crate::core::go_aim::start_probe(app.clone());
-        }
+        // 【APP51 任务1】开启动作 <1ms 返回：耗时探测全部转入后台任务，
+        // 前端开关点击后立即变绿/变灰，绝不等待网络探测
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app2.state::<AppState>();
+            if !state.settings.read().go_aim_enabled || *state.status.read() != CoreStatus::Running
+            {
+                return;
+            }
+            // 【APP39 任务4·时机A】开启瞬间立即锁定「当前延迟最低」节点
+            let _ = crate::core::go_aim::lock_fastest_now(&app2, &state).await;
+            // 用户可能在锁定期间关闭开关：再次确认
+            if !state.settings.read().go_aim_enabled || *state.status.read() != CoreStatus::Running
+            {
+                return;
+            }
+            // 内存已有探测结果 → 按评级规则再校准一次；
+            // 否则启动新一轮探测，完成后 apply_selection 自动锁定最佳节点
+            let has_results = !state.aim_results.read().is_empty();
+            if has_results {
+                let _ = crate::core::go_aim::apply_selection(&app2, &state).await;
+            } else {
+                crate::core::go_aim::spawn_monitor(app2.clone());
+                crate::core::go_aim::start_probe(app2.clone());
+            }
+        });
     }
     if !enabled {
         *state.aim_locked_node.write() = None;
@@ -3601,4 +3714,27 @@ pub async fn export_app_logs(
         &state.data_dir,
         module_filter.as_deref(),
     ))
+}
+
+#[cfg(test)]
+mod app51_tests {
+    use super::fallback_selected_node;
+
+    /// 【APP51 任务1】停用/删除订阅后的选中节点清理：
+    /// 节点仍有效 → 保留；节点失效 → 回退到第一个可用节点；无可用节点 → None。
+    #[test]
+    fn test_fallback_selected_node_after_subscription_change() {
+        let valid = vec!["香港01".to_string(), "日本02".to_string()];
+        assert_eq!(
+            fallback_selected_node(Some("日本02"), &valid).as_deref(),
+            Some("日本02")
+        );
+        // 被停用/删除订阅里的旧节点 → 回退
+        assert_eq!(
+            fallback_selected_node(Some("已删除节点"), &valid).as_deref(),
+            Some("香港01")
+        );
+        assert_eq!(fallback_selected_node(None, &valid).as_deref(), Some("香港01"));
+        assert_eq!(fallback_selected_node(Some("任意"), &[]), None);
+    }
 }

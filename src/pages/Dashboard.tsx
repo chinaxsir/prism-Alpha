@@ -315,47 +315,56 @@ export default function Dashboard() {
       .catch(() => setLanState(null));
   }, [lan?.enabled, lan?.profiles]);
 
+  // 【APP51 任务1.3】全开关 0ms 乐观 UI：先同步改前端状态，再异步落盘；
+  // 失败时回滚并 toast，点击后界面立即变色，绝不等待 IPC/内核重启
   const toggleAim = async (v: boolean) => {
+    const store = useCoreStore.getState();
+    const prevStatus = store.goAimStatus;
+    if (prevStatus) store.setGoAimStatus({ ...prevStatus, enabled: v });
     try {
       await setGoAimEnabled(v);
-      const store = useCoreStore.getState();
-      const prev = store.goAimStatus;
-      if (prev) store.setGoAimStatus({ ...prev, enabled: v });
     } catch (e) {
+      if (prevStatus) useCoreStore.getState().setGoAimStatus(prevStatus);
       toast.error(String(e));
     }
   };
 
   const toggleLan = async (v: boolean) => {
+    const store = useCoreStore.getState();
+    const s = store.goLanSettings;
+    // APP 任务5：未配置时拦截开启，Toast 引导并跳转配置区
+    if (v && (!s || !isGoLanConfigured(s))) {
+      toast.error(t("dashboard.lan.configureFirst"));
+      navigate("/settings?focus=goLan");
+      return;
+    }
+    if (!s) return;
+    const next = { ...s, enabled: v };
+    store.setGoLanSettings(next); // 乐观更新
     try {
-      const s = await getGoLanSettings();
-      // APP 任务5：未配置时拦截开启，Toast 引导并跳转配置区
-      if (v && !isGoLanConfigured(s)) {
-        toast.error(t("dashboard.lan.configureFirst"));
-        navigate("/settings?focus=goLan");
-        return;
-      }
-      s.enabled = v;
-      await saveGoLanSettings(s);
-      useCoreStore.getState().setGoLanSettings(s);
+      await saveGoLanSettings(next);
     } catch (e) {
+      useCoreStore.getState().setGoLanSettings(s);
       toast.error(String(e));
     }
   };
 
   const toggleCus = async (v: boolean) => {
+    const store = useCoreStore.getState();
+    const s = store.goCusSettings;
+    // APP 任务5：无模块时拦截开启，Toast 引导并跳转 Go Cus 模块页
+    if (v && (!s || s.modules.length === 0)) {
+      toast.error(t("dashboard.cus.configureFirst"));
+      navigate("/proxies?tab=goCus");
+      return;
+    }
+    if (!s) return;
+    const next = { ...s, enabled: v };
+    store.setGoCusSettings(next); // 乐观更新
     try {
-      const s = await getGoCusSettings();
-      // APP 任务5：无模块时拦截开启，Toast 引导并跳转 Go Cus 模块页
-      if (v && s.modules.length === 0) {
-        toast.error(t("dashboard.cus.configureFirst"));
-        navigate("/proxies?tab=goCus");
-        return;
-      }
-      s.enabled = v;
-      await saveGoCusSettings(s);
-      useCoreStore.getState().setGoCusSettings(s);
+      await saveGoCusSettings(next);
     } catch (e) {
+      useCoreStore.getState().setGoCusSettings(s);
       toast.error(String(e));
     }
   };
@@ -687,7 +696,7 @@ export default function Dashboard() {
               {t("metric.download")}
             </div>
             <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono tracking-tight">
-              {running ? formatSpeed(downSpeed) : "—"}
+              {formatSpeed(downSpeed)}
             </div>
           </div>
           <div className="border-l border-border pl-4">
@@ -696,7 +705,7 @@ export default function Dashboard() {
               {t("metric.upload")}
             </div>
             <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono tracking-tight">
-              {running ? formatSpeed(upSpeed) : "—"}
+              {formatSpeed(upSpeed)}
             </div>
           </div>
         </div>

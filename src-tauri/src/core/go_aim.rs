@@ -39,16 +39,19 @@ const BASELINE_URL: &str = "http://cp.cloudflare.com/generate_204";
 const BASELINE_TIMEOUT_MS: u64 = 1500;
 /// 参与探测的节点基线延迟上限（仅探测存活节点）
 const PROBE_MAX_DELAY_MS: u64 = 2500;
-/// 【APP37 任务3.2】单个平台探测请求超时（毫秒）
-const PROBE_TIMEOUT_MS: u64 = 2200;
-/// 【APP49 任务3】阶段1 极速存活快筛：每批并发测速节点数
-const SCREEN_BATCH_SIZE: usize = 12;
-/// 【APP49 任务3】阶段1 快筛测速 URL（generate_204，任何出口都应 204）
+/// 【APP51 任务1】单个平台探测请求超时（毫秒，严格 1200ms 快速出结果）
+const PROBE_TIMEOUT_MS: u64 = 1200;
+/// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
+const SCREEN_BATCH_SIZE: usize = 32;
+/// 【APP51 任务1】阶段1 快筛单节点超时（毫秒，严格 1500ms）
+const SCREEN_TIMEOUT_MS: u64 = 1500;
+/// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
 const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
-/// 【APP49 任务3】阶段1 快筛单节点超时（毫秒）
-const SCREEN_TIMEOUT_MS: u64 = 1200;
-/// 【APP49 任务3】ChatGPT cdn-trace 探测超时（毫秒，独立于通用探测超时）
-const GPT_TRACE_TIMEOUT_MS: u64 = 1600;
+/// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
+/// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
+const DEEP_PROBE_MAX: usize = 12;
+/// 【APP51 任务1】ChatGPT cdn-trace 探测超时（毫秒，严格 1200ms）
+const GPT_TRACE_TIMEOUT_MS: u64 = 1200;
 /// 故障转移监控间隔（秒）
 const MONITOR_INTERVAL_SECS: u64 = 20;
 
@@ -332,26 +335,37 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // 【APP37 任务3.2】严禁任何 .take/.truncate 节点截断：全部有效真实
     // 节点（148+ 个）必须 100% 纳入探测队列。
 
-    // 2. 【APP49 任务3】阶段1 极速存活快筛：每批 12 个并发 delay 测速。
-    // 超时/失败 → dead_result 立即入缓存并推前端；存活节点记录延迟，
-    // 全部筛完后按延迟升序进入阶段2。
+    // 【APP51 任务1】探测代数：订阅删除/停用/刷新会 +1，发现变化立即中止
+    let generation = state.aim_generation.load(Ordering::Acquire);
+    let generation_changed =
+        |st: &AppState| st.aim_generation.load(Ordering::Acquire) != generation;
+
+    // 2. 【APP51 任务1】阶段1 极速存活快筛：Semaphore 限流 32 路并发
+    //（滚动消费，单节点慢不阻塞后续节点）。超时/失败 → dead_result 立即
+    //入缓存并推前端；存活节点记录延迟，全部筛完后按延迟升序进入阶段2。
     let mut alive: Vec<(String, u64)> = Vec::with_capacity(nodes.len());
-    for chunk in nodes.chunks(SCREEN_BATCH_SIZE) {
-        // 中止条件：用户关闭 Go AIM 开关或停止 VPN
-        if !state.settings.read().go_aim_enabled || !is_running(state) {
-            return Err("探测中止（Go AIM 已关闭或 VPN 已停止）".into());
-        }
-        let checks = chunk.iter().map(|(name, _)| {
-            let api = api.clone();
-            let name = name.clone();
-            async move {
-                let d = api
-                    .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
-                    .await;
-                (name, d)
+    {
+        use futures_util::StreamExt as _;
+        let sem = Arc::new(tokio::sync::Semaphore::new(SCREEN_BATCH_SIZE));
+        let mut stream = futures_util::stream::iter(nodes.iter().cloned())
+            .map(|(name, _)| {
+                let api = api.clone();
+                let sem = sem.clone();
+                async move {
+                    let _permit = sem.acquire_owned().await.ok();
+                    let delay = api
+                        .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
+                        .await;
+                    (name, delay)
+                }
+            })
+            .buffer_unordered(SCREEN_BATCH_SIZE);
+        while let Some((name, delay)) = stream.next().await {
+            // 中止条件：关闭 Go AIM / 停止 VPN / 订阅变更（代数变化）
+            if !state.settings.read().go_aim_enabled || !is_running(state) || generation_changed(state)
+            {
+                return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
             }
-        });
-        for (name, delay) in futures_util::future::join_all(checks).await {
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
                     alive.push((name.clone(), d));
@@ -389,6 +403,27 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         return Err("阶段1 快筛后无存活节点".into());
     }
     tracing::info!("[go-aim] 阶段1 快筛完成：{} 个节点存活，进入阶段2", alive.len());
+
+    // 【APP51 任务1】第 1 名先行同步：按延迟升序的第一名立即成为当前选中节点，
+    // 仪表盘/代理页 1 秒内可见，无需等待 7 平台深测结果
+    {
+        let enabled = state.settings.read().go_aim_enabled;
+        let pinned = state.settings.read().go_aim_pinned_node.is_some();
+        if enabled && !pinned && is_running(state) {
+            let (leader_name, leader_delay) = alive[0].clone();
+            let leader = AimNodeResult {
+                node_name: leader_name,
+                unlocked_tags: vec![],
+                ai_unlocked: false,
+                media_unlocked: false,
+                score: 0,
+                delay_ms: leader_delay,
+                updated_at: now_secs(),
+                probed: false,
+            };
+            let _ = lock_node(app, state, &leader, false).await;
+        }
+    }
 
     // 3. 探针槽位可用性检测：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
@@ -434,9 +469,11 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // 下一个节点（等价于每批 4 个节点的滚动并发）。前 PROBE_SLOTS 个
     //（延迟最低的首批）标记 first_batch，用于秒级锁定。
     let instant_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 【APP51 任务1】深测只取阶段1 延迟最低的 Top12（快筛已覆盖全量节点）
     let queue = Arc::new(tokio::sync::Mutex::new(
         alive
             .into_iter()
+            .take(DEEP_PROBE_MAX)
             .enumerate()
             .map(|(i, (name, d))| (name, d, i < PROBE_SLOTS))
             .collect::<VecDeque<_>>(),
@@ -447,6 +484,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         let api = api.clone();
         let task_app = app.clone();
         let instant_locked = instant_locked.clone();
+        let generation = generation;
         set.spawn(async move {
             let app = task_app;
             let mut done = 0usize;
@@ -456,9 +494,12 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 // 自动选点/手动切点导致的 selected_node 变化绝不再中止探测。
                 {
                     let st = app.state::<AppState>();
-                    if !st.settings.read().go_aim_enabled || !is_running(&st) {
+                    if !st.settings.read().go_aim_enabled
+                        || !is_running(&st)
+                        || st.aim_generation.load(Ordering::Acquire) != generation
+                    {
                         tracing::info!(
-                            "[go-aim] 槽位 {slot} 探测中止（Go AIM 已关闭或 VPN 已停止）"
+                            "[go-aim] 槽位 {slot} 探测中止（Go AIM 关闭、VPN 停止或订阅变更）"
                         );
                         break;
                     }
@@ -467,6 +508,14 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 let Some((name, delay, first_batch)) = next else { break };
                 let result =
                     probe_node(&api, &client, &nr_client, slot, &name, Some(delay)).await;
+                // 【APP51 任务1】订阅在探测期间变更：丢弃本轮结果，绝不污染新节点缓存
+                {
+                    let st = app.state::<AppState>();
+                    if st.aim_generation.load(Ordering::Acquire) != generation {
+                        tracing::info!("[go-aim] 槽位 {slot} 丢弃过期探测结果（订阅已变更）");
+                        break;
+                    }
+                }
                 done += 1;
                 // 实时缓存 + 推送前端徽章
                 // 注意：写锁 guard 必须严格限制在本作用域内，绝不可跨 await

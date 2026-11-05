@@ -3707,6 +3707,59 @@ mod tests {
         assert!(!lan.bypass_on_local_lan);
     }
 
+    /// 【APP51 任务4】新增内网档案为空：wgConfig 是「完整空对象」时，
+    /// normalize 绝不能用顶层旧配置回填任何字段。
+    #[test]
+    fn test_blank_profile_never_refilled_from_legacy_top_level() {
+        let mut settings = GoLanSettings {
+            enabled: false,
+            wg_config: Some(WgManualConfig {
+                server: "old.example.com".into(),
+                server_port: 51820,
+                private_key: "OLD_PRIVATE".into(),
+                peer_public_key: "OLD_PEER".into(),
+                pre_shared_key: None,
+                local_ip: "10.0.0.2/32".into(),
+                mtu: 1420,
+            }),
+            node_uri: "old-uri".into(),
+            lan_cidrs: vec!["192.168.10.0/24".into()],
+            profiles: vec![GoLanProfile {
+                id: "p1".into(),
+                name: "内网 1".into(),
+                enabled: false,
+                bypass_on_local_lan: false,
+                local_wifi_ssid: String::new(),
+                lan_cidrs: Vec::new(),
+                wg_config: Some(WgManualConfig {
+                    server: String::new(),
+                    server_port: 51820,
+                    private_key: String::new(),
+                    peer_public_key: String::new(),
+                    pre_shared_key: None,
+                    local_ip: String::new(),
+                    mtu: 1380,
+                }),
+                node_uri: String::new(),
+                probe_target: String::new(),
+            }],
+            active_profile_id: "p1".into(),
+            ..Default::default()
+        };
+        normalize_go_lan_settings(&mut settings);
+        let p = &settings.profiles[0];
+        let wg = p.wg_config.as_ref().expect("空档案仍应是完整空对象");
+        assert_eq!(wg.server, "", "严禁回填顶层旧 server");
+        assert_eq!(wg.private_key, "", "严禁回填顶层旧私钥");
+        assert_eq!(wg.peer_public_key, "", "严禁回填顶层旧公钥");
+        assert_eq!(wg.local_ip, "", "严禁回填 10.0.0.2/32");
+        assert_eq!(wg.mtu, 1380, "新档案展示 MTU 1380");
+        assert!(p.lan_cidrs.is_empty(), "严禁回填顶层旧内网网段");
+        // 无启用档案 → 顶层旧字段同步清空，不会反向污染新档案
+        assert!(settings.wg_config.is_none());
+        assert!(settings.lan_cidrs.is_empty());
+    }
+
     /// 【APP45 任务1.1】On-Demand 默认关闭（serde 缺省 + Default 均为 false）。
     #[test]
     fn test_bypass_on_local_lan_defaults_false() {

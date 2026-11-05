@@ -1129,9 +1129,11 @@ impl KernelApi {
 
     /// 获取实时连接快照（切页高频轮询：严格 800ms 超时，绝不挂起 IPC）
     pub async fn get_connections(&self) -> Result<serde_json::Value> {
+        // 【APP51 任务2】超时放宽到 1500ms：Windows 内核首次响应常超过 800ms，
+        // 过短超时会让仪表盘误判「内核未运行」并导致速率卡死
         Ok(self
             .authed(shared_client().get(format!("{}/connections", self.base)))
-            .timeout(Duration::from_millis(800))
+            .timeout(Duration::from_millis(1500))
             .send()
             .await?
             .json::<serde_json::Value>()

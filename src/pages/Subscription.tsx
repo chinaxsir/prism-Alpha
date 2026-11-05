@@ -157,13 +157,21 @@ export default function Subscription() {
   };
 
   const handleToggle = async (record: SubscriptionRecord) => {
+    // 【APP51 任务1.3】0ms 乐观 UI：先本地翻转开关，再异步落盘
+    const next = !record.enabled;
+    const optimistic = subs.map((r) =>
+      r.url === record.url ? { ...r, enabled: next } : r,
+    );
+    setSubs(optimistic);
+    useCoreStore.getState().setSubscriptions(optimistic);
     try {
-      await toggleSubscription(record.url, !record.enabled);
+      await toggleSubscription(record.url, next);
       toast.success(t(record.enabled ? "sub.disabled" : "sub.enabled"));
       await load();
     } catch (e) {
       console.error("toggle subscription failed:", e);
       toast.error(String(e));
+      await load();
     }
   };
 

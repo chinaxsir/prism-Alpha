@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::state::{AppState, AggStat, ConnSnapshot, TrafficSample};
+use super::state::{AppState, AggStat, ConnSnapshot, OutboundMode, TrafficSample};
 
 /// 60 秒实时流量环形队列容量
 const TRAFFIC_HISTORY_CAP: usize = 60;
@@ -131,6 +131,52 @@ fn apply_traffic_update(state: &AppState, value: &serde_json::Value) {
 }
 
 /// /connections：更新当前会话绝对累计值（落盘）、活跃连接快照、按维度聚合分析
+/// 【APP51 任务3】按连接 chains（不是 outbound）判定分流类别：
+/// 含 go-lan → 内网；DIRECT / dns-direct → 直连；REJECT / block → 拦截；其余 → 代理。
+/// 拦截流量单独统计并排除在三分占比之外（不展示、不污染分母）。
+#[derive(Debug, PartialEq)]
+enum RouteCategory {
+    Proxy,
+    Direct,
+    Lan,
+    Block,
+}
+
+fn route_category(chains: &[String]) -> RouteCategory {
+    let mut has_direct = false;
+    for c in chains {
+        let n = c.trim().to_ascii_lowercase();
+        if n.contains("go-lan") || n == "golan" {
+            return RouteCategory::Lan;
+        }
+        if n == "reject" || n == "block" || n.contains("reject") {
+            return RouteCategory::Block;
+        }
+        if n == "direct" || n == "dns-direct" || n.contains("dns-direct") {
+            has_direct = true;
+        }
+    }
+    if has_direct {
+        RouteCategory::Direct
+    } else {
+        RouteCategory::Proxy
+    }
+}
+
+/// 【APP51 任务3】未归类差额按路由模式摊入三分：
+/// 直连模式全给 direct；全局模式全给 proxy；规则模式按 80% / 20% 分摊。
+/// 提取为纯函数便于单测，保证三项之和永远等于内核总量。
+fn allocate_untracked(mode: &OutboundMode, untracked: u64) -> (u64, u64) {
+    match mode {
+        OutboundMode::Direct => (0, untracked),
+        OutboundMode::Global => (untracked, 0),
+        OutboundMode::Rule => {
+            let proxy = untracked.saturating_mul(4) / 5;
+            (proxy, untracked.saturating_sub(proxy))
+        }
+    }
+}
+
 fn apply_connections_update(state: &AppState, value: &serde_json::Value, foreground: bool) {
     let download_total = value
         .get("downloadTotal")
@@ -243,12 +289,26 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
     //    新 id 视为 count+1，随后刷新 last_seen（已消失的从 last_seen 移除）
     {
         let mut agg = state.analytics.write();
+        // 【APP51 任务3】本帧三分累加量 + 拦截量，用于总量差额兜底
+        let mut proxy_inc = 0u64;
+        let mut direct_inc = 0u64;
+        let mut lan_inc = 0u64;
+        let mut blocked_inc = 0u64;
         for (id, conn) in &incoming {
             let prev = agg.last_seen.get(id).copied();
             let (prev_up, prev_down) = prev.unwrap_or((0, 0));
             let inc_up = conn.upload.saturating_sub(prev_up);
             let inc_down = conn.download.saturating_sub(prev_down);
             let is_new = prev.is_none();
+            let inc_total = inc_up.saturating_add(inc_down);
+
+            // 【APP51 任务3】按 chains 归类累加三分字节
+            match route_category(&conn.chains) {
+                RouteCategory::Proxy => proxy_inc += inc_total,
+                RouteCategory::Direct => direct_inc += inc_total,
+                RouteCategory::Lan => lan_inc += inc_total,
+                RouteCategory::Block => blocked_inc += inc_total,
+            }
 
             let host_key = if conn.host.is_empty() {
                 "未知".to_string()
@@ -320,6 +380,25 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
                 accumulate(&mut agg.domains, domain, inc_up, inc_down, is_new);
             }
         }
+        // 【APP51 任务3】差额兜底：内核总量 - 已归类量 = 未归类（隐身过滤/已关闭连接等），
+        // 按当前路由模式补入三分累计，保证占比永远有数据、三项之和接近内核总量。
+        let tagged = proxy_inc
+            .saturating_add(direct_inc)
+            .saturating_add(lan_inc)
+            .saturating_add(blocked_inc);
+        let total_inc = download_total
+            .saturating_sub(agg.last_total_down)
+            .saturating_add(upload_total.saturating_sub(agg.last_total_up));
+        let untracked = total_inc.saturating_sub(tagged);
+        let (to_proxy, to_direct) = allocate_untracked(&state.settings.read().outbound_mode, untracked);
+        proxy_inc = proxy_inc.saturating_add(to_proxy);
+        direct_inc = direct_inc.saturating_add(to_direct);
+        agg.proxy_bytes = agg.proxy_bytes.saturating_add(proxy_inc);
+        agg.direct_bytes = agg.direct_bytes.saturating_add(direct_inc);
+        agg.lan_bytes = agg.lan_bytes.saturating_add(lan_inc);
+        agg.last_total_down = download_total;
+        agg.last_total_up = upload_total;
+
         agg.last_seen.retain(|id, _| incoming.contains_key(id));
         for (id, conn) in &incoming {
             agg.last_seen.insert(id.clone(), (conn.upload, conn.download));
@@ -457,7 +536,10 @@ fn local_hhmmss() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_ip_domain, is_ip_literal, looks_like_domain_suffix, resolve_domain};
+    use super::{
+        allocate_untracked, builtin_ip_domain, is_ip_literal, looks_like_domain_suffix,
+        resolve_domain, route_category, OutboundMode, RouteCategory,
+    };
     use std::collections::HashMap;
 
     /// 【APP39 任务3】域名解析优先级：嗅探 host > 反向缓存 > 规则后缀 > 内置映射
@@ -500,5 +582,44 @@ mod tests {
         assert!(!looks_like_domain_suffix("10.0.0.0/8"));
         assert!(!looks_like_domain_suffix("142.250.199.142"));
         assert_eq!(builtin_ip_domain("119.29.29.29"), Some("dns.pub"));
+    }
+
+    /// 【APP51 任务3】连接 chains 分流分类：go-lan / direct / reject / 其余代理
+    #[test]
+    fn test_route_category_from_chains() {
+        let chains = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            route_category(&chains(&["go-lan-home", "节点选择"])),
+            RouteCategory::Lan
+        );
+        assert_eq!(
+            route_category(&chains(&["DIRECT"])),
+            RouteCategory::Direct
+        );
+        assert_eq!(
+            route_category(&chains(&["节点", "dns-direct"])),
+            RouteCategory::Direct
+        );
+        assert_eq!(
+            route_category(&chains(&["REJECT"])),
+            RouteCategory::Block
+        );
+        // 普通代理链：首个出站即节点名，未命中以上规则 → proxy
+        assert_eq!(
+            route_category(&chains(&["香港01", "节点选择"])),
+            RouteCategory::Proxy
+        );
+    }
+
+    /// 【APP51 任务3】未归类差额按路由模式摊入：三项之和必须恒等于差额
+    #[test]
+    fn test_allocate_untracked_by_mode() {
+        assert_eq!(allocate_untracked(&OutboundMode::Direct, 1000), (0, 1000));
+        assert_eq!(allocate_untracked(&OutboundMode::Global, 1000), (1000, 0));
+        let (p, d) = allocate_untracked(&OutboundMode::Rule, 1000);
+        assert_eq!(p + d, 1000);
+        assert_eq!((p, d), (800, 200));
+        // 差额为 0（全部连接已归类）时不产生任何额外分摊
+        assert_eq!(allocate_untracked(&OutboundMode::Rule, 0), (0, 0));
     }
 }
