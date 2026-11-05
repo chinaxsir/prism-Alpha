@@ -62,10 +62,6 @@ var (
 	vpnService *libbox.BoxService
 	vpnCbs     C.prism_vpn_cbs
 	vpnCbsSet  bool
-	// APP34：后台内存回收协程的停止信号。PrismVPNStop 关闭它即可退出
-	// 回收循环；用指针 + 一次性关闭保护，避免重复 Stop 触发
-	// "close of closed channel" panic。
-	memStopCh chan struct{}
 )
 
 // applyIosMemoryLimit 把扩展进程的 Go 堆锁死在安全水位。
@@ -73,11 +69,16 @@ var (
 // iOS NEPacketTunnelProvider 扩展受 Jetsam 物理内存硬限制（通常 50MB），
 // 一旦冲顶就会被系统 SIGKILL（扩展来不及写任何错误文件，表现为
 // 「启动一会儿自动停止」）。因此：
-//   - GCPercent(30)：堆每增长 30% 就回收一次；过低的 15% 会在 148 节点
-//     测速/探测高峰期造成 GC 假死，30% 是峰值与卡顿的平衡点；
-//   - MemoryLimit(38MiB)：软上限，低于 50MiB Jetsam 红线并留出充足
-//     缓冲（25MiB 过低会导致 GC 假死与扩展退出），逼近时 GC 主动提前
-//     回收，宁可变慢也不被系统强杀。
+//   - GCPercent(75)：堆增长 75% 才回收。过低的 30% 在大流量（内网 SMB /
+//     WebDAV / 飞牛影视 HTTP 流）下会每秒触发数十次 GC，每次 STW 停顿都被
+//     TCP 拥塞控制误判为丢包、cwnd 砍半，直接把内网传输锁死在 500–600KB/s；
+//     75% 只占约 18MiB 堆即触发回收，仍安全低于 42MiB 软上限。
+//   - MemoryLimit(42MiB)：软上限，低于 50MiB Jetsam 红线并留出滑动窗口
+//     缓冲池（大流量下不再频繁 STW），逼近时 GC 主动提前回收。
+//
+// 【APP48 任务1.1】彻底移除后台每 30 秒强制 runtime.GC() 的协程：
+// 强制 GC 会周期性 STW 停顿，大流量下同样造成拥塞窗口坍塌。
+// 仅在 PrismVPNStop 停止隧道时执行一次 runtime.GC() 释放内存。
 //
 // init() 与 PrismVPNStart 开头都要调用一次：init 覆盖 c-archive 静态库
 // 被扩展加载的那一刻；PrismVPNStart 覆盖「上次 Stop 后被其它代码改写过
@@ -86,44 +87,12 @@ func applyIosMemoryLimit() {
 	if runtime.GOOS != "ios" {
 		return
 	}
-	debug.SetGCPercent(30)
-	debug.SetMemoryLimit(38 << 20) // 38 MiB < iOS 50MiB Jetsam 硬红线
+	debug.SetGCPercent(75)
+	debug.SetMemoryLimit(42 * 1024 * 1024) // 42 MiB < iOS 50MiB Jetsam 硬红线
 }
 
 func init() {
 	applyIosMemoryLimit()
-}
-
-// startMemoryReclaimer 启动每 30 秒一次的后台内存回收协程。
-// 只调用 runtime.GC()：频繁 debug.FreeOSMemory() 会把还可持续复用的
-// 堆页强制还给 OS，引发虚拟内存页抖动与缺页中断，反而拖慢转发。
-// 调用方必须持有 vpnMu（在 PrismVPNStart 成功分支内调用）。
-func startMemoryReclaimer() {
-	ch := make(chan struct{})
-	memStopCh = ch
-	go func(stop <-chan struct{}) {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				runtime.GC()
-			}
-		}
-	}(ch)
-}
-
-// stopMemoryReclaimer 关闭后台回收协程（幂等）。
-func stopMemoryReclaimer() {
-	vpnMu.Lock()
-	ch := memStopCh
-	memStopCh = nil
-	vpnMu.Unlock()
-	if ch != nil {
-		close(ch)
-	}
 }
 
 //export PrismVPNSetCallbacks
@@ -161,10 +130,6 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 		return C.CString("start vpn service: " + err.Error())
 	}
 	vpnService = service
-	// APP37：启动成功后开启每 30 秒一次的后台内存回收（仅 runtime.GC），
-	// 确保扩展进程内存始终保持在 38MiB 软上限内的安全水位，
-	// 绝不触碰 50MiB Jetsam 红线。
-	startMemoryReclaimer()
 	return nil
 }
 
@@ -174,9 +139,9 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 // vpnMu 永远无法释放，后续 PrismVPNStart 死锁超时 60 秒触发
 // code=12: The VPN session failed to connect in a timely manner。
 func PrismVPNStop() {
-	// APP34：先停掉后台内存回收协程（幂等），避免隧道已关闭后仍在
-	// 定期 runtime.GC/FreeOSMemory 造成无谓扰动。
-	stopMemoryReclaimer()
+	// 【APP48 任务1.1】隧道停止时只做一次 GC 归还堆内存；运行期不再有
+	// 每 30 秒强制 GC 的 STW 停顿，大流量（内网 SMB/WebDAV）不再被卡在 600KB/s。
+	runtime.GC()
 
 	vpnMu.Lock()
 	inst := vpnService

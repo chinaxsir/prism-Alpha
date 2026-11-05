@@ -114,6 +114,10 @@ export interface Entitlement {
   maxSeats: number | null;
   /** 已用席位 */
   usedSeats: number | null;
+  /** 【APP48】服务端是否允许订阅云端同步（Alpha 内测授权恒为 false） */
+  syncAvailable: boolean;
+  /** 【APP48】Alpha 内测授权标记：true 时展示「Alpha 内测版」并隐藏云端同步 */
+  alpha: boolean;
 }
 
 export const activatePro = (code: string, email: string) =>

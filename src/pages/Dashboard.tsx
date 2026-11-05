@@ -818,17 +818,19 @@ function EngineCard({
       }`}
     >
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {icon}
           <span
             className={clsx(
-              "text-[19px] font-bold tracking-tight whitespace-nowrap",
+              // 【APP48 任务2】英文长标题必须先收缩再截断，绝不把开关挤出屏幕
+              "min-w-0 flex-1 truncate text-[19px] font-bold tracking-tight",
               tone ?? "text-gray-100",
             )}
+            title={name}
           >
             {name}
           </span>
-          <span className="text-[11px] px-1.5 py-0.5 rounded bg-glass text-text-muted whitespace-nowrap">
+          <span className="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-glass text-text-muted whitespace-nowrap">
             {tag}
           </span>
         </div>

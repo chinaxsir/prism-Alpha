@@ -15,7 +15,12 @@
 //! 本地缓存整体 AES-256-GCM 加密落盘（license.dat），密钥由设备 ID 派生：
 //! 拷走文件读不出 Key/邮箱/有效期，篡改密文解密即失败，防逆向与破解。
 
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{LazyLock, RwLock};
+use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -62,6 +67,10 @@ pub struct EntitlementStatus {
     /// 旧版缓存缺失该字段时默认 false（每日同步后自动修正）
     #[serde(default)]
     pub sync_available: bool,
+    /// 【APP48】Alpha 内测授权标记：true 时 UI 显示「Alpha 内测版 · 到期时间」，
+    /// 按 Pro 能力放行但强制关闭云端链接同步；正式授权恒为 false
+    #[serde(default)]
+    pub alpha: bool,
 }
 
 impl EntitlementStatus {
@@ -76,6 +85,7 @@ impl EntitlementStatus {
             max_seats: None,
             used_seats: None,
             sync_available: false,
+            alpha: false,
         }
     }
 
@@ -556,13 +566,203 @@ pub(crate) fn http_builder() -> Result<reqwest::ClientBuilder> {
         .no_proxy())
 }
 
-/// 直连失败后强制 IPv4 源重试：部分网络 IPv6 出口为黑洞（AAAA 优先 +
-/// SYN 无响应），hyper 顺序尝试地址会耗尽超时。用 0.0.0.0 绑定源地址时
-/// v6 目标因地址族不匹配立即跳过，连接器秒级回退到 v4 目标。
+/// 授权服务固定域名（编译期 obf，运行时判断隐身白名单时使用明文常量）
+pub const PRISM_HOST: &str = "prism.sarl";
+
+/// 本地混合代理端口（内核运行中才非 0）：授权请求优先借道代理穿透。
+/// 【APP48 任务3】由 commands 在内核启动/停止时写入，避免授权层反向依赖 AppState。
+static LOCAL_MIXED_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// prism.sarl 经 DoH 解析出的真实公网 IP 集合（隐身白名单，任务 4 复用）
+static STEALTH_IPS: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// 内核启动成功后登记本地混合代理端口（0 = 未运行/不可用）
+pub fn set_local_mixed_port(port: u16) {
+    LOCAL_MIXED_PORT.store(port, Ordering::Relaxed);
+}
+
+/// 内核停止时清空端口，确保后续授权请求不再走已失效的本地代理
+pub fn clear_local_mixed_port() {
+    LOCAL_MIXED_PORT.store(0, Ordering::Relaxed);
+}
+
+fn local_mixed_port() -> Option<u16> {
+    let p = LOCAL_MIXED_PORT.load(Ordering::Relaxed);
+    (p > 0).then_some(p)
+}
+
+/// 记住 prism.sarl 解析出的 IP（任务 4 隐身过滤 + 后续直接命中）
+pub fn remember_stealth_ip(ip: &str) {
+    if let Ok(addr) = ip.trim().parse::<IpAddr>() {
+        STEALTH_IPS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr.to_string());
+    }
+}
+
+/// 当前隐身 IP 快照（测试与前端过滤复用）
+pub fn stealth_ips_snapshot() -> Vec<String> {
+    STEALTH_IPS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// 【APP48 任务4】隐身判断：命中 prism.sarl 域名或其 DoH 解析出的任意 IP。
+/// 连接采集 / 分析统计 / 规则选择器在返回前端前必须用它过滤。
+pub fn is_stealth_protected_host_or_ip(val: &str) -> bool {
+    let s = val.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    if s.contains(PRISM_HOST) {
+        return true;
+    }
+    let ips = STEALTH_IPS.read().unwrap_or_else(|e| e.into_inner());
+    ips.iter().any(|ip| s == *ip || s.contains(ip.as_str()))
+}
+
+/// 从任意 DNS 响应 JSON 中递归提取 IPv4 字面量（兼容 Cloudflare DNS-JSON
+/// `Answer[].data` 与 AdGuard/ AliDNS `data[]` 两种结构）。
+fn collect_ipv4_from_json(v: &Value, out: &mut Vec<IpAddr>) {
+    match v {
+        Value::String(s) => {
+            if let Ok(addr) = s.trim().parse::<IpAddr>()
+                && addr.is_ipv4()
+            {
+                out.push(addr);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_ipv4_from_json(item, out);
+            }
+        }
+        Value::Object(map) => {
+            // DNS-JSON 的 Answer[].type == 1 才是 A 记录；其余字段递归即可
+            for item in map.values() {
+                collect_ipv4_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 【APP48 任务3 通道2】通过加密 DoH（阿里 / 腾讯 / Cloudflare）解析
+/// prism.sarl 的真实公网 IP。客户端用 `.resolve(host, IP)` 固定解析结果，
+/// 既能绕过运营商 DNS 污染，又不破坏 HTTPS 证书链（SNI 仍为 DoH 主机名）。
+pub async fn doh_resolve_prism_ips() -> Vec<IpAddr> {
+    // (DoH 主机名, 其公网 IP, 路径)
+    const PROVIDERS: [(&str, &str, &str); 3] = [
+        ("dns.alidns.com", "223.5.5.5", "/resolve"),
+        ("doh.pub", "1.12.12.12", "/dns-query"),
+        ("cloudflare-dns.com", "1.1.1.1", "/dns-query"),
+    ];
+    let mut found: Vec<IpAddr> = Vec::new();
+    for (host, ip, path) in PROVIDERS {
+        let Ok(addr) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .resolve(host, SocketAddr::new(addr, 443))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let url = format!("https://{host}{path}?name={PRISM_HOST}&type=A");
+        let resp = client
+            .get(&url)
+            .header("accept", "application/dns-json")
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<Value>().await else {
+            continue;
+        };
+        let mut ips = Vec::new();
+        collect_ipv4_from_json(&body, &mut ips);
+        for addr in ips {
+            remember_stealth_ip(&addr.to_string());
+            if !found.contains(&addr) {
+                found.push(addr);
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    found
+}
+
+/// 【APP48 任务3】四级容灾授权请求引擎：
+/// 1. 本地代理隧道（内核运行中 127.0.0.1:{mixed_port}）穿透网络阻断；
+/// 2. DoH 解析真实 IP 后 `resolve` 固定解析直连（免疫 DNS 污染）；
+/// 3. 系统默认网络栈直连（含 IPv4 源强制重试）；
+/// 4. 全部失败由上层 `offline_status` 保留本地有效授权（不掉 Pro）。
 pub(crate) async fn send_with_v4_fallback(
     make: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response> {
     let mut last: Option<String> = None;
+
+    // ---- 通道 1：本地代理隧道 ----
+    if let Some(port) = local_mixed_port()
+        && let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+    {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(3))
+            .no_proxy()
+            .proxy(proxy)
+            .build();
+        if let Ok(client) = client {
+            match make(&client).send().await {
+                Ok(resp) => {
+                    tracing::info!("license request via local proxy 127.0.0.1:{port} ok");
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let clean = sanitize_license_error(&e.to_string());
+                    tracing::warn!("license via local proxy failed: {clean}");
+                    last = Some(clean);
+                }
+            }
+        }
+    }
+
+    // ---- 通道 2：DoH 解析真实 IP + 固定解析直连 ----
+    let resolved = doh_resolve_prism_ips().await;
+    for addr in resolved {
+        let mut builder = http_builder()?;
+        builder = builder
+            .timeout(Duration::from_secs(5))
+            .resolve(PRISM_HOST, SocketAddr::new(addr, 443));
+        let Ok(client) = builder.build() else {
+            continue;
+        };
+        match make(&client).send().await {
+            Ok(resp) => {
+                tracing::info!("license request via DoH-pinned {addr} ok");
+                return Ok(resp);
+            }
+            Err(e) => {
+                let clean = sanitize_license_error(&e.to_string());
+                tracing::warn!("license via DoH-pinned {addr} failed: {clean}");
+                last = Some(clean);
+            }
+        }
+    }
+
+    // ---- 通道 3：标准直连（IPv4 源强制重试） ----
     for force_v4 in [false, true] {
         let mut b = http_builder()?;
         if force_v4 {
@@ -618,6 +818,9 @@ struct ActivateResponse {
     /// Pro/买断且未被管控 → 允许订阅云端同步
     #[serde(default)]
     sync_available: bool,
+    /// 【APP48】Alpha 内测授权（plan 仍为 pro，但 UI 显示「内测版」且无云端同步）
+    #[serde(default)]
+    alpha: bool,
 }
 
 /// GET /api/license/status 响应
@@ -635,6 +838,9 @@ struct StatusResponse {
     used_seats: Option<u32>,
     #[serde(default)]
     sync_available: bool,
+    /// 【APP48】Alpha 内测授权标记（/license/status 同步返回）
+    #[serde(default)]
+    alpha: bool,
 }
 
 /// 状态查询失败分类：决定走「清除缓存」还是「离线锁定」
@@ -736,6 +942,9 @@ fn map_activation_error(http: u16, machine: &str, server_msg: &str) -> Option<&'
     let hit = |words: &[&str]| words.iter().any(|w| hay.contains(w));
     if hit(&["not_found", "invalid_key", "invalid_license", "no_such"]) || http == 404 {
         Some("invalid_key")
+    } else if hit(&["alpha_device_bound", "alpha_unbind", "内测授权已绑定"]) {
+        // 【APP48】内测 Key 只能绑 1 台设备；提示联系管理员解绑，绝不重复重试
+        Some("alpha_device_bound")
     } else if hit(&["email", "mismatch", "account"]) {
         Some("email_mismatch")
     } else if hit(&["rate", "too_many", "throttl"]) {
@@ -801,20 +1010,25 @@ fn map_entitlement(
     max_seats: Option<u32>,
     used_seats: Option<u32>,
     sync_available: bool,
+    alpha: bool,
 ) -> EntitlementStatus {
     let expired =
         server_status == "expired" || expires_at.map(|exp| exp <= now_secs()).unwrap_or(false);
     let status = if expired { "expired" } else { "active" };
     EntitlementStatus {
         status: status.into(),
-        kind: Some(if plan == "team" { "lifetime" } else { "subscription" }.into()),
+        // 【APP48】Alpha 内测授权虽是 plan=pro，但绝不能被渲染成「买断/永久」；
+        // 统一按 subscription + 到期时间展示。
+        kind: Some(if plan == "team" && !alpha { "lifetime" } else { "subscription" }.into()),
         expires_at,
         source: Some("code".into()),
         last_verified_at: now_secs(),
         plan: (!plan.is_empty()).then(|| plan.to_string()),
         max_seats,
         used_seats,
-        sync_available,
+        // Alpha 内测授权不包含云端链接同步（服务端亦返回 403 sync_unavailable_for_alpha）
+        sync_available: sync_available && !alpha,
+        alpha,
     }
 }
 
@@ -902,14 +1116,18 @@ pub async fn activate(
     let base = server_base(settings);
     let device_id_str = device_id(data_dir)?;
 
+    // 【APP48 任务6】Alpha 内测 Key（A- 开头）无需额外字段：
+    // 依据 api-license-activate.md，正式 Key 与内测 Key 共用同一套接口，
+    // 客户端不区分类型，直接放入 license_key，按响应中的 alpha 做 UI 区分。
+    let body = serde_json::json!({
+        "license_key": license_key.clone(),
+        "email": email,
+        "device_id": device_id_str,
+        "device_name": device_name(),
+    });
     let resp = post_with_fallback(
         &format!("{base}{}", crate::obf!("/api/license/activate")),
-        &serde_json::json!({
-            "license_key": license_key.clone(),
-            "email": email,
-            "device_id": device_id_str,
-            "device_name": device_name(),
-        }),
+        &body,
     )
     .await?;
 
@@ -955,6 +1173,7 @@ pub async fn activate(
         data.max_seats,
         None,
         data.sync_available,
+        data.alpha,
     );
     match fetch_status(&base, &license_key).await {
         Ok(s) if s.valid => {
@@ -965,6 +1184,7 @@ pub async fn activate(
                 s.max_seats,
                 s.used_seats,
                 s.sync_available,
+                s.alpha,
             );
         }
         Ok(_) => {}
@@ -1040,6 +1260,7 @@ pub async fn verify_remote(
                 s.max_seats,
                 s.used_seats,
                 s.sync_available,
+                s.alpha,
             );
             // 同步成功：授权信息（含有效期）重新加密落盘，并记为当天已同步
             save_cache(
@@ -1232,6 +1453,7 @@ mod tests {
             max_seats: Some(1),
             used_seats: Some(1),
             sync_available: false,
+            alpha: false,
         }
     }
 
@@ -1303,5 +1525,38 @@ mod tests {
         assert_eq!(cache.entitlement.status, "expired");
         // 高水位线绝不回退
         assert!(cache.max_seen_unix >= now + CLOCK_ROLLBACK_TOLERANCE + 60);
+    }
+
+    /// 【APP48 任务6】Alpha 内测授权：plan 虽是 pro，但必须按订阅+到期展示，
+    /// 绝不能被渲染成「买断/永久」，且云端同步恒不可用。
+    #[test]
+    fn alpha_license_not_lifetime_and_sync_off() {
+        let exp = parse_expires_at("2026-12-31 23:59").unwrap();
+        let ent = map_entitlement(
+            "pro",
+            "active",
+            Some(exp),
+            Some(1),
+            Some(1),
+            true, // 服务端即便返回可同步，Alpha 也必须关闭
+            true,
+        );
+        assert_eq!(ent.kind.as_deref(), Some("subscription"));
+        assert!(ent.alpha, "alpha 标记必须保真传给前端");
+        assert!(!ent.sync_available, "Alpha 内测授权不允许云端同步");
+        assert_eq!(ent.status, "active");
+        assert!(exp > now_secs(), "内测授权按到期时间正常失效");
+    }
+
+    /// 【APP48 任务4】隐身白名单：prism.sarl 与其 DoH 解析 IP 必须命中。
+    #[test]
+    fn stealth_guard_hides_domain_and_ip() {
+        remember_stealth_ip("203.0.113.9");
+        assert!(is_stealth_protected_host_or_ip("prism.sarl"));
+        assert!(is_stealth_protected_host_or_ip("203.0.113.9"));
+        assert!(is_stealth_protected_host_or_ip("https://prism.sarl/api/x"));
+        assert!(!is_stealth_protected_host_or_ip("example.com"));
+        assert!(!is_stealth_protected_host_or_ip("8.8.8.8"));
+        assert!(stealth_ips_snapshot().iter().any(|ip| ip == "203.0.113.9"));
     }
 }

@@ -38,12 +38,14 @@ fn default_mtu() -> u32 {
     1420
 }
 
-/// 【APP30 任务2】go-lan-home 运行时隧道 MTU = 1280（不修改用户保存的
-/// `settings.go_lan.wg_config.mtu`，前端仍显示导入值；仅写入内核 JSON）。
-/// log8.txt 实证：MTU 1420 时 gVisor 向飞牛 NAS 宣告 MSS 1380，1420 字节
-/// 网页大包 + 60 字节 WG 头在蜂窝/PPPoE 链路上被丢弃；1280 时宣告
-/// MSS 1240，网页 / TLS 证书 / SMB 大包 100% 通过。
-pub const GO_LAN_RUNTIME_MTU: u32 = 1280;
+/// 【APP30 任务2 / APP48 任务1.2】go-lan-home 运行时隧道 MTU = 1380
+/// （不修改用户保存的 `settings.go_lan.wg_config.mtu`，前端仍显示导入值；
+/// 仅写入内核 JSON）。
+/// 1280（MSS 1240）虽然兼容性最好，但内网 SMB/WebDAV/飞牛影视大流量下
+/// 每 1240 字节就切一次包，实测吞吐被锁在 500–600KB/s；1380 → MSS 1340，
+/// 扣除 60 字节 WG 头后仍低于 PPPoE(1492) / 蜂窝典型 MTU(1420/1500)，
+/// 内网大包一次通过，兼容性与吞吐兼顾。
+pub const GO_LAN_RUNTIME_MTU: u32 = 1380;
 
 /// 历史常量：用户配置 MTU 的展示默认值（不再直接写入内核 JSON）
 pub const GO_LAN_MTU_FLOOR: u32 = 1280;
@@ -1992,7 +1994,7 @@ fn wg_outbound_value(
             None => {}
         }
     }
-    // 【APP30 任务2】内核 JSON 的 go-lan-home MTU 无条件锁死 1280（用户
+    // 【APP48 任务1.2】内核 JSON 的 go-lan-home MTU 无条件锁死 1380（用户
     // 保存的 wg_config.mtu 保持不变），并附加 connect_timeout 5s。
     let mtu = GO_LAN_RUNTIME_MTU;
     outbound["mtu"] = json!(mtu);
@@ -2000,7 +2002,7 @@ fn wg_outbound_value(
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(
-            "已构建 {tag} 顶层单节点出站: {}:{}（隧道地址 {local_addrs_log}，运行时 MTU 1280 / MSS 1240）",
+            "已构建 {tag} 顶层单节点出站: {}:{}（隧道地址 {local_addrs_log}，运行时 MTU 1380 / MSS 1340）",
             outbound["server"].as_str().unwrap_or("?"),
             wg.server_port
         ),
@@ -2857,11 +2859,11 @@ mod tests {
             44,
             "输出必须是标准 44 位 Base64"
         );
-        // 【APP30 任务2】内核 JSON 的 MTU 无条件锁死 GO_LAN_RUNTIME_MTU（1280）
+        // 【APP48 任务1.2】内核 JSON 的 MTU 无条件锁死 GO_LAN_RUNTIME_MTU（1380）
         assert_eq!(
             ob["mtu"].as_u64(),
             Some(GO_LAN_RUNTIME_MTU as u64),
-            "go-lan-home 写入内核的 MTU 必须为 1280"
+            "go-lan-home 写入内核的 MTU 必须为 1380"
         );
         assert_eq!(
             ob["connect_timeout"].as_str(),
@@ -2870,10 +2872,10 @@ mod tests {
         );
     }
 
-    /// 【APP30 任务2】无论用户配置多少（1280 / 1400 / 1500 / 9000），
-    /// 写入内核 JSON 的 go-lan-home MTU 一律统一为 1280（MSS 1240）。
+    /// 【APP48 任务1.2】无论用户配置多少（1280 / 1400 / 1500 / 9000），
+    /// 写入内核 JSON 的 go-lan-home MTU 一律统一为 1380（MSS 1340）。
     #[test]
-    fn test_wg_runtime_mtu_unified_1280() {
+    fn test_wg_runtime_mtu_unified() {
         let make = |mtu: u32| GoLanSettings {
             enabled: true,
             wg_config: Some(WgManualConfig {
@@ -2893,7 +2895,7 @@ mod tests {
             assert_eq!(
                 ob["mtu"].as_u64(),
                 Some(GO_LAN_RUNTIME_MTU as u64),
-                "用户配置 MTU {mtu} 必须统一改写为 1280"
+                "用户配置 MTU {mtu} 必须统一改写为 1380"
             );
         }
     }

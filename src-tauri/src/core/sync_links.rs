@@ -411,12 +411,25 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
     // 5. 基线对齐云端最新状态
     save_mirror(&data_dir, &cloud);
 
-    // 6. 本地有增删且内核运行中 → 重启生效（一次性）
-    if changed && *state.status.read() == super::state::CoreStatus::Running {
-        tracing::info!("订阅同步：本地订阅已变更，重启内核生效");
+    // 6. 本地有增删且内核运行中 → 仅在前台时重启生效（一次性）。
+    // 【APP48 任务5.3】后台定时对账（App 在后台/锁屏/扩展刚被系统回收时）
+    // 绝不重启隧道：iOS 扩展在 50MB Jetsam 红线内重建必然被系统强杀，
+    // 表现为「用着用着自动断开」。后台只落盘缓存并广播事件，
+    // 下一次用户主动启动或回前台时自然加载最新订阅。
+    let foreground = state
+        .app_in_foreground
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if changed
+        && *state.status.read() == super::state::CoreStatus::Running
+        && foreground
+        && cfg!(not(any(target_os = "ios", target_os = "android")))
+    {
+        tracing::info!("订阅同步：本地订阅已变更，前台重启内核生效");
         if let Err(e) = crate::ipc::commands::restart_core(app, &state).await {
             tracing::warn!("订阅同步后内核重启失败：{e}");
         }
+    } else if changed {
+        tracing::info!("订阅同步：后台/移动端变更仅落盘缓存，隧道保持不重启");
     }
 
     // 7. 有任何变更（新增/删除/空壳补拉）→ 通知前端刷新订阅列表与

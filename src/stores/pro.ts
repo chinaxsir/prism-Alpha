@@ -22,6 +22,8 @@ const INACTIVE: Entitlement = {
   plan: null,
   maxSeats: null,
   usedSeats: null,
+  syncAvailable: false,
+  alpha: false,
 };
 
 /** 可使用 Pro：仅服务端联网校验有效（active）；offline/expired/revoked/inactive 一律锁定 */

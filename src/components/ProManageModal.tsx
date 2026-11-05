@@ -66,8 +66,11 @@ function statusTextT(
   plan: string | null,
   status: EntitlementState,
   t: (k: string) => string,
+  alpha = false,
 ): string {
   if (status !== "active") return t(STATUS_META[status].key);
+  // 【APP48】Alpha 内测授权独立文案：绝不显示成 Pro 订阅/团队买断
+  if (alpha) return t("pro.status.alphaActive");
   if (plan === "team") return t("pro.status.teamPermanent");
   if (plan === "pro") return t("pro.status.proActive");
   if (plan === "free") return t("pro.status.freeActive");
@@ -79,7 +82,10 @@ export function planTextT(
   plan: string | null,
   kind: string | null,
   t: (k: string) => string,
+  alpha = false,
 ): string {
+  // 【APP48】内测 Key 激活后固定展示「Alpha 内测版」
+  if (alpha) return t("pro.plan.alpha");
   if (plan && PLAN_LABEL[plan]) return t(PLAN_LABEL[plan]);
   if (kind === "lifetime") return t("pro.plan.lifetime");
   if (kind === "subscription") return t("pro.plan.subscription");
@@ -192,7 +198,12 @@ export default function ProManageModal({ open, onClose }: Props) {
               <span
                 className={`inline-block h-1.5 w-1.5 rounded-full ${STATUS_META[entitlement.status].dot}`}
               />
-              {statusTextT(entitlement.plan, entitlement.status, t)}
+              {statusTextT(
+                entitlement.plan,
+                entitlement.status,
+                t,
+                entitlement.alpha
+              )}
             </span>
             <button
               onClick={onClose}
@@ -258,15 +269,21 @@ export default function ProManageModal({ open, onClose }: Props) {
             icon={<Sparkles size={16} className="text-accent" />}
             iconBg="bg-accent/10"
             title={t("pro.currentPlan")}
-            value={planTextT(entitlement.plan, entitlement.kind, t)}
+            value={planTextT(
+              entitlement.plan,
+              entitlement.kind,
+              t,
+              entitlement.alpha
+            )}
           />
           <DetailRow
             icon={<Check size={16} className="text-gray-400" />}
             title={t("pro.expiry")}
             value={
               <span className="flex items-center gap-1.5">
-                {entitlement.plan === "team" ||
-                (entitlement.kind === "lifetime" && !entitlement.expiresAt)
+                {!entitlement.alpha &&
+                (entitlement.plan === "team" ||
+                  (entitlement.kind === "lifetime" && !entitlement.expiresAt))
                   ? t("pro.permanent")
                   : fmtDateTime(entitlement.expiresAt)}
                 {/* 【APP-4 任务2】到期时间附剩余天数 */}
@@ -307,12 +324,20 @@ export default function ProManageModal({ open, onClose }: Props) {
             <RefreshCw size={12} className={proBusy ? "animate-spin" : ""} />
             {proBusy ? t("pro.licensingBusy") : t("pro.verifyNow")}
           </button>
-          <button
-            onClick={handleDeactivate}
-            className="flex-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-400 transition-colors hover:bg-latency-bad/20 hover:text-latency-bad"
-          >
-            {t("pro.remove")}
-          </button>
+          {/* 【APP48 任务6】Alpha 内测 Key 只能绑 1 台设备，用户端不支持自行解绑，
+              移除按钮替换为联系管理员的提示 */}
+          {entitlement.alpha ? (
+            <div className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-surface-hover px-3 py-2 text-center text-[11px] text-gray-400">
+              {t("pro.alphaNoUnbind")}
+            </div>
+          ) : (
+            <button
+              onClick={handleDeactivate}
+              className="flex-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-400 transition-colors hover:bg-latency-bad/20 hover:text-latency-bad"
+            >
+              {t("pro.remove")}
+            </button>
+          )}
         </div>
       </div>
     </div>

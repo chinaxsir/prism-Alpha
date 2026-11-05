@@ -78,6 +78,12 @@ const LICENSE_ERROR_MAP: Record<
     titleKey: "pro.err.license_blocked.title",
     detailKey: "pro.err.license_blocked.detail",
   },
+  // 【APP48 任务6】Alpha 内测 Key 只能绑 1 台设备，需提示联系管理员解绑
+  alpha_device_bound: {
+    code: "alpha_device_bound",
+    titleKey: "pro.err.alpha_device_bound.title",
+    detailKey: "pro.err.alpha_device_bound.detail",
+  },
 };
 
 /** 从后端错误字符串提取标准错误码并映射到错误卡片文案。
@@ -158,8 +164,9 @@ export function ActivateProModal({
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
   const counting = retryAfter > 0;
 
-  /** 展示当前方案：优先服务端 plan 字段（free/pro/team），回落到授权类型 */
+  /** 展示当前方案：Alpha 内测优先，其次服务端 plan，最后回落授权类型 */
   const planText = (e: Entitlement): string => {
+    if (e.alpha) return t("pro.plan.alpha");
     if (e.plan && PLAN_LABEL[e.plan]) return t(PLAN_LABEL[e.plan]);
     if (e.kind === "lifetime") return t("pro.plan.lifetime");
     if (e.kind === "subscription") return t("pro.plan.subscription");

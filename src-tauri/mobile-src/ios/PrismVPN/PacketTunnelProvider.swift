@@ -398,6 +398,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 【APP-3】事件驱动网络切换监听：系统网络路径变化时才回调，
     /// 取代原先每 3 秒轮询 getifaddrs 的心跳定时器
     private var pathMonitor: NWPathMonitor?
+    /// 【APP48 任务5.4】切网去抖：同一轮网络切换只保留最后一次重载任务
+    private var pendingPathCheck: DispatchWorkItem?
 
     private var resolvedSharedDirURL: URL?
     private var lastOpenTunError: String?
@@ -759,14 +761,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 【APP-3】事件驱动切网：NWPathMonitor 在系统网络路径真正变化
     ///（Wi-Fi ⇄ 蜂窝、断网恢复、默认路由切换）时才回调，网络稳定时
     /// CPU / 磁盘开销为 0；替代原先每 3 秒调用一次 getifaddrs 的定时器。
-    /// NWPathMonitor 的回调在 vpnQueue 上执行，稍作延迟等待
-    /// startSystemPathMonitor 更新默认网卡名，再执行热重载判定。
+    /// 【APP48 任务5.4】稳网判定：系统切网瞬间会连续触发 3~5 次
+    /// pathUpdateHandler（Wi-Fi 掉信号 → 蜂窝 → 默认路由生效），旧版 0.5s
+    /// 去抖会在「半切换」状态下热重载内核，导致隧道反复重建甚至被系统杀。
+    /// 现改为 1.5s 静默去抖 + 合并同一轮所有回调，路径稳定后才重载一次。
     private func startNetworkPathMonitor() {
         pathMonitor?.cancel()
+        pendingPathCheck?.cancel()
         let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] _ in
-            self?.vpnQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.checkAndReloadIfNetworkChanged()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            // 仅在路径可用时进入去抖；断网/不可用不触发无意义重启
+            guard path.status == .satisfied else { return }
+            self.vpnQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.pendingPathCheck?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    self?.checkAndReloadIfNetworkChanged()
+                }
+                self.pendingPathCheck = work
+                // 1.5s ≥ 1s：等待交换机/基带完成路由收敛，避免半切换抖动
+                self.vpnQueue.asyncAfter(deadline: .now() + 1.5, execute: work)
             }
         }
         monitor.start(queue: vpnQueue)

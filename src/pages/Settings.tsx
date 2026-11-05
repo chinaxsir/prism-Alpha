@@ -91,8 +91,9 @@ export default function Settings() {
   // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
   // 订阅版显示到期时间，日期本身作为可点击入口打开授权信息弹窗
   const permanent =
-    entitlement.plan === "team" ||
-    (entitlement.kind === "lifetime" && !entitlement.expiresAt);
+    !entitlement.alpha &&
+    (entitlement.plan === "team" ||
+      (entitlement.kind === "lifetime" && !entitlement.expiresAt));
   const tunGated = !proUnlocked;
 
   // 语言与外观偏好（全局 store，改动即时生效；同时持久化到后端 settings.json）
@@ -653,9 +654,22 @@ export default function Settings() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 shrink-0 text-surge-amber" />
-              <span className="text-sm font-semibold text-text">Prism Pro</span>
-              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[11px] font-medium text-emerald-400">
-                {t("pro.status.active")}
+              <span className="truncate text-sm font-semibold text-text">
+                {entitlement.alpha
+                  ? `Prism ${t("pro.plan.alpha")}`
+                  : "Prism Pro"}
+              </span>
+              <span
+                className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                  entitlement.alpha
+                    ? "bg-surge-amber/15 text-surge-amber"
+                    : "bg-emerald-500/15 text-emerald-400"
+                }`}
+              >
+                {/* 【APP48】内测授权显示「内测」徽章，绝不冒充 Pro 订阅 */}
+                {entitlement.alpha
+                  ? t("pro.alphaBadge")
+                  : t("pro.status.active")}
               </span>
             </div>
             <div className="mt-1 truncate text-xs text-text-muted">

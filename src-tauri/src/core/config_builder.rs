@@ -1219,7 +1219,8 @@ pub fn build(
         // 保证目标地址原样转发，自签名内网 HTTPS 不受影响。
         "sniff": true,
         "sniff_override_destination": false,
-        "sniff_timeout": "300ms",
+        // 【APP48 任务1.2】嗅探超时统一 100ms，减少首包等待
+        "sniff_timeout": "100ms",
     }));
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
@@ -1244,25 +1245,27 @@ pub fn build(
             "type": "tun",
             "tag": TUN_TAG,
             "address": tun_addresses,
-            // 【APP39 任务2.1】tun-in MTU 锁定 1280：与 iOS utun
-            // (settings.mtu)、go-lan-home 出站 MTU 三处完全一致，
-            // TCP MSS 自动推算为 1240，内网自签名 HTTPS（:8001）大包
-            // 不再被系统拒绝。
-            "mtu": 1280,
+            // 【APP48 任务1.2】tun-in MTU 提升到 1400：1280 时 MSS 仅 1240，
+            // 内网 SMB/WebDAV 大包在蜂窝/PPPoE 链路上被切分，实测内网传输
+            // 被锁在 500–600KB/s；1400 → MSS 1360，大包一次通过。
+            // iOS utun (PacketTunnelProvider settings.mtu) 与 go-lan-home
+            // 出站 MTU（1380）同步调整，三层一致避免分段。
+            "mtu": 1400,
             "auto_route": true,
-            // 【APP39 任务2.1】tun-in 改为纯用户态 gvisor 栈：
-            // mixed 栈的 TCP 走 system 栈、由扩展进程创建 utun 虚拟地址
-            // (172.19.0.2) 的内部 BSD Socket，被 iOS NECP 防回环策略
-            // 拒绝（report handshake success: connection refused 刷屏）。
-            // gvisor 全程内存转发，Safari TCP 与远程桌面 UDP 同通道。
-            "stack": "gvisor",
+            // 【APP48 任务1.2】栈改为 mixed：纯 gvisor 用户态转发每个 packet
+            // 都要经过内存拷贝与 gVisor 网络栈，大流量下 CPU 打满、吞吐见顶。
+            // mixed 栈的 TCP 短连接走 system 栈（iOS utun 直连，不再被 NECP
+            // 拒绝），WireGuard 内网长连接仍由 gVisor 处理，兼顾吞吐与防回环。
+            "stack": "mixed",
             // 【APP39 任务3】开启非改写式被动嗅探：提取 TLS SNI / HTTP Host
             // 到 metadata.host，分析页「域名/IP」切换才有真实域名；
             // sniff_override_destination=false 保证不改写目标地址，
             // 内网 ip_cidr → go-lan-home 匹配不被破坏。
             "sniff": true,
             "sniff_override_destination": false,
-            "sniff_timeout": "300ms",
+            // 【APP48 任务1.2】嗅探超时 300ms → 100ms：缩短首包等待，
+            // 网页/小文件请求不再为等 SNI 多付 200ms 握手延迟。
+            "sniff_timeout": "100ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -1435,16 +1438,15 @@ pub fn build(
         }
     });
 
-    // 【APP36 任务1.1】route.rules 头部固定顺序（严格自上而下）：
+    // 【APP48 任务1.3】route.rules 头部固定顺序（严格自上而下）：
     // ① DNS 劫持（protocol dns / port 53 → dns-out）
     // ② 853 拦截 + 公共 DNS 的 DoH/DoT 直连拦截
-    // ③ QUIC 拦截（protocol quic / UDP 443，强制 Safari 走 TCP）
-    // ④ wg_server_ip/32 → direct 豁免（多路档案逐个豁免）
-    // ⑤ ip_cidr: go_lan_cidrs → go-lan-*（必须早于 clash_mode: direct、
-    //    ip_is_private: true、clash_mode: global；On-Demand 直连规则已在
-    //    go_lan_rules 最顶部，因此直接 extend 即可保证优先级）
-    // 说明：853 拦截避免 iOS 在隧道就绪前直连 8.8.8.8:853 反复超时刷屏；
-    // 公共 DNS 的 DoH/DoT 端点（8.8.8.8 等 443/853）一律 block。
+    // ③ wg_server_ip/32 → direct 豁免（多路档案逐个豁免，必须早于 go-lan
+    //    回家规则，否则 WG 握手包被 ip_cidr 命中回家隧道形成环路）
+    // ④ ip_cidr: go_lan_cidrs → go-lan-*（必须在 QUIC 拦截之前！否则内网
+    //    NAS 的 UDP/443（SMB over QUIC、WebDAV、影视直连）会被 protocol
+    //    quic / udp 443 规则抢先 block，表现为「内网大文件传一半就断」）
+    // ⑤ QUIC 拦截（protocol quic / UDP 443，强制 Safari 走 TCP）
     let mut head_rules: Vec<Value> = vec![
         json!({ "protocol": "dns", "outbound": "dns-out" }),
         json!({ "port": 53, "outbound": "dns-out" }),
@@ -1455,19 +1457,21 @@ pub fn build(
             "outbound": "block"
         }),
     ];
-    // QUIC：APP36 要求置于 go-lan-home 之前；tun-in 已关闭 sniff，
-    // 仅靠 protocol 匹配无法识别，故同时用 UDP/443 兜底。
-    if settings.block_quic || !go_lan_rules.is_empty() {
-        head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
-        head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
-    }
     for ip in &wg_server_ips {
         head_rules.push(json!({
             "ip_cidr": [format!("{ip}/32")],
             "outbound": "direct"
         }));
     }
+    // 【APP48 任务1.3】回家规则前置：先于 QUIC/UDP443 拦截，保护内网 UDP 流量
+    let has_go_lan_rules = !go_lan_rules.is_empty();
     head_rules.extend(go_lan_rules);
+    // QUIC：tun-in 已关闭 sniff，仅靠 protocol 匹配无法识别，故同时用
+    // UDP/443 兜底；必须排在 go-lan 之后（内网 UDP/443 不能被误杀）。
+    if settings.block_quic || has_go_lan_rules {
+        head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
+        head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
+    }
     for (i, rule) in head_rules.into_iter().enumerate() {
         route_rules.insert(i, rule);
     }
@@ -3327,11 +3331,11 @@ rules:
             Some("10.8.0.2/24"),
             "单地址 local_address 必须统一 /24"
         );
-        // 【APP30 任务2】go-lan-home 写入内核的运行时 MTU 无条件 1280
+        // 【APP48 任务1.2】go-lan-home 写入内核的运行时 MTU 无条件 1380
         assert_eq!(
             wg["mtu"].as_u64(),
-            Some(1280),
-            "go-lan-home 写入内核的 MTU 必须为 1280"
+            Some(1380),
+            "go-lan-home 写入内核的 MTU 必须为 1380"
         );
         assert_eq!(wg["domain_strategy"].as_str(), Some("ipv4_only"));
         // 【IPA9 任务4.3】严禁 inet4_bind_address（5G 蜂窝下引发 i/o timeout）
@@ -3374,13 +3378,17 @@ rules:
             wg_pos < go_lan_first,
             "WG 服务端豁免必须早于 go-lan 回家规则"
         );
-        // QUIC 与 853 必须早于 go-lan-home
+        // 【APP48 任务1.3】QUIC / UDP 443 拦截必须晚于 go-lan-home，
+        // 否则内网 NAS 的 UDP/443（SMB over QUIC、WebDAV）会被误杀。
         let quic_pos = rules
             .iter()
             .position(|r| r.get("network").and_then(Value::as_str) == Some("udp")
                 && r.get("port").and_then(Value::as_u64) == Some(443));
         assert!(quic_pos.is_some(), "Go Lan 开启时必须注入 QUIC 拦截");
-        assert!(quic_pos.unwrap() < go_lan_first, "QUIC 拦截必须早于 go-lan-home");
+        assert!(
+            go_lan_first < quic_pos.unwrap(),
+            "go-lan 回家规则必须早于 QUIC 拦截"
+        );
         let cidrs: Vec<String> = rules
             .iter()
             .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
@@ -3525,8 +3533,21 @@ rules:
             .iter()
             .find(|i| i["tag"] == TUN_TAG)
             .expect("tun-in 入站必须存在");
-        assert_eq!(tun["stack"].as_str(), Some("gvisor"), "tun-in 协议栈必须锁死 gvisor");
-        assert_eq!(tun["mtu"].as_u64(), Some(1280), "tun-in MTU 必须锁死 1280");
+        assert_eq!(
+            tun["stack"].as_str(),
+            Some("mixed"),
+            "【APP48】tun-in 协议栈必须为 mixed（大流量走 system 栈）"
+        );
+        assert_eq!(
+            tun["mtu"].as_u64(),
+            Some(1400),
+            "【APP48】tun-in MTU 必须为 1400"
+        );
+        assert_eq!(
+            tun["sniff_timeout"].as_str(),
+            Some("100ms"),
+            "【APP48】tun-in 嗅探超时必须为 100ms"
+        );
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启被动嗅探");
         assert_eq!(
             tun["sniff_override_destination"].as_bool(),

@@ -63,6 +63,10 @@ pub struct RuntimePerception {
     /// - false → 超出买断范围，Pro 功能受限 + 弹升级引导，但 APP 继续可用。
     #[serde(default)]
     pub version_in_scope: Option<bool>,
+
+    /// 【APP48 任务6】Alpha 内测授权：true 时按 Pro 放行，但云端同步不可用。
+    #[serde(default)]
+    pub alpha: bool,
 }
 
 /// check/heartbeat 响应
@@ -317,11 +321,18 @@ pub fn emit_revoked(
 
 fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) {
     let mut ent = state.entitlement.read().clone();
+    // 【APP48 任务6】runtime.alpha 需保真：内测授权 plan 可能也是 pro/team，
+    // 但绝不能渲染成买断/永久，且必须关闭云端同步。
+    ent.alpha = runtime.alpha;
+    if ent.alpha {
+        ent.sync_available = false;
+    }
     let Some(plan) = runtime.plan.clone() else {
+        state.apply_entitlement(ent);
         return;
     };
     ent.plan = Some(plan.clone());
-    ent.kind = Some(if plan == "team" { "lifetime" } else { "subscription" }.into());
+    ent.kind = Some(if plan == "team" && !ent.alpha { "lifetime" } else { "subscription" }.into());
     ent.max_seats = runtime.max_seats;
     if let Some(exp_str) = runtime.expires_at.as_deref()
         && let Some(exp) = license::parse_expires_at(exp_str)

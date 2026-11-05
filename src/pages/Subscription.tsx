@@ -268,7 +268,7 @@ export default function Subscription() {
                       </div>
                     ) : (
                       <>
-                        <span className="truncate text-[16px] font-bold text-text">
+                        <span className="min-w-0 flex-1 truncate text-[16px] font-bold text-text">
                           {displayName(record)}
                         </span>
                         <button
@@ -348,7 +348,7 @@ export default function Subscription() {
                   })()}
                 </div>
 
-                <div className="flex shrink-0 items-center gap-2">
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
                   {/* 启停开关：停用后该订阅不参与配置合并 */}
                   <Switch
                     checked={record.enabled}

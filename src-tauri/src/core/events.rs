@@ -193,6 +193,17 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
                         .collect()
                 })
                 .unwrap_or_default();
+            // 【APP48 任务4】隐身过滤：prism.sarl 及其 DoH 解析出的 IP
+            // 一律不进连接列表、不进 ip→domain 缓存、不进聚合分析，
+            // 防止用户/第三方从「连接」「分析 Top 主机」反推授权服务并恶意阻断。
+            if super::license::is_stealth_protected_host_or_ip(&host)
+                || super::license::is_stealth_protected_host_or_ip(&destination_ip)
+                || super::license::is_stealth_protected_host_or_ip(&meta_str(
+                    "rulePayload",
+                ))
+            {
+                continue;
+            }
             incoming.insert(
                 id.clone(),
                 ConnSnapshot {

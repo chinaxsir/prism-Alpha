@@ -62,6 +62,8 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     if *state.status.read() == CoreStatus::Stopped
         && crate::core::kernel::sync_or_recover_running_vpn(app, state).await
     {
+        // 【APP48 任务3】系统隧道其实仍在运行 → 登记本地代理供授权容灾使用
+        crate::core::license::set_local_mixed_port(state.settings.read().mixed_port);
         return Ok(());
     }
     // 【APP33 任务3.1】启动前纠偏 selected_node：若残留「剩余流量」等假
@@ -90,6 +92,8 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     state
         .transition(CoreStatus::Running)
         .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP48 任务3】内核运行中：授权请求优先借道本地混合代理穿透阻断
+    crate::core::license::set_local_mixed_port(state.settings.read().mixed_port);
 
     // 启动后自动测速并切换到延迟最低的可用节点（用户随后仍可手动改选）
     // 【APP26 任务2.3】仅当未开启 Go AIM 且用户从未手动点选节点时才自动优选
@@ -554,6 +558,7 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
     state
         .transition(CoreStatus::Running)
         .map_err(|e| sanitize_err(&e.to_string()))?;
+    crate::core::license::set_local_mixed_port(state.settings.read().mixed_port);
 
     // 与 start_core 一致：重启后自动测速选点（APP26：同样受 Go AIM /
     // 用户手动选点条件约束）
@@ -906,6 +911,8 @@ pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
     }
     state.reset_runtime_stats();
     *state.today_bytes_cache.write() = crate::core::store::today_total_bytes(&state.data_dir);
+    // 【APP48 任务3】内核已停：授权请求不再借道本地代理，回落到 DoH/直连
+    crate::core::license::clear_local_mixed_port();
 
     Ok(())
 }
@@ -2097,7 +2104,25 @@ pub async fn save_custom_rules(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    crate::core::store::save_custom_rules(&state.data_dir, &rules)
+    // 【APP48 任务4】隐身保护：禁止任何针对授权服务域名/隐身 IP 的拦截规则，
+    // 防止用户或恶意配置把 prism.sarl 打进 REJECT，导致授权校验永久失败。
+    let filtered: Vec<String> = rules
+        .into_iter()
+        .filter(|rule| {
+            let lower = rule.to_ascii_lowercase();
+            let target_auth = crate::core::license::is_stealth_protected_host_or_ip(&lower);
+            let is_block = lower.contains("reject")
+                || lower.contains("block")
+                || lower.contains("drop");
+            if target_auth && is_block {
+                tracing::warn!("已忽略针对授权服务的拦截规则: {rule}");
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    crate::core::store::save_custom_rules(&state.data_dir, &filtered)
         .map_err(|e| format!("保存自定义规则失败: {e}"))?;
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
@@ -2350,6 +2375,11 @@ pub async fn deactivate_pro(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
+    // 【APP48 任务6】Alpha 内测 Key 只能绑定 1 台设备，用户端不支持自行解绑
+    // （服务端 /license/deactivate 亦返回 403 alpha_unbind_not_allowed）。
+    if state.entitlement.read().alpha {
+        return Err("内测授权不支持自行解绑，请联系管理员解绑后再更换设备".into());
+    }
     // 解绑凭据（license_key / email / device_id）存在 license.dat 内，
     // 必须在下方本地清理前同步捕获，随后交给后台任务异步上报。
     let binding = {
@@ -2543,12 +2573,38 @@ fn kernel_info(state: &AppState) -> KernelInfoDto {
     }
 }
 
+/// 【APP48 任务4】从 Clash API `/connections` 响应中剥离 prism.sarl 隐身连接：
+/// host / destinationIP / rulePayload 任一命中隐身白名单即整条丢弃，
+/// 不计入连接列表，也不进入 ip→domain 缓存与聚合统计。
+fn strip_stealth_connections(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(arr) = value
+        .get_mut("connections")
+        .and_then(|v| v.as_array_mut())
+    {
+        arr.retain(|c| {
+            let meta = c.get("metadata");
+            let get = |key: &str| {
+                meta.and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            };
+            !(crate::core::license::is_stealth_protected_host_or_ip(get("host"))
+                || crate::core::license::is_stealth_protected_host_or_ip(
+                    get("destinationIP"),
+                )
+                || crate::core::license::is_stealth_protected_host_or_ip(get("rulePayload")))
+        });
+    }
+    value
+}
+
 #[tauri::command]
 pub async fn get_connections(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     state
         .kernel_api()
         .get_connections()
         .await
+        .map(strip_stealth_connections)
         .map_err(|e| sanitize_err(&e.to_string()))
 }
 
@@ -2587,7 +2643,12 @@ pub async fn get_traffic_stats(
 ) -> Result<serde_json::Value, String> {
     // 实时流量走 WebSocket 事件（traffic://tick），此处返回持久化统计 + 当前连接快照
     let stats = crate::core::store::load_traffic_stats(&state.data_dir);
-    let conns = state.kernel_api().get_connections().await.unwrap_or_default();
+    let conns = state
+        .kernel_api()
+        .get_connections()
+        .await
+        .map(strip_stealth_connections)
+        .unwrap_or_default();
     Ok(serde_json::json!({
         "stats": stats,
         "connections": conns,
