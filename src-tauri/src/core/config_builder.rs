@@ -1425,7 +1425,14 @@ pub fn build(
     // 注意：store_selected 等字段在 1.8+ 已从 clash_api 移除，写了会 FATAL
     let cache_path = work_dir.join("cache.db");
     let mut clash_api = json!({
-        "external_controller": api_addr
+        "external_controller": api_addr,
+        // 【APP49 任务1】启动即按用户所选 规则/全局/直连 模式运行，
+        // 与运行期 PATCH /configs 热切换形成闭环
+        "default_mode": match settings.outbound_mode {
+            crate::core::state::OutboundMode::Rule => "rule",
+            crate::core::state::OutboundMode::Global => "global",
+            crate::core::state::OutboundMode::Direct => "direct",
+        }
     });
     if !api_secret.is_empty() {
         clash_api["secret"] = json!(api_secret);

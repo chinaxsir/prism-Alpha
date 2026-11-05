@@ -18,6 +18,7 @@ import {
   Languages,
   Palette,
   FileTerminal,
+  Rss,
 } from "lucide-react";
 
 import {
@@ -541,6 +542,14 @@ export default function Settings() {
           desc={t("settings.closeConnsDesc")}
           checked={form.closeConnectionsOnSwitch ?? false}
           onChange={(v) => patchPrefs({ closeConnectionsOnSwitch: v })}
+        />
+        {/* 【APP49 任务2.2】启动时自动更新全部订阅（每天一次，默认开启） */}
+        <ToggleRow
+          icon={<Rss size={16} className="text-gray-400" />}
+          title={t("sub.autoUpdateDaily")}
+          desc={t("sub.autoUpdateDailyDesc")}
+          checked={form.autoUpdateSubsDaily ?? true}
+          onChange={(v) => patchPrefs({ autoUpdateSubsDaily: v })}
         />
       </SettingsGroup>
 

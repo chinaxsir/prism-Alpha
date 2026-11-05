@@ -16,6 +16,7 @@ import { closeAllConnections, closeConnection, getCustomRules, saveCustomRules }
 import { formatBytes } from "@/utils/format";
 import { extractRootDomain } from "@/utils/domain";
 import { useTranslation } from "@/i18n";
+import { useAppVisible } from "@/hooks/useAppVisible";
 import { useCoreStore, type ConnItem } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { Feature } from "@/pro/gating";
@@ -88,11 +89,15 @@ export default function Connections() {
 
   // 【APP42 任务4.1】下行实时速度（全局 store，events.rs 每帧推送）
   const downSpeed = useCoreStore((s) => s.downSpeed);
-  // 会话时长每秒跳动：连接本身不重绘，仅本页 tick 刷新
+  // 会话时长每秒跳动：连接本身不重绘，仅本页 tick 刷新；
+  // 【APP49 任务6】后台时清理定时器（彻底静止待机），回前台立即补刷一次再恢复
+  const appVisible = useAppVisible();
   useEffect(() => {
+    if (!appVisible) return;
+    forceTick((n) => n + 1);
     const timer = setInterval(() => forceTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [appVisible]);
 
   const fmtDuration = (start?: string) => {
     if (!start) return "—";

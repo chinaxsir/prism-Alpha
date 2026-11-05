@@ -426,6 +426,56 @@ export default function GoLanModal({ open, onClose }: Props) {
     setProbeOk(null);
   };
 
+  /** 【APP49 任务5】清空当前配置：只清空当前激活 Tab 档案的字段（保留档案
+   *  条目与名称，其他档案不动），并立即调用 save_go_lan_settings 落盘 */
+  const clearCurrentProfile = async () => {
+    if (!window.confirm(t("goLan.clearCurrentConfirm"))) return;
+    const clearedForm: GoLanForm = {
+      ...EMPTY_GO_LAN,
+      id: form.id,
+      name: form.name,
+      enabled: false,
+      // 全局字段（局域网 DNS / 域名后缀 / 托管参数 / 模式）不属于单档案，保持原值
+      mode: form.mode,
+      lanDns: form.lanDns,
+      lanDomains: form.lanDomains,
+      managedServer: form.managedServer,
+      deviceCode: form.deviceCode,
+    };
+    const prev = profiles.find((p) => p.id === form.id);
+    const clearedProfile = formToProfile(clearedForm, prev);
+    const nextProfiles = profiles.map((p) =>
+      p.id === form.id ? clearedProfile : p,
+    );
+    setForm(clearedForm);
+    setProfiles(nextProfiles);
+    setPasteBuf("");
+    setPasteHint("");
+    setProbeMsg("");
+    setProbeOk(null);
+    try {
+      const base: GoLanSettings = loaded ?? ({} as GoLanSettings);
+      await saveGoLanSettings({
+        ...base,
+        enabled: nextProfiles.some((p) => p.enabled),
+        bypassOnLocalLan: clearedForm.bypassOnLocalLan,
+        profiles: nextProfiles,
+        activeProfileId: form.id,
+        // 顶层旧版字段与被清空档案对齐，防止旧读取方拿到残留配置
+        nodeUri: clearedProfile.nodeUri,
+        wgConfig: clearedProfile.wgConfig ?? null,
+        lanCidrs: clearedProfile.lanCidrs,
+      });
+      const fresh = await getGoLanSettings();
+      setLoaded(fresh);
+      setGoLanSettings(fresh);
+      setStatus(await getGoLanStatus().catch(() => null));
+      toast.success(t("goLan.cleared"));
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   const deleteProfile = () => {
     if (profiles.length <= 1) {
       clearAllProfiles();
@@ -761,10 +811,10 @@ export default function GoLanModal({ open, onClose }: Props) {
               {t("goLan.profiles")}
             </span>
             <button
-              onClick={clearAllProfiles}
+              onClick={() => void clearCurrentProfile()}
               className="rounded px-1.5 py-0.5 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
             >
-              {t("goLan.clearAll")}
+              {t("goLan.clearCurrent")}
             </button>
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">

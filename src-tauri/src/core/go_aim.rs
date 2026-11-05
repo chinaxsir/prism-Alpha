@@ -41,6 +41,14 @@ const BASELINE_TIMEOUT_MS: u64 = 1500;
 const PROBE_MAX_DELAY_MS: u64 = 2500;
 /// 【APP37 任务3.2】单个平台探测请求超时（毫秒）
 const PROBE_TIMEOUT_MS: u64 = 2200;
+/// 【APP49 任务3】阶段1 极速存活快筛：每批并发测速节点数
+const SCREEN_BATCH_SIZE: usize = 12;
+/// 【APP49 任务3】阶段1 快筛测速 URL（generate_204，任何出口都应 204）
+const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
+/// 【APP49 任务3】阶段1 快筛单节点超时（毫秒）
+const SCREEN_TIMEOUT_MS: u64 = 1200;
+/// 【APP49 任务3】ChatGPT cdn-trace 探测超时（毫秒，独立于通用探测超时）
+const GPT_TRACE_TIMEOUT_MS: u64 = 1600;
 /// 故障转移监控间隔（秒）
 const MONITOR_INTERVAL_SECS: u64 = 20;
 
@@ -71,8 +79,8 @@ fn probe_port_reachable(port: u16) -> bool {
 /// （APP-4 曾把黑名单写反，导致所有节点被判为未解锁）。
 const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
-/// 流媒体受限地区（TikTok 等在 CN/HK/MO/RU 等地不可用）
-const MEDIA_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU"];
+/// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
+const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN"];
 
 /// 出口地区探测端点（依次兜底）：cdn-trace 返回多行 key=value，
 /// 其中 `loc=XX` 即 Cloudflare 观测到的出口国家/地区代码。
@@ -89,6 +97,25 @@ fn parse_trace_loc(body: &str) -> Option<String> {
             .map(|s| s.trim().to_uppercase())
             .filter(|s| !s.is_empty())
     })
+}
+
+/// 【APP49 任务3】按延迟升序排序（纯函数，便于单元测试）。
+/// 阶段1 快筛结束后调用，保证阶段2 从延迟最低的节点开始探测。
+fn sort_by_delay(mut nodes: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    nodes.sort_by_key(|(_, d)| *d);
+    nodes
+}
+
+/// 地区是否命中受限名单（纯函数）：loc 未知（None）时视为未命中，
+/// 是否要求 loc 必须存在由调用方决定。
+fn region_blocked(loc: Option<&str>, blocklist: &[&str]) -> bool {
+    matches!(loc, Some(l) if blocklist.contains(&l))
+}
+
+/// 【APP49 任务3】Netflix 解锁判定（纯函数）：区域锁片源 81280792——
+/// 200/301/302 判完整解锁；403/404 及其余状态码判未解锁。
+fn netflix_unlocked(status: u16) -> bool {
+    matches!(status, 200 | 301 | 302)
 }
 
 /// 经代理读取当前出口地区代码（多端点兜底）。
@@ -282,54 +309,90 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
     nodes
 }
 
-/// 全量探测：读取全部节点 → 4 个槽位并行消费共享队列 → 逐节点真实
-/// HTTP 探测 → 写缓存 + 推事件。每个节点都必须生成 AimNodeResult
-/// （死节点 unlocked_tags=[] 且 probed=true），绝不遗漏"未检测"状态。
+/// 全量探测（APP49 任务3 两阶段漏斗）：
+/// 阶段1 极速存活快筛——全部候选真实节点按每批 12 个并发调用 Clash API
+/// `/proxies/{tag}/delay`（gstatic generate_204，1200ms），超时/失败记
+/// dead_result，存活节点延迟写入状态缓存并按延迟升序排序；
+/// 阶段2 低延迟优先探测——一次性预建 4 槽位探针客户端（连接池复用），
+/// 4 个槽位并行消费共享队列，逐节点真实 HTTP 探测 → 写缓存 + 推事件。
+/// 每个节点都必须生成 AimNodeResult（死节点 unlocked_tags=[] 且
+/// probed=true），绝不遗漏"未检测"状态。
 async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     let api = state.kernel_api();
-    // APP34：移动端扩展进程受 Jetsam 50MB 硬限制，探测规模必须收敛。
-    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
 
     // 1. 读取全量节点列表
     let proxies = api
         .get_proxies()
         .await
         .map_err(|e| format!("读取节点列表失败: {e}"))?;
-    let mut nodes = collect_nodes(&proxies);
-
-    // 2. 全部节点都没有延迟数据 → 先做一次组测速拿基线。
-    // 移动端严禁全量组测速（同样会一次性打满 148 个节点），直接跳过：
-    // 无历史延迟的节点由 probe_node 内的单节点基线补测覆盖。
-    if !mobile && !nodes.is_empty() && nodes.iter().all(|(_, d)| d.is_none()) {
-        tracing::info!("[go-aim] 无历史延迟数据，先执行组基线测速");
-        let _ = api
-            .group_url_test(
-                "PROXY",
-                Some(BASELINE_URL),
-                Some(BASELINE_TIMEOUT_MS as u32),
-                None,
-            )
-            .await;
-        let proxies = api
-            .get_proxies()
-            .await
-            .map_err(|e| format!("读取节点列表失败: {e}"))?;
-        nodes = collect_nodes(&proxies);
-    }
+    let nodes = collect_nodes(&proxies);
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
-    // 有基线延迟的优先探测（延迟从低到高），无延迟的排后（探测循环内逐个补测）
-    nodes.sort_by_key(|(_, d)| d.unwrap_or(u64::MAX));
     // 【APP37 任务3.2】严禁任何 .take/.truncate 节点截断：全部有效真实
-    // 节点（148+ 个）必须 100% 纳入探测队列，由下方 4 槽位滚动并发
-    // + 1.5s 快筛保证在不突破扩展内存上限的前提下跑完全程。
+    // 节点（148+ 个）必须 100% 纳入探测队列。
+
+    // 2. 【APP49 任务3】阶段1 极速存活快筛：每批 12 个并发 delay 测速。
+    // 超时/失败 → dead_result 立即入缓存并推前端；存活节点记录延迟，
+    // 全部筛完后按延迟升序进入阶段2。
+    let mut alive: Vec<(String, u64)> = Vec::with_capacity(nodes.len());
+    for chunk in nodes.chunks(SCREEN_BATCH_SIZE) {
+        // 中止条件：用户关闭 Go AIM 开关或停止 VPN
+        if !state.settings.read().go_aim_enabled || !is_running(state) {
+            return Err("探测中止（Go AIM 已关闭或 VPN 已停止）".into());
+        }
+        let checks = chunk.iter().map(|(name, _)| {
+            let api = api.clone();
+            let name = name.clone();
+            async move {
+                let d = api
+                    .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
+                    .await;
+                (name, d)
+            }
+        });
+        for (name, delay) in futures_util::future::join_all(checks).await {
+            match delay {
+                Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
+                    alive.push((name.clone(), d));
+                    // 存活节点延迟写入状态缓存（probed=false 占位，
+                    // 阶段2 完成后会被真实探测结果覆盖），前端徽章实时刷新
+                    let placeholder = AimNodeResult {
+                        node_name: name.clone(),
+                        unlocked_tags: vec![],
+                        ai_unlocked: false,
+                        media_unlocked: false,
+                        score: 0,
+                        delay_ms: d,
+                        updated_at: now_secs(),
+                        probed: false,
+                    };
+                    state.aim_results.write().insert(name.clone(), placeholder.clone());
+                    let _ = app.emit(
+                        AIM_EVENT,
+                        serde_json::json!({ "name": name, "result": placeholder }),
+                    );
+                }
+                _ => {
+                    let dead = dead_result(&name);
+                    state.aim_results.write().insert(name.clone(), dead.clone());
+                    let _ = app.emit(
+                        AIM_EVENT,
+                        serde_json::json!({ "name": name, "result": dead }),
+                    );
+                }
+            }
+        }
+    }
+    let alive = sort_by_delay(alive);
+    if alive.is_empty() {
+        return Err("阶段1 快筛后无存活节点".into());
+    }
+    tracing::info!("[go-aim] 阶段1 快筛完成：{} 个节点存活，进入阶段2", alive.len());
 
     // 3. 探针槽位可用性检测：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
     // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
-    // 【APP37 任务3.2】4 个槽位（GO-AIM-PROBE-0..3 / 端口 2083..2086）
-    // 全部启用滚动并发，严禁移动端减半。
     let slots: Vec<usize> = (0..PROBE_SLOTS)
         .filter(|slot| probe_port_reachable(PROBE_PORT_BASE + *slot as u16))
         .collect();
@@ -341,33 +404,51 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     }
     tracing::info!("[go-aim] 可用探针槽位: {slots:?}");
 
-    // 4. 共享任务队列：可用槽位并行消费，任一槽位空闲即取下一个节点
-    //（等价于每批 4 个节点的滚动并发：某槽位完成即补入下一批的第一个）。
+    // 4. 【APP49 任务3】阶段2 开始前一次性预建全部槽位探针客户端
+    //（普通客户端 + Gemini 无重定向客户端），连接池全程复用，
+    // 严禁在探测循环内重复 build。
+    let mut slot_clients = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let client = match build_probe_client(slot) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[go-aim] 槽位 {slot} 探测客户端构建失败: {e}");
+                continue;
+            }
+        };
+        // Gemini 判定只看首跳 Location，必须独立的无重定向客户端
+        let nr_client = match build_probe_client_no_redirect(slot) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[go-aim] 槽位 {slot} 无重定向客户端构建失败: {e}");
+                continue;
+            }
+        };
+        slot_clients.push((slot, client, nr_client));
+    }
+    if slot_clients.is_empty() {
+        return Err("全部探针客户端构建失败".into());
+    }
+
+    // 5. 共享任务队列（延迟升序）：可用槽位并行消费，任一槽位空闲即取
+    // 下一个节点（等价于每批 4 个节点的滚动并发）。前 PROBE_SLOTS 个
+    //（延迟最低的首批）标记 first_batch，用于秒级锁定。
+    let instant_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let queue = Arc::new(tokio::sync::Mutex::new(
-        nodes.into_iter().collect::<VecDeque<_>>(),
+        alive
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, d))| (name, d, i < PROBE_SLOTS))
+            .collect::<VecDeque<_>>(),
     ));
     let mut set = tokio::task::JoinSet::new();
-    for slot in slots {
+    for (slot, client, nr_client) in slot_clients {
         let queue = queue.clone();
         let api = api.clone();
         let task_app = app.clone();
+        let instant_locked = instant_locked.clone();
         set.spawn(async move {
             let app = task_app;
-            let client = match build_probe_client(slot) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("[go-aim] 槽位 {slot} 探测客户端构建失败: {e}");
-                    return 0usize;
-                }
-            };
-            // Gemini 判定只看首跳 Location，必须独立的无重定向客户端
-            let nr_client = match build_probe_client_no_redirect(slot) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("[go-aim] 槽位 {slot} 无重定向客户端构建失败: {e}");
-                    return 0usize;
-                }
-            };
             let mut done = 0usize;
             loop {
                 // 【APP37 任务3.2】探测循环只允许两个中止条件：
@@ -383,9 +464,9 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     }
                 }
                 let next = queue.lock().await.pop_front();
-                let Some((name, _)) = next else { break };
+                let Some((name, delay, first_batch)) = next else { break };
                 let result =
-                    probe_node(&api, &client, &nr_client, slot, &name).await;
+                    probe_node(&api, &client, &nr_client, slot, &name, Some(delay)).await;
                 done += 1;
                 // 实时缓存 + 推送前端徽章
                 // 注意：写锁 guard 必须严格限制在本作用域内，绝不可跨 await
@@ -399,11 +480,45 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result }),
                 );
+                // 【APP49 任务3】秒级锁定：首批（延迟最低的前 4 个）中一旦
+                // 出现解锁 ChatGPT/Claude 的节点，立即走既有锁定路径切换为
+                // 当前节点（lock_node 内部同步主选择器/GLOBAL/settings 并
+                // 广播事件），后台继续完成剩余节点探测评级。手动指定节点时
+                // 绝不抢锁；全程仅锁定一次。
+                if first_batch
+                    && result
+                        .unlocked_tags
+                        .iter()
+                        .any(|t| t == "GPT" || t == "Claude")
+                {
+                    let app_state = app.state::<AppState>();
+                    let enabled = app_state.settings.read().go_aim_enabled;
+                    let pinned = app_state.settings.read().go_aim_pinned_node.is_some();
+                    if enabled
+                        && !pinned
+                        && is_running(&app_state)
+                        && !instant_locked.swap(true, Ordering::AcqRel)
+                    {
+                        tracing::info!(
+                            "[go-aim] 首批秒级锁定 AI 解锁节点「{}」（延迟 {}ms）",
+                            result.node_name,
+                            result.delay_ms
+                        );
+                        crate::core::logger::info(
+                            crate::core::logger::MOD_GO_AIM,
+                            &format!(
+                                "首批秒级锁定 AI 解锁节点「{}」（延迟 {}ms）",
+                                result.node_name, result.delay_ms
+                            ),
+                        );
+                        // 探测中的锁定不得断开现有连接（close_conns=false），
+                        // 否则会砍断其余槽位正在进行的探针 HTTP 连接。
+                        let _ = lock_node(&app, &app_state, &result, false).await;
+                    }
+                }
                 // 【APP39 任务4·时机B】探测过程中实时同步：只要出现延迟更低
                 // 的合格节点，立即刷新全局「当前节点」（仪表盘/代理页 1 秒内
                 // 跟随），无需等全量探测结束。手动指定节点时绝不抢锁。
-                // 探测中的锁定不得断开现有连接：探针 HTTP 请求本身也是内核
-                // 连接，全量断开会让其余槽位的探测立刻失败。
                 {
                     let app_state = app.state::<AppState>();
                     let enabled = app_state.settings.read().go_aim_enabled;
@@ -473,23 +588,28 @@ fn build_probe_client_no_redirect(slot: usize) -> Result<reqwest::Client, String
         .map_err(|e| e.to_string())
 }
 
-/// 单节点探测：1.5s 极速连通性快筛确认存活 → 探针选择器切到该节点 →
-/// 7 个平台并发真实请求判定。死节点生成 probed=true 的空结果。
+/// 单节点探测：复用阶段1 快筛延迟（无则 1.5s 基线补测确认存活）→
+/// 探针选择器切到该节点 → 7 个平台并发真实请求判定。
+/// 死节点生成 probed=true 的空结果。
 async fn probe_node(
     api: &crate::core::kernel::KernelApi,
     client: &reqwest::Client,
     nr_client: &reqwest::Client,
     slot: usize,
     name: &str,
+    prescreened_delay: Option<u64>,
 ) -> AimNodeResult {
-    // 1. 【APP42 任务1.3】1.5s 极速连通性快筛：只走 Clash API delay
-    //   （cp.cloudflare.com/generate_204，timeout=1500）。TUN 开启时主进程
-    //    TCP 握手会命中 utun 栈返回 2~4ms 假延迟，故彻底移除 TCP 回退。
+    // 1. 【APP49 任务3】阶段1 已用 gstatic generate_204（1200ms）确认存活，
+    //    直接复用其延迟，跳过重复测速以加速首批锁定；无预筛延迟时回退到
+    //    原有的 1.5s 极速连通性快筛（cp.cloudflare.com/generate_204）。
     //    API 不通即死节点：直接记为不可达（delay=None、unlocked=[]），
     //    跳过后续全部平台 HTTP 探测。
-    let base_delay = match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
-        Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
-        _ => return dead_result(name),
+    let base_delay = match prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS) {
+        Some(d) => d,
+        None => match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
+            Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
+            _ => return dead_result(name),
+        },
     };
 
     // 2. 探针选择器切到该节点（独立组，绝不影响主选择器/GLOBAL）
@@ -590,12 +710,15 @@ async fn check_once(
     if probe.tag == "Gemini" {
         return check_gemini_first_hop(nr_client, probe.url, exit_loc).await;
     }
-    let resp = match client
+    // 【APP49 任务3】ChatGPT trace 探测独立收紧到 1600ms（每请求级超时，
+    // 不影响客户端上其他平台的 2200ms 通用超时）
+    let mut req = client
         .get(probe.url)
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
+        .header("Accept-Language", "en-US,en;q=0.9");
+    if probe.tag == "GPT" {
+        req = req.timeout(std::time::Duration::from_millis(GPT_TRACE_TIMEOUT_MS));
+    }
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(_) => return None, // 传输失败 → 由 check_platform 补测
     };
@@ -624,59 +747,26 @@ async fn check_once(
     // 出口地区：优先使用 probe_node 预取的共享值，其次解析本次响应体
     // （GPT/Claude/TK 的探测 URL 本身就是 cdn-trace 端点）
     let loc = exit_loc.map(str::to_string).or_else(|| parse_trace_loc(&body));
-    // 地区未知（cdn-trace 不可达）时不因未知而判死，交由状态码/正文判定
-    let region_allowed = |list: &[&str]| match loc.as_deref() {
-        Some(l) => !list.contains(&l),
-        None => true,
-    };
+    // 【APP49 任务3】AI/TikTok 判定要求 loc 必须解析成功且不命中受限名单
+    let loc_allowed = |list: &[&str]| loc.as_deref().is_some_and(|l| !region_blocked(Some(l), list));
 
     let verdict = match probe.tag {
-        // GPT：出口地区非受限 + OpenAI 边缘节点放行（200/401 为标准放行）。
-        // 旧接口 ios.chat.openai.com/.../server_status 已下线（404），必须废弃
-        "GPT" => {
-            if !region_allowed(AI_BLOCKLIST) {
-                return Some(false);
-            }
-            Some(match client.get("https://api.openai.com/v1/models").send().await {
-                Ok(r) => {
-                    let s = r.status().as_u16();
-                    let b = r.text().await.unwrap_or_default().to_lowercase();
-                    if b.contains("unsupported_country")
-                        || b.contains("not supported in your country")
-                    {
-                        false
-                    } else {
-                        match s {
-                            // 合法地区：200 正常 / 401 未带 Key 的标准响应
-                            200 | 401 => true,
-                            // 地区封锁
-                            403 => false,
-                            // 429 等限流：以出口地区为准
-                            _ => loc.is_some(),
-                        }
-                    }
-                }
-                // 二次请求失败：以主端点可达 + 出口地区判定为准
-                Err(_) => status == 200 && loc.is_some(),
-            })
-        }
-        // Claude：出口地区非受限，且未被 Cloudflare 403 拦截
-        "Claude" => {
-            if !region_allowed(AI_BLOCKLIST) {
-                return Some(false);
-            }
-            Some(if status == 403 { loc.is_some() } else { status < 500 })
-        }
+        // 【APP49 任务3】GPT：chatgpt.com/cdn-cgi/trace（1600ms）——
+        // 解析 loc= 且国家码不得属于 AI 受限名单（CN/HK/MO/RU/BY/IR/KP/CU/SY）
+        "GPT" => Some(status == 200 && loc_allowed(AI_BLOCKLIST)),
+        // 【APP49 任务3】Claude：claude.ai/cdn-cgi/trace 同样排除受限区
+        "Claude" => Some(status == 200 && loc_allowed(AI_BLOCKLIST)),
         // Gemini：已在 check_once 入口提前分支（首跳 Location 判定），此处不可达
         "Gemini" => Some(false),
-        // NF：区域锁片源 81280792——跟随重定向后 200 即解锁，404 判封锁
-        "NF" => Some(status == 200),
+        // 【APP49 任务3】NF：区域锁片源 81280792——200/301/302 判完整解锁，
+        // 403/404 及其余状态码判未解锁
+        "NF" => Some(netflix_unlocked(status)),
         // Disney+：200 且未跳到不可用提示页
         "Disney+" => Some(status == 200 && !final_url.contains("unavailable")),
-        // YT：Premium 页 200 且正文不含「国家不可用」
-        "YT" => Some(status == 200 && !body_lc.contains("youtube premium is not available")),
-        // TikTok：出口地区不在流媒体受限名单
-        "TK" => Some(status == 200 && region_allowed(MEDIA_BLOCKLIST)),
+        // 【APP49 任务3】YT：Premium 页 200 且正文不含 "not available"
+        "YT" => Some(status == 200 && !body_lc.contains("not available")),
+        // 【APP49 任务3】TikTok：trace loc 不得为 CN/HK/IN
+        "TK" => Some(status == 200 && loc_allowed(TIKTOK_BLOCKLIST)),
         _ => Some(false),
     };
     verdict
@@ -692,9 +782,7 @@ async fn check_gemini_first_hop(
     url: &str,
     exit_loc: Option<&str>,
 ) -> Option<bool> {
-    if let Some(l) = exit_loc
-        && AI_BLOCKLIST.contains(&l)
-    {
+    if region_blocked(exit_loc, AI_BLOCKLIST) {
         return Some(false);
     }
     let resp = match nr_client
@@ -743,19 +831,20 @@ pub async fn apply_selection(app: &AppHandle, state: &AppState) -> Result<Option
 
     // 手动指定：目标节点仍在存活结果中则直接锁定（评级照跑但不覆盖）
     let pinned = state.settings.read().go_aim_pinned_node.clone();
+    let close_conns = state.settings.read().close_connections_on_switch;
     if let Some(pinned) = pinned
         && let Some(res) = results.get(&pinned)
         && res.probed
         && res.delay_ms > 0
     {
-        return lock_node(app, state, res, true).await.map(Some);
+        return lock_node(app, state, res, close_conns).await.map(Some);
     }
 
     let Some(best) = pick_best(&results) else {
         tracing::warn!("[go-aim] 解锁池为空，保持当前节点不变");
         return Ok(None);
     };
-    lock_node(app, state, &best, true).await.map(Some)
+    lock_node(app, state, &best, close_conns).await.map(Some)
 }
 
 /// 执行锁定：若与当前锁定一致则跳过；否则切主组 + GLOBAL 并广播。
@@ -879,7 +968,9 @@ pub async fn lock_fastest_now(app: &AppHandle, state: &AppState) -> Option<Strin
         updated_at: 0,
         probed: true,
     };
-    if let Err(e) = lock_node(app, state, &res, true).await {
+    // 【APP49】仅当用户开启「切换策略时关闭连接」才断开旧连接
+    let close_conns = state.settings.read().close_connections_on_switch;
+    if let Err(e) = lock_node(app, state, &res, close_conns).await {
         tracing::warn!("[go-aim] 开启瞬间锁定最低延迟节点失败: {e}");
         return None;
     }
@@ -1052,9 +1143,51 @@ mod tests {
                 "{good} 是 AI 平台正常可用地区，不应在受限名单中"
             );
         }
-        // 真实受限地区必须在名单中
-        for bad in ["CN", "HK", "MO", "RU", "KP", "IR"] {
+        // 【APP49 任务3】扩展：真实受限地区必须全部在名单中
+        for bad in ["CN", "HK", "MO", "RU", "KP", "IR", "BY", "CU", "SY"] {
             assert!(AI_BLOCKLIST.contains(&bad), "{bad} 应在 AI 受限名单中");
+        }
+    }
+
+    #[test]
+    fn test_sort_by_delay_ascending() {
+        // 【APP49 任务3】阶段1 快筛后必须按延迟升序进入阶段2
+        let nodes = vec![
+            ("c".to_string(), 300u64),
+            ("a".to_string(), 40),
+            ("b".to_string(), 120),
+        ];
+        let sorted = sort_by_delay(nodes);
+        let names: Vec<&str> = sorted.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"], "必须按延迟升序排列");
+        // 相同延迟保持稳定，且不修改原值
+        let dup = vec![("x".to_string(), 100u64), ("y".to_string(), 100)];
+        let sorted = sort_by_delay(dup);
+        assert_eq!(sorted.len(), 2);
+        assert!(sorted.iter().all(|(_, d)| *d == 100));
+    }
+
+    #[test]
+    fn test_region_blocked() {
+        // blocklist 判定：命中受限区为 true，正常区/未知 loc 为 false
+        assert!(region_blocked(Some("CN"), AI_BLOCKLIST));
+        assert!(region_blocked(Some("HK"), AI_BLOCKLIST));
+        assert!(!region_blocked(Some("US"), AI_BLOCKLIST));
+        assert!(!region_blocked(None, AI_BLOCKLIST), "loc 未知时不应判封锁");
+        // TikTok 名单仅 CN/HK/IN：RU 不在其中
+        assert!(region_blocked(Some("IN"), TIKTOK_BLOCKLIST));
+        assert!(!region_blocked(Some("RU"), TIKTOK_BLOCKLIST));
+        assert!(!region_blocked(Some("US"), TIKTOK_BLOCKLIST));
+    }
+
+    #[test]
+    fn test_netflix_unlocked_status() {
+        // 【APP49 任务3】Netflix：200/301/302 判完整解锁，403/404 不解锁
+        for ok in [200u16, 301, 302] {
+            assert!(netflix_unlocked(ok), "状态码 {ok} 应判完整解锁");
+        }
+        for locked in [403u16, 404, 500, 0] {
+            assert!(!netflix_unlocked(locked), "状态码 {locked} 应判未解锁");
         }
     }
 

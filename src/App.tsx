@@ -10,10 +10,19 @@ import Dashboard from "@/pages/Dashboard";
 import Subscription from "@/pages/Subscription";
 import Analytics from "@/pages/Analytics";
 import Settings from "@/pages/Settings";
-import { useCoreStore, type CoreStatus, type OutboundMode, type RunMode, type UserSettings } from "@/stores/core";
+import {
+  applyThemeToDom,
+  resolveSystemLanguage,
+  useCoreStore,
+  type CoreStatus,
+  type OutboundMode,
+  type RunMode,
+  type UserSettings,
+} from "@/stores/core";
 import { useProStore } from "@/stores/pro";
-import { applyTheme, usePrefsStore } from "@/stores/prefs";
+import { usePrefsStore } from "@/stores/prefs";
 import { resolveLang, useTranslation } from "@/i18n";
+import { useAppVisible } from "@/hooks/useAppVisible";
 import {
   getCoreStatus,
   getRuntimeSnapshot,
@@ -105,20 +114,49 @@ export default function App() {
       .catch(() => undefined);
   }, [setLanguage, setTheme]);
 
-  // 应用外观，并实时监听系统深浅色变化（跟随系统时无感切换）
+  // 【APP49 任务5】应用外观（统一收口 applyThemeToDom），并实时监听系统
+  // 深浅色变化；document visibilitychange 与 window focus 时重新应用，
+  // 保证 iOS 控制中心切深浅色后回到 App 0 延迟跟随
   useEffect(() => {
-    applyTheme(theme);
+    applyThemeToDom(theme);
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => {
-      if (usePrefsStore.getState().theme === "system") applyTheme("system");
+    const reapply = () => {
+      if (usePrefsStore.getState().theme === "system") applyThemeToDom("system");
     };
-    mq.addEventListener?.("change", onChange);
-    return () => mq.removeEventListener?.("change", onChange);
+    mq.addEventListener?.("change", reapply);
+    // 兼容旧 WebView（addEventListener 缺失时走 addListener）
+    mq.addListener?.(reapply);
+    document.addEventListener("visibilitychange", reapply);
+    window.addEventListener("focus", reapply);
+    return () => {
+      mq.removeEventListener?.("change", reapply);
+      mq.removeListener?.(reapply);
+      document.removeEventListener("visibilitychange", reapply);
+      window.removeEventListener("focus", reapply);
+    };
   }, [theme]);
+
+  // 【APP49 任务5】语言跟随系统：system 时按 navigator.languages[0] 解析，
+  // 监听 languagechange 与 visibilitychange 触发重算（重渲染后
+  // 各组件 t() 会重新读取系统语言）
+  const [, setLangTick] = useState(0);
+  useEffect(() => {
+    if (language !== "system") return;
+    const bump = () => setLangTick((n) => n + 1);
+    window.addEventListener("languagechange", bump);
+    document.addEventListener("visibilitychange", bump);
+    return () => {
+      window.removeEventListener("languagechange", bump);
+      document.removeEventListener("visibilitychange", bump);
+    };
+  }, [language]);
 
   // 同步 <html lang>，保持无障碍与排版字体正确
   useEffect(() => {
-    document.documentElement.lang = resolveLang(language) === "zh" ? "zh-CN" : "en";
+    document.documentElement.lang =
+      (language === "system" ? resolveSystemLanguage() : resolveLang(language)) === "zh"
+        ? "zh-CN"
+        : "en";
   }, [language]);
 
   // 【APP36 任务2.2】拦截全局撤销/重做输入事件：焦点不在输入框时调用
@@ -270,35 +308,19 @@ export default function App() {
     };
   }, []);
 
-  // 前后台不间断：定时拉取后端快照，并在从后台切回前台（亮屏解锁）瞬间立即同步
+  // 前后台省电（【APP49 任务6】）：隐藏（锁屏/切 App）时彻底清理轮询
+  // 定时器不再唤醒 JS 线程；切回前台瞬间立即补拉一次快照再恢复 2s 定时。
+  const appVisible = useAppVisible();
   useEffect(() => {
+    // 上报后端：后台时暂停事件推送与连接聚合，切回前台立即恢复
+    void setAppForeground(appVisible).catch(() => undefined);
+    if (!appVisible) return;
+    // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
+    // refreshRuntime 会先查状态并触发后端自动接管。
     void refreshRuntime();
-    const syncForeground = () => {
-      const visible = document.visibilityState === "visible";
-      // 上报后端：后台时暂停事件推送与连接聚合，切回前台立即恢复
-      void setAppForeground(visible).catch(() => undefined);
-      if (visible) void refreshRuntime();
-    };
-    const id = window.setInterval(() => {
-      // 隐藏（锁屏/切 App）时不再每 2s 唤醒 JS 线程，彻底静止待机
-      if (document.visibilityState !== "visible") return;
-      // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
-      // refreshRuntime 会先查状态并触发后端自动接管。
-      void refreshRuntime();
-    }, 2000);
-    syncForeground();
-    document.addEventListener("visibilitychange", syncForeground);
-    window.addEventListener("focus", syncForeground);
-    // pageshow：移动端系统回退缓存页（bfcache）恢复时 visibilitychange
-    // 可能不触发，pageshow 兜底拉取快照（IPA-12）
-    window.addEventListener("pageshow", syncForeground);
-    return () => {
-      window.clearInterval(id);
-      document.removeEventListener("visibilitychange", syncForeground);
-      window.removeEventListener("focus", syncForeground);
-      window.removeEventListener("pageshow", syncForeground);
-    };
-  }, [refreshRuntime]);
+    const id = window.setInterval(() => void refreshRuntime(), 2000);
+    return () => window.clearInterval(id);
+  }, [appVisible, refreshRuntime]);
 
   // 系统 VPN 被撤销（Android onRevoke：用户在系统设置关闭 / 其他 VPN 抢占）
   // → 停止内核并对齐前端状态

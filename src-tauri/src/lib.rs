@@ -108,6 +108,14 @@ pub fn run() {
                 }
             });
 
+            // 【APP49 任务2.2】启动时自动更新全部订阅（默认开启，每天仅一次）。
+            // 启动后延迟 5s 等网络就绪；当天已更新则直接跳过。
+            let auto_update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                ipc::commands::auto_update_subscriptions_daily(auto_update_handle).await;
+            });
+
             // 授权到期实时巡检（每 10 秒一次纯内存整数比较）：
             // 无论是否联网，跨过 expires_at 立即终止全部 Pro 功能并通知前端；
             // 同时维护进程内时钟高水位线，运行中被调回系统时间也立即熔断。
@@ -256,6 +264,7 @@ pub fn run() {
             ipc::commands::set_outbound_mode,
             ipc::commands::select_proxy,
             ipc::commands::update_subscription,
+            ipc::commands::update_all_subscriptions,
             ipc::commands::rename_subscription,
             ipc::commands::list_subscriptions,
             ipc::commands::get_cached_proxies,
@@ -274,6 +283,7 @@ pub fn run() {
             ipc::commands::get_connections,
             ipc::commands::close_connection,
             ipc::commands::close_all_connections,
+            ipc::commands::reset_analytics_stats,
             ipc::commands::get_traffic_stats,
             ipc::commands::get_runtime_snapshot,
             ipc::commands::add_traffic_tick,

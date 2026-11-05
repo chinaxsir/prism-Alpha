@@ -1,17 +1,32 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Download, Eraser, FileTerminal, RefreshCw, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  ClipboardCopy,
+  Download,
+  Eraser,
+  FileTerminal,
+  RefreshCw,
+  X,
+} from "lucide-react";
 import clsx from "clsx";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
+import { useCoreStore } from "@/stores/core";
 import {
   clearAppLogs,
   getAppLogs,
+  getCoreStatus,
+  getGoLanStatus,
+  getProxyGroups,
   type AppLogEntry,
 } from "@/api/ipc";
 
 /** 【IPA9 任务1】「设置 -> 运行日志」全局诊断中心弹窗
  *
- * - 顶部模块筛选标签栏（flex-wrap 自动换行，最右侧标签不被截断）
+ * - 【APP49 任务5】顶部诊断摘要卡：内核状态 / 当前节点+延迟 / 物理网卡 /
+ *   Go Lan 状态 / DNS·入站 / 内存·平台，附「复制诊断报告」按钮
+ * - 顶部分类筛选 chips（全部/内核/Go Lan/Go AIM/订阅/仅看异常，
+ *   flex-wrap 自动换行，最右侧标签不被截断）
  * - 右上角实时显示日志占用空间（上限 512 KB）
  * - 每条日志渲染为上下两行全宽卡片：
  *   第一行 level 徽章 + module 徽章 + 时分秒毫秒时间戳；
@@ -20,15 +35,24 @@ import {
  * - 打开期间每 2 秒自动轮询
  */
 
-const MODULE_TABS: { key: string; value: string | null; labelKey: string }[] = [
+/** 异常关键词：error / warn / fail（不区分大小写，level 与正文命中均算） */
+const ERROR_RE = /error|warn|fail/i;
+
+/** 「仅看异常」分类的内部标识（非后端模块名） */
+const ERRORS_FILTER = "__errors__";
+
+/** 【APP49 任务5】分类筛选 chips：全部 / 内核 / Go Lan / Go AIM / 订阅 / 仅看异常 */
+const CATEGORY_TABS: { key: string; value: string | null; labelKey: string }[] = [
   { key: "all", value: null, labelKey: "logs.filterAll" },
-  { key: "golan", value: "GoLan", labelKey: "logs.filterGoLan" },
   { key: "kernel", value: "Kernel", labelKey: "logs.filterKernel" },
-  { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
-  { key: "pro", value: "Pro", labelKey: "logs.filterPro" },
+  { key: "golan", value: "GoLan", labelKey: "logs.filterGoLan" },
   { key: "goaim", value: "GoAim", labelKey: "logs.filterGoAim" },
-  { key: "gocus", value: "GoCus", labelKey: "logs.filterGoCus" },
+  { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
+  { key: "errors", value: ERRORS_FILTER, labelKey: "logs.filterErrors" },
 ];
+
+/** App 版本（诊断摘要与诊断报告展示） */
+const APP_VERSION = "v0.3.81";
 
 interface LogViewerModalProps {
   open: boolean;
@@ -88,11 +112,23 @@ export default function LogViewerModal({
   const [exporting, setExporting] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // ---- 【APP49 任务5】诊断摘要数据源（全局 store 实时读取） ----
+  const coreStatus = useCoreStore((s) => s.status);
+  const runMode = useCoreStore((s) => s.mode);
+  const settings = useCoreStore((s) => s.settings);
+  const goLanCfg = useCoreStore((s) => s.goLanSettings);
+  const memoryUsage = useCoreStore((s) => s.memoryUsage);
+  const [nodeInfo, setNodeInfo] = useState<{ name: string; delay: number | null } | null>(null);
+  const [nicText, setNicText] = useState("");
+
   const load = useCallback(
     async (module: string | null) => {
       setLoading(true);
       try {
-        const payload = await getAppLogs(module ?? undefined);
+        // 「仅看异常」拉全量后在前端按关键词过滤
+        const payload = await getAppLogs(
+          module === ERRORS_FILTER ? undefined : (module ?? undefined),
+        );
         setEntries(payload.entries ?? []);
         setTotalBytes(payload.totalBytes ?? 0);
       } catch (e) {
@@ -102,6 +138,87 @@ export default function LogViewerModal({
       }
     },
     [],
+  );
+
+  // 打开时拉取诊断摘要：当前节点+延迟（内核运行时读代理组测速历史）、
+  // 物理网卡（Go Lan 状态携带 physicalIps；无 IPC / 无权限时回退系统平台）
+  useEffect(() => {
+    if (!open) return;
+    (async () => {
+      try {
+        const st = await getCoreStatus();
+        const group = st.mainSelector ?? "";
+        if (st.status === "running" && group) {
+          try {
+            const resp = (await getProxyGroups()) as {
+              proxies?: Record<
+                string,
+                { name: string; type: string; now?: string; history?: { delay: number }[] }
+              >;
+            };
+            const map = resp.proxies ?? {};
+            const nowName = map[group]?.now || st.selectedNode || "";
+            const node = nowName ? map[nowName] : undefined;
+            const hist = node?.history;
+            setNodeInfo({
+              name: nowName,
+              delay: hist && hist.length > 0 ? hist[hist.length - 1].delay : null,
+            });
+            return;
+          } catch {
+            /* 代理组不可用时回落持久化节点名 */
+          }
+        }
+        const name = st.selectedNode ?? "";
+        setNodeInfo(name ? { name, delay: null } : null);
+      } catch {
+        setNodeInfo(null);
+      }
+    })();
+    getGoLanStatus()
+      .then((s) => setNicText(s.physicalIps.join(", ")))
+      .catch(() => setNicText(""));
+  }, [open]);
+
+  /** 诊断摘要条目（卡片渲染与复制报告共用同一份文案） */
+  const diagLines = useMemo((): Array<[string, string]> => {
+    const onOff = (v: boolean) => (v ? t("logs.diagOn") : t("logs.diagOff"));
+    const kernelText = `${
+      coreStatus === "running"
+        ? t("status.connected")
+        : coreStatus === "starting"
+          ? t("status.starting")
+          : t("status.disconnected")
+    } · ${t(runMode === "tun" ? "runMode.tun" : "runMode.systemProxy")}`;
+    const nodeText = nodeInfo?.name
+      ? `${nodeInfo.name}${
+          nodeInfo.delay != null && nodeInfo.delay > 0 ? ` · ${nodeInfo.delay}ms` : ""
+        }`
+      : t("logs.diagNone");
+    const nic = nicText || navigator.platform || t("common.unknown");
+    const goLanText = goLanCfg ? onOff(goLanCfg.enabled) : t("logs.diagOff");
+    const inboundText =
+      `mixed: ${settings.mixedPort} · allow_lan: ${onOff(settings.allowLan)} · ` +
+      `IPv6: ${onOff(settings.ipv6 ?? false)} · QUIC: ${onOff(settings.blockQuic ?? false)}`;
+    const platform = `${navigator.platform || "unknown"}`;
+    const sysText = `${APP_VERSION} · ${(memoryUsage / 1048576).toFixed(1)} MB · ${platform}`;
+    return [
+      [t("logs.diagKernel"), kernelText],
+      [t("logs.diagNode"), nodeText],
+      [t("logs.diagNic"), nic],
+      [t("logs.diagGoLan"), goLanText],
+      [t("logs.diagInbound"), inboundText],
+      [t("logs.diagSystem"), sysText],
+    ];
+  }, [t, coreStatus, runMode, nodeInfo, nicText, goLanCfg, settings, memoryUsage]);
+
+  /** 分类筛选后的可见日志（「仅看异常」按 error/warn/fail 关键词过滤） */
+  const visibleEntries = useMemo(
+    () =>
+      activeModule === ERRORS_FILTER
+        ? entries.filter((e) => ERROR_RE.test(e.level) || ERROR_RE.test(e.message))
+        : entries,
+    [entries, activeModule],
   );
 
   useEffect(() => {
@@ -201,6 +318,49 @@ export default function LogViewerModal({
     toast.success(t("logs.exportCopied"));
   };
 
+  /** 剪贴板写入（navigator.clipboard 优先，失败回退 textarea execCommand） */
+  const copyText = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      /* 落入下方回退 */
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  };
+
+  /** 【APP49 任务5】复制诊断报告：诊断摘要 + 最近 100 条日志写入剪贴板 */
+  const handleCopyDiag = async () => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const lines: string[] = [t("logs.diagHeader"), t("logs.exportTime", { time: ts }), ""];
+    for (const [k, v] of diagLines) lines.push(`${k}: ${v}`);
+    lines.push("", `------ ${t("logs.title")} ------`);
+    for (const e of entries.slice(-100)) {
+      lines.push(`[${e.timestamp}][${e.level}][${e.module}] ${e.message}`);
+    }
+    const ok = await copyText(lines.join("\n"));
+    if (ok) toast.success(t("logs.diagCopied"));
+    else toast.error(t("logs.diagCopyFailed"));
+  };
+
   /** 【IPA9 任务1.2】清空日志：调用后端 clear_app_logs 后立即把前端
    *  列表置空、容量归零，避免轮询把旧日志又拉回来（后端 LAST_CLEARED
    *  机制会过滤外部文件中的旧内容）。 */
@@ -244,9 +404,39 @@ export default function LogViewerModal({
           </div>
         </div>
 
-        {/* 模块筛选标签栏：flex-wrap 自动换行，最右侧标签不被截断 */}
+        {/* 【APP49 任务5】诊断摘要卡 */}
+        <div className="shrink-0 border-b border-border px-3 py-2">
+          <div className="rounded-xl border border-border bg-surface-card px-3 py-2">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="flex items-center gap-1.5 text-[11px] font-semibold text-gray-300">
+                <Activity size={12} className="text-accent" />
+                {t("logs.diagTitle")}
+              </span>
+              <button
+                onClick={() => void handleCopyDiag()}
+                className="flex items-center gap-1 rounded-md bg-accent/15 px-2 py-0.5 text-[11px] text-accent transition-colors hover:bg-accent/25"
+              >
+                <ClipboardCopy size={11} />
+                {t("logs.copyDiag")}
+              </button>
+            </div>
+            <div className="grid grid-cols-1 gap-x-3 gap-y-1 text-[11px] sm:grid-cols-2">
+              {diagLines.map(([k, v]) => (
+                <div key={k} className="flex items-baseline gap-1.5">
+                  <span className="shrink-0 text-gray-500">{k}</span>
+                  <span className="min-w-0 truncate font-mono text-gray-300" title={v}>
+                    {v}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* 分类筛选 chips（全部/内核/Go Lan/Go AIM/订阅/仅看异常）：
+            flex-wrap 自动换行，最右侧标签不被截断 */}
         <div className="flex shrink-0 flex-wrap gap-1.5 border-b border-border px-3 py-2 text-xs">
-          {MODULE_TABS.map((tab) => (
+          {CATEGORY_TABS.map((tab) => (
             <button
               key={tab.key}
               onClick={() => setActiveModule(tab.value)}
@@ -267,12 +457,12 @@ export default function LogViewerModal({
           ref={listRef}
           className="flex-1 space-y-1.5 overflow-y-auto bg-black/40 px-3 py-2"
         >
-          {entries.length === 0 ? (
+          {visibleEntries.length === 0 ? (
             <div className="py-10 text-center text-gray-500">
               {loading ? t("logs.loading") : t("logs.empty")}
             </div>
           ) : (
-            entries.map((e) => {
+            visibleEntries.map((e) => {
               const msg =
                 e.module === "Kernel" ? stripKernelHeader(e.message) : e.message;
               // 时间戳只显示时分秒毫秒（去掉日期前缀）

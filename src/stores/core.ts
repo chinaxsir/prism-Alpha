@@ -12,6 +12,52 @@ export type CoreStatus = "stopped" | "starting" | "running" | "stopping" | "erro
 export type RunMode = "systemProxy" | "tun";
 export type OutboundMode = "rule" | "global" | "direct";
 
+/** 主题偏好（跟随系统 / 深色 / 浅色） */
+export type ThemeSetting = "system" | "dark" | "light";
+
+/** 【APP49 任务5】统一主题应用入口：解析 system 偏好并把结果写入 DOM
+ * （dark/light class 与 data-theme 属性），供 App 挂载、系统深浅色变化、
+ * visibilitychange / window focus 时 0 延迟跟随调用。 */
+export function applyThemeToDom(themeSetting: ThemeSetting): "dark" | "light" {
+  let resolved: "dark" | "light";
+  if (themeSetting === "dark" || themeSetting === "light") {
+    resolved = themeSetting;
+  } else {
+    try {
+      resolved = window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+    } catch {
+      resolved = "dark";
+    }
+  }
+  const root = document.documentElement;
+  root.classList.toggle("dark", resolved === "dark");
+  root.classList.toggle("light", resolved === "light");
+  root.setAttribute("data-theme", resolved);
+  // CSS color-scheme：浏览器原生控件（滚动条/表单）+ WebView 状态栏适配
+  root.style.colorScheme = resolved;
+  // <meta name="theme-color">：PWA/WebView 状态栏底色
+  const bg = resolved === "dark" ? "#0B0D13" : "#F4F5F9";
+  let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+  if (!meta) {
+    meta = document.createElement("meta");
+    meta.setAttribute("name", "theme-color");
+    document.head.appendChild(meta);
+  }
+  meta.setAttribute("content", bg);
+  return resolved;
+}
+
+/** 【APP49 任务5】系统语言解析：优先 navigator.languages[0]，zh 开头为中文 */
+export function resolveSystemLanguage(): "zh" | "en" {
+  const nav =
+    typeof navigator !== "undefined"
+      ? navigator.languages?.[0] || navigator.language || ""
+      : "";
+  return nav.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
 export interface UserSettings {
   mixedPort: number;
   allowLan: boolean;
@@ -31,6 +77,10 @@ export interface UserSettings {
   language?: Language;
   /** 外观：跟随系统 / 深色 / 浅色 */
   theme?: ThemePref;
+  /** 【APP49】启动时自动更新全部订阅（每天一次） */
+  autoUpdateSubsDaily?: boolean;
+  /** 最近一次自动更新成功的日期戳（后端维护） */
+  lastAutoUpdateSubsDate?: string;
 }
 
 export interface TrafficPoint {
@@ -74,6 +124,8 @@ export interface AnalyticsSummary {
   ips: Array<[string, AggStat]>;
   outbounds: Array<[string, AggStat]>;
   rules: Array<[string, AggStat]>;
+  /** 【APP49 任务4】按传输协议聚合（TCP / UDP） */
+  protocols: Array<[string, AggStat]>;
 }
 
 /** 【APP35 任务3】常见公共 IP 的域名兜底映射（无连接元数据时也能显示域名） */
@@ -205,7 +257,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   traffic: [],
   todayBytes: 0,
   connections: [],
-  analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [] },
+  analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [], protocols: [] },
   ipToDomain: { ...BUILTIN_IP_DOMAIN },
   domainToIp: {},
   sessionTraffic: 0,
@@ -290,7 +342,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       memoryUsage: 0,
       startedAtMs: null,
       connections: [],
-      analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [] },
+      analytics: { hosts: [], domains: [], ips: [], outbounds: [], rules: [], protocols: [] },
       sessionTraffic: 0,
     }),
 

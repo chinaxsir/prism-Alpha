@@ -7,6 +7,7 @@ import {
   listSubscriptions,
   renameSubscription,
   toggleSubscription,
+  updateAllSubscriptions,
   updateSubscription,
   type SubscriptionRecord,
 } from "@/api/ipc";
@@ -44,6 +45,8 @@ export default function Subscription() {
   const [name, setName] = useState("");
   const [adding, setAdding] = useState(false);
   const [updatingUrl, setUpdatingUrl] = useState<string | null>(null);
+  /// 【APP49 任务2.2】「全部更新」进行中标记
+  const [updatingAll, setUpdatingAll] = useState(false);
   // 【APP47 任务2.2】订阅操作错误：文档流内联高对比横幅（不再用悬浮 Toast
   // 遮挡下方「添加并更新」按钮，且浅色外观下为深红字/浅红底，绝不白底白字）
   const [actionError, setActionError] = useState<string | null>(null);
@@ -117,6 +120,23 @@ export default function Subscription() {
     } catch (e) {
       console.error("rename subscription failed:", e);
       toast.error(String(e));
+    }
+  };
+
+  /// 【APP49 任务2.2】一键更新全部已启用订阅
+  const handleUpdateAll = async () => {
+    if (updatingAll) return;
+    setUpdatingAll(true);
+    setActionError(null);
+    try {
+      await updateAllSubscriptions();
+      toast.success(t("sub.allUpdated"));
+      await load();
+    } catch (e) {
+      console.error("update all subscriptions failed:", e);
+      setActionError(String(e));
+    } finally {
+      setUpdatingAll(false);
     }
   };
 
@@ -214,9 +234,26 @@ export default function Subscription() {
 
       {/* 订阅列表 */}
       <div className="bg-surface-card rounded-xl p-5">
-        <h2 className="text-[16px] font-bold text-text mb-4">
-          {t("sub.myList", { count: subs.length })}
-        </h2>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h2 className="text-[16px] font-bold text-text">
+            {t("sub.myList", { count: subs.length })}
+          </h2>
+          {/* 【APP49 任务2.2】一键更新全部已启用订阅（多 UA + 本地代理/DoH 通道） */}
+          {subs.length > 0 && (
+            <button
+              onClick={handleUpdateAll}
+              disabled={updatingAll}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-surface-hover px-3 py-1.5 text-[13px] font-semibold text-text transition-colors hover:bg-accent/10 hover:text-accent disabled:opacity-50"
+            >
+              {updatingAll ? (
+                <Spinner size={12} />
+              ) : (
+                <RefreshCw size={13} />
+              )}
+              {updatingAll ? t("sub.updatingAll") : t("sub.updateAll")}
+            </button>
+          )}
+        </div>
 
         {loading ? (
           <div className="flex justify-center py-10">

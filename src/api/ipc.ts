@@ -55,6 +55,10 @@ export const selectProxy = (group: string, name: string) =>
 export const updateSubscription = (url: string, name?: string | null) =>
   invoke("update_subscription", { url, name: name ?? null });
 
+/** 【APP49 任务2.2】一键更新全部已启用订阅 */
+export const updateAllSubscriptions = () =>
+  invoke<void>("update_all_subscriptions");
+
 /** 【APP42 任务2.1】重命名订阅备注（本地立即生效，Pro 用户静默上行云端） */
 export const renameSubscription = (url: string, name: string) =>
   invoke<void>("rename_subscription", { url, name });
@@ -153,6 +157,10 @@ export const closeConnection = (id: string) =>
 
 export const closeAllConnections = () =>
   invoke<void>("close_all_connections");
+
+/** 【APP49 任务4】清空分析聚合统计（分析页「清空统计」按钮） */
+export const resetAnalyticsStats = () =>
+  invoke<void>("reset_analytics_stats");
 export const getRules = () => invoke("get_rules");
 export const getProxyGroups = () => invoke("get_proxy_groups");
 

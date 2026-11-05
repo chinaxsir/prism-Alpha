@@ -118,6 +118,12 @@ pub struct UserSettings {
     /// 界面主题（system | dark | light；随设置表单一起落盘）
     #[serde(default = "default_system")]
     pub theme: String,
+    /// 【APP49 任务2.2】启动时自动更新全部订阅（每天一次，默认开启）。
+    #[serde(default = "default_true")]
+    pub auto_update_subs_daily: bool,
+    /// 最近一次自动更新成功执行的日期（YYYY-MM-DD），用于「每天仅一次」。
+    #[serde(default)]
+    pub last_auto_update_subs_date: String,
 }
 
 /// language / theme 等枚举字符串字段缺失时的兜底默认值
@@ -152,6 +158,8 @@ impl Default for UserSettings {
             selected_node: None,
             language: "system".to_string(),
             theme: "system".to_string(),
+            auto_update_subs_daily: true,
+            last_auto_update_subs_date: String::new(),
         }
     }
 }
@@ -221,6 +229,10 @@ pub struct AnalyticsAgg {
     /// 【APP39 任务3】IP → 域名 反向缓存（由 metadata.host 实时填充），
     /// 供后续同一 IP 的无域名连接补齐域名
     pub ip_to_domain: HashMap<String, String>,
+    /// 【APP49 任务4】按传输协议聚合（TCP / UDP，源自 metadata.network）。
+    /// 聚合结构无磁盘缓存，新增字段天然兼容旧数据（启动即空表）
+    #[serde(default)]
+    pub protocols: HashMap<String, AggStat>,
 }
 
 /// 跨 IPC 共享的全局状态
@@ -443,7 +455,23 @@ impl AppState {
         agg.ip_to_domain.clear();
         agg.outbounds.clear();
         agg.rules.clear();
+        agg.protocols.clear();
         agg.last_seen.clear();
+    }
+
+    /// 【APP49 任务4】清空分析聚合（分析页「清空统计」按钮）。
+    /// 与 reset_runtime_stats 不同：保留 last_seen 增量基准，
+    /// 避免清空后仍活跃的连接在下一帧被当作新连接重复 count+1；
+    /// 流量曲线 / 连接池不动。前端经运行时快照轮询拿到清空后的数据。
+    pub fn reset_analytics(&self) {
+        let mut agg = self.analytics.write();
+        agg.hosts.clear();
+        agg.domains.clear();
+        agg.ips.clear();
+        agg.ip_to_domain.clear();
+        agg.outbounds.clear();
+        agg.rules.clear();
+        agg.protocols.clear();
     }
 
     /// 构造运行时统计快照（供 get_runtime_snapshot IPC 返回）。
@@ -513,6 +541,8 @@ impl AppState {
             "ips": top8(&agg.ips),
             "outbounds": top8(&agg.outbounds),
             "rules": top8(&agg.rules),
+            // 【APP49 任务4】TCP / UDP 协议维度聚合（camelCase 序列化）
+            "protocols": top8(&agg.protocols),
         });
         drop(agg);
 

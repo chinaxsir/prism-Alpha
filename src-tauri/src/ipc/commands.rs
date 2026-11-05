@@ -1040,8 +1040,11 @@ pub async fn set_outbound_mode(
         api.patch_mode(mode_str)
             .await
             .map_err(|e| format!("热切换出站模式失败: {}", sanitize_err(&e.to_string())))?;
-        // 旧连接继续走旧出口直至自然结束，主动清理保证立即按新模式路由
-        let _ = api.close_all_connections().await;
+        // 【APP49 任务1】仅在「切换策略时关闭连接」开启时清理旧连接；
+        // 内核始终保持运行（VPN 不断开、计时器不重置、Go Lan 不受影响）
+        if state.settings.read().close_connections_on_switch {
+            let _ = api.close_all_connections().await;
+        }
         use tauri::Emitter;
         let _ = app.emit("outbound-mode://changed", mode_str);
     }
@@ -1189,6 +1192,42 @@ pub async fn update_subscription(
         super::super::core::sync_links::push_link(&app2, &url2, name2).await;
     });
     Ok(())
+}
+
+/// 【APP49 任务2.2】「全部更新」按钮：一键拉取全部已启用订阅。
+/// 逐条顺序执行（复用 refresh_subscription 的多 UA/代理/DoH 通道），
+/// 全部完成后广播 subscriptions://changed 刷新列表；全部失败才报错。
+#[tauri::command]
+pub async fn update_all_subscriptions(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let urls: Vec<String> = crate::core::store::load_subscriptions(&state.data_dir)
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.url)
+        .collect();
+    if urls.is_empty() {
+        return Err("暂无可更新的订阅".to_string());
+    }
+    let mut ok = 0usize;
+    let mut last_err = String::new();
+    for url in &urls {
+        match refresh_subscription(&app, &state, url).await {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                tracing::warn!("[SubUpdateAll] 更新失败 {url}: {e}");
+                last_err = e;
+            }
+        }
+    }
+    use tauri::Emitter;
+    let _ = app.emit("subscriptions://changed", ());
+    if ok == 0 {
+        Err(format!("全部更新失败：{last_err}"))
+    } else {
+        Ok(())
+    }
 }
 
 /// 【APP42 任务2.1】重命名订阅备注（本地优先：立即落盘 + 广播事件；
@@ -1609,12 +1648,66 @@ async fn fetch_remote_text(
                 }
             }
         }
+    }
+
+    // ---- 【APP49 任务2.1 通道B】DoH 防污染：直连（与本地代理）均失败时，
+    // 通过阿里/腾讯/Cloudflare DoH 解析订阅域名真实 IP，`.resolve` 固定解析
+    // 直连拉取（绕过运营商 DNS 污染，SNI/证书链不受影响）----
+    if let Ok(parsed) = reqwest::Url::parse(&url) {
+        if let Some(host) = parsed.host_str() {
+            let ips = crate::core::license::doh_resolve_ips(host).await;
+            if !ips.is_empty() {
+                let port = parsed
+                    .port()
+                    .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+                'doh: for ip in ips.iter().take(3) {
+                    for ua in &uas {
+                        let client = match reqwest::Client::builder()
+                            .http1_only()
+                            .user_agent(*ua)
+                            .timeout(SUBSCRIPTION_TIMEOUT)
+                            .connect_timeout(std::time::Duration::from_secs(8))
+                            .danger_accept_invalid_certs(true)
+                            .redirect(reqwest::redirect::Policy::limited(5))
+                            .no_proxy()
+                            .resolve(host, std::net::SocketAddr::new(*ip, port))
+                            .build()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                last_err = format!("创建 HTTP 客户端失败: {e}");
+                                continue;
+                            }
+                        };
+                        match try_fetch_text(&client, &url).await {
+                            Ok((text, quota)) => {
+                                tracing::info!(
+                                    "fetch remote text succeeded via DoH-pinned {host}->{ip}"
+                                );
+                                return Ok((text, quota));
+                            }
+                            Err(e) => {
+                                last_err = e;
+                                tracing::warn!("fetch via DoH-pinned {ip} failed: {last_err}");
+                            }
+                        }
+                    }
+                    // 首个 IP 全部 UA 失败再试下一个 IP，最多 3 个
+                    if last_err.is_empty() {
+                        break 'doh;
+                    }
+                }
+            }
+        }
+    }
+
+    if local_proxy.is_some() {
         Err(format!(
-            "下载失败：{last_err}（直连与本地代理转发均已尝试，请检查节点可用性后重试）"
+            "下载失败：{last_err}（直连、本地代理转发与 DoH 防污染通道均已尝试，请检查节点可用性后重试）"
         ))
     } else {
         Err(format!(
-            "下载失败：{last_err}（已尝试多 UA 与 IPv4 直连；若机器处于受限网络，请先启动内核再更新订阅）"
+            "下载失败：{last_err}（已尝试多 UA/IPv4 直连与 DoH 防污染解析；若机器处于受限网络，请先启动内核再更新订阅）"
         ))
     }
 }
@@ -1815,6 +1908,50 @@ pub struct SubscriptionDto {
     pub download_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub expire_at: Option<u64>,
+}
+
+/// 【APP49 任务2.2】启动时自动更新全部已启用订阅：默认开启，每天仅一次
+/// （上次成功日期 < 今天才执行），避免多设备订阅同步风暴。
+/// 更新完成后广播 subscriptions://changed 让列表页实时刷新。
+pub async fn auto_update_subscriptions_daily(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let (enabled, last_day) = {
+        let s = state.settings.read();
+        (
+            s.auto_update_subs_daily,
+            s.last_auto_update_subs_date.clone(),
+        )
+    };
+    if !enabled {
+        return;
+    }
+    let today = (crate::core::license::now_unix().max(0) / 86_400) as u64;
+    if last_day.parse::<u64>().ok() == Some(today) {
+        return;
+    }
+    let urls: Vec<String> = crate::core::store::load_subscriptions(&state.data_dir)
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.url)
+        .collect();
+    if urls.is_empty() {
+        return;
+    }
+    tracing::info!("[AutoUpdate] 每日自动更新 {} 条订阅", urls.len());
+    for url in &urls {
+        if let Err(e) = refresh_subscription(&app, &state, url).await {
+            tracing::warn!("[AutoUpdate] 更新失败 {url}: {e}");
+        }
+    }
+    // 无论个别订阅失败与否都记录当天日期：失败走下次启动重试，
+    // 避免「某条订阅永久 404」导致每次启动都全量拉一轮。
+    let mut settings = state.settings.read().clone();
+    settings.last_auto_update_subs_date = today.to_string();
+    if let Err(e) = state.save_settings(settings) {
+        tracing::warn!("[AutoUpdate] 记录更新日期失败: {e}");
+    }
+    use tauri::Emitter;
+    let _ = app.emit("subscriptions://changed", ());
 }
 
 /// 获取已保存的订阅记录（订阅页展示）
@@ -2637,6 +2774,16 @@ pub async fn close_all_connections(state: State<'_, AppState>) -> Result<(), Str
         .map_err(|e| sanitize_err(&e.to_string()))
 }
 
+/// 【APP49 任务4】清空分析聚合统计（分析页「清空统计」按钮）。
+/// 聚合仅存于内存（AppState.analytics，无磁盘缓存），清空后前端经
+/// get_runtime_snapshot 轮询自动拿到空数据；保留 last_seen 增量基准，
+/// 避免仍活跃的连接被重复计数。
+#[tauri::command]
+pub async fn reset_analytics_stats(state: State<'_, AppState>) -> Result<(), String> {
+    state.reset_analytics();
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_traffic_stats(
     state: State<'_, AppState>,
@@ -2834,14 +2981,29 @@ pub async fn save_settings(
 
     // 影响入站/系统代理/出站结构的字段变更必须重建配置才能真实生效，
     // 否则系统代理指向旧端口、内核监听旧端口，显示与实际脱节
+    // 【APP49 任务1】outbound_mode 不再触发重启：改走 Clash API PATCH 热切换
     let needs_restart = prev.mixed_port != next.mixed_port
         || prev.allow_lan != next.allow_lan
         || prev.system_proxy != next.system_proxy
-        || prev.outbound_mode != next.outbound_mode
         || prev.ipv6 != next.ipv6
         || prev.block_quic != next.block_quic;
     if needs_restart && *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
+    }
+    // 出站模式变化时热切换（与 set_outbound_mode 一致：内核不重启，
+    // 仅按用户设置决定是否清理旧连接）
+    if prev.outbound_mode != next.outbound_mode
+        && *state.status.read() == CoreStatus::Running
+    {
+        let mode_str = match next.outbound_mode {
+            crate::core::state::OutboundMode::Rule => "rule",
+            crate::core::state::OutboundMode::Global => "global",
+            crate::core::state::OutboundMode::Direct => "direct",
+        };
+        let api = state.kernel_api();
+        if api.patch_mode(mode_str).await.is_ok() && next.close_connections_on_switch {
+            let _ = api.close_all_connections().await;
+        }
     }
     // 【APP-11 任务3】保存后广播最新设置，前端所有页面（仪表盘/设置）实时同步
     let _ = app.emit(

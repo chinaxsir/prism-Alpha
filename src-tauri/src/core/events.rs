@@ -274,6 +274,23 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
             accumulate(&mut agg.outbounds, outbound_key, inc_up, inc_down, is_new);
             accumulate(&mut agg.rules, rule_key, inc_up, inc_down, is_new);
 
+            // 【APP49 任务4】按传输协议（metadata.network）分别计数，
+            // 归一为大写 TCP / UDP；未知协议不入聚合
+            let proto_key = match conn.network.to_ascii_lowercase().as_str() {
+                "tcp" => "TCP",
+                "udp" => "UDP",
+                _ => "",
+            };
+            if !proto_key.is_empty() {
+                accumulate(
+                    &mut agg.protocols,
+                    proto_key.to_string(),
+                    inc_up,
+                    inc_down,
+                    is_new,
+                );
+            }
+
             // 【APP39 任务3】域名 / IP 双聚合 + IP→域名 反向缓存：
             // 1) host 为真实域名时立刻写入缓存，后续同 IP 无域名连接可补齐；
             // 2) ips 严格按目标 IP（纯 IP，绝不混入域名）；

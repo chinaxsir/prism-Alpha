@@ -3,7 +3,7 @@ const zh: Record<string, string> = {
   "settings.title": "设置",
 
   // ---- 外观与语言 ----
-  "settings.appearance": "外观与语言",
+  "settings.appearance": "外观语言",
   "settings.appearanceDesc": "界面语言与深浅色外观，可跟随系统自动切换",
   "settings.language": "语言",
   "settings.language.system": "跟随系统",

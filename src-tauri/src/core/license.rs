@@ -656,6 +656,16 @@ fn collect_ipv4_from_json(v: &Value, out: &mut Vec<IpAddr>) {
 /// prism.sarl 的真实公网 IP。客户端用 `.resolve(host, IP)` 固定解析结果，
 /// 既能绕过运营商 DNS 污染，又不破坏 HTTPS 证书链（SNI 仍为 DoH 主机名）。
 pub async fn doh_resolve_prism_ips() -> Vec<IpAddr> {
+    let ips = doh_resolve_ips(PRISM_HOST).await;
+    for addr in &ips {
+        remember_stealth_ip(&addr.to_string());
+    }
+    ips
+}
+
+/// 【APP49 任务2.1 通道B】通用 DoH 解析：对任意主机名经阿里/腾讯/
+/// Cloudflare 三家 DoH 取真实 IPv4（供订阅下载等场景绕过 DNS 污染）。
+pub async fn doh_resolve_ips(target_host: &str) -> Vec<IpAddr> {
     // (DoH 主机名, 其公网 IP, 路径)
     const PROVIDERS: [(&str, &str, &str); 3] = [
         ("dns.alidns.com", "223.5.5.5", "/resolve"),
@@ -676,7 +686,7 @@ pub async fn doh_resolve_prism_ips() -> Vec<IpAddr> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let url = format!("https://{host}{path}?name={PRISM_HOST}&type=A");
+        let url = format!("https://{host}{path}?name={target_host}&type=A");
         let resp = client
             .get(&url)
             .header("accept", "application/dns-json")
@@ -692,7 +702,6 @@ pub async fn doh_resolve_prism_ips() -> Vec<IpAddr> {
         let mut ips = Vec::new();
         collect_ipv4_from_json(&body, &mut ips);
         for addr in ips {
-            remember_stealth_ip(&addr.to_string());
             if !found.contains(&addr) {
                 found.push(addr);
             }

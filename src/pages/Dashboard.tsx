@@ -36,6 +36,7 @@ import {
 import { useCoreStore, type RunMode, isDummyNodeName } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { useTranslation } from "@/i18n";
+import { useAppVisible } from "@/hooks/useAppVisible";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
 import { toast } from "@/components/ui/Toast";
@@ -97,7 +98,13 @@ export default function Dashboard() {
   const [lanState, setLanState] = useState<GoLanStatus | null>(null);
 
   const running = status === "running";
+  const outboundMode = useCoreStore((s) => s.outboundMode);
   const modeLabel = (m: RunMode) => t(m === "tun" ? "runMode.tun" : "runMode.systemProxy");
+  // 【APP49 任务1】副标题动态显示组合状态：运行模式 · TUN 规则/全局/直连
+  const modeCombo =
+    mode === "tun"
+      ? `${modeLabel(mode)} ${t(`outbound.${outboundMode}`)}`
+      : modeLabel(mode);
 
   // 拉取主选择组与当前节点（内核运行时才有实时数据）
   const loadCurrentNode = async () => {
@@ -179,32 +186,17 @@ export default function Dashboard() {
   // nowMs 本地时钟，以 250ms 轻量间隔刷新，时长 = (nowMs - startedAtMs)
   // 差值实时计算；亮屏/回前台第一帧由下方唤醒监听 0ms 校准
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // 【APP49 任务6】App 前台可见性：后台时所有定时器暂停清理
+  const appVisible = useAppVisible();
 
   useEffect(() => {
-    if (!running) return;
-    let timer: number | undefined;
-    // 【APP-3】后台（锁屏/切 App）停掉 250ms 时钟：不再每秒 4 次唤醒 JS 线程，
-    // 回前台由下方 syncClockImmediately 立即校准，时长显示无跳变
-    const start = () => {
-      if (timer !== undefined) return;
-      setNowMs(Date.now());
-      timer = window.setInterval(() => setNowMs(Date.now()), 250);
-    };
-    const stop = () => {
-      if (timer !== undefined) {
-        window.clearInterval(timer);
-        timer = undefined;
-      }
-    };
-    const sync = () =>
-      document.visibilityState === "visible" ? start() : stop();
-    sync();
-    document.addEventListener("visibilitychange", sync);
-    return () => {
-      stop();
-      document.removeEventListener("visibilitychange", sync);
-    };
-  }, [running]);
+    // 【APP-3 / APP49 任务6】后台（锁屏/切 App）停掉 250ms 时钟：清理 interval
+    // 不再每秒 4 次唤醒 JS 线程；回前台立即校准一次再恢复定时，时长无跳变
+    if (!running || !appVisible) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [running, appVisible]);
 
   // 关键唤醒监听（IPA-12）：亮屏/回前台瞬间第 1 步 0ms 刷新本地时钟
   // （时长立刻跳到准确值，不等任何异步请求），第 2 步后台静默拉取
@@ -240,11 +232,13 @@ export default function Dashboard() {
   }, []);
 
   // 【APP26 任务2.2】启动期间 250ms 快速轮询：iOS 隧道通常约 1.5s 建好，
-  // 若后端状态事件滞后，界面也能立即切到「已连接」，不必等默认轮询周期
+  // 若后端状态事件滞后，界面也能立即切到「已连接」，不必等默认轮询周期；
+  // 【APP49 任务6】后台时清理定时器，回前台立即补拉一次再恢复
   useEffect(() => {
-    if (status !== "starting") return;
+    if (status !== "starting" || !appVisible) return;
     let stopped = false;
-    const timer = window.setInterval(() => {
+    let timer: number | undefined;
+    const poll = () => {
       getCoreStatus()
         .then((data) => {
           if (stopped || data.status === "starting") return;
@@ -259,15 +253,17 @@ export default function Dashboard() {
           });
           if (data.outboundMode) store.setOutboundMode(data.outboundMode);
           stopped = true;
-          window.clearInterval(timer);
+          if (timer !== undefined) window.clearInterval(timer);
         })
         .catch(() => undefined);
-    }, 250);
+    };
+    poll();
+    timer = window.setInterval(poll, 250);
     return () => {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [status]);
+  }, [status, appVisible]);
 
   // 实时展示的已连接秒数：固定公式 nowMs - startedAtMs 差值（IPA-12）；
   // 基准尚未就绪时回退 store 内 uptimeSecs（启动事件与首次拉取的间隙）
@@ -529,7 +525,7 @@ export default function Dashboard() {
                 仅「已连接」显示计时器时，下方才显示运行模式。 */}
             {running ? (
               <div className="text-xs text-gray-500 mt-1">
-                {t("dashboard.runModeLabel", { mode: modeLabel(mode) })}
+                {t("dashboard.runModeLabel", { mode: modeCombo })}
               </div>
             ) : null}
           </div>
