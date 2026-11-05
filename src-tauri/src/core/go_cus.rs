@@ -1504,4 +1504,86 @@ tracker.bad.com = 0.0.0.0
         assert!(text.contains("com.apple.security.root"));
         assert!(text.contains("PayloadContent"));
     }
+
+    /// 【APP50 任务5】官方一键模板（前端 GoCus.tsx CUS_TEMPLATES 的等价内容）：
+    /// 去广告 → block、AI/流媒体 → PROXY 占位（由 config_builder 归一为主策略组）、
+    /// 国内加速 → direct，且均以 domain_suffix 规则形式编译输出。
+    #[test]
+    fn test_official_templates_compile_to_expected_rules() {
+        // (模板 key, 代表性规则行, 期望编译出的域名, 期望 outbound)
+        let cases: [(&str, &str, &str, &str); 4] = [
+            (
+                "adblock",
+                "DOMAIN-SUFFIX,doubleclick.net,REJECT",
+                "doubleclick.net",
+                "block",
+            ),
+            ("ai", "DOMAIN-SUFFIX,openai.com,PROXY", "openai.com", "PROXY"),
+            ("media", "DOMAIN-SUFFIX,netflix.com,PROXY", "netflix.com", "PROXY"),
+            (
+                "cnDirect",
+                "DOMAIN-SUFFIX,taobao.com,DIRECT",
+                "taobao.com",
+                "direct",
+            ),
+        ];
+        for (key, rule_line, expect_domain, expect_outbound) in cases {
+            let raw = format!("#!name={key}\n#!desc=官方模板\n[Rule]\n{rule_line}\n");
+            let parsed = parse_universal_module(&raw);
+            assert_eq!(parsed.rules.len(), 1, "{key} 模板应解析出 1 条规则");
+            let mut settings = GoCusSettings {
+                enabled: true,
+                ..Default::default()
+            };
+            settings.modules.push(CusModule {
+                id: key.to_string(),
+                name: key.to_string(),
+                desc: None,
+                source: format!("builtin://{key}"),
+                raw_content: raw,
+                enabled: true,
+                stats: parsed.stats(),
+                updated_at: 0,
+            });
+            let compiled = compile(&settings, "PROXY");
+            let hit = compiled.rules.iter().any(|r| {
+                r.get("outbound").and_then(Value::as_str) == Some(expect_outbound)
+                    && r
+                        .get("domain_suffix")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().any(|d| d.as_str() == Some(expect_domain)))
+                        .unwrap_or(false)
+            });
+            assert!(
+                hit,
+                "{key} 模板应编译出 domain_suffix[{expect_domain}] → {expect_outbound} 规则: {:?}",
+                compiled.rules
+            );
+        }
+        // 隐私头净化模板：$(remove-X-Forwarded-For) 改写 → 目标域名进边车集合
+        let raw = "#!name=privacy\n[URL Rewrite]\n^https?://([^/]*\\.)?google\\.com/ url request-header $(remove-X-Forwarded-For)\n";
+        let parsed = parse_universal_module(raw);
+        assert_eq!(parsed.rewrites.len(), 1, "隐私模板应解析出 1 条改写");
+        assert_eq!(parsed.rewrites[0].action, "header");
+        let mut settings = GoCusSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        settings.modules.push(CusModule {
+            id: "privacy".into(),
+            name: "privacy".into(),
+            desc: None,
+            source: "builtin://privacy".into(),
+            raw_content: raw.into(),
+            enabled: true,
+            stats: parsed.stats(),
+            updated_at: 0,
+        });
+        let compiled = compile(&settings, "PROXY");
+        assert!(
+            compiled.sidecar_domains.contains(&"google.com".to_string()),
+            "隐私模板的 header 改写域名必须进入边车集合: {:?}",
+            compiled.sidecar_domains
+        );
+    }
 }

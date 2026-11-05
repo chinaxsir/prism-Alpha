@@ -58,6 +58,139 @@ const REWRITE_ACTIONS = new Set([
   "response-header",
 ]);
 
+// ============================== 【APP50 任务5】官方精选一键模板库 ==============================
+
+/** 模板定义：content 为标准 sgmodule（#!name/#!desc + [Rule]/[URL Rewrite]）。
+ *  导入走后端 import_go_cus_module：本地内容直接解析、按内容去重（重复导入
+ *  为更新而非重复新增）、首个模块导入自动开启引擎、VPN 运行中自动热重载。 */
+interface CusTemplate {
+  key: string;
+  nameKey: string;
+  descKey: string;
+  content: string;
+}
+
+const CUS_TEMPLATES: CusTemplate[] = [
+  {
+    key: "adblock",
+    nameKey: "proxies.goCus.tpl.adblock.name",
+    descKey: "proxies.goCus.tpl.adblock.desc",
+    content: `#!name=🛡️ 去广告净化
+#!desc=屏蔽主流广告/统计/埋点域名（谷歌/百度/腾讯/字节/快手/友盟等）
+[Rule]
+DOMAIN-SUFFIX,ad.com,REJECT
+DOMAIN-SUFFIX,ads.google.com,REJECT
+DOMAIN-SUFFIX,doubleclick.net,REJECT
+DOMAIN-SUFFIX,googlesyndication.com,REJECT
+DOMAIN-SUFFIX,google-analytics.com,REJECT
+DOMAIN-SUFFIX,hm.baidu.com,REJECT
+DOMAIN-SUFFIX,pos.baidu.com,REJECT
+DOMAIN-SUFFIX,cpro.baidu.com,REJECT
+DOMAIN-SUFFIX,e.qq.com,REJECT
+DOMAIN-SUFFIX,gdt.qq.com,REJECT
+DOMAIN-SUFFIX,bugly.qq.com,REJECT
+DOMAIN-SUFFIX,umeng.com,REJECT
+DOMAIN-SUFFIX,umengcloud.com,REJECT
+DOMAIN-SUFFIX,miaozhen.com,REJECT
+DOMAIN-SUFFIX,tanx.com,REJECT
+DOMAIN-SUFFIX,pangolin-sdk-toutiao.com,REJECT
+DOMAIN-SUFFIX,adkwai.com,REJECT
+DOMAIN-SUFFIX,app-measurement.com,REJECT`,
+  },
+  {
+    key: "ai",
+    nameKey: "proxies.goCus.tpl.ai.name",
+    descKey: "proxies.goCus.tpl.ai.desc",
+    content: `#!name=🤖 AI 服务分流
+#!desc=OpenAI/Claude/Gemini/Copilot/Cursor 等 AI 服务走代理
+[Rule]
+DOMAIN-SUFFIX,openai.com,PROXY
+DOMAIN-SUFFIX,chatgpt.com,PROXY
+DOMAIN-SUFFIX,oaistatic.com,PROXY
+DOMAIN-SUFFIX,oaiusercontent.com,PROXY
+DOMAIN-SUFFIX,anthropic.com,PROXY
+DOMAIN-SUFFIX,claude.ai,PROXY
+DOMAIN-SUFFIX,gemini.google.com,PROXY
+DOMAIN-SUFFIX,bard.google.com,PROXY
+DOMAIN-SUFFIX,generativelanguage.googleapis.com,PROXY
+DOMAIN-SUFFIX,perplexity.ai,PROXY
+DOMAIN-SUFFIX,cursor.sh,PROXY
+DOMAIN-SUFFIX,copilot.microsoft.com,PROXY
+DOMAIN-SUFFIX,grok.com,PROXY
+DOMAIN-SUFFIX,x.ai,PROXY`,
+  },
+  {
+    key: "media",
+    nameKey: "proxies.goCus.tpl.media.name",
+    descKey: "proxies.goCus.tpl.media.desc",
+    content: `#!name=🎬 流媒体解锁
+#!desc=Netflix/YouTube/Disney+/TikTok/Spotify/Twitch 等流媒体走代理
+[Rule]
+DOMAIN-SUFFIX,netflix.com,PROXY
+DOMAIN-SUFFIX,netflix.net,PROXY
+DOMAIN-SUFFIX,nflxvideo.net,PROXY
+DOMAIN-SUFFIX,nflximg.net,PROXY
+DOMAIN-SUFFIX,youtube.com,PROXY
+DOMAIN-SUFFIX,googlevideo.com,PROXY
+DOMAIN-SUFFIX,ytimg.com,PROXY
+DOMAIN-SUFFIX,disneyplus.com,PROXY
+DOMAIN-SUFFIX,bamgrid.com,PROXY
+DOMAIN-SUFFIX,tiktok.com,PROXY
+DOMAIN-SUFFIX,tiktokv.com,PROXY
+DOMAIN-SUFFIX,tiktokcdn.com,PROXY
+DOMAIN-SUFFIX,spotify.com,PROXY
+DOMAIN-SUFFIX,scdn.co,PROXY
+DOMAIN-SUFFIX,twitch.tv,PROXY
+DOMAIN-SUFFIX,hbomax.com,PROXY`,
+  },
+  {
+    key: "cnDirect",
+    nameKey: "proxies.goCus.tpl.cnDirect.name",
+    descKey: "proxies.goCus.tpl.cnDirect.desc",
+    content: `#!name=⚡ 国内直连加速
+#!desc=.cn 域名与国内主流站点、Apple/微软 CDN 直连
+[Rule]
+DOMAIN-SUFFIX,cn,DIRECT
+DOMAIN-SUFFIX,baidu.com,DIRECT
+DOMAIN-SUFFIX,qq.com,DIRECT
+DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+DOMAIN-SUFFIX,taobao.com,DIRECT
+DOMAIN-SUFFIX,tmall.com,DIRECT
+DOMAIN-SUFFIX,jd.com,DIRECT
+DOMAIN-SUFFIX,bilibili.com,DIRECT
+DOMAIN-SUFFIX,hdslb.com,DIRECT
+DOMAIN-SUFFIX,douyin.com,DIRECT
+DOMAIN-SUFFIX,163.com,DIRECT
+DOMAIN-SUFFIX,xiaomi.com,DIRECT
+DOMAIN-SUFFIX,icloud-content.com,DIRECT
+DOMAIN-SUFFIX,mzstatic.com,DIRECT
+DOMAIN-SUFFIX,akadns.net,DIRECT
+DOMAIN-SUFFIX,windowsupdate.com,DIRECT`,
+  },
+  {
+    key: "privacy",
+    nameKey: "proxies.goCus.tpl.privacy.name",
+    descKey: "proxies.goCus.tpl.privacy.desc",
+    content: `#!name=🧹 隐私头净化
+#!desc=对主流站点删除 X-Forwarded-For 追踪请求头（当前仅 HTTP 明文生效）
+# 注：QUIC(UDP/443) 降级需在系统防火墙层实现，sing-box 路由规则不承载；
+# HTTPS 请求的 CONNECT 隧道为端到端加密，请求头改写无法注入。
+[URL Rewrite]
+^https?://([^/]*\\.)?google\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?youtube\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?facebook\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?instagram\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?x\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?reddit\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?wikipedia\\.org/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?github\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?stackoverflow\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?amazon\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?bing\\.com/ url request-header $(remove-X-Forwarded-For)
+^https?://([^/]*\\.)?baidu\\.com/ url request-header $(remove-X-Forwarded-For)`,
+  },
+];
+
 function isRewriteSection(header: string): boolean {
   const h = header.trim().toLowerCase();
   return h === "[url rewrite]" || h === "[rewrite_local]" || h === "[rewrite]";
@@ -222,6 +355,11 @@ export default function GoCus() {
   // 模块导入
   const [source, setSource] = useState("");
   const [importing, setImporting] = useState(false);
+  // 【APP50 任务5】模板库一键导入的进行中标记（按模板 key）
+  const [importingTpl, setImportingTpl] = useState<string | null>(null);
+  // 【APP50 任务4】iOS WKWebView 静默拦截 window.confirm（恒返回 false），
+  // 模块删除改用「二次点击确认」（3s 自动复位）
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
   // CA
   const [ca, setCa] = useState<CaInfo | null>(null);
@@ -288,6 +426,21 @@ export default function GoCus() {
     }
   };
 
+  /** 【APP50 任务5】一键导入官方模板：后端自动开启引擎（首个模块）并在
+   *  VPN 运行中热重载；重复导入同一模板为更新（按内容去重） */
+  const importTemplate = async (tpl: CusTemplate) => {
+    setImportingTpl(tpl.key);
+    try {
+      const m = await importGoCusModule(tpl.content);
+      toast.success(t("proxies.goCus.importSuccess", { name: m.name }));
+      await reload();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setImportingTpl(null);
+    }
+  };
+
   const toggleModule = async (m: CusModule, enabled: boolean) => {
     if (!settings) return;
     const next: GoCusSettings = {
@@ -306,7 +459,16 @@ export default function GoCus() {
   };
 
   const removeModule = async (m: CusModule) => {
-    if (!window.confirm(t("proxies.goCus.deleteConfirm", { name: m.name }))) return;
+    // 【APP50 任务4】二次点击确认（iOS 无 window.confirm）
+    if (confirmingDeleteId !== m.id) {
+      setConfirmingDeleteId(m.id);
+      window.setTimeout(
+        () => setConfirmingDeleteId((cur) => (cur === m.id ? null : cur)),
+        3000,
+      );
+      return;
+    }
+    setConfirmingDeleteId(null);
     try {
       await deleteGoCusModule(m.id);
       toast.success(t("proxies.goCus.moduleDeleted"));
@@ -471,6 +633,45 @@ export default function GoCus() {
               </div>
             </div>
 
+            {/* 【APP50 任务5】官方精选一键模板库 */}
+            <div className="rounded-2xl border border-border bg-surface-card p-5">
+              <h3 className="mb-1 text-sm font-semibold text-gray-100">
+                {t("proxies.goCus.templateLibTitle")}
+              </h3>
+              <p className="mb-3 text-xs text-gray-500">
+                {t("proxies.goCus.templateLibDesc")}
+              </p>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {CUS_TEMPLATES.map((tpl) => (
+                  <div
+                    key={tpl.key}
+                    className="flex items-center justify-between gap-2 rounded-xl border border-border bg-surface-hover px-3 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-semibold text-gray-200">
+                        {t(tpl.nameKey)}
+                      </p>
+                      <p className="mt-0.5 line-clamp-2 text-[11px] leading-4 text-gray-500">
+                        {t(tpl.descKey)}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => void importTemplate(tpl)}
+                      disabled={importingTpl === tpl.key}
+                      className="flex shrink-0 items-center gap-1 rounded-lg bg-accent px-2.5 py-1.5 text-[11px] text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+                    >
+                      {importingTpl === tpl.key ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : (
+                        <Download size={12} />
+                      )}
+                      {t("proxies.goCus.templateImport")}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             {settings.modules.length === 0 ? (
               <div className="rounded-2xl border border-border bg-surface-card">
                 <EmptyState
@@ -528,8 +729,16 @@ export default function GoCus() {
                         />
                         <button
                           onClick={() => removeModule(m)}
-                          title={t("proxies.goCus.deleteModule")}
-                          className="p-1.5 text-gray-500 transition-colors hover:text-latency-bad"
+                          title={
+                            confirmingDeleteId === m.id
+                              ? t("proxies.goCus.confirmDeleteAgain")
+                              : t("proxies.goCus.deleteModule")
+                          }
+                          className={`rounded p-1.5 transition-colors ${
+                            confirmingDeleteId === m.id
+                              ? "bg-red-500/20 text-latency-bad ring-1 ring-red-500/40"
+                              : "text-gray-500 hover:text-latency-bad"
+                          }`}
                         >
                           <Trash2 size={15} />
                         </button>

@@ -2,6 +2,8 @@ node_modules/
 dist/
 .tools/
 src-tauri/target/
+# macOS 端交叉校验（fake-bin 桩工具链）独立 target 目录，严禁入库
+src-tauri/target-darwin/
 # License 服务端与 Cloudflare Worker 仅保留在本地，严禁同步到仓库
 license-server/
 license-worker/

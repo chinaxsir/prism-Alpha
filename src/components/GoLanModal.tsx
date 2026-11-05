@@ -377,6 +377,10 @@ export default function GoLanModal({ open, onClose }: Props) {
   const [probing, setProbing] = useState(false);
   const [probeMsg, setProbeMsg] = useState("");
   const [probeOk, setProbeOk] = useState<boolean | null>(null);
+  // 【APP50 任务2】iOS WKWebView 静默拦截 window.confirm（恒返回 false），
+  // 改用「二次点击确认」：第一次点击进入确认态（3s 自动复位），第二次才执行
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   // 【APP14 任务1】客户端私钥明文/密文切换，方便核对一键识别是否完整
   const [showPrivKey, setShowPrivKey] = useState(false);
 
@@ -427,14 +431,17 @@ export default function GoLanModal({ open, onClose }: Props) {
   };
 
   /** 【APP49 任务5】清空当前配置：只清空当前激活 Tab 档案的字段（保留档案
-   *  条目与名称，其他档案不动），并立即调用 save_go_lan_settings 落盘 */
+   *  条目与名称，其他档案不动），并立即调用 save_go_lan_settings 落盘。
+   *  【APP50 任务2】严禁 window.confirm（iOS WKWebView 静默返回 false） */
   const clearCurrentProfile = async () => {
-    if (!window.confirm(t("goLan.clearCurrentConfirm"))) return;
     const clearedForm: GoLanForm = {
       ...EMPTY_GO_LAN,
       id: form.id,
       name: form.name,
       enabled: false,
+      // 【APP50 任务2】清空即真正清空：隧道地址留空、MTU 回到运行时值 1380
+      wgLocalIp: "",
+      wgMtu: 1380,
       // 全局字段（局域网 DNS / 域名后缀 / 托管参数 / 模式）不属于单档案，保持原值
       mode: form.mode,
       lanDns: form.lanDns,
@@ -473,10 +480,13 @@ export default function GoLanModal({ open, onClose }: Props) {
       toast.success(t("goLan.cleared"));
     } catch (e) {
       toast.error(String(e));
+    } finally {
+      setConfirmingClear(false);
     }
   };
 
   const deleteProfile = () => {
+    setConfirmingDelete(false);
     if (profiles.length <= 1) {
       clearAllProfiles();
       return;
@@ -491,7 +501,7 @@ export default function GoLanModal({ open, onClose }: Props) {
   };
 
   const clearAllProfiles = async () => {
-    if (!window.confirm(t("goLan.clearAllConfirm"))) return;
+    // 【APP50 任务2】严禁 window.confirm（iOS WKWebView 静默返回 false）
     setProfiles([]);
     setActiveId("");
     setForm({ ...EMPTY_GO_LAN, id: "home", name: "家里", enabled: false });
@@ -668,19 +678,13 @@ export default function GoLanModal({ open, onClose }: Props) {
     }
   };
 
-  // 【APP40 任务1】精准 IP:端口 探测：前端先做格式校验，未输入端口且
-  // 无 http(s):// 前缀时直接内联提示，绝不发起无意义的全端口扫描。
+  // 【APP50 任务3】内网目标探测：支持纯 IP（默认测 http:80 / https:443）、
+  // IP:端口、域名:端口与 http(s):// 完整 URL，后端逐个尝试常用 Web 端口。
   const handleProbe = async () => {
     const target = form.probeTarget.trim();
     if (!target) return;
-    const hasScheme = /^https?:\/\//i.test(target);
-    const hostPart = target.replace(/^https?:\/\//i, "").split("/")[0];
-    const hasPort = /:\d+$/.test(hostPart) && !hostPart.startsWith(":");
-    if (!hasScheme && !hasPort) {
-      setProbeOk(false);
-      setProbeMsg(t("goLan.probeMissingPort"));
-      return;
-    }
+    // 【APP50 任务3】支持纯 IP（后端默认探测该 IP 的 http:80 / https:443）
+    // 与 IP:端口 / 域名:端口；不再前端强制要求端口号
     setProbing(true);
     setProbeOk(null);
     setProbeMsg(t("logs.probeRunning"));
@@ -810,11 +814,25 @@ export default function GoLanModal({ open, onClose }: Props) {
             <span className="text-[11px] font-medium text-gray-400">
               {t("goLan.profiles")}
             </span>
+            {/* 【APP50 任务2】二次点击确认（iOS WKWebView 无 window.confirm） */}
             <button
-              onClick={() => void clearCurrentProfile()}
-              className="rounded px-1.5 py-0.5 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
+              onClick={() => {
+                if (!confirmingClear) {
+                  setConfirmingClear(true);
+                  window.setTimeout(() => setConfirmingClear(false), 3000);
+                  return;
+                }
+                void clearCurrentProfile();
+              }}
+              className={`rounded px-1.5 py-0.5 text-[11px] transition-colors ${
+                confirmingClear
+                  ? "bg-red-500/20 font-bold text-red-400 ring-1 ring-red-500/40"
+                  : "text-red-400 hover:bg-red-500/10"
+              }`}
             >
-              {t("goLan.clearCurrent")}
+              {confirmingClear
+                ? t("goLan.confirmClearAgain")
+                : t("goLan.clearCurrent")}
             </button>
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
@@ -878,10 +896,22 @@ export default function GoLanModal({ open, onClose }: Props) {
               placeholder={t("goLan.profileNamePlaceholder")}
               className="min-w-0 flex-1 rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:border-accent focus:outline-none"
             />
+            {/* 【APP50 任务2】二次点击确认（iOS WKWebView 无 window.confirm） */}
             <button
-              onClick={deleteProfile}
+              onClick={() => {
+                if (!confirmingDelete) {
+                  setConfirmingDelete(true);
+                  window.setTimeout(() => setConfirmingDelete(false), 3000);
+                  return;
+                }
+                deleteProfile();
+              }}
               title={t("goLan.deleteProfile")}
-              className="flex shrink-0 items-center justify-center rounded-md border border-red-500/30 bg-red-500/10 px-2.5 text-red-400 transition-colors hover:bg-red-500/20"
+              className={`flex shrink-0 items-center justify-center rounded-md border px-2.5 transition-colors ${
+                confirmingDelete
+                  ? "border-red-400 bg-red-500/30 text-red-300"
+                  : "border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20"
+              }`}
             >
               <Trash2 size={14} />
             </button>
@@ -1115,16 +1145,19 @@ export default function GoLanModal({ open, onClose }: Props) {
           />
         </div>
 
-        {/* 【APP40 任务2】On-Demand 局域网直连 */}
-        <div className="rounded-lg border border-border bg-surface px-3 py-2">
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-gray-300">{t("goLan.bypassTitle")}</span>
+        {/* 【APP50 任务2】On-Demand 局域网直连：自适应高度两行卡片，
+            标题与开关一行、完整说明文字独占一行，杜绝边框压住文字 */}
+        <div className="rounded-xl border border-border bg-surface-elevated p-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[13px] font-semibold text-gray-200">
+              {t("goLan.bypassTitle")}
+            </span>
             <Switch
               checked={form.bypassOnLocalLan}
               onChange={(v) => patch({ bypassOnLocalLan: v })}
             />
           </div>
-          <p className="mt-1 text-[11px] leading-4 text-gray-500">
+          <p className="mt-2 text-[11px] leading-relaxed text-gray-500">
             {t("goLan.bypassHint")}
           </p>
         </div>

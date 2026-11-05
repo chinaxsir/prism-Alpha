@@ -166,6 +166,26 @@ const zh: Record<string, string> = {
   "proxies.goCus.deleteConfirm": "确定删除模块「{name}」？该操作不可撤销。",
   "proxies.goCus.moduleDeleted": "模块已删除",
   "proxies.goCus.caGenerated": "CA 证书已生成",
+  "proxies.goCus.confirmDeleteAgain": "再点一次确认删除",
+  "proxies.goCus.templateLibTitle": "✨ 官方精选一键模板库",
+  "proxies.goCus.templateLibDesc":
+    "覆盖高频分流场景，一键导入即刻生效（导入后自动开启引擎，VPN 运行中自动热重载）",
+  "proxies.goCus.templateImport": "一键导入",
+  "proxies.goCus.tpl.adblock.name": "🛡️ 去广告净化",
+  "proxies.goCus.tpl.adblock.desc":
+    "屏蔽主流广告 / 统计 / 埋点域名（谷歌 / 百度 / 腾讯 / 字节 / 快手 / 友盟等 18 类）",
+  "proxies.goCus.tpl.ai.name": "🤖 AI 服务分流",
+  "proxies.goCus.tpl.ai.desc":
+    "OpenAI / Claude / Gemini / Copilot / Cursor 等 14 个 AI 服务走代理",
+  "proxies.goCus.tpl.media.name": "🎬 流媒体解锁",
+  "proxies.goCus.tpl.media.desc":
+    "Netflix / YouTube / Disney+ / TikTok / Spotify / Twitch 等 16 个平台走代理",
+  "proxies.goCus.tpl.cnDirect.name": "⚡ 国内直连加速",
+  "proxies.goCus.tpl.cnDirect.desc":
+    ".cn 域名与国内主流站点、Apple / 微软 CDN 共 16 条规则直连，不进代理",
+  "proxies.goCus.tpl.privacy.name": "🧹 隐私头净化",
+  "proxies.goCus.tpl.privacy.desc":
+    "对主流站点删除 X-Forwarded-For 追踪请求头（当前仅 HTTP 明文生效）",
 };
 
 const en: Record<string, string> = {
@@ -347,6 +367,26 @@ const en: Record<string, string> = {
   "proxies.goCus.deleteConfirm": "Delete module \"{name}\"? This cannot be undone.",
   "proxies.goCus.moduleDeleted": "Module deleted",
   "proxies.goCus.caGenerated": "CA certificate generated",
+  "proxies.goCus.confirmDeleteAgain": "Tap again to confirm",
+  "proxies.goCus.templateLibTitle": "✨ Curated One-Click Templates",
+  "proxies.goCus.templateLibDesc":
+    "High-frequency routing scenarios, one tap to import and apply (engine auto-enables; hot-reloads when VPN is running)",
+  "proxies.goCus.templateImport": "Import",
+  "proxies.goCus.tpl.adblock.name": "🛡️ Ad Blocking",
+  "proxies.goCus.tpl.adblock.desc":
+    "Block 18 mainstream ad / analytics / tracking domains (Google, Baidu, Tencent, ByteDance, Kuaishou, Umeng…)",
+  "proxies.goCus.tpl.ai.name": "🤖 AI Services via Proxy",
+  "proxies.goCus.tpl.ai.desc":
+    "Route 14 AI services through proxy: OpenAI / Claude / Gemini / Copilot / Cursor…",
+  "proxies.goCus.tpl.media.name": "🎬 Streaming Unlock",
+  "proxies.goCus.tpl.media.desc":
+    "Route 16 platforms through proxy: Netflix / YouTube / Disney+ / TikTok / Spotify / Twitch…",
+  "proxies.goCus.tpl.cnDirect.name": "⚡ China Direct Boost",
+  "proxies.goCus.tpl.cnDirect.desc":
+    "16 rules: .cn domains, major Chinese sites and Apple / Microsoft CDN go direct, bypassing the proxy",
+  "proxies.goCus.tpl.privacy.name": "🧹 Privacy Header Scrubber",
+  "proxies.goCus.tpl.privacy.desc":
+    "Strip X-Forwarded-For tracking headers on major sites (plain HTTP only for now)",
 };
 
 export default { zh, en };

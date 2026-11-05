@@ -106,6 +106,16 @@ pub(crate) fn is_valid_usable_proxy_node(node: &ClashNode) -> bool {
     true
 }
 
+/// 【APP50 任务2】auto_detect_interface 仅桌面端启用。
+/// iOS NetworkExtension 沙盒内 sing-box DefaultInterfaceMonitor 无平台回调
+/// 恒返回 nil 接口 → 全部 DNS 查询与出站连接 0ms 报 no available network
+/// interface（log11 图1 全部节点超时根因）；Android 11+ SELinux 拦截
+/// netlink 枚举。移动端由扩展层接管：iOS 扩展 sanitize 强制
+/// route.default_interface = 物理网卡，Android 由 protect 回调保护 socket。
+pub(crate) fn auto_detect_interface_enabled() -> bool {
+    !cfg!(any(target_os = "android", target_os = "ios"))
+}
+
 pub struct BuiltConfig {
     pub config: Value,
     /// 转换过程中的降级/跳过提示（不致命）
@@ -754,12 +764,35 @@ pub fn build(
         "已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into(),
     );
 
-    // 【APP47 任务3.2】删除 APP45 的"节点域名 DoH 预解析替换 IPv4"：
-    // 把节点 server 换成 IP 后，机场轮换 IP / 多落地 CDN 节点会永久失效，
-    // 且部分机场校验 Host/SNI 与源域名一致性。改为：节点 server 100% 保留
-    // 订阅原始域名，由内核 DNS（dns-direct 223.5.5.5 走 direct 出站 +
-    // default_interface 物理网卡）在启动时一次性解析缓存。见 dns 构建段
-    // （dns.enable_hosts / route.default_interface）。
+    // 【APP50 任务2】节点域名批量预解析（主进程 DoH，重启用 APP47 移除的能力）：
+    // log11 实证——iOS 扩展内节点域名（*.the-best-airport.com）UDP DNS 解析
+    // 会被 utun 自拦截失败，导致节点 0ms 超时。主进程网络权限完整，构建期用
+    // 阿里/腾讯 DoH 把节点 server 域名解析为真实公网 IPv4 写入配置
+    // （tls.server_name / ws Host 已在 node_to_outbound 从独立字段写入，
+    // SNI/Host 校验不受影响）；仅接受合法公网 IPv4（剔除 198.18/127/0.0.0.0/
+    // 私网），解析失败或超时（整体 ≤2.6s，结果 300s 缓存）的域名保留原样，
+    // 由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡绑定）兜底。
+    let mut node_hosts: Vec<String> = Vec::new();
+    for parsed in &parsed_list {
+        for node in parsed
+            .profile
+            .proxies
+            .iter()
+            .chain(parsed.provider_nodes.values().flatten())
+        {
+            let s = node.server.trim();
+            if !s.is_empty() && s.parse::<std::net::IpAddr>().is_err() {
+                node_hosts.push(s.to_string());
+            }
+        }
+    }
+    let node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
+    if !node_ip_map.is_empty() {
+        warnings.push(format!(
+            "已预解析 {} 个节点域名为公网 IPv4（300s 缓存，SNI/Host 保留原域名）",
+            node_ip_map.len()
+        ));
+    }
 
     // ---- 逐订阅产出出站/组/规则 ----
     let mut node_tags: Vec<String> = Vec::new();
@@ -778,7 +811,7 @@ pub fn build(
 
         // 订阅自身节点
         for node in &profile.proxies {
-            if let Some(t) = emit_node(&mut outbounds, &mut known_tags, &mut warnings, node, &apply, &mut total_nodes) {
+            if let Some(t) = emit_node(&mut outbounds, &mut known_tags, &mut warnings, node, &apply, &mut total_nodes, &node_ip_map) {
                 node_tags.push(t);
             }
         }
@@ -792,6 +825,7 @@ pub fn build(
                     node,
                     &apply,
                     &mut total_nodes,
+                    &node_ip_map,
                 ) {
                     node_tags.push(t);
                 }
@@ -1395,6 +1429,14 @@ pub fn build(
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
+        // 【APP50 任务2】备用直连 DNS：TCP 53 的腾讯 119.29.29.29，
+        // UDP 53 被运营商劫持/静默丢弃时经 TCP 兜底解析节点域名
+        json!({
+            "tag": "dns-direct-tcp",
+            "address": "tcp://119.29.29.29",
+            "detour": "direct",
+            "strategy": "ipv4_only",
+        }),
     ];
 
     // Android DNS 清洗（APP-2 断层二修复 + APP-11B 任务3 统一）：
@@ -1527,12 +1569,11 @@ pub fn build(
             } else {
                 final_tag.clone()
             },
-            // Android（IPA-12 2.5）：必须关闭——auto_detect_interface 经
-            // netlink 枚举默认网卡并按名绑定，Android 11+ SELinux 拦截普通
-            // 应用的 netlink 操作（permission denied）。出站 socket 保护由
-            // protect 回调（cb_protect → VpnService.protect）完成；桌面/iOS
-            // 维持 true（iOS 无 netlink 实现不会实际触发，保持原状不变）
-            "auto_detect_interface": !cfg!(target_os = "android")
+            // 【APP50 任务2】移动端（iOS/Android）必须禁用
+            // auto_detect_interface：iOS 沙盒内 DefaultInterfaceMonitor
+            // 恒 nil（no available network interface），Android SELinux
+            // 拦截 netlink；桌面端维持 true。详见 auto_detect_interface_enabled()
+            "auto_detect_interface": auto_detect_interface_enabled()
         },
         "experimental": experimental
     });
@@ -1652,6 +1693,7 @@ fn emit_node(
     node: &ClashNode,
     apply: &dyn Fn(&str) -> String,
     total_nodes: &mut usize,
+    ip_map: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     // 【APP32 任务1.2】同名节点自动去重：两个相同 tag 的 outbound 会让
     // sing-box 直接启动失败，自动追加 " (2)"/" (3)" 序号后缀确保 tag 唯一。
@@ -1680,6 +1722,18 @@ fn emit_node(
                 return None;
             }
             outbound["tag"] = json!(tag);
+            // 【APP50 任务2】server 域名 → 预解析公网 IPv4（tls.server_name /
+            // ws Host 在 node_to_outbound 内已从 sni/servername/host 独立字段
+            // 写入，此处仅替换连接地址，不影响 SNI/Host 校验）
+            let server = outbound
+                .get("server")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(server) = server {
+                if let Some(ip) = ip_map.get(&server.to_ascii_lowercase()) {
+                    outbound["server"] = json!(ip);
+                }
+            }
             if let Some(note) = note {
                 warnings.push(format!("节点 '{}': {}", node.name, note));
             }
@@ -2848,12 +2902,15 @@ rules:
 
     /// 回归（测速全部超时）：服务器为域名的节点必须出现在 DNS outbound 规则中
     /// 且指向 dns-local；dns-remote 必须是国内可达的 DoH（不再是 1.1.1.1）。
+    /// 【APP50 任务2】节点域名经主进程 DoH 预解析成功后 server 会被替换为
+    /// IPv4（内核无需再解析）——测试使用永不解析的 .invalid TLD（RFC 2606）
+    /// 保证域名保留，从而确定性地校验 dns-local 兜底规则。
     #[test]
     fn node_server_domains_resolve_via_dns_local() {
         let clash = r#"
 proxies:
   - {name: IP-NODE, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
-  - {name: DOM-NODE, type: vless, server: node-9.sub.ibuy.eu.cc, port: 443, uuid: 11111111-2222-3333-4444-555555555555}
+  - {name: DOM-NODE, type: vless, server: dom-node.nonexistent.invalid, port: 443, uuid: 11111111-2222-3333-4444-555555555555}
 proxy-groups:
   - {name: 节点选择, type: select, proxies: [IP-NODE, DOM-NODE]}
 rules:
@@ -4121,5 +4178,91 @@ rules:
             !rewritten.is_empty(),
             "第三方组规则出口必须被归一化为 Proxy: {rules:?}"
         );
+    }
+
+    /// 【APP50 任务2】移动端（iOS/Android）必须禁用 auto_detect_interface：
+    /// iOS NetworkExtension 沙盒内 sing-box DefaultInterfaceMonitor 恒返回 nil
+    /// → 全部 DNS/连接 0ms 报 no available network interface（log11 根因）；
+    /// Android 11+ SELinux 拦截 netlink。桌面端维持启用。
+    /// 生成的 route 配置必须与平台策略函数一致。
+    #[test]
+    fn auto_detect_interface_disabled_on_mobile() {
+        let enabled = super::auto_detect_interface_enabled();
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        assert!(!enabled, "移动端必须禁用 auto_detect_interface");
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        assert!(enabled, "桌面端保持启用 auto_detect_interface");
+
+        let yaml = r#"
+proxies:
+  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK1]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), yaml.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-adi"),
+            &std::env::temp_dir().join("prism-cb-test-adi/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build 必须成功");
+        assert_eq!(
+            built.config["route"]["auto_detect_interface"].as_bool(),
+            Some(enabled),
+            "route.auto_detect_interface 与平台策略函数不一致"
+        );
+    }
+
+    /// 【APP50 任务2】DNS 结构：dns-direct=223.5.5.5（detour=direct）+
+    /// 备用 dns-direct-tcp=tcp://119.29.29.29（detour=direct），且
+    /// dns.rules 第 1 条必须为 {outbound: any, server: dns-direct}
+    /// （所有出站的域名解析一律走直连 DNS，杜绝节点域名经代理解析死循环）。
+    #[test]
+    fn dns_direct_and_tcp_fallback_present() {
+        let yaml = r#"
+proxies:
+  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK1]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), yaml.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-dns"),
+            &std::env::temp_dir().join("prism-cb-test-dns/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build 必须成功");
+        let servers = built.config["dns"]["servers"].as_array().unwrap();
+        let direct = servers
+            .iter()
+            .find(|s| s["tag"].as_str() == Some("dns-direct"))
+            .expect("dns-direct 服务器缺失");
+        assert_eq!(direct["address"].as_str(), Some("223.5.5.5"));
+        assert_eq!(direct["detour"].as_str(), Some("direct"));
+        let direct_tcp = servers
+            .iter()
+            .find(|s| s["tag"].as_str() == Some("dns-direct-tcp"))
+            .expect("dns-direct-tcp 备用服务器缺失");
+        assert_eq!(direct_tcp["address"].as_str(), Some("tcp://119.29.29.29"));
+        assert_eq!(direct_tcp["detour"].as_str(), Some("direct"));
+        let first_rule = &built.config["dns"]["rules"][0];
+        assert_eq!(first_rule["outbound"].as_str(), Some("any"));
+        assert_eq!(first_rule["server"].as_str(), Some("dns-direct"));
     }
 }

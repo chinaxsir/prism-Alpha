@@ -881,13 +881,11 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 }
 
 // ---------------- 【APP45 任务2.2】代理节点域名批量预解析 ----------------
-// 【APP47 任务3.2】已停止在 config_builder 调用：节点 server 一律保留订阅原始
-// 域名，由内核 DNS（dns-direct 223.5.5.5 + default_interface）解析，避免机场
-// 轮换 IP / CDN 多落地节点被写死失效。工具函数保留以备后续单独使用。
-#[allow(dead_code)]
+// 【APP50 任务2】config_builder 重新启用：log11 实证 iOS 扩展内节点域名
+// UDP DNS 被 utun 自拦截失败（0ms 超时），主进程构建期 DoH 预解析为
+// 公网 IPv4 写入 server（SNI/Host 保留原域名），内核 dns-direct 兜底。
 const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-#[allow(dead_code)]
 fn node_host_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
     static CACHE: std::sync::OnceLock<
@@ -909,7 +907,6 @@ fn node_host_cache(
 /// 整体在独立工作线程 + current_thread runtime 内并发执行，调用方最多
 /// 阻塞 2600ms；命中 300s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
 /// 私网/fake-ip（198.18/15）等非法解析结果。
-#[allow(dead_code)]
 pub(crate) fn doh_resolve_node_hosts_ipv4(
     hosts: &[String],
 ) -> std::collections::HashMap<String, String> {
@@ -1501,7 +1498,9 @@ const PROBE_MISSING_PORT_MSG: &str =
 
 /// 【APP40 任务1】严格解析 `IP:端口` / `http(s)://IP:端口/path`：
 /// - 显式 `http://` 未写端口 → 默认 80；显式 `https://` 未写端口 → 443；
-/// - 纯 IP（无端口且无协议头）→ Err(PROBE_MISSING_PORT_MSG)，绝不发起扫描。
+/// - 【APP50 任务3】纯 IP（无端口且无协议头）→ 端口哨兵 0，探测阶段仅
+///   依次尝试 http:80 → https:443（最多 2 次 Clash API 延迟测试），
+///   绝不盲目扫描其他端口。
 fn parse_probe_input(raw: &str) -> Result<ProbeInput, String> {
     let no_invisible = strip_invisible_and_non_ascii(raw);
     let first = no_invisible.split(';').next().unwrap_or("").trim();
@@ -1539,7 +1538,8 @@ fn parse_probe_input(raw: &str) -> Result<ProbeInput, String> {
             }
             _ => match p_scheme_default(scheme) {
                 Some(default) => (host_port.to_string(), default, p.clone()),
-                None => return Err(PROBE_MISSING_PORT_MSG.into()),
+                // 【APP50 任务3】纯 IP → 端口哨兵 0（默认探测 80/443）
+                None => (host_port.to_string(), 0, p.clone()),
             },
         }
     };
@@ -1563,9 +1563,10 @@ fn p_scheme_default(scheme: Option<&str>) -> Option<u16> {
 }
 
 /// 【APP15 任务2】兼容旧调用：返回 (ip, 显式端口)。
+/// 【APP50 任务3】纯 IP 的端口哨兵 0 在此映射回 None（语义：未指定端口）。
 pub fn parse_probe_target(raw: &str) -> (String, Option<u16>) {
     match parse_probe_input(raw) {
-        Ok(t) => (t.ip, Some(t.port)),
+        Ok(t) => (t.ip, if t.port == 0 { None } else { Some(t.port) }),
         Err(_) => {
             let no_invisible = strip_invisible_and_non_ascii(raw);
             let host = no_invisible
@@ -1786,17 +1787,46 @@ pub async fn probe_intranet_ip(
     }
 
     let scheme_hint = input.scheme.as_deref();
+    // 【APP50 任务3】端口哨兵 0（纯 IP）→ 展示 80/443
+    let port_desc = if input.port == 0 {
+        "80/443".to_string()
+    } else {
+        input.port.to_string()
+    };
     crate::core::logger::info(
         log,
         &format!(
-            "正在检测内网目标: {target_ip}:{}{}（出站 {tag}）...",
-            input.port,
+            "正在检测内网目标: {target_ip}:{port_desc}{}（出站 {tag}）...",
             scheme_hint.map(|s| format!(" [{s}]")).unwrap_or_default()
         ),
     );
 
     // 5. 探测：On-Demand 直连 → 仅直连；否则 Clash API → 直连 → 单端口 TCP
-    let mut result: Result<PortProbeHit, String> = if bypassed {
+    // 【APP50 任务3】纯 IP（端口哨兵 0）：仅依次探测 http:80 → https:443
+    // （最多 2 次 Clash API 延迟测试，绝不盲目扫描其他端口），首次成功即返回
+    let mut result: Result<PortProbeHit, String> = if input.port == 0 {
+        let mut r = Err("未发起探测".to_string());
+        for (scheme, port) in [("http", 80u16), ("https", 443u16)] {
+            r = if bypassed {
+                probe_web_protocols_direct_only(&target_ip, port, Some(scheme), &input.path).await
+            } else {
+                probe_web_protocols(
+                    &target_ip,
+                    port,
+                    Some(scheme),
+                    &input.path,
+                    api_addr,
+                    api_secret,
+                    &tag,
+                )
+                .await
+            };
+            if r.is_ok() {
+                break;
+            }
+        }
+        r
+    } else if bypassed {
         probe_web_protocols_direct_only(&target_ip, input.port, scheme_hint, &input.path).await
     } else {
         probe_web_protocols(
@@ -1810,7 +1840,7 @@ pub async fn probe_intranet_ip(
         )
         .await
     };
-    if result.is_err() && !bypassed {
+    if result.is_err() && !bypassed && input.port != 0 {
         // 非 Web 端口（3389 / 22 / 445…）单端口握手兜底，绝不扫描其他端口
         if let Ok(ms) = probe_single_port_tcp(&target_ip, input.port).await {
             result = Ok(PortProbeHit {
@@ -1821,30 +1851,27 @@ pub async fn probe_intranet_ip(
     }
     match result {
         Ok(hit) => {
-            // 【APP45 任务1.1】0ms/1ms 是数据包根本没进 WireGuard 隧道、在本地
-            // 回环或当前外部 Wi-Fi 局域网秒回的假阳性（On-Demand 直连除外）。
-            // 真实穿过 WG 隧道的外网穿透延迟通常在 10ms~300ms。
-            if !bypassed && hit.latency_ms <= 1 {
-                let msg = format!(
-                    "❌ 检测到 {target_ip}:{} 延迟仅 {} ms（疑似本地回环/同网段直连，未穿过「{}」隧道），请检查该内网网段是否与本机当前局域网重合",
-                    input.port, hit.latency_ms, profile.name
-                );
-                crate::core::logger::warn(log, &msg);
-                return GoLanProbeResult {
-                    reachable: false,
-                    target_ip,
-                    latency_ms: None,
-                    message: msg,
-                };
-            }
+            // 【APP50 任务3】彻底删除「延迟 ≤1ms 误判拦截」：真实内网或高速隧道
+            // 完全可能是 1~5ms；超时的真实特征是 Clash API HTTP 非 200 /
+            // delay 字段缺失或为 0（probe_clash_delay_for_tag 已严格拦截，
+            // 只有 HTTP 200 且 delay > 0 才会走到这里）。
+            let shown_port = if input.port == 0 {
+                if hit.scheme.eq_ignore_ascii_case("https") {
+                    443
+                } else {
+                    80
+                }
+            } else {
+                input.port
+            };
             let od_note = if bypassed {
                 "（⚡ On-Demand 同局域网直连，已自动跳过隧道）"
             } else {
                 ""
             };
             let msg = format!(
-                "✅ 已通过「{}」隧道连通 {}://{target_ip}:{}{od_note} · 延迟 {} ms",
-                profile.name, hit.scheme, input.port, hit.latency_ms
+                "✅ 已通过「{}」隧道连通 {}://{target_ip}:{shown_port}{od_note} · 延迟 {} ms",
+                profile.name, hit.scheme, hit.latency_ms
             );
             crate::core::logger::info(log, &msg);
             GoLanProbeResult {
@@ -1855,9 +1882,15 @@ pub async fn probe_intranet_ip(
             }
         }
         Err(_) => {
+            // 【APP50 任务3】明确失败文案：含档案名；纯 IP 时不带端口号
+            let target_desc = if input.port == 0 {
+                target_ip.clone()
+            } else {
+                format!("{target_ip}:{}", input.port)
+            };
             let msg = format!(
-                "❌ 未能连通 {target_ip}:{}（连接超时，请确认端口已开放且 WG 路由正常）",
-                input.port
+                "❌ 未能通过「{}」隧道连通 {target_desc}（握手或目标端口响应超时，请确认 WG 配置及目标端口已开放）",
+                profile.name
             );
             crate::core::logger::warn(log, &msg);
             GoLanProbeResult {
@@ -2780,7 +2813,9 @@ mod tests {
         );
     }
 
-    /// 【APP40 任务1】未输入端口必须返回友好提示，且绝不发起任何端口扫描。
+    /// 【APP40 任务1 / APP50 任务3】未输入目标必须返回友好提示；
+    /// 纯 IP 现在合法——默认探测 http:80 / https:443（最多 2 次延迟测试，
+    /// 绝不盲目扫描其他端口），目标不可达时返回「未能通过」失败文案。
     #[tokio::test]
     async fn test_probe_requires_explicit_port() {
         let lan = GoLanSettings {
@@ -2797,18 +2832,70 @@ mod tests {
             }),
             ..Default::default()
         };
-        for raw in [None, Some("192.168.10.253"), Some(" 192.168.10.253 ")] {
-            let r = probe_intranet_ip(raw, "", "", true, true, &lan).await;
-            assert!(!r.reachable, "无端口输入必须直接提示: {r:?}");
-            assert!(
-                r.message.contains("IP:端口"),
-                "必须提示用户输入 IP:端口: {}",
-                r.message
-            );
-        }
-        // 显式 IP:端口 才能进入后续流程（此处因内核未运行而提示启动）
+        // 未输入目标 → 友好提示
+        let r = probe_intranet_ip(None, "", "", true, true, &lan).await;
+        assert!(!r.reachable, "无输入必须直接提示: {r:?}");
+        assert!(
+            r.message.contains("IP:端口"),
+            "必须提示用户输入 IP:端口: {}",
+            r.message
+        );
+        // 【APP50 任务3】纯 IP 不再被拦截：进入默认 80/443 探测流程。
+        // 可达性取决于测试环境（本机恰在同网段且目标在线时会真实连通成功），
+        // 因此只断言文案结构：含目标 IP、绝无「请输入端口」拦截、
+        // 绝无「延迟仅 1 ms」式误报
+        let r = probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan).await;
+        assert!(r.message.contains("192.168.10.253"), "{}", r.message);
+        assert!(
+            !r.message.contains("请输入"),
+            "纯 IP 不得再被端口拦截: {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("延迟仅"),
+            "超时不得误报为低延迟: {}",
+            r.message
+        );
+        // 显式 IP:端口 且内核未运行 → 提示启动
         let r = probe_intranet_ip(Some("192.168.10.253:8001"), "", "", false, true, &lan).await;
         assert!(r.message.contains("VPN 尚未启动"), "{}", r.message);
+    }
+
+    /// 【APP50 任务3】「清空当前配置」后的空档案必须可保存：
+    /// enabled=false 的空档案（无 WG 私钥/服务端/网段）不得触发
+    /// save_go_lan_settings 的「请先填写完整的回家节点参数」校验拦截，
+    /// 且顶层旧字段不得被反向回填。
+    #[test]
+    fn empty_disabled_profile_is_saveable() {
+        let mut s = GoLanSettings {
+            // 模拟清空前顶层残留的旧配置
+            wg_config: Some(WgManualConfig {
+                server: "old.example.com".into(),
+                server_port: 51820,
+                private_key: test_key(40),
+                peer_public_key: test_key(41),
+                pre_shared_key: None,
+                local_ip: "10.0.0.2/32".into(),
+                mtu: 1420,
+            }),
+            lan_cidrs: vec!["192.168.10.0/24".into()],
+            ..Default::default()
+        };
+        s.profiles.push(GoLanProfile {
+            id: "home".into(),
+            name: "家里".into(),
+            enabled: false, // 清空后的空档案
+            ..Default::default()
+        });
+        normalize_go_lan_settings(&mut s);
+        // save_go_lan_settings 的拒绝条件为 enabled && !is_configured(&lan)
+        assert!(
+            !(s.enabled && !is_configured(&s)),
+            "空档案（enabled=false）保存不得被校验拦截"
+        );
+        // 无启用档案时顶层字段必须同步清空（严禁反向回填旧配置）
+        assert!(s.wg_config.is_none(), "顶层 wg_config 必须清空");
+        assert!(s.lan_cidrs.is_empty(), "顶层 lan_cidrs 必须清空");
     }
 
     #[test]

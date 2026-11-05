@@ -20,6 +20,10 @@ private var cachedPhysicalIfName: String = "en0"
 /// 断网 en0；双卡/VoLTE 多 pdp_ip* 场景据此识别真正的数据网卡
 private var systemDefaultInterfaceName: String = ""
 private var systemDefaultIsCellular: Bool = false
+/// 【APP50 任务1】系统当前路径是否仍使用 Wi-Fi：与 systemDefaultIsCellular
+/// 组合判定「纯 5G/4G 蜂窝」状态（cellular && !wifi），此时严禁把出站
+/// 绑定到残留旧 IP 的 en0（log11 WG network is unreachable 根因）。
+private var systemDefaultUsesWifi: Bool = false
 private var prismPathMonitor: NWPathMonitor?
 
 /// 启动常驻 NWPathMonitor（幂等），实时记录系统默认路由使用的物理网卡
@@ -30,6 +34,7 @@ private func startSystemPathMonitor() {
     monitor.pathUpdateHandler = { path in
         let cellular = path.usesInterfaceType(.cellular)
         systemDefaultIsCellular = cellular
+        systemDefaultUsesWifi = path.usesInterfaceType(.wifi)
         if cellular {
             systemDefaultInterfaceName =
                 path.availableInterfaces.first { $0.type == .cellular }?.name ?? ""
@@ -281,6 +286,16 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
     // 最优蜂窝候选：系统默认路由同名 > 有可路由 IPv4 > 仅 IPv6（IMS 专网）
     let bestCell = cellNamedCandidate ?? cellV4Candidate ?? cellV6Candidate
 
+    // 【APP50 任务1】纯蜂窝绝对优先：NWPathMonitor 指示系统路径正在使用
+    // 蜂窝且未使用 Wi-Fi（5G/4G 流量状态，或弱 Wi-Fi 已被 iOS 切走）时，
+    // 必须直接返回最优 pdp_ip*，严禁返回残留旧局域网 IP 但已无外网路由的
+    // en0（log11：go-lan-* 被绑死 en0 报 sendmsg: network is unreachable）。
+    if systemDefaultIsCellular && !systemDefaultUsesWifi, let cell = bestCell {
+        cachedPhysicalIfIndex = cell.index
+        cachedPhysicalIfName = cell.name
+        return attached(cell)
+    }
+
     // 【APP11 任务1.1】内核路由实测最优先：谁能真正连公网就用谁。
     // 直接向 223.5.5.5:53 connect 后 getsockname 得到内核选定的源 IP，
     // 再反查承载该 IP 的物理网卡。弱 Wi-Fi（有局域网 IP 但无外网）时
@@ -344,42 +359,12 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
 /// bind_interface，让外层 WireGuard UDP 100% 从 5G/Wi-Fi 天线直链发出，
 /// 绝不被 iOS 默认路由吸回 utun 送进海外 VLESS-WebSocket 节点
 ///（log9.txt 第 37~42 行 ws closed: 1005 的根因）。
+/// 【APP50 任务1】直接复用 findActivePhysicalInterface() 的判定结果：
+/// 其「纯蜂窝绝对优先 + 内核路由实测」逻辑可在 5G 下精准返回 pdp_ip0，
+/// 根治旧实现「en0 有残留 IP 就盲选 en0」导致 WG 绑死断网网卡的问题。
 private func findPhysicalInterfaceName() -> String {
-    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>? = nil
-    guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else { return "en0" }
-    defer { freeifaddrs(ifaddrPtr) }
-
-    var wifiName = ""
-    var cellularName = ""
-    var otherName = ""
-
-    var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
-    while let ifa = ptr?.pointee {
-        defer { ptr = ifa.ifa_next }
-        let flags = Int32(ifa.ifa_flags)
-        guard (flags & IFF_UP) != 0, let addr = ifa.ifa_addr, Int32(addr.pointee.sa_family) == AF_INET else { continue }
-        let name = String(cString: ifa.ifa_name)
-        if name.hasPrefix("lo") || name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("ap") {
-            continue
-        }
-        var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        guard inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { continue }
-        let ip = String(cString: buf)
-        if ip.hasPrefix("127.") || ip.hasPrefix("169.254.") || ip.hasPrefix("172.19.") { continue }
-
-        if name == "en0" {
-            wifiName = name
-        } else if name.hasPrefix("pdp_ip") && cellularName.isEmpty {
-            cellularName = name
-        } else if name.hasPrefix("en") && otherName.isEmpty {
-            otherName = name
-        }
-    }
-    if !wifiName.isEmpty { return wifiName }
-    if !cellularName.isEmpty { return cellularName }
-    if !otherName.isEmpty { return otherName }
-    return "pdp_ip0"
+    let name = findActivePhysicalInterface().name
+    return name.isEmpty ? "en0" : name
 }
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -703,48 +688,62 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let oldIf = activeBoundInterface
         let newIf = latestPhy.name
-        // 【APP49 任务7】切网零重启：绝不 PrismVPNStop/Start 销毁重建内核
-        // （旧实现会打断全部连接并重置计时器，切网瞬间还有峰值内存抖动）。
-        // 仅①经 Clash API 清理绑定在旧网卡上的失效套接字，新连接即刻走新
-        // 物理网卡；②Go Lan On-Demand 同网段命中变化时单独热更新路由表。
-        writeExtLog("INFO", "🌐 物理网络已无感切换至 \(newIf) (\(latestPhy.ipv4))，保持内核持续运行")
+        // 【APP50 任务1】切网软重启：bind_interface / default_interface 已
+        // 恢复为显式物理网卡绑定（根治 no available network interface），
+        // 而 sing-box v1.11.3 的 Clash API PUT /configs 为空实现、无法热更
+        // 出站网卡绑定，因此物理网卡实质切换（en0 ↔ pdp_ip0）时必须软重启
+        // Go 内核：重新 sanitize 磁盘配置并以新网卡重启。NEPacketTunnel
+        // 会话与 utun 保持不变，主 APP UI 不闪断。
+        writeExtLog("INFO", "🌐 物理网络切换 \(oldIf) -> \(newIf) (\(latestPhy.ipv4))，软重启内核重新绑定物理网卡")
         isReloadingForNetworkChange = true
-        activeBoundInterface = newIf
         writeHeartbeat("netSwitch:\(oldIf)->\(newIf)")
 
         vpnQueue.async { [weak self] in
             guard let self = self else { return }
-            self.clearStaleConnectionsViaClashAPI()
+            self.restartKernelOnCurrentQueue(newPhy: latestPhy)
             self.refreshOnDemandBypassIfNeeded(phyName: newIf, phyIPv4: latestPhy.ipv4)
             self.isReloadingForNetworkChange = false
         }
     }
 
-    /// 【APP49 任务7】经 Clash API 清理绑定在旧物理网卡上的失效连接。
-    /// 仅发一次异步 DELETE /connections；失败只记日志，绝不影响内核运行。
-    private func clearStaleConnectionsViaClashAPI() {
-        guard let rawConfig = try? loadRawConfigText(),
-              let data = rawConfig.data(using: .utf8),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let clashAPI = (root["experimental"] as? [String: Any])?["clash_api"] as? [String: Any],
-              let controller = clashAPI["external_controller"] as? String,
-              !controller.isEmpty
+    /// 【APP50 任务1】物理网卡切换后的内核软重启（必须在 vpnQueue 调用）：
+    /// PrismVPNStop → 等待旧内核释放端口 → 重新读取磁盘原始配置并以新物理
+    /// 网卡重新 sanitize（route.default_interface 与全部出站 bind_interface
+    /// 指向新网卡）→ PrismVPNStart。隧道会话不销毁，UI 侧计时器不重置。
+    private func restartKernelOnCurrentQueue(newPhy: PhysicalInterface) {
+        guard let workDir = activeWorkDir,
+              let rawConfig = try? loadRawConfigText()
         else { return }
-        let secret = clashAPI["secret"] as? String
-        let base = controller.hasPrefix("http") ? controller : "http://\(controller)"
-        guard let url = URL(string: "\(base)/connections") else { return }
-        var req = URLRequest(url: url, timeoutInterval: 3.0)
-        req.httpMethod = "DELETE"
-        if let secret = secret, !secret.isEmpty {
-            req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-        }
-        URLSession.shared.dataTask(with: req) { _, resp, err in
-            if let err = err {
-                NSLog("[PrismVPN] 切网清理旧连接失败（忽略）: \(err.localizedDescription)")
-            } else if let http = resp as? HTTPURLResponse {
-                NSLog("[PrismVPN] 切网旧连接已清理 HTTP \(http.statusCode)")
+        PrismVPNStop()
+        // 旧内核非阻塞关闭（内部 1500ms 上限），等待其完全释放 mixed-in /
+        // Clash API 端口与 utun fd，避免新内核 bind 冲突
+        Thread.sleep(forTimeInterval: 1.8)
+        let sanitized = sanitizeConfigForExtension(
+            rawConfig,
+            workDir: workDir,
+            phyName: newPhy.name,
+            phyIPv4: newPhy.ipv4
+        )
+        writeGoLanExtLog(sanitized)
+        let errorPtr = sanitized.withCString { configPtr in
+            workDir.path.withCString { dirPtr in
+                PrismVPNStart(
+                    UnsafeMutablePointer(mutating: configPtr),
+                    UnsafeMutablePointer(mutating: dirPtr)
+                )
             }
-        }.resume()
+        }
+        if let errorPtr = errorPtr {
+            let message = String(cString: errorPtr)
+            PrismKernelFree(errorPtr)
+            writeExtLog("WARN", "🌐 切网软重启内核失败: \(message)")
+            writeHeartbeat("netSwitch-restart-failed")
+            return
+        }
+        activeBoundInterface = newPhy.name
+        writeHeartbeat("running(\(newPhy.name))")
+        writeExtLog("INFO", "🌐 内核已切换至 \(newPhy.name) (\(newPhy.ipv4))，全部出站已重新绑定")
+        scheduleGoLanWarmup(sanitizedConfig: sanitized)
     }
 
     /// 【APP49 任务7】Go Lan On-Demand 直连热更新：切网后本机 Wi-Fi 网段
@@ -841,8 +840,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self?.checkAndReloadIfNetworkChanged()
                 }
                 self.pendingPathCheck = work
-                // 1.5s ≥ 1s：等待交换机/基带完成路由收敛，避免半切换抖动
-                self.vpnQueue.asyncAfter(deadline: .now() + 1.5, execute: work)
+                // 【APP50 任务1】2.0s 去抖：等待交换机/基带完成路由收敛，
+                // 避免半切换状态下软重启内核导致隧道反复重建
+                self.vpnQueue.asyncAfter(deadline: .now() + 2.0, execute: work)
             }
         }
         monitor.start(queue: vpnQueue)
@@ -907,6 +907,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
               let arr = (try? JSONSerialization.jsonObject(with: data)) as? [String]
         else { return [] }
         return arr
+    }
+
+    /// 【APP50 任务1】读取 sanitizeConfigForExtension 落盘的全部 go-lan-*
+    /// WG 服务端公网 IP（workDir/golan_wg_server.txt，每行一个，如
+    /// 14.105.27.177、123.144.208.12）。openTun 将其以 /32 写入
+    /// ipv4Settings.excludedRoutes，确保 WG 外层 UDP 握手包 100% 从物理
+    /// 网卡直发，根治 sendmsg: network is unreachable。
+    private func loadGoLanWgServerIPs() -> [String] {
+        guard let workDir = activeWorkDir else { return [] }
+        let url = workDir.appendingPathComponent("golan_wg_server.txt")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        var out: [String] = []
+        for line in text.components(separatedBy: .newlines) {
+            let ip = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isValidIPv4Literal(ip), !ip.hasPrefix("127."), !out.contains(ip) {
+                out.append(ip)
+            }
+        }
+        return out
     }
 
     /// 【APP40 任务2】读取 Rust 写下的多路档案元数据
@@ -991,7 +1010,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 再按 /25 与 /24 拆成两条，规避 iOS NECP 单条 /24 路由被
         // 本地 Wi-Fi 同网段直接短路的问题。
         var included: [NEIPv4Route] = [NEIPv4Route.default()]
-        for cidrStr in loadGoLanRouteCidrs() {
+        let goLanRouteCidrs = loadGoLanRouteCidrs()
+        for cidrStr in goLanRouteCidrs {
             guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
             let subnetRoute = NEIPv4Route(
                 destinationAddress: parsed.networkAddress,
@@ -1047,6 +1067,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 )
             )
         }
+        // 【APP50 任务1】把全部 go-lan-* WG 服务端公网 IP（/32）与直连 DNS
+        // 223.5.5.5（/32）写入 excludedRoutes：iOS 内核强制这些包绕开 utun
+        // 虚拟网卡，从当前活跃物理网卡（en0/pdp_ip0）直接发出，WG 外层 UDP
+        // 握手包绝不被默认路由吸回隧道，根治
+        // write udp4 ... sendmsg: network is unreachable（log11 第114/134行）。
+        for epIP in loadGoLanWgServerIPs() {
+            // 防呆：Endpoint IP 若落在已 included 的内网网段内则跳过
+            var insideIncluded = false
+            for cidrStr in goLanRouteCidrs where ipv4InCidr(epIP, cidrStr) {
+                insideIncluded = true
+                break
+            }
+            if insideIncluded { continue }
+            excluded.append(
+                NEIPv4Route(destinationAddress: epIP, subnetMask: "255.255.255.255")
+            )
+        }
+        excluded.append(
+            NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
+        )
         ipv4.excludedRoutes = excluded
         if !excluded.isEmpty {
             writeExtLog("INFO", "[GoLan-Ext] ⚡ On-Demand 直连网段已写入 excludedRoutes: \(bypassCidrs)")
@@ -1513,12 +1553,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             outbounds[i].removeValue(forKey: "bind_interface")
             outbounds[i].removeValue(forKey: "inet4_bind_address")
             outbounds[i].removeValue(forKey: "routing_mark")
-            // 【APP49 任务7】仅 go-lan-home（WireGuard）保留物理网卡绑定：
-            // 外层 WG UDP 必须钉在物理网卡上且目标是局域网私网段，不会被
-            // TUN 默认路由接管。direct 与代理节点不再写死 bind_interface，
-            // 由 route.auto_detect_interface 在切网时动态跟随系统默认路由，
-            // 杜绝写死 en0 后切 5G 全断的问题。
-            if !physIfName.isEmpty, tag.hasPrefix("go-lan") {
+            // 【APP50 任务1】根治 no available network interface：iOS 扩展
+            // 沙盒内 sing-box DefaultInterfaceMonitor 无系统网卡枚举回调，
+            // auto_detect_interface=true 会让所有 DNS 查询与出站连接在 0ms
+            // 内直接报错（log11 图1 全部节点超时根因）。恢复为 direct /
+            // wireguard(go-lan-*) / 全部代理节点出站显式 bind_interface 到
+            // 当前活跃物理网卡；selector / urltest / block / dns 等功能性
+            // 分组出站不参与绑定。
+            if !physIfName.isEmpty,
+               t == "direct" || proxyOutboundTypes.contains(t)
+            {
                 outbounds[i]["bind_interface"] = physIfName
             }
             if t == "dns" {
@@ -2028,18 +2072,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
 
         // 4. 修正 route
-        // 【APP49 任务7】切网零重启：启用 auto_detect_interface，让 sing-box
-        // 在 en0(Wi-Fi) ↔ pdp_ip0(5G) 切换时自动跟随系统默认路由，不再依赖
-        // 给代理/direct 出站写死 bind_interface（写死 en0 会导致切 5G 后全断）。
-        // go-lan-home WireGuard 出站仍保留 bind_interface：外层 WG UDP 必须
-        // 钉在物理网卡上，且其目标为局域网私网段，不会被 TUN 默认路由接管。
+        // 【APP50 任务1】iOS 扩展沙盒严禁 auto_detect_interface=true：
+        // sing-box 内部的 DefaultInterfaceMonitor 在 NetworkExtension 沙盒中
+        // 没有注册 Apple 平台网卡枚举回调，默认网卡指针恒为 nil，导致所有
+        // DNS 查询与节点出站连接在 0ms 内直接报错
+        // "no available network interface"（log11 图1 全部超时唯一根因）。
+        // 恢复显式 route.default_interface = 当前活跃物理网卡，配合上方全部
+        // 出站 bind_interface 显式绑定；切网由 NWPathMonitor 事件驱动软重启
+        // 内核重新绑定（见 checkAndReloadIfNetworkChanged）。
         var route = (root["route"] as? [String: Any]) ?? [:]
-        route["auto_detect_interface"] = true
-        // 【APP49 任务7】不再写死 route.default_interface：其值来自启动时刻
-        // 的物理网卡，切网（en0 ↔ pdp_ip0）后即成脏数据，会把系统级兜底出站
-        // 钉死在旧网卡上造成全断。由 auto_detect_interface 动态跟随系统默认
-        // 路由，DoH / 代理域名解析同样不会再从 utun 自身环回。
-        route.removeValue(forKey: "default_interface")
+        route["auto_detect_interface"] = false
+        if !physIfName.isEmpty {
+            route["default_interface"] = physIfName
+        } else {
+            route.removeValue(forKey: "default_interface")
+        }
         route["final"] = mainProxyTag
 
         var rules = (route["rules"] as? [[String: Any]]) ?? []
