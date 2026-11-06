@@ -3921,6 +3921,28 @@ mod tests {
         assert!(!is_profile_lan_direct_active(&disabled, &physical));
     }
 
+    /// 【APP55 任务3】多隧道精准判定：同一物理局域网下，只有网段命中的
+    /// 隧道显示直连，其余隧道必须保持隧道状态（Home 直连 / Nidec 隧道）
+    #[test]
+    fn test_is_profile_lan_direct_active_is_per_tunnel() {
+        let home = sample_profile("home", "家里", &["10.10.10.0/24"], "10.196.0.2/32", 70);
+        let nidec = sample_profile("nidec", "Nidec", &["10.31.2.0/23"], "10.196.0.3/32", 71);
+        // 本机处于家里局域网 10.10.10.0/24
+        let physical: Vec<std::net::Ipv4Addr> = vec!["10.10.10.20".parse().unwrap()];
+        assert!(
+            is_profile_lan_direct_active(&home, &physical),
+            "命中家里网段的隧道必须直连"
+        );
+        assert!(
+            !is_profile_lan_direct_active(&nidec, &physical),
+            "未命中的 Nidec 隧道绝不能因别的隧道直连而误显示直连"
+        );
+        // 反之处在 Nidec 局域网
+        let physical: Vec<std::net::Ipv4Addr> = vec!["10.31.2.55".parse().unwrap()];
+        assert!(is_profile_lan_direct_active(&nidec, &physical));
+        assert!(!is_profile_lan_direct_active(&home, &physical));
+    }
+
     /// 【APP54 任务1】条件 B 防御：公网探针目标绝不允许触发直连；
     /// 无物理局域网地址（仅有 TUN 地址）时同样不得直连
     #[test]

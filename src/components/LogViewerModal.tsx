@@ -29,22 +29,21 @@ import {
  * - 打开期间每 2 秒自动轮询
  */
 
-/** 异常关键词：error / warn / fail（不区分大小写，level 与正文命中均算） */
-const ERROR_RE = /error|warn|fail/i;
-
 /** 「仅看异常」分类的内部标识（非后端模块名） */
 const ERRORS_FILTER = "__errors__";
-/** 「Pro 功能」聚合分类：Go AIM / Go Lan / Go Cus */
-const PRO_FILTER = "__pro__";
 
-/** 【APP54 任务3】分类筛选胶囊：全部 / Pro 功能 / 规则运行 / 节点连接 /
- *  内核记录 / 仅看异常（flex-wrap 自动换行，最右标签不被截断） */
+/** 【APP55 任务5】精确分类筛选胶囊：全部 / 内核 / 节点 / 规则 /
+ *  Go AIM / Go Lan / Go Cus / 订阅 / 仅看异常。
+ *  value 与后端 module 字段严格一一对应，禁止前端模糊归类。 */
 const CATEGORY_TABS: { key: string; value: string | null; labelKey: string }[] = [
   { key: "all", value: null, labelKey: "logs.filterAll" },
-  { key: "pro", value: PRO_FILTER, labelKey: "logs.filterPro" },
-  { key: "rule", value: "Rule", labelKey: "logs.filterRule" },
-  { key: "node", value: "Node", labelKey: "logs.filterNode" },
   { key: "kernel", value: "Kernel", labelKey: "logs.filterKernel" },
+  { key: "node", value: "Node", labelKey: "logs.filterNode" },
+  { key: "rule", value: "Rule", labelKey: "logs.filterRule" },
+  { key: "goaim", value: "GoAIM", labelKey: "logs.filterGoAim" },
+  { key: "golan", value: "GoLan", labelKey: "logs.filterGoLan" },
+  { key: "gocus", value: "GoCus", labelKey: "logs.filterGoCus" },
+  { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
   { key: "errors", value: ERRORS_FILTER, labelKey: "logs.filterErrors" },
 ];
 
@@ -66,22 +65,26 @@ const levelColor = (level: string) =>
       ? "bg-amber-500/15 text-amber-400"
       : "bg-sky-500/15 text-sky-300";
 
-const moduleBadge = (module: string) =>
-  module === "GoLan"
-    ? "bg-emerald-500/15 text-emerald-300"
-    : module === "Pro"
-      ? "bg-violet-500/15 text-violet-300"
-      : module === "Sub"
-        ? "bg-sky-500/15 text-sky-300"
-        : module === "GoAim"
-          ? "bg-amber-500/15 text-amber-300"
-          : module === "GoCus"
-            ? "bg-pink-500/15 text-pink-300"
-            : module === "Rule"
-              ? "bg-indigo-500/15 text-indigo-300"
-              : module === "Node"
-                ? "bg-cyan-500/15 text-cyan-300"
-                : "bg-gray-500/15 text-gray-300";
+const moduleBadge = (module: string) => {
+  switch (module) {
+    case "Kernel":
+      return "bg-indigo-500/15 text-indigo-300";
+    case "Node":
+      return "bg-blue-600/15 text-blue-300";
+    case "Rule":
+      return "bg-cyan-500/15 text-cyan-300";
+    case "GoAIM":
+      return "bg-emerald-500/15 text-emerald-300";
+    case "GoLan":
+      return "bg-orange-500/15 text-orange-300";
+    case "GoCus":
+      return "bg-purple-500/15 text-purple-300";
+    case "Sub":
+      return "bg-rose-500/15 text-rose-300";
+    default:
+      return "bg-gray-500/15 text-gray-300";
+  }
+};
 
 /** 剥离 Kernel 日志中重复的头部前缀：
  *  `+0000 2026-10-26 09:44:10 ERROR [xxxx] connection: ...` → `connection: ...`
@@ -111,12 +114,12 @@ export default function LogViewerModal({
   const listRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(
-    async (module: string | null) => {
+    async (_module: string | null) => {
       setLoading(true);
       try {
-        // 「仅看异常」「Pro 功能」需拉全量后在前端聚合过滤
-        const needAll = module === ERRORS_FILTER || module === PRO_FILTER;
-        const payload = await getAppLogs(needAll ? undefined : (module ?? undefined));
+        // 【APP55 任务5】始终拉全量，分类筛选在前端严格按 module 精确匹配，
+        // 避免后端模糊过滤把 Go Lan 混进 Kernel
+        const payload = await getAppLogs();
         setEntries(payload.entries ?? []);
         setTotalBytes(payload.totalBytes ?? 0);
       } catch (e) {
@@ -128,17 +131,19 @@ export default function LogViewerModal({
     [],
   );
 
-  /** 分类筛选后的可见日志（异常按关键词过滤，Pro 按模块聚合） */
+  /** 【APP55 任务5】严格分类：仅异常按 WARN/ERROR 级别过滤，
+   *  其余类别要求 module 与分类值完全相等（大小写不敏感） */
   const visibleEntries = useMemo(() => {
     if (activeModule === ERRORS_FILTER) {
-      return entries.filter((e) => ERROR_RE.test(e.level) || ERROR_RE.test(e.message));
-    }
-    if (activeModule === PRO_FILTER) {
       return entries.filter((e) =>
-        ["GoAim", "GoLan", "GoCus", "Pro"].includes(e.module)
+        /^(WARN|ERROR)$/i.test((e.level ?? "").trim())
       );
     }
-    return entries;
+    if (activeModule === null) return entries;
+    const target = activeModule.toLowerCase();
+    return entries.filter(
+      (e) => (e.module ?? "Kernel").trim().toLowerCase() === target
+    );
   }, [entries, activeModule]);
 
   // 打开期间每 2 秒轮询（activeModule/refreshSignal 变化时立即重拉）

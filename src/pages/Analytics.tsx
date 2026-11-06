@@ -4,13 +4,11 @@ import {
   ListFilter,
   PieChart,
   Plus,
-  Trash2,
 } from "lucide-react";
 
 import {
   getCustomRules,
   getRules,
-  resetAnalyticsStats,
   saveCustomRules,
 } from "@/api/ipc";
 import { toast } from "@/components/ui/Toast";
@@ -42,7 +40,6 @@ export default function Analytics() {
   const analytics = useCoreStore((s) => s.analytics);
   const ipToDomain = useCoreStore((s) => s.ipToDomain);
   const domainToIp = useCoreStore((s) => s.domainToIp);
-  const setAnalytics = useCoreStore((s) => s.setAnalytics);
   const running = status === "running";
   // 【APP35 任务3】Top 主机名默认显示域名，可一键切换为 IP 聚合
   const [hostDisplayMode, setHostDisplayMode] = useState<"domain" | "ip">("domain");
@@ -164,28 +161,6 @@ export default function Analytics() {
       .catch(() => setRuleTypes([]));
   }, [running]);
 
-  // 【APP49 任务4】清空统计：后端清空聚合，前端立即置空等下一帧快照续接
-  const handleReset = async () => {
-    try {
-      await resetAnalyticsStats();
-      setAnalytics({
-        hosts: [],
-        domains: [],
-        ips: [],
-        outbounds: [],
-        rules: [],
-        protocols: [],
-        proxyBytes: 0,
-        directBytes: 0,
-        lanBytes: 0,
-      });
-      toast.success(t("analytics.resetDone"));
-    } catch (e) {
-      console.error("reset analytics failed:", e);
-      toast.error(String(e));
-    }
-  };
-
   // 【APP49 任务4】快捷规则：域名折算根域用 DOMAIN-SUFFIX，IP 用 IP-CIDR 精确匹配
   const applyQuickRule = async (action: RuleAction) => {
     const host = ruleHost;
@@ -214,15 +189,6 @@ export default function Analytics() {
           {!running && (
             <span className="text-xs text-gray-500">{t("analytics.coreNotRunningHint")}</span>
           )}
-          <button
-            type="button"
-            onClick={() => void handleReset()}
-            title={t("analytics.resetStats")}
-            className="flex items-center gap-1.5 rounded-lg bg-surface-card px-3 py-1.5 text-xs text-text-muted transition-colors hover:bg-surface-hover hover:text-text"
-          >
-            <Trash2 size={13} />
-            {t("analytics.resetStats")}
-          </button>
         </div>
       </div>
 

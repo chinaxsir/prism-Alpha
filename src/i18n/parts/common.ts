@@ -449,7 +449,7 @@ const en: Record<string, string> = {
   "logs.filterAll": "All",
   "logs.filterGoLan": "Go Lan",
   "logs.filterKernel": "Kernel",
-  "logs.filterSub": "Subscription",
+  "logs.filterSub": "Subs",
   "logs.filterPro": "Pro Features",
   "logs.filterRule": "Rules",
   "logs.filterNode": "Nodes",

@@ -28,7 +28,7 @@ pub const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
 /// 模块名常量（前端筛选标签与后端埋点保持一致）
 pub const MOD_GO_LAN: &str = "GoLan";
 pub const MOD_KERNEL: &str = "Kernel";
-pub const MOD_GO_AIM: &str = "GoAim";
+pub const MOD_GO_AIM: &str = "GoAIM";
 pub const MOD_GO_CUS: &str = "GoCus";
 pub const MOD_SUB: &str = "Sub";
 pub const MOD_PRO: &str = "Pro";
@@ -50,7 +50,7 @@ pub struct LogEntry {
     pub timestamp: String,
     /// "INFO" | "WARN" | "ERROR"
     pub level: String,
-    /// "GoLan" | "Kernel" | "GoAim" | "GoCus" | "Sub" | "Pro"
+    /// "GoLan" | "Kernel" | "GoAIM" | "GoCus" | "Sub" | "Pro"
     pub module: String,
     pub message: String,
 }
@@ -183,14 +183,58 @@ pub fn error(module: &str, message: impl AsRef<str>) {
     push_entry("ERROR", module, message.as_ref());
 }
 
-/// 内核/扩展日志行 → 模块归类：含 wireguard / go-lan-home 归 GoLan，其余 Kernel
-fn classify_kernel_line(line: &str) -> &'static str {
-    let lower = line.to_lowercase();
-    if lower.contains("wireguard") || lower.contains("go-lan-home") {
+/// 【APP55 任务5】外部日志行（sing-box kernel.log / iOS extension.log）→
+/// 精确单一类别归属 + 剥离冗余前缀。严禁把 Go Lan / Go AIM / 规则 / 节点
+/// 日志一律塞进 Kernel：
+/// - [GoLan-Ext] / [GoLan] / go-lan- / outbound/wireguard → GoLan
+/// - [GoAIM] / GO-AIM-PROBE / aim-probe-in → GoAim
+/// - [GoCus] → GoCus
+/// - [Rule] / route( / match rule → Rule
+/// - [Node] / outbound/vless|trojan|vmess|shadowsocks|hysteria2|tuic → Node
+/// - [Sub] → Sub
+/// - 其余纯内核启停、DNS 与系统网卡日志 → Kernel
+pub fn classify_external_log_line(raw_line: &str) -> (&'static str, String) {
+    let lower = raw_line.to_lowercase();
+    let module = if lower.contains("[golan-ext]")
+        || lower.contains("[golan]")
+        || lower.contains("go-lan-")
+        || lower.contains("outbound/wireguard")
+        || lower.contains("go-lan-home")
+    {
         MOD_GO_LAN
+    } else if lower.contains("[goaim]") || lower.contains("go-aim-probe") || lower.contains("aim-probe-in") {
+        MOD_GO_AIM
+    } else if lower.contains("[gocus]") {
+        MOD_GO_CUS
+    } else if lower.contains("[rule]") || lower.contains("route(") || lower.contains("match rule") {
+        MOD_RULE
+    } else if lower.contains("[node]")
+        || lower.contains("outbound/vless")
+        || lower.contains("outbound/trojan")
+        || lower.contains("outbound/vmess")
+        || lower.contains("outbound/shadowsocks")
+        || lower.contains("outbound/hysteria2")
+        || lower.contains("outbound/tuic")
+    {
+        MOD_NODE
+    } else if lower.contains("[sub]") {
+        MOD_SUB
     } else {
         MOD_KERNEL
-    }
+    };
+    // 【APP55 任务5】GoLan 扩展日志剥离 `[GoLan-Ext]` 前缀，正文更干净
+    let message = if module == MOD_GO_LAN {
+        let trimmed = raw_line.trim_start();
+        match trimmed.get(..11) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("[GoLan-Ext]") => {
+                trimmed[11..].trim_start().to_string()
+            }
+            _ => trimmed.to_string(),
+        }
+    } else {
+        raw_line.trim().to_string()
+    };
+    (module, message)
 }
 
 /// 【APP11 任务5.2】解析 sing-box 内核日志行自带的时间戳。
@@ -422,7 +466,8 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
         if is_benign_close_line(line) {
             continue;
         }
-        let module = classify_kernel_line(line);
+        // 【APP55 任务5】外部日志行精确归类（GoLan/GoAIM/GoCus/Rule/Node/Sub/Kernel）
+        let (module, classified) = classify_external_log_line(line);
         let lower = line.to_lowercase();
         let level = if lower.contains("error") || lower.contains("fatal") || lower.contains("失败") {
             "ERROR"
@@ -450,7 +495,7 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
             timestamp,
             level: level.into(),
             module: module.into(),
-            message: strip_leading_datetime(line).chars().take(500).collect(),
+            message: strip_leading_datetime(&classified).chars().take(500).collect(),
         });
     }
 }
@@ -726,9 +771,41 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        beijing_now_string, is_benign_close_line, is_noise_eperm_line, strip_leading_datetime,
-        MOD_NODE, MOD_RULE, PHASE_CONNECTED, PHASE_FORWARDING, PHASE_HANDSHAKE, PHASE_NODE_IDENT,
+        beijing_now_string, classify_external_log_line, is_benign_close_line, is_noise_eperm_line,
+        strip_leading_datetime, MOD_GO_AIM, MOD_GO_CUS, MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE,
+        MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING, PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
+
+    /// 【APP55 任务5】外部日志行必须精确落入单一类别，禁止一律归 Kernel
+    #[test]
+    fn test_classify_external_log_line_categories() {
+        let cases = [
+            ("[GoLan-Ext] 内网直连探测 10.10.10.253:8001 可达", MOD_GO_LAN),
+            ("[GoLan] profile home bypass on local lan", MOD_GO_LAN),
+            ("outbound/wireguard[home]: handshake complete", MOD_GO_LAN),
+            ("[GoAIM] probe gpt unlocked", MOD_GO_AIM),
+            ("GO-AIM-PROBE-IN: 已进入探测通道", MOD_GO_AIM),
+            ("[GoCus] 模块已加载: AdBlock", MOD_GO_CUS),
+            ("[Rule] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_RULE),
+            ("match rule: DOMAIN,www.apple.com,DIRECT", MOD_RULE),
+            ("[Node] HK-01 握手成功 32ms", MOD_NODE),
+            ("outbound/vless[HK1]: connected", MOD_NODE),
+            ("outbound/hysteria2[US2]: connected", MOD_NODE),
+            ("[Sub] 订阅更新完成 18/20", MOD_SUB),
+            ("start inbound/tun[tun-in]: create tun", MOD_KERNEL),
+            ("router: loaded 102 rules", MOD_KERNEL),
+        ];
+        for (line, want) in cases {
+            assert_eq!(classify_external_log_line(line).0, want, "line={line}");
+        }
+        // GoLan 扩展前缀必须剥离，正文保留
+        let (module, message) = classify_external_log_line("[GoLan-Ext] 直连 10.10.10.253:8001");
+        assert_eq!(module, MOD_GO_LAN);
+        assert_eq!(message, "直连 10.10.10.253:8001");
+        // 普通中文行不得因按字节切片而 panic
+        let (_, message) = classify_external_log_line("中文开头且足够长的普通内核日志行");
+        assert_eq!(message, "中文开头且足够长的普通内核日志行");
+    }
 
     /// 【APP39 任务2.2】正常关闭/策略拦截日志必须被识别并丢弃，不再显示 ERROR
     #[test]

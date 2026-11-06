@@ -884,12 +884,13 @@ export default function GoLanModal({ open, onClose }: Props) {
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
             {profiles.map((p) => {
               const st = statusOf(p.id);
-              // 【APP54 任务1】优先使用后端注入的 isDirect / 全局直连映射，
-              // 保证 VPN 开启后物理网段直连仍显示 ⚡ 直连
-              const direct =
-                status?.goLanProfileDirectMap?.[p.id] === true ||
-                st?.isDirect === true ||
-                st?.state === "direct";
+              // 【APP55 任务3】多隧道精准直连：仅当本档案开启 On-Demand 且
+              // 自身网段命中才显示 ⚡，未命中的隧道保持 🔒
+              const direct = Boolean(
+                p.bypassOnLocalLan &&
+                  (status?.goLanProfileDirectMap?.[p.id] === true ||
+                    st?.isDirect === true)
+              );
               const on = p.id === form.id ? form.enabled : p.enabled;
               return (
                 <button

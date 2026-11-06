@@ -2788,8 +2788,9 @@ pub async fn save_custom_rules(
         .map_err(|e| format!("保存自定义规则失败: {e}"))?;
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
+        // 【APP55 任务5】规则变更属于 Rule 类别，不能混入内核日志
         crate::core::logger::info(
-            crate::core::logger::MOD_KERNEL,
+            crate::core::logger::MOD_RULE,
             "规则变更已热重载内核配置（无需重新启动 VPN）",
         );
     }

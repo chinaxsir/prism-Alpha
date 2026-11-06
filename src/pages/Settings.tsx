@@ -479,18 +479,6 @@ export default function Settings() {
           <div className="flex items-center gap-2">
             <Home className="w-4 h-4 text-surge-orange shrink-0" />
             <span className="font-semibold text-sm text-text">{t("engine.goLan")}</span>
-            <span className="text-[11px] px-1.5 py-0.5 rounded bg-surface-hover text-text-muted">
-              {t("engine.goLanTag")}
-            </span>
-            {/* 【APP54 任务1】任一启用档案直连时展示 ⚡ 直连 胶囊 */}
-            {proUnlocked &&
-              (goLanCfg?.profiles ?? []).some(
-                (p) => p.enabled && p.isDirect === true
-              ) && (
-                <span className="shrink-0 rounded-md bg-[#24B414]/15 px-1.5 py-0.5 text-[11px] font-bold text-[#24B414] dark:text-[#30D158]">
-                  ⚡ {t("dashboard.lan.directBadge")}
-                </span>
-              )}
           </div>
           <div className="text-xs text-text-muted mt-1 leading-relaxed break-words">
             {!proUnlocked
@@ -501,7 +489,7 @@ export default function Settings() {
                     .filter((p) => p.enabled)
                     .map((p) =>
                       `${p.name} (${
-                        p.isDirect
+                        p.bypassOnLocalLan && p.isDirect
                           ? t("goLan.statusDirect")
                           : t("goLan.statusTunnel")
                       })`

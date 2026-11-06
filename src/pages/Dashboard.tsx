@@ -76,6 +76,9 @@ export default function Dashboard() {
   /// 新装/冷启动/无订阅时一律静默显示灰点「未连接」，绝不误报
   /// 同步 ref：避免 React 异步更新导致 catch 里读到旧值 false
   const manualStartRef = useRef(false);
+  /// 【APP55 任务1】手动启动失败标记：仅用户亲手点启动且本次启动失败才为 true；
+  /// 页面初始化恒 false，冷启动/自动同步/订阅更新等非手动操作绝不置红
+  const [manualStartFailed, setManualStartFailed] = useState(false);
   const navigate = useNavigate();
 
   // Pro 授权状态（APP-13 任务3：入口常驻，未激活时卡片整体置灰）
@@ -399,9 +402,11 @@ export default function Dashboard() {
         useCoreStore.getState().setStartedAtMs(null);
         // 停止后重置手动启动标记：下次要手动点启动才会再次显示错误
         manualStartRef.current = false;
+        setManualStartFailed(false);
       } else {
         // 【APP53 任务1.1】标记用户已亲手点过启动，只有此后的错误才展示红点
         manualStartRef.current = true;
+        setManualStartFailed(false);
         setStatus("starting");
         await startCore();
         setStatus("running");
@@ -411,6 +416,7 @@ export default function Dashboard() {
       // 【APP53 任务1.1】只在用户明确手动点过启动后才展示 error；
       // 冷启动/自动恢复/切网重试的失败一律静默显示「未连接」
       if (manualStartRef.current) {
+        setManualStartFailed(true);
         setStatus("error");
         setErrorMsg(String(e));
       } else {
@@ -418,6 +424,11 @@ export default function Dashboard() {
       }
     }
   };
+
+  // 【APP55 任务1】连接成功后清空失败标记，状态灯回归绿色
+  useEffect(() => {
+    if (running) setManualStartFailed(false);
+  }, [running]);
 
   /// 节点最近一次延迟（无测速记录为 undefined）
   const nodeDelay = (n: ProxyEntry): number | undefined =>
@@ -486,8 +497,8 @@ export default function Dashboard() {
   // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
   const lanCidrs = lan?.lanCidrs ?? [];
   // 【APP40 任务2】多档案副标题：已启用: 家里 (⚡ 直连) · 公司 (🔒 隧道)
-  // 【APP54 任务1】直连判定以后端注入的 isDirect / goLanProfileDirectMap 为准，
-  // 不再依赖旧的 profileStates 字符串字段（VPN 开启后仍能正确显示物理网段直连）
+  // 【APP55 任务3】多隧道精准直连：只看本档案自身网段是否命中，
+  // 严禁用「任一档案直连」的全局状态给所有隧道挂 ⚡
   const enabledLanProfiles = (lan?.profiles ?? []).filter((p) => p.enabled);
   const lanDirectMap = lanState?.goLanProfileDirectMap ?? {};
   const lanStatus =
@@ -497,9 +508,8 @@ export default function Dashboard() {
             .map((p) => {
               const st = lanState?.profiles.find((x) => x.id === p.id);
               const isDirect =
-                lanDirectMap[p.id] === true ||
-                st?.isDirect === true ||
-                st?.state === "direct";
+                p.bypassOnLocalLan === true &&
+                (lanDirectMap[p.id] === true || st?.isDirect === true);
               const badge = isDirect
                 ? t("goLan.statusDirect")
                 : t("goLan.statusTunnel");
@@ -552,7 +562,7 @@ export default function Dashboard() {
                     ? "bg-latency-good"
                     : status === "starting"
                       ? "bg-amber-400"
-                      : status === "error"
+                      : manualStartFailed
                         ? "bg-latency-bad"
                         : "bg-gray-500"
                 } ${running || status === "starting" ? "animate-pulse" : ""}`}
@@ -564,7 +574,7 @@ export default function Dashboard() {
                 ? t("status.connected")
                 : status === "starting"
                   ? t("status.starting")
-                  : status === "error"
+                  : manualStartFailed
                     ? t("status.startFailed")
                     : t("status.disconnected")}
             </div>
@@ -659,7 +669,6 @@ export default function Dashboard() {
           icon={<Crosshair size={16} className="text-surge-green" />}
           tone="text-surge-green"
           name={t("engine.goAim")}
-          tag={t("engine.goAimTag")}
           status={proUnlocked ? aimStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (aim?.enabled ?? false)}
           locked={!proUnlocked}
@@ -683,18 +692,9 @@ export default function Dashboard() {
           icon={<Home size={16} className="text-surge-orange" />}
           tone="text-surge-orange"
           name={t("engine.goLan")}
-          tag={t("engine.goLanTag")}
           status={proUnlocked ? lanStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
-          badge={
-            proUnlocked &&
-            (lanState?.goLanAnyDirect ??
-              lanState?.anyOnDemandDirect ??
-              Object.values(lanDirectMap).some(Boolean))
-              ? t("dashboard.lan.directBadge")
-              : undefined
-          }
           onToggle={toggleLan}
           action={
             proUnlocked ? (
@@ -711,7 +711,6 @@ export default function Dashboard() {
           icon={<Wand2 size={16} className="text-surge-purple" />}
           tone="text-surge-purple"
           name={t("engine.goCus")}
-          tag={t("engine.goCusTag")}
           status={proUnlocked ? cusStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (cus?.enabled ?? false)}
           locked={!proUnlocked}
@@ -838,18 +837,15 @@ export default function Dashboard() {
 function EngineCard({
   icon,
   name,
-  tag,
   status,
   enabled,
   onToggle,
   action,
   locked = false,
   tone,
-  badge,
 }: {
   icon: ReactNode;
   name: string;
-  tag: string;
   status: string;
   enabled: boolean;
   onToggle: (v: boolean) => void;
@@ -857,8 +853,6 @@ function EngineCard({
   locked?: boolean;
   /** 【APP47 任务2.3】模块标题彩色文字类（如 text-surge-green） */
   tone?: string;
-  /** 【APP52 任务3】标题旁状态胶囊（Go Lan 局域网直连） */
-  badge?: string;
 }) {
   return (
     <div
@@ -881,14 +875,6 @@ function EngineCard({
           >
             {name}
           </span>
-          <span className="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-glass text-text-muted whitespace-nowrap">
-            {tag}
-          </span>
-          {badge ? (
-            <span className="shrink-0 px-2 py-0.5 rounded-md text-[12px] font-bold bg-[#24B414]/15 text-[#24B414] dark:text-[#30D158] whitespace-nowrap">
-              ⚡ {badge}
-            </span>
-          ) : null}
         </div>
         {/* 【APP47 任务2.3】状态副标题 14px medium 深色正文，最多两行完整展示 */}
         <div

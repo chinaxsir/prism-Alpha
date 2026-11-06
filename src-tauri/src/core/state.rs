@@ -535,24 +535,20 @@ impl AppState {
         Ok(())
     }
 
-    /// 清空运行时统计（内核停止/启动时调用）：60s 队列 / 活跃连接 / 分析聚合。
-    /// 今日流量基数不动（由 store::archive_session 负责归档）
+    /// 【APP55 任务4】清空瞬时运行时数据（内核停止/启动时调用）。
+    ///
+    /// 只重置 60s 流量队列、活跃连接池与总量差分基准；分析聚合
+    /// （hosts / domains / ips / outbounds / rules / protocols）与
+    /// proxy/direct/lan 三类累计字节一律保留——
+    /// VPN 断开重连、内核 downloadTotal 从 0 重新计时时，后续帧在新基准上
+    /// 继续累加，历史统计不会因重启而清零。
+    /// 今日流量基数仍由 store::archive_session 负责归档。
     pub fn reset_runtime_stats(&self) {
         self.traffic_history.write().clear();
         self.connections_live.write().clear();
         let mut agg = self.analytics.write();
-        agg.hosts.clear();
-        agg.domains.clear();
-        agg.ips.clear();
-        agg.ip_to_domain.clear();
-        agg.outbounds.clear();
-        agg.rules.clear();
-        agg.protocols.clear();
+        // 新会话连接 id 从头分配，清空差值基准避免旧会话残留
         agg.last_seen.clear();
-        // 【APP51 任务3】分流累计与总量差分基准一并清零
-        agg.proxy_bytes = 0;
-        agg.direct_bytes = 0;
-        agg.lan_bytes = 0;
         agg.last_total_down = 0;
         agg.last_total_up = 0;
     }
