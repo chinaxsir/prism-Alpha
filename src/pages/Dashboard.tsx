@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity,
@@ -33,7 +33,7 @@ import {
   isGoLanConfigured,
   type GoLanStatus,
 } from "@/api/ipc";
-import { useCoreStore, type RunMode, isDummyNodeName } from "@/stores/core";
+import { useCoreStore, isDummyNodeName } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { useTranslation } from "@/i18n";
 import { useAppVisible } from "@/hooks/useAppVisible";
@@ -58,7 +58,6 @@ interface ProxyEntry {
 export default function Dashboard() {
   const { t } = useTranslation();
   const status = useCoreStore((s) => s.status);
-  const mode = useCoreStore((s) => s.mode);
   const upSpeed = useCoreStore((s) => s.upSpeed);
   const downSpeed = useCoreStore((s) => s.downSpeed);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
@@ -66,11 +65,17 @@ export default function Dashboard() {
   // 今日流量：后端持久化基数 + 当前会话内核绝对累计（前后台不间断）
   const todayBytes = useCoreStore((s) => s.todayBytes);
   const setStatus = useCoreStore((s) => s.setStatus);
+  // 【APP53 任务1.1】运行模式已从主控卡移除，但 start/stop/runtime 同步
+  // 仍需调用这些 setter（内核 API 会上报 mode + outboundMode）
   const setMode = useCoreStore((s) => s.setMode);
   const setOutboundMode = useCoreStore((s) => s.setOutboundMode);
   const setUptime = useCoreStore((s) => s.setUptime);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  /// 【APP53 任务1.1】只有当用户亲手点击了「启动」按钮后发生的错误才展示红点；
+  /// 新装/冷启动/无订阅时一律静默显示灰点「未连接」，绝不误报
+  /// 同步 ref：避免 React 异步更新导致 catch 里读到旧值 false
+  const manualStartRef = useRef(false);
   const navigate = useNavigate();
 
   // Pro 授权状态（APP-13 任务3：入口常驻，未激活时卡片整体置灰）
@@ -98,14 +103,8 @@ export default function Dashboard() {
   const [lanState, setLanState] = useState<GoLanStatus | null>(null);
 
   const running = status === "running";
-  const outboundMode = useCoreStore((s) => s.outboundMode);
-  const modeLabel = (m: RunMode) => t(m === "tun" ? "runMode.tun" : "runMode.systemProxy");
-  // 【APP49 任务1】副标题动态显示组合状态：运行模式 · TUN 规则/全局/直连
-  const modeCombo =
-    mode === "tun"
-      ? `${modeLabel(mode)} ${t(`outbound.${outboundMode}`)}`
-      : modeLabel(mode);
-
+  // 【APP53 任务1.2】运行模式字样已从主控卡移除，outboundMode/mode 不再直接渲染；
+  // 内核运行模式仍由 start/stop/runtime 同步调用 store.setMode/setOutboundMode 记录。
   // 拉取主选择组与当前节点（内核运行时才有实时数据）
   const loadCurrentNode = async () => {
     try {
@@ -377,15 +376,25 @@ export default function Dashboard() {
         setStatus("stopped");
         setUptime(0);
         useCoreStore.getState().setStartedAtMs(null);
+        // 停止后重置手动启动标记：下次要手动点启动才会再次显示错误
+        manualStartRef.current = false;
       } else {
+        // 【APP53 任务1.1】标记用户已亲手点过启动，只有此后的错误才展示红点
+        manualStartRef.current = true;
         setStatus("starting");
         await startCore();
         setStatus("running");
       }
     } catch (e) {
       console.error("toggle core failed:", e);
-      setStatus("error");
-      setErrorMsg(String(e));
+      // 【APP53 任务1.1】只在用户明确手动点过启动后才展示 error；
+      // 冷启动/自动恢复/切网重试的失败一律静默显示「未连接」
+      if (manualStartRef.current) {
+        setStatus("error");
+        setErrorMsg(String(e));
+      } else {
+        setStatus("stopped");
+      }
     }
   };
 
@@ -490,7 +499,7 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-2.5">
       <h1 className="text-[22px] font-bold tracking-tight">{t("dashboard.title")}</h1>
 
       {/* 出站模式快捷切换（规则/全局/直连） */}
@@ -499,7 +508,7 @@ export default function Dashboard() {
       {/* Hero 状态卡（Shadowrocket 风格：满宽，左状态右按钮）
           【APP39 任务1】启动前后背景色恒定：严禁随 running 变色，
           始终 bg-surface-card + border-border，与其余卡片完全一致 */}
-      <div className="rounded-2xl p-5 border bg-surface-card border-border">
+      <div className="rounded-2xl py-3.5 px-4 border bg-surface-card border-border">
         <div className="flex items-center justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">
@@ -528,15 +537,6 @@ export default function Dashboard() {
             <div className="text-2xl font-bold tabular-nums text-gray-100">
               {running ? formatUptime(displayUptimeSecs) : "Prism"}
             </div>
-            {/* 未连接/启动中时左侧仅保留状态圆点与 Prism 标题：不再显示
-                「正在建立 VPN 隧道，请稍候」副标题，避免点击启动瞬间卡片
-                高度跳动（启动反馈由状态点与右侧「启动中」按钮承载）。
-                仅「已连接」显示计时器时，下方才显示运行模式。 */}
-            {running ? (
-              <div className="text-xs text-gray-500 mt-1">
-                {t("dashboard.runModeLabel", { mode: modeCombo })}
-              </div>
-            ) : null}
           </div>
           <button
             onClick={toggle}
@@ -579,7 +579,7 @@ export default function Dashboard() {
           onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
           role={nodes.length > 0 ? "button" : undefined}
           className={clsx(
-            "rounded-[16px] bg-surface-card p-4 border border-border flex flex-col justify-between min-h-[88px] min-w-0",
+            "rounded-[16px] bg-surface-card py-2.5 px-3.5 border border-border flex flex-col justify-between min-h-[62px] min-w-0",
             nodes.length > 0 && "cursor-pointer active:opacity-80 transition-opacity"
           )}
         >
@@ -596,21 +596,21 @@ export default function Dashboard() {
           </div>
           {/* 【APP47 任务1.2】未启动也展示持久化的上次选中节点，绝不显示「—」 */}
           <div
-            className="mt-2 text-[15px] font-bold text-text leading-snug break-all line-clamp-2"
+            className="mt-1 text-[15px] font-bold text-text leading-snug break-all line-clamp-2"
             title={currentNode || persistedNode || nodes[0]?.name}
           >
             {currentNode || persistedNode || nodes[0]?.name || t("dashboard.noSelection")}
           </div>
         </div>
 
-        <div className="rounded-[16px] bg-surface-card p-4 border border-border flex flex-col justify-between min-h-[88px] min-w-0">
+        <div className="rounded-[16px] bg-surface-card py-2.5 px-3.5 border border-border flex flex-col justify-between min-h-[62px] min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
             <BarChart3 size={18} className="shrink-0 text-[#00C7BE]" />
             <span className="text-[15px] font-bold text-[#00C7BE] whitespace-nowrap">
               {t("metric.todayTraffic")}
             </span>
           </div>
-          <div className="mt-2 text-[17px] font-bold tabular-nums text-text leading-snug whitespace-nowrap">
+          <div className="mt-1 text-[17px] font-bold tabular-nums text-text leading-snug whitespace-nowrap">
             {formatBytes(todayBytes || 0)}
           </div>
         </div>

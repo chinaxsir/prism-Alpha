@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, Crosshair, ListFilter, ListChecks, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ListChecks, ListFilter, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 
 import {
   getCustomRules,
@@ -8,7 +8,6 @@ import {
   saveCustomRules,
 } from "@/api/ipc";
 import ProGate from "@/components/ProGate";
-import RuleTargetPicker from "@/components/RuleTargetPicker";
 import Spinner from "@/components/ui/Spinner";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
@@ -53,8 +52,6 @@ export default function Rules() {
   // 【APP42 任务4.2】策略选择器弹窗：点击行末编辑图标或双击行打开
   const [pickerIndex, setPickerIndex] = useState<number | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
-  // 【APP43 任务3】从连接 / 分析页选择域名或 IP 批量生成规则
-  const [targetPickerOpen, setTargetPickerOpen] = useState(false);
   // 【APP44】手动添加表单默认折叠，避免三行输入框把规则列表挤到首屏之外
   const [formOpen, setFormOpen] = useState(false);
   const payloadRef = useRef<HTMLInputElement>(null);
@@ -177,24 +174,6 @@ export default function Rules() {
   const removeAt = (index: number) =>
     persist(custom.filter((_, i) => i !== index));
 
-  /// 【APP43 任务3】目标选择器确认：批量合并去重后整体保存
-  const handleTargetConfirm = (lines: string[]) => {
-    setTargetPickerOpen(false);
-    const merged = [...custom];
-    let added = 0;
-    for (const line of lines) {
-      if (!merged.includes(line)) {
-        merged.push(line);
-        added += 1;
-      }
-    }
-    if (added === 0) {
-      toast.error(t("proxies.rules.err.exists"));
-      return;
-    }
-    persist(merged);
-  };
-
   return (
     <div className="space-y-6">
       <ProGate feature={Feature.Rules}>
@@ -206,14 +185,7 @@ export default function Rules() {
               {t("proxies.rules.customTitle", { count: custom.length })}
             </h2>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setTargetPickerOpen(true)}
-                className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-xs text-gray-300 hover:border-accent/50 hover:text-gray-100"
-              >
-                <Crosshair size={13} className="text-accent" />
-                {t("proxies.rules.pickTarget")}
-              </button>
+              {/* 【APP53 任务2.1】精简规则页：移除「从连接/分析选择」按钮，仅保留手动输入添加规则 */}
               <button
                 type="button"
                 onClick={() => {
@@ -405,13 +377,6 @@ export default function Rules() {
           )}
         </div>
       </ProGate>
-
-      {/* 【APP43 任务3】从连接 / 分析页选择域名或 IP → 批量生成规则 */}
-      <RuleTargetPicker
-        open={targetPickerOpen}
-        onClose={() => setTargetPickerOpen(false)}
-        onConfirm={handleTargetConfirm}
-      />
 
       {/* 【APP42 任务4.2】策略选择器：搜索过滤 + 一键应用 */}
       {pickerIndex != null && (

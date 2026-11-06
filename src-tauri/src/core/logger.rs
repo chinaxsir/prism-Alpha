@@ -99,7 +99,11 @@ fn now_timestamp() -> String {
     let fmt = format_description!(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
     );
-    let dt = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    // 【APP53 任务4.1】统一北京时间（UTC+8）：不再跟随系统本地时区，
+    // 保证 Mac（无论在哪个时区）、Windows、iOS、Android 四端日志时间戳一致，
+    // 后端内核日志转换时也强制 +8h。
+    let bj = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
+    let dt = time::OffsetDateTime::now_utc().to_offset(bj);
     dt.format(&fmt).unwrap_or_else(|_| "0000-00-00 00:00:00.000".into())
 }
 
@@ -247,8 +251,9 @@ fn parse_leading_epoch(line: &str) -> Option<String> {
     let fmt =
         format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
     let dt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
-    let off = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    dt.to_offset(off).format(&fmt).ok()
+    // 【APP53 任务4.1】内核日志转换统一北京时间（UTC+8）
+    let bj = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
+    dt.to_offset(bj).format(&fmt).ok()
 }
 
 /// 把外部文本日志（内核 kernel.log / iOS 扩展诊断文件）按行合并为条目。

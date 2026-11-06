@@ -507,6 +507,75 @@ pub fn split_profile_cidrs_for_on_demand(
     (tunnel, direct)
 }
 
+/// 【APP53 任务1.3】同步判定：档案是否应标记为「局域网直连」（CIDR 匹配 + bypass 开关）。
+/// 网关可达性探测（跨 VLAN 场景）由调用方在 async 上下文中额外补充检测。
+pub fn evaluate_profile_lan_direct_state(
+    profile: &GoLanProfile,
+    phys_wifi_ips: &[std::net::Ipv4Addr],
+) -> bool {
+    if !profile.enabled || !profile.bypass_on_local_lan {
+        return false;
+    }
+    let (_tunnel, direct) = split_profile_cidrs_for_on_demand(profile, phys_wifi_ips);
+    !direct.is_empty()
+}
+
+/// 从 CIDR 生成常见网关候选（.1 / .254）
+fn gateway_candidates_from_cidr(cidr: &str) -> Option<String> {
+    let (base, _prefix) = cidr.split_once('/')?;
+    let mut parts = base.split('.').filter_map(|p| p.parse::<u8>().ok()).collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+    let last = parts[3];
+    let candidates = match last {
+        0..=2 => [1u8, 254],
+        1 => [254, 2],
+        _ => [1, 254],
+    };
+    for c in candidates {
+        parts[3] = c;
+        let s = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3]);
+        if s != base {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// 【APP53 任务1.3】跨档案聚合网关候选（优先 probe_target，否则 lan_cidrs 的网关）。
+pub fn gateway_candidates_from_candidates(
+    profile: &GoLanProfile,
+    _lan_settings: &GoLanSettings,
+) -> Option<std::net::SocketAddr> {
+    let default_port: u16 = 5000;
+    if !profile.probe_target.trim().is_empty() {
+        let (h, p) = split_host_port_safe(&profile.probe_target, default_port);
+        if let Ok(addr) = format!("{h}:{p}").parse::<std::net::SocketAddr>() {
+            return Some(addr);
+        }
+    }
+    for cidr in crate::core::go_lan::profile_route_cidrs(profile) {
+        if let Some(gw_host) = gateway_candidates_from_cidr(&cidr) {
+            if let Ok(addr) = format!("{gw_host}:{default_port}").parse::<std::net::SocketAddr>() {
+                return Some(addr);
+            }
+        }
+    }
+    None
+}
+
+/// "host:port" 安全拆分：非法 host 返回 ("", default_port)
+fn split_host_port_safe(target: &str, default_port: u16) -> (String, u16) {
+    if let Some((h, p)) = target.rsplit_once(':') {
+        let h = h.trim().to_string();
+        let port = p.parse::<u16>().unwrap_or(default_port);
+        (h, port)
+    } else {
+        (target.trim().to_string(), default_port)
+    }
+}
+
 /// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4。
 /// 过滤 utun / tun / ppp / wg / loopback / 172.19.0.x / 169.254.x.x /
 /// WireGuard 虚拟地址 10.196.0.2 与 fake-ip 198.18/15。

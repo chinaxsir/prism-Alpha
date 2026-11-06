@@ -40,7 +40,7 @@ const BASELINE_TIMEOUT_MS: u64 = 1500;
 /// 参与探测的节点基线延迟上限（仅探测存活节点）
 const PROBE_MAX_DELAY_MS: u64 = 2500;
 /// 【APP51 任务1】单个平台探测请求超时（毫秒，严格 1200ms 快速出结果）
-const PROBE_TIMEOUT_MS: u64 = 1200;
+const PROBE_TIMEOUT_MS: u64 = 2800;
 /// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
 const SCREEN_BATCH_SIZE: usize = 32;
 /// 【APP51 任务1】阶段1 快筛单节点超时（毫秒，严格 1500ms）
@@ -49,7 +49,7 @@ const SCREEN_TIMEOUT_MS: u64 = 1500;
 const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
 /// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
 /// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
-const DEEP_PROBE_MAX: usize = 12;
+// DEEP_PROBE_MAX 已移除（APP53 任务2.3：Go AIM 必须检测完所有可达节点）
 /// 【APP51 任务1】ChatGPT cdn-trace 探测超时（毫秒，严格 1200ms）
 const GPT_TRACE_TIMEOUT_MS: u64 = 1200;
 /// 故障转移监控间隔（秒）
@@ -233,15 +233,13 @@ pub fn start_probe(app: AppHandle) {
         tracing::debug!("[go-aim] Go AIM 未开启，跳过全量探测");
         return;
     }
-    if state.aim_probing.swap(true, Ordering::AcqRel) {
+    if !state.aim_probing.swap(true, Ordering::AcqRel) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         return;
     }
-    if !is_running(&state) {
-        state.aim_probing.store(false, Ordering::Release);
-        tracing::debug!("[go-aim] 内核未运行，跳过探测");
-        return;
-    }
+    // 【APP53 任务2.3】不再硬闸 is_running：预览模式（内核未运行）同样允许
+    // Go AIM 执行，走离线 TCP/TLS 握手基线测速 + 节点地区智能解锁识别路径。
+    // 内核运行时走原有的真实隧道 AI/流媒体探测路径。
     drop(state);
 
     tauri::async_runtime::spawn(async move {
@@ -338,13 +336,64 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
 /// probed=true），绝不遗漏"未检测"状态。
 async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     let api = state.kernel_api();
+    let preview_mode = !is_running(state);
+    // 提前 clone 一份 api，避免 preview_mode 分支 return 之前被 stage1 move
+    let api_after_stage1 = api.clone();
 
     // 1. 读取全量节点列表
-    let proxies = api
-        .get_proxies()
-        .await
-        .map_err(|e| format!("读取节点列表失败: {e}"))?;
-    let nodes = collect_nodes(&proxies);
+    let (nodes, offline_endpoints): (Vec<(String, Option<u64>)>, Option<Vec<(String, String, u16)>>) =
+        if preview_mode {
+            // 【APP53 任务2.3】预览模式：内核未运行时从订阅缓存读取节点，
+            // 同时记录每个节点的 server/port 用于离线 TCP 测速基线。
+            let subs = crate::core::store::load_subscriptions(&state.data_dir);
+            let mut names: Vec<(String, Option<u64>)> = Vec::new();
+            let mut eps: Vec<(String, String, u16)> = Vec::new();
+            for r in subs {
+                if !r.enabled {
+                    continue;
+                }
+                let path = crate::core::store::profile_path(&state.data_dir, &r.url);
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+                    continue;
+                };
+                let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) else {
+                    continue;
+                };
+                for p in proxies {
+                    let Some(name) = p.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(server) = p.get("server").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                    if name.is_empty() || server.is_empty() || port == 0 {
+                        continue;
+                    }
+                    if crate::core::config_builder::is_builtin_non_proxy_tag(name) {
+                        continue;
+                    }
+                    if crate::core::config_builder::is_info_or_ad_node_name(name) {
+                        continue;
+                    }
+                    names.push((name.to_string(), None));
+                    eps.push((name.to_string(), server.to_string(), port));
+                }
+            }
+            if names.is_empty() {
+                return Err("节点列表为空，请先刷新订阅".into());
+            }
+            (names, Some(eps))
+        } else {
+            let proxies = api
+                .get_proxies()
+                .await
+                .map_err(|e| format!("读取节点列表失败: {e}"))?;
+            (collect_nodes(&proxies), None)
+        };
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
@@ -360,25 +409,48 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     //（滚动消费，单节点慢不阻塞后续节点）。超时/失败 → dead_result 立即
     //入缓存并推前端；存活节点记录延迟，全部筛完后按延迟升序进入阶段2。
     let mut alive: Vec<(String, u64)> = Vec::with_capacity(nodes.len());
+    // preview_mode 下用 server/port 做离线 TCP 测速替代 api.test_delay
+    let ep_map: std::collections::HashMap<String, (String, u16)> = offline_endpoints
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .map(|(n, s, p)| (n.clone(), (s.clone(), *p)))
+                .collect()
+        })
+        .unwrap_or_default();
     {
         use futures_util::StreamExt as _;
         let sem = Arc::new(tokio::sync::Semaphore::new(SCREEN_BATCH_SIZE));
+        let ep_map_c = ep_map.clone();
         let mut stream = futures_util::stream::iter(nodes.iter().cloned())
-            .map(|(name, _)| {
+            .map(move |(name, _)| {
                 let api = api.clone();
                 let sem = sem.clone();
+                let ep_map = ep_map_c.clone();
                 async move {
                     let _permit = sem.acquire_owned().await.ok();
-                    let delay = api
-                        .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
-                        .await;
+                    let delay = if let Some((server, port)) = ep_map.get(&name) {
+                        // 预览模式：离线 TCP 握手测速
+                        crate::ipc::commands::measure_offline_node_delay(
+                            server,
+                            *port,
+                            PROBE_TIMEOUT_MS as u32,
+                        )
+                        .await
+                    } else {
+                        // 内核运行：真实隧道 HTTP 测速
+                        api.test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32).await
+                    };
                     (name, delay)
                 }
             })
             .buffer_unordered(SCREEN_BATCH_SIZE);
         while let Some((name, delay)) = stream.next().await {
-            // 中止条件：关闭 Go AIM / 停止 VPN / 订阅变更（代数变化）
-            if !state.settings.read().go_aim_enabled || !is_running(state) || generation_changed(state)
+            // 中止条件：关闭 Go AIM / 内核运行时停止 VPN / 订阅变更（代数变化）
+            let running = is_running(state);
+            if !state.settings.read().go_aim_enabled
+                || (running && !preview_mode && !running)
+                || generation_changed(state)
             {
                 return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
             }
@@ -441,6 +513,42 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         }
     }
 
+    // 【APP53 任务2.3】预览模式（内核未运行）跳过阶段2 真实 HTTP 探测——
+    // alive 节点的延迟基线已由离线 TCP 握手给出，AI/流媒体解锁能力留空。
+    // 内核启动后会二次用真实隧道刷新完整探测结果。
+    if preview_mode {
+        let best = alive[0].clone();
+        // 把 alive 节点全部置为 probed=false（等待内核启动后刷新），
+        // 只保留离线 TCP 基线延迟作为徽章与排序依据。
+        for (name, d) in alive.iter() {
+            let mut cur = state
+                .aim_results
+                .read()
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            cur.delay_ms = *d;
+            cur.probed = false;
+            cur.updated_at = now_secs();
+            state.aim_results.write().insert(name.clone(), cur);
+        }
+        // 锁定基线最快节点为默认选择（与内核运行时行为一致）
+        let leader = AimNodeResult {
+            node_name: best.0.clone(),
+            unlocked_tags: vec![],
+            ai_unlocked: false,
+            media_unlocked: false,
+            score: 0,
+            delay_ms: best.1,
+            updated_at: now_secs(),
+            probed: false,
+        };
+        let _ = lock_node(app, state, &leader, false).await;
+        state.aim_probing.store(false, Ordering::Release);
+        let _ = app.emit(AIM_EVENT, serde_json::json!({ "phase": "preview_done", "best": best.0 }));
+        return Ok(alive.len());
+    }
+
     // 3. 探针槽位可用性检测：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
     // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
@@ -485,11 +593,10 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // 下一个节点（等价于每批 4 个节点的滚动并发）。前 PROBE_SLOTS 个
     //（延迟最低的首批）标记 first_batch，用于秒级锁定。
     let instant_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 【APP51 任务1】深测只取阶段1 延迟最低的 Top12（快筛已覆盖全量节点）
+    // 【APP53 任务2.3】深测全量可达节点（无 DEEP_PROBE_MAX 截断）
     let queue = Arc::new(tokio::sync::Mutex::new(
         alive
             .into_iter()
-            .take(DEEP_PROBE_MAX)
             .enumerate()
             .map(|(i, (name, d))| (name, d, i < PROBE_SLOTS))
             .collect::<VecDeque<_>>(),
@@ -497,7 +604,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     let mut set = tokio::task::JoinSet::new();
     for (slot, client, nr_client) in slot_clients {
         let queue = queue.clone();
-        let api = api.clone();
+        let api = api_after_stage1.clone();
         let task_app = app.clone();
         let instant_locked = instant_locked.clone();
         let generation = generation;

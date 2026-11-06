@@ -2373,7 +2373,11 @@ async fn resolve_real_ipv4s(
     out
 }
 
-async fn measure_offline_node_delay(server: &str, port: u16, timeout_ms: u32) -> Option<u64> {
+pub(crate) async fn measure_offline_node_delay(
+    server: &str,
+    port: u16,
+    timeout_ms: u32,
+) -> Option<u64> {
     let ips = resolve_real_ipv4s(server, port, timeout_ms).await;
     for ip in ips.into_iter().take(4) {
         let start = std::time::Instant::now();
@@ -3509,12 +3513,11 @@ pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Res
     if !state.is_pro_active() {
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
-    if *state.status.read() != CoreStatus::Running {
-        return Err("请先启动代理内核后再执行 Go AIM 真实节点检测".into());
-    }
+    // 【APP53 任务2.3】预览模式（内核未运行）同样允许 Go AIM 执行：
+    // 先全量测速（离线 TCP/TLS 握手）对可达节点做基线，再基于节点地区/出口 IP
+    // 归属地智能识别 AI/流媒体解锁能力，内核启动后会二次用真实隧道刷新。
+    // 内核运行时走原有的真实隧道探测路径（2800ms 超时 + 4 探针槽位）。
     let already = state.aim_probing.load(std::sync::atomic::Ordering::Acquire);
-    // 【APP52 任务1】手动重测 = 回到自动选点模式：清空手动标记，
-    // 本轮探测完成后按最低延迟重新自动选点。
     if !already {
         let mut settings = state.settings.read().clone();
         settings.user_manually_selected_node = false;
@@ -3730,14 +3733,28 @@ pub async fn get_go_lan_status(
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
     let mut items: Vec<serde_json::Value> = Vec::new();
-    // 【APP52 任务3】全局 On-Demand 判定：任一启用隧道命中本机局域网即 true；
-    // profile_states 为每个档案输出 direct / tunnel / off，供仪表盘与弹窗展示。
     let mut any_on_demand_direct = false;
     let mut profile_states = serde_json::Map::new();
     for (tag, profile) in crate::core::go_lan::enabled_profiles(&lan) {
+        let mut direct_hit = crate::core::go_lan::evaluate_profile_lan_direct_state(&profile, &physical);
+        // 【APP53 任务1.3】跨 VLAN 但同物理局域网路由可达：快速探测网关
+        // （lan_cidrs 的 .1/.254 或 probe_target）150ms 内 TCP 可达也判定直连
+        if !direct_hit && !physical.is_empty() && profile.bypass_on_local_lan {
+            if let Some(gw) = crate::core::go_lan::gateway_candidates_from_candidates(&profile, &lan) {
+                if tokio::time::timeout(
+                    std::time::Duration::from_millis(150),
+                    tokio::net::TcpStream::connect(&gw),
+                )
+                .await
+                .is_ok_and(|r| r.is_ok())
+                {
+                    direct_hit = true;
+                }
+            }
+        }
         let (tunnel, direct) =
             crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
-        let mut bypassed = direct;
+        let mut bypassed = if direct_hit { direct.clone() } else { direct };
         if bypassed.is_empty() {
             if let Some(cidrs) = ios_bypass.iter().find(|(t, _)| t == &tag).map(|(_, c)| c) {
                 bypassed = cidrs.clone();
@@ -3754,6 +3771,7 @@ pub async fn get_go_lan_status(
             "name": profile.name,
             "enabled": profile.enabled,
             "onDemand": profile.bypass_on_local_lan,
+            "isDirect": state_str == "direct",
             "state": state_str,
             "bypassCidrs": bypassed,
             "tunnelCidrs": tunnel,

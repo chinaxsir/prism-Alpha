@@ -52,13 +52,11 @@ const PROTOCOL_LABEL: Record<string, string> = {
   HTTP: "HTTP",
 };
 
-/// Go AIM 筛选 pills
-type AimFilter = "all" | "aim" | "ai" | "media";
+/// Go AIM 筛选 pills（APP53 任务2.1 去掉 AI / 流媒体分类，仅保留 全部 / Go AIM）
+type AimFilter = "all" | "aim";
 const AIM_FILTERS: Array<{ value: AimFilter; labelKey: string }> = [
   { value: "all", labelKey: "common.all" },
   { value: "aim", labelKey: "engine.goAim" },
-  { value: "ai", labelKey: "proxies.aim.ai" },
-  { value: "media", labelKey: "proxies.aim.media" },
 ];
 
 /** Go AIM 平台细分徽章配色（APP 任务3，与指令 1:1 对齐） */
@@ -431,8 +429,7 @@ export default function Proxies() {
     const r = aim?.results[n.name];
     if (!r) return false;
     if (filter === "aim") return isNodeAimUnlocked(r);
-    if (filter === "ai") return isNodeAiUnlocked(r);
-    return isNodeMediaUnlocked(r);
+    return false;
   });
 
   /// 已探测到的结果数：为 0 说明还没跑过探测（切到 AI/流媒体栏时自动补一次）
