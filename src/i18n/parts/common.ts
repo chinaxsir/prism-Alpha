@@ -9,6 +9,12 @@ const zh: Record<string, string> = {
   "nav.subscription": "订阅",
   "nav.analytics": "分析",
   "nav.settings": "设置",
+  // 【APP54 任务6】底部导航英文短名（窄屏不溢出）
+  "navShort.dashboard": "仪表盘",
+  "navShort.proxies": "代理",
+  "navShort.subscription": "订阅",
+  "navShort.analytics": "分析",
+  "navShort.settings": "设置",
 
   // ---- 通用动作 ----
   "common.save": "保存",
@@ -90,7 +96,9 @@ const zh: Record<string, string> = {
   "logs.filterGoLan": "Go Lan",
   "logs.filterKernel": "内核",
   "logs.filterSub": "订阅",
-  "logs.filterPro": "Pro 授权",
+  "logs.filterPro": "Pro 功能",
+  "logs.filterRule": "规则运行",
+  "logs.filterNode": "节点连接",
   "logs.filterGoAim": "Go AIM",
   "logs.filterGoCus": "Go Cus",
   "logs.loading": "读取中...",
@@ -355,6 +363,12 @@ const en: Record<string, string> = {
   "nav.subscription": "Subscriptions",
   "nav.analytics": "Analytics",
   "nav.settings": "Settings",
+  // 【APP54 任务6】底部导航英文短名（当前仅英文分支使用短名）
+  "navShort.dashboard": "Home",
+  "navShort.proxies": "Proxy",
+  "navShort.subscription": "Subs",
+  "navShort.analytics": "Stats",
+  "navShort.settings": "Settings",
 
   // ---- Common actions ----
   "common.save": "Save",
@@ -364,7 +378,7 @@ const en: Record<string, string> = {
   "common.confirm": "Confirm",
   "common.copy": "Copy",
   "common.activate": "Activate",
-  "common.configure": "Configure",
+  "common.configure": "Config",
   "common.close": "Close",
   "common.search": "Search",
   "common.all": "All",
@@ -421,9 +435,9 @@ const en: Record<string, string> = {
   "engine.goAim": "Go AIM",
   "engine.goLan": "Go Lan",
   "engine.goCus": "Go Cus",
-  "engine.goAimTag": "AI Streaming",
-  "engine.goLanTag": "Home Intranet",
-  "engine.goCusTag": "Rewrite & Scripts",
+  "engine.goAimTag": "AI & Media",
+  "engine.goLanTag": "Intranet",
+  "engine.goCusTag": "Modules",
   "engine.goLanProbe": "Probe",
 
   // ---- Logs (APP6) ----
@@ -436,7 +450,9 @@ const en: Record<string, string> = {
   "logs.filterGoLan": "Go Lan",
   "logs.filterKernel": "Kernel",
   "logs.filterSub": "Subscription",
-  "logs.filterPro": "Pro License",
+  "logs.filterPro": "Pro Features",
+  "logs.filterRule": "Rules",
+  "logs.filterNode": "Nodes",
   "logs.filterGoAim": "Go AIM",
   "logs.filterGoCus": "Go Cus",
   "logs.loading": "Loading...",

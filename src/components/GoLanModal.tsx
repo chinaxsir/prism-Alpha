@@ -884,6 +884,12 @@ export default function GoLanModal({ open, onClose }: Props) {
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
             {profiles.map((p) => {
               const st = statusOf(p.id);
+              // 【APP54 任务1】优先使用后端注入的 isDirect / 全局直连映射，
+              // 保证 VPN 开启后物理网段直连仍显示 ⚡ 直连
+              const direct =
+                status?.goLanProfileDirectMap?.[p.id] === true ||
+                st?.isDirect === true ||
+                st?.state === "direct";
               const on = p.id === form.id ? form.enabled : p.enabled;
               return (
                 <button
@@ -903,16 +909,14 @@ export default function GoLanModal({ open, onClose }: Props) {
                     )}
                   />
                   <span className="max-w-[82px] truncate">{p.name}</span>
-                  {st && on && (
-                    <span
-                      className={clsx(
-                        "tabular-nums",
-                        st.state === "direct" ? "text-amber-300" : "text-sky-300",
-                      )}
-                    >
-                      {st.state === "direct"
-                        ? t("goLan.statusDirect")
-                        : t("goLan.statusTunnel")}
+                  {on && direct && (
+                    <span className="whitespace-nowrap text-amber-300">
+                      {t("goLan.statusDirect")}
+                    </span>
+                  )}
+                  {on && !direct && st && (
+                    <span className="whitespace-nowrap text-sky-300">
+                      {t("goLan.statusTunnel")}
                     </span>
                   )}
                 </button>

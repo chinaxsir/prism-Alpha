@@ -530,7 +530,6 @@ fn gateway_candidates_from_cidr(cidr: &str) -> Option<String> {
     let last = parts[3];
     let candidates = match last {
         0..=2 => [1u8, 254],
-        1 => [254, 2],
         _ => [1, 254],
     };
     for c in candidates {
@@ -584,7 +583,7 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
     // 【APP44 任务6】iOS 主程序不再恒返回空：getifaddrs 枚举 en0（Wi-Fi）/
     // pdp_ip0（蜂窝），保证设置页「局域网地址」展示真实内网 IP，而不是
     // 198.18.x.x 的 fake-ip 或 utun 的 10.196.0.2。按 Wi-Fi > 有线 > 蜂窝排序。
-    #[cfg(target_os = "ios")]
+    #[cfg(unix)]
     {
         use std::net::Ipv4Addr;
         let mut found: Vec<(u8, Ipv4Addr)> = Vec::new();
@@ -602,18 +601,22 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
                             .into_owned();
                         let sin = ifa.ifa_addr as *const libc::sockaddr_in;
                         let ip = Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
-                        let rank = if name == "en0" {
-                            0
-                        } else if name.starts_with("en") || name.starts_with("eth") {
-                            1
-                        } else if name.starts_with("pdp_ip") {
-                            3
-                        } else {
-                            9
-                        };
-                        if rank < 9 {
-                            found.push((rank, ip));
+                        if is_virtual_iface_name(&name) {
+                            cur = ifa.ifa_next;
+                            continue;
                         }
+                        let rank = if name == "en0" || name == "wlan0" || name == "eth0" {
+                            0
+                        } else if name.starts_with("en")
+                            || name.starts_with("eth")
+                            || name.starts_with("wlan")
+                            || name.starts_with("wl")
+                        {
+                            1
+                        } else {
+                            3
+                        };
+                        found.push((rank, ip));
                     }
                     cur = ifa.ifa_next;
                 }
@@ -632,7 +635,7 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
         }
         return out;
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(unix))]
     {
         let mut candidates: Vec<std::net::Ipv4Addr> = Vec::new();
         #[cfg(target_os = "windows")]
@@ -650,12 +653,16 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
                             "wireguard",
                             "tap",
                             "tun",
+                            "utun",
+                            "ppp",
+                            "wg",
                             "loopback",
                             "vethernet",
                             "hyper-v",
                             "wsl",
                             "vmware",
                             "virtualbox",
+                            "virtual",
                             "bluetooth",
                             "蓝牙",
                         ]
@@ -729,6 +736,86 @@ pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
         }
         out
     }
+}
+
+/// 【APP54 任务1】物理网卡名过滤：剔除 VPN 隧道 / 回环 / 蜂窝 / 容器等虚拟接口。
+/// VPN TUN 开启后 getifaddrs 会同时列出 utun（10.196.x.x）与物理 en0，
+/// 不过滤会把隧道地址误判为局域网地址，导致 Go Lan 永远命中不到真实网段。
+#[cfg(unix)]
+fn is_virtual_iface_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [
+        "utun", "tun", "tap", "ppp", "wg", "lo", "pdp_ip", "rmnet", "clat", "llw", "awdl", "anpi",
+        "bridge", "veth", "docker", "vmnet", "vboxnet", "tailscale", "zt",
+    ]
+    .iter()
+    .any(|k| n.starts_with(k))
+}
+
+/// 【APP54 任务1】判定档案是否应标记「⚡ 直连」：
+/// - 条件 A：本机物理局域网地址命中该档案内网网段（同子网直连）；
+/// - 条件 B：跨 VLAN 但物理局域网内可达——探针目标/网关在 35ms 内 TCP 可达，
+///   且目标必须是私网地址（公网目标绝不触发直连）。
+/// 同步实现：35ms 上限，最多若干候选，调用方应在 blocking 线程执行。
+pub fn is_profile_lan_direct_active(
+    profile: &GoLanProfile,
+    physical_wifi_ips: &[std::net::Ipv4Addr],
+) -> bool {
+    if !profile.enabled || !profile.bypass_on_local_lan {
+        return false;
+    }
+    let (_tunnel, direct) = split_profile_cidrs_for_on_demand(profile, physical_wifi_ips);
+    if !direct.is_empty() {
+        return true;
+    }
+    // 条件 B 依赖本机确实存在物理局域网地址（否则只有 TUN 地址，探测无意义）
+    if physical_wifi_ips.is_empty() {
+        return false;
+    }
+    let default_port: u16 = 5000;
+    let mut targets: Vec<std::net::SocketAddr> = Vec::new();
+    if !profile.probe_target.trim().is_empty() {
+        let (host, port) = split_host_port_safe(&profile.probe_target, default_port);
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
+            && is_private_lan_target(ip)
+        {
+            targets.push(std::net::SocketAddr::from((ip, port)));
+        }
+    }
+    for cidr in profile_route_cidrs(profile) {
+        if let Some(gw) = gateway_candidates_from_cidr(&cidr)
+            && let Ok(ip) = gw.parse::<std::net::Ipv4Addr>()
+            && is_private_lan_target(ip)
+        {
+            targets.push(std::net::SocketAddr::from((ip, default_port)));
+        }
+    }
+    for addr in targets {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(35))
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 私网探测目标（排除 loopback / 链路本地 / fake-ip / WG 虚拟地址 / 公网）
+fn is_private_lan_target(ip: std::net::Ipv4Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+        return false;
+    }
+    let o = ip.octets();
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return false;
+    }
+    if o[0] == 172 && o[1] == 19 {
+        return false;
+    }
+    if ip.to_string() == "10.196.0.2" {
+        return false;
+    }
+    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]) || (o[0] == 192 && o[1] == 168))
 }
 
 /// 【APP44 任务6】判定是否可作为「本机局域网地址」展示 / 用于 On-Demand 判定：
@@ -3817,6 +3904,49 @@ mod tests {
         assert!(!t_office.contains(&"10.8.0.0/24".to_string()));
         let any_direct = !d_home.is_empty() || !d_office.is_empty();
         assert!(any_direct, "任一启用隧道命中即 any_on_demand_direct=true");
+    }
+
+    /// 【APP54 任务1】条件 A：物理局域网地址命中档案网段 → 必须直连
+    #[test]
+    fn test_is_profile_lan_direct_active_matches_same_subnet() {
+        let home = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 64);
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.20".parse().unwrap()];
+        assert!(is_profile_lan_direct_active(&home, &physical));
+        // 关闭 On-Demand / 关闭档案时一律不直连
+        let mut off = home.clone();
+        off.bypass_on_local_lan = false;
+        assert!(!is_profile_lan_direct_active(&off, &physical));
+        let mut disabled = home.clone();
+        disabled.enabled = false;
+        assert!(!is_profile_lan_direct_active(&disabled, &physical));
+    }
+
+    /// 【APP54 任务1】条件 B 防御：公网探针目标绝不允许触发直连；
+    /// 无物理局域网地址（仅有 TUN 地址）时同样不得直连
+    #[test]
+    fn test_is_profile_lan_direct_active_rejects_public_or_no_physical() {
+        let mut home = sample_profile("home", "家里", &["10.255.0.0/24"], "10.196.0.2/32", 65);
+        home.probe_target = "8.8.8.8:5000".into();
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.1.20".parse().unwrap()];
+        assert!(
+            !is_profile_lan_direct_active(&home, &physical),
+            "公网探针目标必须被过滤"
+        );
+        let same = sample_profile("home2", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 66);
+        assert!(!is_profile_lan_direct_active(&same, &[]));
+    }
+
+    /// 【APP54 任务1】虚拟网卡（VPN/回环/蜂窝）必须全部剔除，避免把
+    /// utun 的 10.196.x.x 误判为局域网地址
+    #[cfg(unix)]
+    #[test]
+    fn test_virtual_iface_names_filtered() {
+        for name in ["utun3", "tun0", "tap1", "ppp0", "wg0", "lo0", "pdp_ip0", "rmnet0", "clat4"] {
+            assert!(is_virtual_iface_name(name), "{name} 应被剔除");
+        }
+        for name in ["en0", "en1", "wlan0", "eth0"] {
+            assert!(!is_virtual_iface_name(name), "{name} 是物理网卡");
+        }
     }
 
     /// 【APP52 任务3】空白 / 非标准 WireGuard 配置必须判为无效

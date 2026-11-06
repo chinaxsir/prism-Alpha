@@ -3,6 +3,12 @@
  * 由「代理集群」任务维护（ProxiesHub / Proxies / Connections / Rules / GoCus）。
  */
 const zh: Record<string, string> = {
+  // ---- 代理中心四栏（英文短名防溢出） ----
+  "proxyHub.tab.nodes": "节点",
+  "proxyHub.tab.connections": "连接",
+  "proxyHub.tab.rules": "规则",
+  "proxyHub.tab.goCus": "Go Cus",
+
   // ---- 节点 / Go AIM 筛选 ----
   "proxies.aim.ai": "AI",
   "proxies.aim.media": "流媒体",
@@ -35,6 +41,13 @@ const zh: Record<string, string> = {
   "proxies.notSelected": "未选择",
   "proxies.coreNotRunningPreview": "· 内核未运行（预览模式）",
   "proxies.nodeCount": "{count} 节点",
+  // 【APP54 任务5】实时进度文案（位置 A / B 共用）
+  "proxies.progress.testing": "测速中 {done}/{total} ({percent}%)",
+  "proxies.progress.aimTesting": "AIM 检测中 {done}/{total} ({percent}%)",
+  "proxies.progress.aimIdle": "AIM {aim}/{total} 个节点",
+  "proxies.progress.nodesIdle": "{tested}/{total} 节点已测速",
+  "proxies.progress.aimChip": "Go AIM · {done}/{total} ({percent}%)",
+  "proxies.progress.goAimIdle": "Go AIM ({aim}/{total})",
   "proxies.empty.noMatch": "无符合筛选条件的节点",
   "proxies.resetFilter": "重置筛选",
   "proxies.badge.netflix": "Netflix (NF)",
@@ -111,7 +124,8 @@ const zh: Record<string, string> = {
   "proxies.rules.targetConfirm": "添加 {count} 条规则",
 
   // ---- Go Cus ----
-  "proxies.goCus.tab.modules": "模块",
+  "proxies.goCus.tab.all": "全部",
+  "proxies.goCus.tab.override": "覆写",
   "proxies.goCus.tab.rewrites": "改写",
   "proxies.goCus.tab.mitm": "MitM",
   "proxies.goCus.tab.scripts": "脚本",
@@ -170,7 +184,8 @@ const zh: Record<string, string> = {
   "proxies.goCus.templateLibTitle": "✨ 官方精选一键模板库",
   "proxies.goCus.templateLibDesc":
     "覆盖高频分流场景，一键导入即刻生效（导入后自动开启引擎，VPN 运行中自动热重载）",
-  "proxies.goCus.templateImport": "一键导入",
+  "proxies.goCus.templateImport": "导入",
+  "proxies.goCus.templateAdded": "已添加",
   "proxies.goCus.tpl.adblock.name": "🛡️ 去广告净化",
   "proxies.goCus.tpl.adblock.desc":
     "屏蔽主流广告 / 统计 / 埋点域名（谷歌 / 百度 / 腾讯 / 字节 / 快手 / 友盟等 18 类）",
@@ -189,6 +204,12 @@ const zh: Record<string, string> = {
 };
 
 const en: Record<string, string> = {
+  // ---- Proxy hub tabs (short labels, no overflow) ----
+  "proxyHub.tab.nodes": "Nodes",
+  "proxyHub.tab.connections": "Conns",
+  "proxyHub.tab.rules": "Rules",
+  "proxyHub.tab.goCus": "Go Cus",
+
   // ---- Nodes / Go AIM filter ----
   "proxies.aim.ai": "AI",
   "proxies.aim.media": "Streaming",
@@ -216,7 +237,7 @@ const en: Record<string, string> = {
   "proxies.goAim.lockedTip": "Pro feature: available after activation",
   "proxies.goAim.probeTip": "Run Go AIM unlock probe (AI / streaming)",
   "proxies.goAim.probeNeedCore": "Probe available after starting the core",
-  "proxies.goAim.detect": "AI Check",
+  "proxies.goAim.detect": "AI Probe",
   "proxies.searchNodes": "Search nodes…",
   "proxies.speedTestNeedCore": "Speed test available after starting the core",
   "proxies.speedTest": "Speed Test",
@@ -225,6 +246,13 @@ const en: Record<string, string> = {
   "proxies.notSelected": "None",
   "proxies.coreNotRunningPreview": "· Core not running (preview mode)",
   "proxies.nodeCount": "{count} nodes",
+  // 【APP54 任务5】Live progress labels (position A / B)
+  "proxies.progress.testing": "Testing {done}/{total} ({percent}%)",
+  "proxies.progress.aimTesting": "AIM {done}/{total} ({percent}%)",
+  "proxies.progress.aimIdle": "AIM {aim}/{total} nodes",
+  "proxies.progress.nodesIdle": "{tested}/{total} nodes tested",
+  "proxies.progress.aimChip": "Go AIM · {done}/{total} ({percent}%)",
+  "proxies.progress.goAimIdle": "Go AIM ({aim}/{total})",
   "proxies.empty.noMatch": "No nodes match the current filter",
   "proxies.resetFilter": "Reset filters",
   "proxies.badge.netflix": "Netflix (NF)",
@@ -309,10 +337,11 @@ const en: Record<string, string> = {
   "proxies.rules.targetConfirm": "Add {count} rules",
 
   // ---- Go Cus ----
-  "proxies.goCus.tab.modules": "Modules",
-  "proxies.goCus.tab.rewrites": "Rewrites",
+  "proxies.goCus.tab.all": "All",
+  "proxies.goCus.tab.override": "Override",
+  "proxies.goCus.tab.rewrites": "Rewrite",
   "proxies.goCus.tab.mitm": "MitM",
-  "proxies.goCus.tab.scripts": "Scripts",
+  "proxies.goCus.tab.scripts": "Script",
   "proxies.goCus.loadFailed":
     "Failed to load Go Cus settings, please restart the app and try again",
   "proxies.goCus.engineTitle": "Go Cus Engine",
@@ -371,22 +400,23 @@ const en: Record<string, string> = {
   "proxies.goCus.templateLibTitle": "✨ Curated One-Click Templates",
   "proxies.goCus.templateLibDesc":
     "High-frequency routing scenarios, one tap to import and apply (engine auto-enables; hot-reloads when VPN is running)",
-  "proxies.goCus.templateImport": "Import",
-  "proxies.goCus.tpl.adblock.name": "🛡️ Ad Blocking",
+  "proxies.goCus.templateImport": "Add",
+  "proxies.goCus.templateAdded": "Added",
+  "proxies.goCus.tpl.adblock.name": "AdBlock & Privacy Guard",
   "proxies.goCus.tpl.adblock.desc":
-    "Block 18 mainstream ad / analytics / tracking domains (Google, Baidu, Tencent, ByteDance, Kuaishou, Umeng…)",
-  "proxies.goCus.tpl.ai.name": "🤖 AI Services via Proxy",
+    "Block ads, popups & tracking domains",
+  "proxies.goCus.tpl.ai.name": "AI Services Routing",
   "proxies.goCus.tpl.ai.desc":
-    "Route 14 AI services through proxy: OpenAI / Claude / Gemini / Copilot / Cursor…",
-  "proxies.goCus.tpl.media.name": "🎬 Streaming Unlock",
+    "Route OpenAI, Claude & Gemini via Proxy",
+  "proxies.goCus.tpl.media.name": "Global Media Unlock",
   "proxies.goCus.tpl.media.desc":
-    "Route 16 platforms through proxy: Netflix / YouTube / Disney+ / TikTok / Spotify / Twitch…",
-  "proxies.goCus.tpl.cnDirect.name": "⚡ China Direct Boost",
+    "Route Netflix, YouTube, Disney+ & TikTok",
+  "proxies.goCus.tpl.cnDirect.name": "CN & Apple CDN Direct",
   "proxies.goCus.tpl.cnDirect.desc":
-    "16 rules: .cn domains, major Chinese sites and Apple / Microsoft CDN go direct, bypassing the proxy",
-  "proxies.goCus.tpl.privacy.name": "🧹 Privacy Header Scrubber",
+    "Direct connection for domestic & Apple services",
+  "proxies.goCus.tpl.privacy.name": "HTTP Privacy Header",
   "proxies.goCus.tpl.privacy.desc":
-    "Strip X-Forwarded-For tracking headers on major sites (plain HTTP only for now)",
+    "Strip tracking headers & protect privacy",
 };
 
 export default { zh, en };

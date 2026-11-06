@@ -504,10 +504,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// 【APP54 任务3】扩展日志统一北京时间（UTC+8）：显式指定 Asia/Shanghai，
+    /// 不跟随设备系统时区，保证与主 App 后端日志时间戳口径完全一致。
+    private static let extLogDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
     /// 【APP34】向 App Group vpn_trace.log 追加一行扩展日志（通用入口）。
     /// 与 writeGoLanExtLog 共用同一文件与格式，主 App 会按模块关键字归类。
     private func writeExtLog(_ level: String, _ message: String) {
-        let ts = Int(Date().timeIntervalSince1970)
+        let ts = Self.extLogDateFormatter.string(from: Date())
         let line = "\(ts) \(level) \(message)\n"
         for dir in sharedDirURLs() {
             let url = dir.appendingPathComponent("vpn_trace.log")

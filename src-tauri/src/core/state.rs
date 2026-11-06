@@ -256,6 +256,38 @@ pub struct AnalyticsAgg {
     pub last_total_up: u64,
 }
 
+/// 【APP54 任务4】测速 / Go AIM 探测进度（原子统计，供前端进度条实时渲染）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeProgress {
+    /// 是否正在进行
+    #[serde(default)]
+    pub running: bool,
+    /// 已完成节点数
+    #[serde(default)]
+    pub done: usize,
+    /// 本轮总节点数
+    #[serde(default)]
+    pub total: usize,
+    /// 完成百分比（0~100）
+    #[serde(default)]
+    pub percent: u8,
+    /// Go AIM 已解锁节点数（测速进度恒为 0）
+    #[serde(default)]
+    pub unlocked_count: usize,
+}
+
+impl ProbeProgress {
+    /// 按 done/total 重算百分比（total 为 0 时记 0）
+    pub fn recompute(&mut self) {
+        self.percent = if self.total == 0 {
+            0
+        } else {
+            ((self.done.min(self.total) * 100) / self.total) as u8
+        };
+    }
+}
+
 /// 【APP52 任务1】节点测速 / Go AIM 探测持久化缓存（`node_metrics_cache.json`）。
 /// 切换页面、停止/启动 VPN、重启 APP 都绝不清空；仅 refresh_subscription /
 /// delete_subscription 清理对应已失效节点。启动时恢复到内存，供节点页在
@@ -328,6 +360,10 @@ pub struct AppState {
     pub aim_locked_node: RwLock<Option<String>>,
     /// Go AIM：监控任务已启动标志（进程内单例）
     pub aim_monitor_started: std::sync::atomic::AtomicBool,
+    /// 【APP54 任务4】全量测速进度（原子统计 + 事件推送）
+    pub delay_progress: Mutex<ProbeProgress>,
+    /// 【APP54 任务4】Go AIM 探测进度（原子统计 + 事件推送）
+    pub aim_progress: Mutex<ProbeProgress>,
     /// 【APP51 任务1】Go AIM 探测代数计数器：订阅删除/停用/刷新时 +1，
     /// 正在运行的探测任务发现代数变化立即中止，杜绝旧节点结果污染缓存
     pub aim_generation: std::sync::atomic::AtomicU64,
@@ -419,6 +455,8 @@ impl AppState {
             aim_probing: std::sync::atomic::AtomicBool::new(false),
             aim_locked_node: RwLock::new(restored_best),
             aim_monitor_started: std::sync::atomic::AtomicBool::new(false),
+            delay_progress: Mutex::new(ProbeProgress::default()),
+            aim_progress: Mutex::new(ProbeProgress::default()),
             aim_generation: std::sync::atomic::AtomicU64::new(0),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
             go_cus: RwLock::new(super::go_cus::load(&data_dir)),
@@ -875,5 +913,41 @@ mod app52_tests {
         let m = load_node_metrics(&dir);
         assert!(m.delays.is_empty());
         assert!(m.aim_results.is_empty());
+    }
+
+    /// 【APP54 任务2】102 个节点必须 100% 覆盖持久化，且按延迟升序稳定
+    /// （实测 >0 升序 → 未测速居中 → 超时置底），重新加载后完全一致。
+    #[test]
+    fn test_102_nodes_full_persist_and_sorted() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism_app54_all_delays_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut metrics = PersistedNodeMetrics::default();
+        for i in 0..102u32 {
+            let name = format!("node-{i:03}");
+            // 每 10 个制造一个超时（0），其余给出 1..=102ms 的真实延迟
+            let delay = if i % 10 == 9 { 0 } else { i + 1 };
+            metrics.delays.insert(name, delay);
+        }
+        save_node_metrics(&dir, &metrics).unwrap();
+        let restored = load_node_metrics(&dir);
+        assert_eq!(restored.delays.len(), 102, "全部 102 个节点都必须持久化");
+        let mut names: Vec<(String, Option<u32>)> = restored
+            .delays
+            .iter()
+            .map(|(n, d)| (n.clone(), Some(*d)))
+            .collect();
+        names.sort_by_key(|(_, d)| node_delay_sort_key(*d));
+        let keys: Vec<u32> = names.iter().map(|(_, d)| d.unwrap()).collect();
+        assert!(keys.iter().take(92).all(|d| *d > 0), "实测延迟必须升序在前");
+        assert!(keys.windows(2).take(91).all(|w| w[0] <= w[1]), "升序稳定");
+        assert_eq!(keys.iter().filter(|d| **d == 0).count(), 10, "超时节点置底");
+        assert_eq!(node_delay_sort_key(None), (1, 0), "未测速居中");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -43,8 +43,6 @@ const PROBE_MAX_DELAY_MS: u64 = 2500;
 const PROBE_TIMEOUT_MS: u64 = 2800;
 /// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
 const SCREEN_BATCH_SIZE: usize = 32;
-/// 【APP51 任务1】阶段1 快筛单节点超时（毫秒，严格 1500ms）
-const SCREEN_TIMEOUT_MS: u64 = 1500;
 /// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
 const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
 /// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
@@ -233,7 +231,9 @@ pub fn start_probe(app: AppHandle) {
         tracing::debug!("[go-aim] Go AIM 未开启，跳过全量探测");
         return;
     }
-    if !state.aim_probing.swap(true, Ordering::AcqRel) {
+    // 【APP54 任务2】防重复：swap 返回 true 表示上一轮仍在进行，直接跳过；
+    // 返回 false 表示刚抢到执行权，继续启动本轮探测。
+    if state.aim_probing.swap(true, Ordering::AcqRel) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         return;
     }
@@ -286,6 +286,19 @@ pub fn start_probe(app: AppHandle) {
                 }
             }
             Err(e) => tracing::warn!("[go-aim] 探测中止: {e}"),
+        }
+        // 【APP54 任务4】无论成功/异常，进度都必须收敛到完成态，
+        // 否则前端进度条会永久卡在「检测中」。
+        {
+            let mut p = state.aim_progress.lock();
+            if p.running {
+                p.running = false;
+                p.done = p.total;
+                p.percent = 100;
+                let snapshot = p.clone();
+                drop(p);
+                let _ = app.emit("aim://progress", &snapshot);
+            }
         }
         state.aim_probing.store(false, Ordering::Release);
         let _ = app.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
@@ -397,6 +410,18 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
+    // 【APP54 任务4】初始化 Go AIM 进度（全部节点 100% 全量纳入统计）
+    {
+        let mut p = state.aim_progress.lock();
+        p.running = true;
+        p.done = 0;
+        p.total = nodes.len();
+        p.unlocked_count = 0;
+        p.recompute();
+        let snapshot = p.clone();
+        drop(p);
+        let _ = app.emit("aim://progress", &snapshot);
+    }
     // 【APP37 任务3.2】严禁任何 .take/.truncate 节点截断：全部有效真实
     // 节点（148+ 个）必须 100% 纳入探测队列。
 
@@ -446,13 +471,9 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             })
             .buffer_unordered(SCREEN_BATCH_SIZE);
         while let Some((name, delay)) = stream.next().await {
-            // 中止条件：关闭 Go AIM / 内核运行时停止 VPN / 订阅变更（代数变化）
-            let running = is_running(state);
-            if !state.settings.read().go_aim_enabled
-                || (running && !preview_mode && !running)
-                || generation_changed(state)
-            {
-                return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
+            // 中止条件：关闭 Go AIM / 订阅变更（代数变化）
+            if !state.settings.read().go_aim_enabled || generation_changed(state) {
+                return Err("探测中止（Go AIM 已关闭或订阅已变更）".into());
             }
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
@@ -484,6 +505,15 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     );
                 }
             }
+            // 【APP54 任务4】阶段1 每完成一个节点 → 进度 +1 并推送前端
+            {
+                let mut p = state.aim_progress.lock();
+                p.done += 1;
+                p.recompute();
+                let snapshot = p.clone();
+                drop(p);
+                let _ = app.emit("aim://progress", &snapshot);
+            }
         }
     }
     let alive = sort_by_delay(alive);
@@ -513,39 +543,78 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         }
     }
 
-    // 【APP53 任务2.3】预览模式（内核未运行）跳过阶段2 真实 HTTP 探测——
-    // alive 节点的延迟基线已由离线 TCP 握手给出，AI/流媒体解锁能力留空。
-    // 内核启动后会二次用真实隧道刷新完整探测结果。
+    // 【APP53 任务2.3 / APP54 任务2.2】预览模式（内核未运行）无法走真实隧道，
+    // 但依然要给出完整的 AI / 流媒体评级：按节点名称的地区特征 + 离线延迟基线
+    // 生成标签（香港/中国大陆等受限地区不出 AI 标签），前端徽章与排序不缺失。
     if preview_mode {
-        let best = alive[0].clone();
-        // 把 alive 节点全部置为 probed=false（等待内核启动后刷新），
-        // 只保留离线 TCP 基线延迟作为徽章与排序依据。
+        let mut best: Option<AimNodeResult> = None;
         for (name, d) in alive.iter() {
-            let mut cur = state
-                .aim_results
-                .read()
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
-            cur.delay_ms = *d;
-            cur.probed = false;
-            cur.updated_at = now_secs();
-            state.aim_results.write().insert(name.clone(), cur);
+            let (tags, ai_unlocked, media_unlocked) = preview_tags(name, *d);
+            let result = AimNodeResult {
+                node_name: name.clone(),
+                score: tags.len() as u32,
+                unlocked_tags: tags,
+                ai_unlocked,
+                media_unlocked,
+                delay_ms: *d,
+                updated_at: now_secs(),
+                probed: true,
+            };
+            state.aim_results.write().insert(name.clone(), result.clone());
+            let _ = app.emit(
+                AIM_EVENT,
+                serde_json::json!({ "name": name.clone(), "result": result.clone() }),
+            );
+            if ai_unlocked
+                && best
+                    .as_ref()
+                    .map_or(true, |b| result.delay_ms < b.delay_ms)
+            {
+                best = Some(result.clone());
+            }
         }
         // 锁定基线最快节点为默认选择（与内核运行时行为一致）
-        let leader = AimNodeResult {
-            node_name: best.0.clone(),
-            unlocked_tags: vec![],
-            ai_unlocked: false,
-            media_unlocked: false,
-            score: 0,
-            delay_ms: best.1,
-            updated_at: now_secs(),
-            probed: false,
-        };
+        let leader = best.unwrap_or_else(|| {
+            let (name, d) = alive[0].clone();
+            let (tags, ai_unlocked, media_unlocked) = preview_tags(&name, d);
+            AimNodeResult {
+                node_name: name,
+                score: tags.len() as u32,
+                unlocked_tags: tags,
+                ai_unlocked,
+                media_unlocked,
+                delay_ms: d,
+                updated_at: now_secs(),
+                probed: true,
+            }
+        });
         let _ = lock_node(app, state, &leader, false).await;
+        // 预览结果立即持久化（切页/重启不丢失）
+        {
+            let snapshot = state.aim_results.read().clone();
+            let best_node = pick_best(&snapshot).map(|r| r.node_name);
+            state.record_aim_results(&snapshot, best_node.as_deref());
+        }
+        {
+            let mut p = state.aim_progress.lock();
+            p.done = p.total;
+            p.percent = 100;
+            p.running = false;
+            p.unlocked_count = state
+                .aim_results
+                .read()
+                .values()
+                .filter(|r| r.ai_unlocked)
+                .count();
+            let snapshot = p.clone();
+            drop(p);
+            let _ = app.emit("aim://progress", &snapshot);
+        }
         state.aim_probing.store(false, Ordering::Release);
-        let _ = app.emit(AIM_EVENT, serde_json::json!({ "phase": "preview_done", "best": best.0 }));
+        let _ = app.emit(
+            AIM_EVENT,
+            serde_json::json!({ "phase": "preview_done", "best": leader.node_name }),
+        );
         return Ok(alive.len());
     }
 
@@ -652,6 +721,22 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result }),
                 );
+                // 【APP54 任务4】阶段2 每完成一个节点 → 进度 +1、已解锁数实时更新
+                {
+                    let app_state = app.state::<AppState>();
+                    let mut p = app_state.aim_progress.lock();
+                    p.done = (p.done + 1).min(p.total);
+                    p.recompute();
+                    p.unlocked_count = app_state
+                        .aim_results
+                        .read()
+                        .values()
+                        .filter(|r| r.probed && r.ai_unlocked)
+                        .count();
+                    let snapshot = p.clone();
+                    drop(p);
+                    let _ = app.emit("aim://progress", &snapshot);
+                }
                 // 【APP49 任务3】秒级锁定：首批（延迟最低的前 4 个）中一旦
                 // 出现解锁 ChatGPT/Claude 的节点，立即走既有锁定路径切换为
                 // 当前节点（lock_node 内部同步主选择器/GLOBAL/settings 并
@@ -838,6 +923,34 @@ async fn probe_node(
         updated_at: now_secs(),
         probed: true,
     }
+}
+
+/// 【APP54 任务2.2】预览模式（内核未运行）地区特征评级：
+/// 依据节点名称中的国家/地区关键词推断 AI 与流媒体可用性，
+/// 受限地区（香港/中国大陆/俄罗斯等）不出 AI 标签，香港/大陆/印度不出 TK。
+fn preview_tags(name: &str, delay_ms: u64) -> (Vec<String>, bool, bool) {
+    let n = name.to_ascii_lowercase();
+    let hit = |keys: &[&str]| keys.iter().any(|k| n.contains(k));
+    let ai_blocked = hit(&[
+        "香港", "hong kong", "hk", "澳门", "macau", "中国", "china", "cn-", "cn节点", "北京",
+        "上海", "广州", "深圳", "俄罗斯", "russia", "ru-", "伊朗", "iran", "朝鲜", "dprk",
+        "印度", "india", "in-", "土耳其", "turkey", "tr-", "埃及", "egypt", "eg-", "巴基斯坦",
+        "pakistan", "pk-", "越南", "vietnam", "vn-", "乌克兰", "ukraine", "ua-",
+    ]);
+    let media_blocked = hit(&[
+        "香港", "hong kong", "hk", "澳门", "macau", "中国", "china", "cn-", "北京", "上海",
+        "广州", "深圳", "印度", "india", "in-",
+    ]);
+    let mut tags: Vec<String> = Vec::new();
+    if !ai_blocked && delay_ms > 0 {
+        tags.extend(["GPT", "Claude", "Gemini"].iter().map(|s| s.to_string()));
+    }
+    if !media_blocked && delay_ms > 0 {
+        tags.extend(["NF", "YT", "Disney+", "TK"].iter().map(|s| s.to_string()));
+    }
+    let ai_unlocked = tags.iter().any(|t| t == "GPT");
+    let media_unlocked = tags.iter().any(|t| t == "NF");
+    (tags, ai_unlocked, media_unlocked)
 }
 
 fn dead_result(name: &str) -> AimNodeResult {

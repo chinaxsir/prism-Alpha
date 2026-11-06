@@ -37,6 +37,7 @@ import {
   type Entitlement,
   type GoCusSettings,
   type GoLanSettings,
+  type ProbeProgress,
 } from "@/api/ipc";
 import { isMobile } from "@/pro/gating";
 import ProxiesHub from "@/pages/ProxiesHub";
@@ -79,6 +80,21 @@ export default function App() {
         store.setStatus(st.status);
         store.setMode(st.mode);
         if (st.outboundMode) store.setOutboundMode(st.outboundMode);
+        // 【APP54 任务4/5】状态查询同时对齐测速 / Go AIM 进度
+        store.setDelayProgress({
+          running: st.delayProgress?.running === true,
+          done: st.delayProgress?.done ?? 0,
+          total: st.delayProgress?.total ?? 0,
+          percent: st.delayProgress?.percent ?? 0,
+          unlockedCount: st.delayProgress?.unlockedCount ?? 0,
+        });
+        store.setAimProgress({
+          running: st.aimProgress?.running === true,
+          done: st.aimProgress?.done ?? 0,
+          total: st.aimProgress?.total ?? 0,
+          percent: st.aimProgress?.percent ?? 0,
+          unlockedCount: st.aimProgress?.unlockedCount ?? 0,
+        });
         store.syncStartedAt(st);
         if (st.status !== "running") return;
       }
@@ -322,10 +338,19 @@ export default function App() {
     const memory = listen<{ inuse: number }>("memory://tick", (e) => {
       useCoreStore.getState().setMemoryUsage(e.payload.inuse);
     });
+    // 【APP54 任务4/5】测速 / Go AIM 进度广播：全局 store 收口，任意页面实时渲染
+    const delayProgress = listen<ProbeProgress>("delays://progress", (e) => {
+      if (e.payload) useCoreStore.getState().setDelayProgress(e.payload);
+    });
+    const aimProgress = listen<ProbeProgress>("aim://progress", (e) => {
+      if (e.payload) useCoreStore.getState().setAimProgress(e.payload);
+    });
     return () => {
       traffic.then((fn) => fn());
       telemetry.then((fn) => fn());
       memory.then((fn) => fn());
+      delayProgress.then((fn) => fn());
+      aimProgress.then((fn) => fn());
     };
   }, []);
 
@@ -405,7 +430,7 @@ export default function App() {
       )}
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="flex-1 overflow-y-auto overflow-x-hidden px-6 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+        <main className="w-full max-w-full flex-1 overflow-y-auto overflow-x-hidden box-border px-4 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
           {/* APP-5 任务1：全局常驻横幅已移除。到期/解绑提示仅在激活 Pro 弹窗
               与设置 → PRISM PRO 激活区内展示，平时界面保持清爽。 */}
           <Routes>

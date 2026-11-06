@@ -96,9 +96,14 @@ html {
 }
 
 /* 杜绝任何子元素把页面撑宽导致内容横向溢出屏幕（iOS WKWebView 上
-   曾出现个别设置行整体偏移出卡片右缘，页面级裁剪兜底） */
+   曾出现个别设置行整体偏移出卡片右缘，页面级裁剪兜底）。
+   【APP54 任务6】英文界面长文案（如 "Load Balancing" / "Subscription"）
+   同样绝不能撑破屏幕：html/body/#root 统一 100% 宽 + 硬裁剪。 */
 html,
-body {
+body,
+#root {
+  width: 100%;
+  max-width: 100vw;
   overflow-x: hidden;
 }
 

@@ -5,8 +5,42 @@ import type {
   GoAimStatus,
   GoCusSettings,
   GoLanSettings,
+  ProbeProgress,
   SubscriptionRecord,
 } from "@/api/ipc";
+
+/** 【APP54 任务2】节点指标前端镜像键：切换页面 / 启停 VPN / 重启 APP 都不清空。
+ *  只有「手动重新测速」或「订阅刷新/增删」才会覆盖对应节点。 */
+const NODE_METRICS_KEY = "prism_node_metrics_v1";
+
+interface NodeMetricsMirror {
+  delays: Record<string, number>;
+  updatedAt: number;
+}
+
+function loadNodeMetricsMirror(): NodeMetricsMirror {
+  try {
+    const raw = localStorage.getItem(NODE_METRICS_KEY);
+    if (!raw) return { delays: {}, updatedAt: 0 };
+    const parsed = JSON.parse(raw) as Partial<NodeMetricsMirror>;
+    const delays =
+      parsed.delays && typeof parsed.delays === "object" ? parsed.delays : {};
+    return { delays, updatedAt: parsed.updatedAt ?? 0 };
+  } catch {
+    return { delays: {}, updatedAt: 0 };
+  }
+}
+
+function saveNodeMetricsMirror(delays: Record<string, number>) {
+  try {
+    localStorage.setItem(
+      NODE_METRICS_KEY,
+      JSON.stringify({ delays, updatedAt: Date.now() } satisfies NodeMetricsMirror),
+    );
+  } catch {
+    /* 隐私模式 / 存储已满：静默忽略，内存态仍生效 */
+  }
+}
 
 export type CoreStatus = "stopped" | "starting" | "running" | "stopping" | "error";
 export type RunMode = "systemProxy" | "tun";
@@ -240,10 +274,22 @@ interface CoreState {
   /** 【APP-10 任务4】订阅列表缓存；null = 尚未加载（订阅页首帧直出，
       消除 Switch 启用态切页闪烁） */
   subscriptions: SubscriptionRecord[] | null;
+  /** 【APP54 任务2】节点延迟前端镜像（localStorage 持久化，切页/启停不丢） */
+  nodeDelays: Record<string, number>;
+  /** 【APP54 任务4】全量测速进度 */
+  delayProgress: ProbeProgress;
+  /** 【APP54 任务4】Go AIM 探测进度 */
+  aimProgress: ProbeProgress;
   setGoAimStatus: (s: GoAimStatus | null) => void;
   setGoLanSettings: (s: GoLanSettings | null) => void;
   setGoCusSettings: (s: GoCusSettings | null) => void;
   setSubscriptions: (s: SubscriptionRecord[] | null) => void;
+  /** 合并写入延迟（0 = 超时，保留区分未测速）并同步 localStorage */
+  mergeNodeDelays: (next: Record<string, number>) => void;
+  /** 订阅刷新/增删后清理已失效节点（唯一允许删除延迟缓存的入口） */
+  retainNodeDelays: (validNames: string[]) => void;
+  setDelayProgress: (p: ProbeProgress) => void;
+  setAimProgress: (p: ProbeProgress) => void;
 }
 
 // 环形缓冲：仅保留最近 60 个采样点（1 分钟）
@@ -381,10 +427,32 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   goLanSettings: null,
   goCusSettings: null,
   subscriptions: null,
+  nodeDelays: loadNodeMetricsMirror().delays,
+  delayProgress: { running: false, done: 0, total: 0, percent: 0, unlockedCount: 0 },
+  aimProgress: { running: false, done: 0, total: 0, percent: 0, unlockedCount: 0 },
   setGoAimStatus: (goAimStatus) => set({ goAimStatus }),
   setGoLanSettings: (goLanSettings) => set({ goLanSettings }),
   setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
   setSubscriptions: (subscriptions) => set({ subscriptions }),
+
+  mergeNodeDelays: (next) => {
+    if (Object.keys(next).length === 0) return;
+    const merged = { ...get().nodeDelays, ...next };
+    set({ nodeDelays: merged });
+    saveNodeMetricsMirror(merged);
+  },
+  retainNodeDelays: (validNames) => {
+    const valid = new Set(validNames);
+    const prev = get().nodeDelays;
+    const kept: Record<string, number> = {};
+    for (const [name, delay] of Object.entries(prev)) {
+      if (valid.has(name)) kept[name] = delay;
+    }
+    set({ nodeDelays: kept });
+    saveNodeMetricsMirror(kept);
+  },
+  setDelayProgress: (delayProgress) => set({ delayProgress }),
+  setAimProgress: (aimProgress) => set({ aimProgress }),
 }));
 
 /**

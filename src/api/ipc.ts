@@ -37,6 +37,23 @@ export interface CoreStatusDto {
   outboundMode?: OutboundMode;
   /** 【APP47 任务1.2】持久化选中节点名（内核未运行时仪表盘也展示） */
   selectedNode?: string | null;
+  /** 【APP54 任务1】任一启用 Go Lan 档案处于局域网直连 */
+  goLanAnyDirect?: boolean;
+  /** 【APP54 任务1】档案 id → 是否直连 */
+  goLanProfileDirectMap?: Record<string, boolean>;
+  /** 【APP54 任务4/5】全量测速进度快照 */
+  delayProgress?: ProbeProgress;
+  /** 【APP54 任务4/5】Go AIM 检测进度快照 */
+  aimProgress?: ProbeProgress;
+}
+
+/** 【APP54 任务4】测速 / Go AIM 进度快照（事件 + 状态查询共用） */
+export interface ProbeProgress {
+  running: boolean;
+  done: number;
+  total: number;
+  percent: number;
+  unlockedCount: number;
 }
 
 export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");
@@ -182,6 +199,11 @@ export const getCachedProxies = () =>
 export const testCachedProxies = (timeoutMs?: number) =>
   invoke<Record<string, number>>("test_cached_proxies", { timeoutMs });
 
+/** 【APP54 任务2】全量测速：100% 覆盖全部节点（DoH 预解析 + 20 并发滑窗），
+ *  返回 name→delay（0 表示超时）。运行中/未运行均可调用。 */
+export const testAllDelays = () =>
+  invoke<Record<string, number>>("test_all_delays");
+
 export const getSettings = () => invoke<UserSettings>("get_settings");
 export const saveSettings = (settings: UserSettings) =>
   invoke("save_settings", { settings });
@@ -259,6 +281,8 @@ export interface GoLanProfile {
   nodeUri: string;
   /** 该档案保存的内网检测目标（如 192.168.10.253:8001） */
   probeTarget: string;
+  /** 【APP54 任务1】后端注入的运行时直连状态（不参与保存） */
+  isDirect?: boolean;
 }
 
 export interface GoLanSettings {
@@ -292,6 +316,7 @@ export const normalizeGoLanProfile = (raw: Partial<GoLanProfile> | null, index: 
     wgConfig: p.wgConfig ?? null,
     nodeUri: typeof p.nodeUri === "string" ? p.nodeUri : "",
     probeTarget: typeof p.probeTarget === "string" ? p.probeTarget : "",
+    isDirect: p.isDirect === true,
   };
 };
 
@@ -327,6 +352,8 @@ export interface GoLanProfileStatus {
   name: string;
   enabled: boolean;
   onDemand: boolean;
+  /**【APP54 任务1】运行时直连判定（同网段命中或 35ms 内网探针可达） */
+  isDirect?: boolean;
   state: "direct" | "tunnel";
   bypassCidrs: string[];
   tunnelCidrs: string[];
@@ -336,8 +363,12 @@ export interface GoLanStatus {
   physicalIps: string[];
   /** 【APP52 任务3】任一启用隧道命中本机局域网 → 仪表盘翠绿胶囊 */
   anyOnDemandDirect?: boolean;
+  /** 【APP54 任务1】同 anyOnDemandDirect（方案字段名） */
+  goLanAnyDirect?: boolean;
   /** 【APP52 任务3】档案 id → direct / tunnel / off */
   profileStates?: Record<string, "direct" | "tunnel" | "off">;
+  /** 【APP54 任务1】档案 id → isDirect */
+  goLanProfileDirectMap?: Record<string, boolean>;
 }
 export const getGoLanStatus = async (): Promise<GoLanStatus> => {
   const raw = await invoke<GoLanStatus>("get_go_lan_status");
@@ -345,7 +376,9 @@ export const getGoLanStatus = async (): Promise<GoLanStatus> => {
     profiles: Array.isArray(raw?.profiles) ? raw.profiles : [],
     physicalIps: Array.isArray(raw?.physicalIps) ? raw.physicalIps : [],
     anyOnDemandDirect: raw?.anyOnDemandDirect === true,
+    goLanAnyDirect: raw?.goLanAnyDirect === true || raw?.anyOnDemandDirect === true,
     profileStates: raw?.profileStates ?? {},
+    goLanProfileDirectMap: raw?.goLanProfileDirectMap ?? {},
   };
 };
 

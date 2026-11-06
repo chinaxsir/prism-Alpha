@@ -34,14 +34,17 @@ const ERROR_RE = /error|warn|fail/i;
 
 /** 「仅看异常」分类的内部标识（非后端模块名） */
 const ERRORS_FILTER = "__errors__";
+/** 「Pro 功能」聚合分类：Go AIM / Go Lan / Go Cus */
+const PRO_FILTER = "__pro__";
 
-/** 【APP49 任务5】分类筛选 chips：全部 / 内核 / Go Lan / Go AIM / 订阅 / 仅看异常 */
+/** 【APP54 任务3】分类筛选胶囊：全部 / Pro 功能 / 规则运行 / 节点连接 /
+ *  内核记录 / 仅看异常（flex-wrap 自动换行，最右标签不被截断） */
 const CATEGORY_TABS: { key: string; value: string | null; labelKey: string }[] = [
   { key: "all", value: null, labelKey: "logs.filterAll" },
+  { key: "pro", value: PRO_FILTER, labelKey: "logs.filterPro" },
+  { key: "rule", value: "Rule", labelKey: "logs.filterRule" },
+  { key: "node", value: "Node", labelKey: "logs.filterNode" },
   { key: "kernel", value: "Kernel", labelKey: "logs.filterKernel" },
-  { key: "golan", value: "GoLan", labelKey: "logs.filterGoLan" },
-  { key: "goaim", value: "GoAim", labelKey: "logs.filterGoAim" },
-  { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
   { key: "errors", value: ERRORS_FILTER, labelKey: "logs.filterErrors" },
 ];
 
@@ -74,7 +77,11 @@ const moduleBadge = (module: string) =>
           ? "bg-amber-500/15 text-amber-300"
           : module === "GoCus"
             ? "bg-pink-500/15 text-pink-300"
-            : "bg-gray-500/15 text-gray-300";
+            : module === "Rule"
+              ? "bg-indigo-500/15 text-indigo-300"
+              : module === "Node"
+                ? "bg-cyan-500/15 text-cyan-300"
+                : "bg-gray-500/15 text-gray-300";
 
 /** 剥离 Kernel 日志中重复的头部前缀：
  *  `+0000 2026-10-26 09:44:10 ERROR [xxxx] connection: ...` → `connection: ...`
@@ -107,10 +114,9 @@ export default function LogViewerModal({
     async (module: string | null) => {
       setLoading(true);
       try {
-        // 「仅看异常」拉全量后在前端按关键词过滤
-        const payload = await getAppLogs(
-          module === ERRORS_FILTER ? undefined : (module ?? undefined),
-        );
+        // 「仅看异常」「Pro 功能」需拉全量后在前端聚合过滤
+        const needAll = module === ERRORS_FILTER || module === PRO_FILTER;
+        const payload = await getAppLogs(needAll ? undefined : (module ?? undefined));
         setEntries(payload.entries ?? []);
         setTotalBytes(payload.totalBytes ?? 0);
       } catch (e) {
@@ -122,14 +128,18 @@ export default function LogViewerModal({
     [],
   );
 
-  /** 分类筛选后的可见日志（「仅看异常」按 error/warn/fail 关键词过滤） */
-  const visibleEntries = useMemo(
-    () =>
-      activeModule === ERRORS_FILTER
-        ? entries.filter((e) => ERROR_RE.test(e.level) || ERROR_RE.test(e.message))
-        : entries,
-    [entries, activeModule],
-  );
+  /** 分类筛选后的可见日志（异常按关键词过滤，Pro 按模块聚合） */
+  const visibleEntries = useMemo(() => {
+    if (activeModule === ERRORS_FILTER) {
+      return entries.filter((e) => ERROR_RE.test(e.level) || ERROR_RE.test(e.message));
+    }
+    if (activeModule === PRO_FILTER) {
+      return entries.filter((e) =>
+        ["GoAim", "GoLan", "GoCus", "Pro"].includes(e.module)
+      );
+    }
+    return entries;
+  }, [entries, activeModule]);
 
   // 打开期间每 2 秒轮询（activeModule/refreshSignal 变化时立即重拉）
   useEffect(() => {
@@ -304,19 +314,17 @@ export default function LogViewerModal({
             visibleEntries.map((e) => {
               const msg =
                 e.module === "Kernel" ? stripKernelHeader(e.message) : e.message;
-              // 时间戳只显示时分秒毫秒（去掉日期前缀）
-              const shortTs = e.timestamp.length >= 12 ? e.timestamp.slice(11) : e.timestamp;
               return (
                 <div
                   key={e.id}
                   className="rounded-lg bg-background/60 border border-border/50 px-3 py-2 space-y-1"
                 >
-                  {/* 第一行：level 徽章 + module 徽章 + 精简时间戳 */}
+                  {/* 第一行：左 级别徽章 + 模块徽章，右 北京时间戳（等宽加粗） */}
                   <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex min-w-0 items-center gap-1.5">
                       <span
                         className={clsx(
-                          "rounded px-1.5 py-0.5 text-[11px] font-semibold",
+                          "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-bold tracking-wide",
                           levelColor(e.level),
                         )}
                       >
@@ -324,15 +332,16 @@ export default function LogViewerModal({
                       </span>
                       <span
                         className={clsx(
-                          "rounded px-1.5 py-0.5 text-[11px] font-medium",
+                          "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
                           moduleBadge(e.module),
                         )}
                       >
                         {e.module}
                       </span>
                     </div>
-                    <span className="shrink-0 font-mono text-[11px] text-gray-500">
-                      {shortTs}
+                    {/* 【APP54 任务3】北京时间戳（UTC+8，后端已统一转换）；日志区为深色底，固定浅色等宽加粗 */}
+                    <span className="shrink-0 whitespace-nowrap font-mono text-[11px] font-bold text-[#E5E5EA]">
+                      {e.timestamp}
                     </span>
                   </div>
                   {/* 第二行：100% 全宽日志正文 */}

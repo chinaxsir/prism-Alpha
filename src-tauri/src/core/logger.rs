@@ -34,6 +34,8 @@ pub const MOD_SUB: &str = "Sub";
 pub const MOD_PRO: &str = "Pro";
 /// 【APP52 任务4】节点生命周期日志分类
 pub const MOD_NODE: &str = "Node";
+/// 【APP54 任务3】规则运行日志分类（规则汇总 / 模式切换 / 规则命中）
+pub const MOD_RULE: &str = "Rule";
 /// 【APP52 任务4】节点连接四阶段生命周期日志前缀（顺序固定，供日志检索）
 pub const PHASE_NODE_IDENT: &str = "[节点识别]";
 pub const PHASE_HANDSHAKE: &str = "[握手阶段]";
@@ -93,18 +95,23 @@ pub fn init(data_dir: &std::path::Path) {
     }));
 }
 
-/// 本地时间戳："YYYY-MM-DD HH:mm:ss.SSS"；取不到本地时区时回退 UTC
-fn now_timestamp() -> String {
+/// 【APP54 任务3】北京时间字符串（UTC+8 固定偏移，格式 `YYYY-MM-DD HH:mm:ss.SSS`）。
+/// 四端统一：无论系统处于哪个时区，日志时间戳一律为北京时间。
+pub fn beijing_now_string() -> String {
     use time::macros::format_description;
     let fmt = format_description!(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
     );
-    // 【APP53 任务4.1】统一北京时间（UTC+8）：不再跟随系统本地时区，
-    // 保证 Mac（无论在哪个时区）、Windows、iOS、Android 四端日志时间戳一致，
-    // 后端内核日志转换时也强制 +8h。
     let bj = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
-    let dt = time::OffsetDateTime::now_utc().to_offset(bj);
-    dt.format(&fmt).unwrap_or_else(|_| "0000-00-00 00:00:00.000".into())
+    time::OffsetDateTime::now_utc()
+        .to_offset(bj)
+        .format(&fmt)
+        .unwrap_or_else(|_| "0000-00-00 00:00:00.000".into())
+}
+
+/// 本地时间戳（北京时间）："YYYY-MM-DD HH:mm:ss.SSS"
+fn now_timestamp() -> String {
+    beijing_now_string()
 }
 
 /// 追加一条日志（内存环形缓冲 + 追加写持久化文件）
@@ -205,7 +212,7 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
             && b[i + 7] == b'-'
             && d(i + 8)
             && d(i + 9)
-            && b[i + 10] == b' '
+            && (b[i + 10] == b' ' || b[i + 10] == b'T' || b[i + 10] == b't')
             && d(i + 11)
             && d(i + 12)
             && b[i + 13] == b':'
@@ -216,6 +223,29 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
             && d(i + 18)
         {
             let base = &line[i..i + 19];
+            // 【APP54 任务3】ISO/RFC3339 形式（如 sing-box `2025-11-06T12:34:56.789Z`）
+            // 先按原时区解析，再强制转换为北京时间（UTC+8）。
+            if i + 19 < n && (b[i + 10] == b'T' || b[i + 10] == b't') {
+                let end = line[i..]
+                    .find(|c: char| c == ' ' || c == ']' || c == '[')
+                    .map(|k| i + k)
+                    .unwrap_or(n);
+                let raw = &line[i..end];
+                if let Ok(dt) = time::OffsetDateTime::parse(
+                    raw,
+                    &time::format_description::well_known::Rfc3339,
+                ) {
+                    use time::macros::format_description;
+                    let fmt = format_description!(
+                        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
+                    );
+                    let bj =
+                        time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
+                    if let Ok(s) = dt.to_offset(bj).format(&fmt) {
+                        return Some(s);
+                    }
+                }
+            }
             let mut ms = String::from("000");
             if i + 20 <= n && b[i + 19] == b'.' {
                 let mut j = i + 20;
@@ -236,6 +266,54 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+/// 【APP54 任务3】去掉日志行开头重复的时间戳前缀（时间戳已单独放在卡片右上角），
+/// 支持 `YYYY-MM-DD HH:mm:ss[.fff]` 与 `YYYY-MM-DDTHH:mm:ss[.fff][Z|±hh:mm]`。
+fn strip_leading_datetime(line: &str) -> &str {
+    let b = line.as_bytes();
+    if b.len() < 19 {
+        return line;
+    }
+    let d = |k: usize| b[k].is_ascii_digit();
+    let looks_like_date = d(0)
+        && d(1)
+        && d(2)
+        && d(3)
+        && b[4] == b'-'
+        && d(5)
+        && d(6)
+        && b[7] == b'-'
+        && d(8)
+        && d(9)
+        && (b[10] == b' ' || b[10] == b'T' || b[10] == b't')
+        && d(11)
+        && d(12)
+        && b[13] == b':'
+        && d(14)
+        && d(15)
+        && b[16] == b':'
+        && d(17)
+        && d(18);
+    if !looks_like_date {
+        return line;
+    }
+    let mut end = 19usize;
+    if end < b.len() && b[end] == b'.' {
+        end += 1;
+        while end < b.len() && b[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    if end < b.len() && (b[end] == b'Z' || b[end] == b'z') {
+        end += 1;
+    } else if end + 5 < b.len()
+        && (b[end] == b'+' || b[end] == b'-')
+        && b[end + 3] == b':'
+    {
+        end += 6;
+    }
+    line[end..].trim_start()
 }
 
 /// 【APP11 任务5.2】解析扩展自写日志行开头的 10 位 Unix 秒级时间戳
@@ -372,7 +450,7 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
             timestamp,
             level: level.into(),
             module: module.into(),
-            message: line.chars().take(500).collect(),
+            message: strip_leading_datetime(line).chars().take(500).collect(),
         });
     }
 }
@@ -648,8 +726,8 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        is_benign_close_line, is_noise_eperm_line, MOD_NODE, PHASE_CONNECTED, PHASE_FORWARDING,
-        PHASE_HANDSHAKE, PHASE_NODE_IDENT,
+        beijing_now_string, is_benign_close_line, is_noise_eperm_line, strip_leading_datetime,
+        MOD_NODE, MOD_RULE, PHASE_CONNECTED, PHASE_FORWARDING, PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
 
     /// 【APP39 任务2.2】正常关闭/策略拦截日志必须被识别并丢弃，不再显示 ERROR
@@ -717,5 +795,43 @@ mod tests {
         let unique: std::collections::HashSet<_> = phases.iter().collect();
         assert_eq!(unique.len(), 4, "四阶段前缀必须唯一");
         assert_eq!(MOD_NODE, "Node");
+        assert_eq!(MOD_RULE, "Rule", "规则运行日志必须归类为 Rule");
+    }
+
+    /// 【APP54 任务3】北京时间戳格式 + 去重旧前缀
+    #[test]
+    fn test_beijing_now_string_and_strip_prefix() {
+        let s = beijing_now_string();
+        assert_eq!(s.len(), 23, "格式 YYYY-MM-DD HH:mm:ss.SSS");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        assert_eq!(&s[19..20], ".");
+        // 固定 UTC+8：与 UTC 时间相差 8 小时（按分钟对比，规避秒级抖动）
+        let bj = time::OffsetDateTime::now_utc().to_offset(
+            time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC),
+        );
+        let expect = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            bj.year(),
+            u8::from(bj.month()),
+            bj.day(),
+            bj.hour(),
+            bj.minute()
+        );
+        assert!(s.starts_with(&expect), "must be UTC+8: {s} vs {expect}");
+
+        // 卡片时间戳单独展示 → 正文必须剥掉重复前缀
+        assert_eq!(
+            strip_leading_datetime("2026-11-06 20:30:59.123 INFO hello"),
+            "INFO hello"
+        );
+        assert_eq!(
+            strip_leading_datetime("2026-11-06T12:30:59.123Z INFO hello"),
+            "INFO hello"
+        );
+        assert_eq!(strip_leading_datetime("plain message"), "plain message");
     }
 }

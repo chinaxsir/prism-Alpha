@@ -7,7 +7,7 @@ import {
   getCoreStatus,
   getProxyGroups,
   getCachedProxies,
-  testCachedProxies,
+  testAllDelays,
   selectProxy,
   urlTest,
   getGoAimStatus,
@@ -104,6 +104,10 @@ export default function Proxies() {
   };
 
   const coreStatus = useCoreStore((s) => s.status);
+  // 【APP54 任务5】测速 / Go AIM 实时进度（全局 store 收口，事件驱动）
+  const delayProgress = useCoreStore((s) => s.delayProgress);
+  const aimProgress = useCoreStore((s) => s.aimProgress);
+  const mergeNodeDelays = useCoreStore((s) => s.mergeNodeDelays);
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
   const proReady = useProStore((s) => s.ready);
   const proUnlocked = useProStore((s) => s.unlocked);
@@ -174,11 +178,30 @@ export default function Proxies() {
         }
       }
     );
+    // 【APP54 任务2/5】全量测速增量结果：逐批合并到延迟/超时集合，
+    // 并同步前端镜像（localStorage），切页回来也不会丢
+    const unDelays = listen<Record<string, number>>("delays://updated", (event) => {
+      const payload = event.payload ?? {};
+      const ok: Record<string, number> = {};
+      const timedOut: string[] = [];
+      for (const [name, delay] of Object.entries(payload)) {
+        if (delay > 0) ok[name] = delay;
+        else timedOut.push(name);
+      }
+      setDelays((prev) => ({ ...prev, ...ok }));
+      setFailed((prev) => {
+        const next = new Set(prev);
+        timedOut.forEach((n) => next.add(n));
+        return next;
+      });
+      mergeNodeDelays(ok);
+    });
     return () => {
       unStatus.then((fn) => fn());
       unProxies.then((fn) => fn());
       unAim.then((fn) => fn());
       unUrlTest.then((fn) => fn());
+      unDelays.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -208,6 +231,12 @@ export default function Proxies() {
             }
             return next;
           });
+          // 同步前端镜像（只存实测 >0，0 表示超时）
+          mergeNodeDelays(
+            Object.fromEntries(
+              Object.entries(resp.prismDelays).filter(([, d]) => d > 0)
+            )
+          );
         }
 
         const groupName = preferred || mainSelectorRef.current;
@@ -259,13 +288,15 @@ export default function Proxies() {
       setNodes(entries);
       setCurrent("");
       // 【APP52 任务1】恢复持久化延迟：实测 >0 进 delays，0 进 failed，
-      // 未测速保持 undefined（排序居中），停止/重启 APP 后依旧按延迟升序。
-      const persistedDelays: Record<string, number> = {};
+      // 未测速保持 undefined（排序居中）。【APP54 任务2】再叠加前端镜像，
+      // 切页/启停 VPN 均不会丢失已测出的延迟。
+      const mirrored = useCoreStore.getState().nodeDelays;
+      const persistedDelays: Record<string, number> = { ...mirrored };
       const persistedFailed = new Set<string>();
       for (const p of list) {
         if (typeof p.delay !== "number") continue;
         if (p.delay > 0) persistedDelays[p.name] = p.delay;
-        else persistedFailed.add(p.name);
+        else if (!(p.name in mirrored)) persistedFailed.add(p.name);
       }
       setDelays(persistedDelays);
       setFailed(persistedFailed);
@@ -309,80 +340,27 @@ export default function Proxies() {
   };
 
   const handleTest = async () => {
-    if (testing) return;
-    // 【APP44 任务1.3】内核未运行：走 DoH + TCP 真实握手测速（不依赖 Clash API）
-    if (coreStatusRef.current !== "running") {
-      if (nodes.length === 0) {
-        toast.error(t("proxies.err.noNodesToTest"));
-        return;
-      }
-      setTesting(true);
-      setFailed(new Set());
-      try {
-        const res = (await testCachedProxies(3000)) ?? {};
-        const ok = new Set(
-          Object.entries(res)
-            .filter(([, d]) => d > 0)
-            .map(([n]) => n)
-        );
-        setFailed(new Set(nodes.map((n) => n.name).filter((n) => !ok.has(n))));
-        setDelays(
-          Object.fromEntries(Object.entries(res).filter(([, d]) => d > 0))
-        );
-      } catch (e) {
-        console.error("offline delay test failed:", e);
-        toast.error(t("proxies.err.testFailed", { error: String(e) }));
-      } finally {
-        setTesting(false);
-      }
-      return;
-    }
-    // 测速前确保拿到最新主选择组名（事件触发时可能尚未同步到 state）
-    const groupName = mainSelectorRef.current;
-    if (!groupName) {
-      // 兜底：重新拉取一次状态，拿到 mainSelector 后再测
-      try {
-        const d = await getCoreStatus();
-        if (d.mainSelector) {
-          setMainSelectorName(d.mainSelector);
-          mainSelectorRef.current = d.mainSelector;
-        }
-      } catch {
-        /* ignore */
-      }
-      if (!mainSelectorRef.current) {
-        toast.error(t("proxies.err.noMainGroup"));
-        return;
-      }
-    }
+    if (testing || delayProgress.running) return;
     if (nodes.length === 0) {
       toast.error(t("proxies.err.noNodesToTest"));
       return;
     }
     setTesting(true);
-    // 清空上一轮失败标记：本轮结果由 url-test-update 增量事件与最终结果重建
+    // 清空上一轮失败标记：本轮结果由 delays://updated 增量事件与最终结果重建
     setFailed(new Set());
     try {
-      const result = (await urlTest(mainSelectorRef.current)) as Record<
-        string,
-        number
-      > | null;
-      const res = result ?? {};
-      // APP 任务4：res[name] 不存在或为 0 一律进 failed 集合（显示超时），
-      // 绝不允许测速完成后任何节点残留空白「—」未检测状态
-      const ok = new Set(
-        Object.entries(res)
-          .filter(([, d]) => d > 0)
-          .map(([n]) => n)
+      // 【APP54 任务2】全量测速：运行中/未运行统一入口，100% 覆盖全部节点。
+      // 后端逐节点写延迟缓存 + 推送进度，完成后自动选最低延迟节点。
+      const res = (await testAllDelays()) ?? {};
+      const ok = Object.fromEntries(
+        Object.entries(res).filter(([, d]) => d > 0)
       );
-      setFailed(
-        new Set(nodes.map((n) => n.name).filter((n) => !ok.has(n)))
-      );
-      setDelays(
-        Object.fromEntries(Object.entries(res).filter(([, d]) => d > 0))
-      );
+      setDelays((prev) => ({ ...prev, ...ok }));
+      setFailed(new Set(nodes.map((n) => n.name).filter((n) => !(n in ok))));
+      mergeNodeDelays(ok);
+      await loadProxies();
     } catch (e) {
-      console.error("url test failed:", e);
+      console.error("all delays test failed:", e);
       toast.error(t("proxies.err.testFailed", { error: String(e) }));
     } finally {
       setTesting(false);
@@ -435,6 +413,9 @@ export default function Proxies() {
   /// 已探测到的结果数：为 0 说明还没跑过探测（切到 AI/流媒体栏时自动补一次）
   const aimResultCount = Object.keys(aim?.results ?? {}).length;
   const aimProbing = Boolean(aim?.probing);
+  /// 【APP54 任务5】已测速节点数（实测 >0 或超时 0 都算已测，未测为 undefined）
+  const testedCount = nodes.filter((n) => typeof lastDelay(n) === "number").length;
+  const aimRunning = aimProgress.running || aimProbing;
 
   // 切到 Go AIM / AI / 流媒体栏且尚无结果时自动触发一次探测，
   // 避免用户看到空白列表而误以为「没有可用节点」
@@ -458,11 +439,9 @@ export default function Proxies() {
     setKeyword("");
   };
 
-  /// 测速完成后按延迟从低到高排列：有延迟的升序在前，未测速保持原序居中，
-  /// 超时的最后。测速进行中不排序（增量结果会导致列表跳动），
-  /// 没有任何测速数据时保持订阅原始顺序。
+  /// 【APP54 任务2】全部 / Go AIM 视图一律按延迟升序：实测 >0 在前，
+  /// 未测速居中，超时置底；没有任何测速数据时保持订阅原始顺序。
   const sorted = useMemo(() => {
-    if (testing) return filtered;
     const hasData = filtered.some((n) => {
       const d = lastDelay(n);
       return typeof d === "number" && d > 0;
@@ -524,7 +503,7 @@ export default function Proxies() {
       {/* Go AIM 筛选 pills + AI 检测入口（Go AIM / AI / 流媒体与检测为 Pro 功能：
           【APP-4 任务3】未激活时 disabled 静默禁用，不弹 Toast / 激活窗） */}
       <div className="flex items-center gap-2">
-        <div className="flex items-center gap-1.5 overflow-x-auto">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
           {AIM_FILTERS.map((f) => {
             const locked = f.value !== "all" && !proActive;
             return (
@@ -547,11 +526,30 @@ export default function Proxies() {
             );
           })}
         </div>
+        <span
+          className={clsx(
+            "ml-auto shrink-0 whitespace-nowrap rounded-full px-2 py-1 text-[11px] font-semibold tabular-nums",
+            aimRunning
+              ? "bg-[#24B414]/15 text-[#24B414] dark:text-[#30D158]"
+              : "bg-glass text-gray-400"
+          )}
+        >
+          {aimRunning
+            ? t("proxies.progress.aimChip", {
+                done: aimProgress.done,
+                total: aimProgress.total || nodes.length,
+                percent: aimProgress.percent,
+              })
+            : t("proxies.progress.goAimIdle", {
+                aim: aimResultCount,
+                total: nodes.length,
+              })}
+        </span>
         <button
           disabled={!proActive}
           onClick={proActive ? handleAimProbe : undefined}
           className={clsx(
-            "ml-auto shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border-strong text-xs transition-colors",
+            "shrink-0 flex items-center gap-1.5 whitespace-nowrap px-3 py-1.5 rounded-lg border border-border-strong text-xs transition-colors",
             proActive
               ? "text-gray-300 hover:border-accent/40 hover:text-accent"
               : "text-gray-500 opacity-50 cursor-not-allowed"
@@ -570,6 +568,9 @@ export default function Proxies() {
             <Crosshair size={13} />
           )}
           {t("proxies.goAim.detect")}
+          {aimRunning && (
+            <span className="tabular-nums">{aimProgress.percent}%</span>
+          )}
         </button>
       </div>
 
@@ -586,12 +587,18 @@ export default function Proxies() {
         </div>
         <button
           onClick={handleTest}
-          disabled={testing || nodes.length === 0}
+          disabled={testing || delayProgress.running || nodes.length === 0}
           className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-accent text-white text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
           title={t("proxies.speedTest")}
         >
           <Zap size={13} className={testing ? "animate-pulse" : ""} />
-          {testing ? t("proxies.speedTesting") : t("proxies.speedTest")}
+          {testing || delayProgress.running ? (
+            <span className="tabular-nums font-semibold">
+              {delayProgress.percent}%
+            </span>
+          ) : (
+            t("proxies.speedTest")
+          )}
         </button>
       </div>
 
@@ -606,7 +613,53 @@ export default function Proxies() {
             </span>
           )}
         </span>
+        <div className="flex shrink-0 items-center gap-2">
         <span>{t("proxies.nodeCount", { count: filtered.length })}</span>
+        {/* 【APP54 任务5】位置 A：搜索框下方状态栏右侧实时进度 */}
+        {delayProgress.running || testing ? (
+          <span className="flex items-center gap-1.5 text-[#007AFF] dark:text-[#0A84FF]">
+            <Zap size={11} className="animate-pulse" />
+            <span className="font-semibold tabular-nums whitespace-nowrap">
+              {t("proxies.progress.testing", {
+                done: delayProgress.done,
+                total: delayProgress.total || nodes.length,
+                percent: delayProgress.percent,
+              })}
+            </span>
+            <span className="h-1.5 w-6 min-w-[24px] overflow-hidden rounded-full bg-glass">
+              <span
+                className="block h-full rounded-full bg-[#007AFF] transition-all dark:bg-[#0A84FF]"
+                style={{ width: `${delayProgress.percent}%` }}
+              />
+            </span>
+          </span>
+        ) : aimRunning ? (
+          <span className="flex items-center gap-1.5 text-[#24B414] dark:text-[#30D158]">
+            <span aria-hidden>🎯</span>
+            <span className="font-semibold tabular-nums whitespace-nowrap">
+              {t("proxies.progress.aimTesting", {
+                done: aimProgress.done,
+                total: aimProgress.total || nodes.length,
+                percent: aimProgress.percent,
+              })}
+            </span>
+          </span>
+        ) : filter === "aim" ? (
+          <span className="font-semibold tabular-nums text-[#24B414] dark:text-[#30D158]">
+            {t("proxies.progress.aimIdle", {
+              aim: aimResultCount,
+              total: nodes.length,
+            })}
+          </span>
+        ) : (
+          <span className="tabular-nums text-gray-400">
+            {t("proxies.progress.nodesIdle", {
+              tested: testedCount,
+              total: nodes.length,
+            })}
+          </span>
+        )}
+        </div>
       </div>
 
       {/* 节点列表流（Shadowrocket 风格；测速完成后按延迟升序） */}

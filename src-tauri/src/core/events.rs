@@ -177,6 +177,25 @@ fn allocate_untracked(mode: &OutboundMode, untracked: u64) -> (u64, u64) {
     }
 }
 
+/// 【APP54 任务3】规则命中日志去重（进程内单例集合，最多 500 条）。
+fn log_rule_hit_dedupe(rule: &str, payload: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut set) = seen.lock() else { return };
+    if set.len() >= 500 {
+        return;
+    }
+    let key = format!("{rule}|{payload}");
+    if !set.insert(key) {
+        return;
+    }
+    super::logger::info(
+        super::logger::MOD_RULE,
+        &format!("规则命中: {rule} {payload}"),
+    );
+}
+
 fn apply_connections_update(state: &AppState, value: &serde_json::Value, foreground: bool) {
     let download_total = value
         .get("downloadTotal")
@@ -283,6 +302,15 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
                 },
             );
         }
+    }
+
+    // 【APP54 任务3】规则命中日志（去重：同一 rule+payload 仅记录一次，
+    // 上限 500 条，避免高频连接把环形日志刷满）
+    for conn in incoming.values() {
+        if conn.rule.is_empty() && conn.rule_payload.is_empty() {
+            continue;
+        }
+        log_rule_hit_dedupe(&conn.rule, &conn.rule_payload);
     }
 
     // 3) 增量聚合（host / outbound / rule）：与 last_seen 上次值求差累加；

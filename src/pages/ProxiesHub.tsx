@@ -18,10 +18,10 @@ const TABS: Array<{
   /** 是否 Pro 专属（已激活后完整解锁） */
   pro?: boolean;
 }> = [
-  { key: "nodes", labelKey: "metric.nodes" },
-  { key: "connections", labelKey: "metric.connections", pro: true },
-  { key: "rules", labelKey: "metric.rules", pro: true },
-  { key: "goCus", labelKey: "engine.goCus", icon: Wand2, pro: true },
+  { key: "nodes", labelKey: "proxyHub.tab.nodes" },
+  { key: "connections", labelKey: "proxyHub.tab.connections", pro: true },
+  { key: "rules", labelKey: "proxyHub.tab.rules", pro: true },
+  { key: "goCus", labelKey: "proxyHub.tab.goCus", icon: Wand2, pro: true },
 ];
 
 /** 代理中心：节点 / 连接 / 规则 / Go Cus 四合一。
@@ -44,8 +44,9 @@ export default function ProxiesHub() {
       {/* 顶部页面标题：保持干净，不放激活按钮（APP-7 任务1） */}
       <h1 className="text-[22px] font-bold tracking-tight">{t("nav.proxies")}</h1>
 
-      {/* 4 栏分段导航：Pro 专属项在未激活时置灰 + 锁图标 + disabled 静默禁用 */}
-      <div className="flex rounded-lg border border-border bg-surface-hover p-1">
+      {/* 4 栏分段导航：固定等分（英文 Nodes | Conns | Rules | Go Cus 不溢出），
+          Pro 专属项在未激活时置灰 + 锁图标 + disabled 静默禁用 */}
+      <div className="grid w-full max-w-full grid-cols-4 gap-1 rounded-lg border border-border bg-surface-hover p-1 box-border">
         {TABS.map((tabItem) => {
           const locked = !!tabItem.pro && !proUnlocked;
           return (
@@ -58,7 +59,7 @@ export default function ProxiesHub() {
                   : setParams(tabItem.key === "nodes" ? {} : { tab: tabItem.key })
               }
               className={clsx(
-                "flex items-center gap-1.5 rounded-md px-4 py-1.5 text-sm transition-colors",
+                "flex min-w-0 items-center justify-center gap-1 rounded-md px-1 py-1.5 text-[13px] font-semibold transition-colors",
                 locked
                   ? "text-gray-500 opacity-50 cursor-not-allowed"
                   : tab === tabItem.key
@@ -66,8 +67,8 @@ export default function ProxiesHub() {
                     : "text-gray-400 hover:text-gray-200"
               )}
             >
-              {tabItem.icon && <tabItem.icon size={14} />}
-              {t(tabItem.labelKey)}
+              {tabItem.icon && <tabItem.icon size={14} className="shrink-0" />}
+              <span className="min-w-0 truncate">{t(tabItem.labelKey)}</span>
               {locked && <Lock size={11} className="shrink-0" />}
             </button>
           );

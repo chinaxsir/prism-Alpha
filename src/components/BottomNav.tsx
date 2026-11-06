@@ -4,6 +4,16 @@ import clsx from "clsx";
 import { navItems } from "./Sidebar";
 import { useTranslation } from "@/i18n";
 
+/** 【APP54 任务6】底部导航英文短名（多语言键 navShort.*），
+ *  配合 truncate 保证 5 个标签在窄屏不换行、不超出容器 */
+const SHORT_LABELS: Record<string, string> = {
+  "/dashboard": "navShort.dashboard",
+  "/proxies": "navShort.proxies",
+  "/subscription": "navShort.subscription",
+  "/analytics": "navShort.analytics",
+  "/settings": "navShort.settings",
+};
+
 /// 移动端底部标签栏（桌面端隐藏，由 Sidebar 承担导航）
 export default function BottomNav() {
   const { t } = useTranslation();
@@ -16,7 +26,7 @@ export default function BottomNav() {
             to={to}
             className={({ isActive }) =>
               clsx(
-                "relative flex-1 flex flex-col items-center gap-1 py-2 text-[11px] transition-colors",
+                "relative flex min-w-0 flex-1 flex-col items-center gap-1 py-2 text-[11px] transition-colors",
                 isActive ? "text-accent" : "text-gray-500"
               )
             }
@@ -31,7 +41,9 @@ export default function BottomNav() {
                   )}
                 />
                 <Icon size={20} strokeWidth={isActive ? 2.2 : 1.8} />
-                <span className={clsx(isActive && "font-medium")}>{t(labelKey)}</span>
+                <span className="max-w-full truncate font-semibold">
+                  {t(SHORT_LABELS[to] ?? labelKey)}
+                </span>
               </>
             )}
           </NavLink>

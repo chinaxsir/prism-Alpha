@@ -16,6 +16,8 @@ const zh: Record<string, string> = {
   "dashboard.aim.restoreAuto": "恢复自动",
   "dashboard.aim.idle": "自动优选解锁 ChatGPT / Claude / Netflix 的最低延迟节点",
   "dashboard.aim.probing": "探测中",
+  "dashboard.aim.progress": "🎯 正在检测: {done}/{total} ({percent}%) · 已解锁 {unlocked} 个",
+  "dashboard.aim.rated": "已锁定: {node} · 已评级 {rated}/{total} 个节点",
   "dashboard.aim.retest": "重测",
   "dashboard.aim.retestFailed": "重测失败：{error}",
   "dashboard.lan.managed": "组网模式",
@@ -49,6 +51,8 @@ const en: Record<string, string> = {
   "dashboard.aim.idle":
     "Auto-picks the lowest-latency node unlocking ChatGPT / Claude / Netflix",
   "dashboard.aim.probing": "Probing",
+  "dashboard.aim.progress": "🎯 Probing: {done}/{total} ({percent}%) · {unlocked} unlocked",
+  "dashboard.aim.rated": "Locked: {node} · {rated}/{total} nodes rated",
   "dashboard.aim.retest": "Retest",
   "dashboard.aim.retestFailed": "Retest failed: {error}",
   "dashboard.lan.managed": "Managed",

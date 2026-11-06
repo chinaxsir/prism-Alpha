@@ -330,11 +330,14 @@ function scriptBadgeClass(type: string): string {
 
 // ============================== 页面 ==============================
 
+/** 【APP54 任务6】子分类标签栏（英文精简：All | Override | Rewrite | Script | MitM），
+ *  容器 flex-wrap 允许自动换行，严禁单行硬撑超出屏幕 */
 const SUB_TABS = [
-  { key: "modules", labelKey: "proxies.goCus.tab.modules" },
+  { key: "all", labelKey: "proxies.goCus.tab.all" },
+  { key: "modules", labelKey: "proxies.goCus.tab.override" },
   { key: "rewrites", labelKey: "proxies.goCus.tab.rewrites" },
-  { key: "mitm", labelKey: "proxies.goCus.tab.mitm" },
   { key: "scripts", labelKey: "proxies.goCus.tab.scripts" },
+  { key: "mitm", labelKey: "proxies.goCus.tab.mitm" },
 ] as const;
 
 type SubTabKey = (typeof SUB_TABS)[number]["key"];
@@ -350,13 +353,15 @@ export default function GoCus() {
   const [loading, setLoading] = useState(
     () => useCoreStore.getState().goCusSettings == null,
   );
-  const [subTab, setSubTab] = useState<SubTabKey>("modules");
+  const [subTab, setSubTab] = useState<SubTabKey>("all");
 
   // 模块导入
   const [source, setSource] = useState("");
   const [importing, setImporting] = useState(false);
   // 【APP50 任务5】模板库一键导入的进行中标记（按模板 key）
   const [importingTpl, setImportingTpl] = useState<string | null>(null);
+  // 【APP54 任务6】本次会话已导入的模板（按钮文案 Add -> Added）
+  const [importedTpls, setImportedTpls] = useState<string[]>([]);
   // 【APP50 任务4】iOS WKWebView 静默拦截 window.confirm（恒返回 false），
   // 模块删除改用「二次点击确认」（3s 自动复位）
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
@@ -433,6 +438,9 @@ export default function GoCus() {
     try {
       const m = await importGoCusModule(tpl.content);
       toast.success(t("proxies.goCus.importSuccess", { name: m.name }));
+      setImportedTpls((prev) =>
+        prev.includes(tpl.key) ? prev : [...prev, tpl.key]
+      );
       await reload();
     } catch (e) {
       toast.error(String(e));
@@ -549,7 +557,7 @@ export default function GoCus() {
 
   if (!settings) {
     return (
-      <div className="rounded-2xl border border-border bg-surface-card p-5">
+      <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
         <p className="py-6 text-center text-sm text-gray-500">
           {t("proxies.goCus.loadFailed")}
         </p>
@@ -561,16 +569,16 @@ export default function GoCus() {
     <ProGate feature={Feature.GoCus}>
       <div className="space-y-4">
         {/* 引擎总开关 */}
-        <div className="flex items-center justify-between rounded-2xl border border-border bg-surface-card p-5">
-          <div className="flex items-center gap-3">
+        <div className="flex w-full max-w-full items-center justify-between overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
+          <div className="flex min-w-0 flex-1 items-center gap-3 pr-2">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/15">
               <Wand2 size={17} className="text-accent" />
             </span>
-            <div>
+            <div className="min-w-0 flex-1">
               <h3 className="text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.engineTitle")}
               </h3>
-              <p className="mt-0.5 text-xs text-gray-500">
+              <p className="mt-0.5 text-[13px] leading-snug text-gray-500 break-words">
                 {t("proxies.goCus.engineDesc")}
               </p>
             </div>
@@ -582,13 +590,13 @@ export default function GoCus() {
           />
         </div>
 
-        {/* 子标签 */}
-        <div className="flex rounded-lg border border-border bg-surface-hover p-1">
+        {/* 子标签（英文精简：All | Override | Rewrite | Script | MitM，自动换行防溢出） */}
+        <div className="flex w-full max-w-full flex-wrap gap-1.5 rounded-lg border border-border bg-surface-hover p-1 box-border">
           {SUB_TABS.map((tabItem) => (
             <button
               key={tabItem.key}
               onClick={() => setSubTab(tabItem.key)}
-              className={`flex-1 rounded-md px-3 py-1.5 text-sm transition-colors ${
+              className={`whitespace-nowrap rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
                 subTab === tabItem.key
                   ? "bg-accent text-white"
                   : "text-gray-400 hover:text-gray-200"
@@ -600,28 +608,28 @@ export default function GoCus() {
         </div>
 
         {/* ---------- 模块 ---------- */}
-        {subTab === "modules" && (
+        {(subTab === "all" || subTab === "modules") && (
           <div className="space-y-4">
-            <div className="rounded-2xl border border-border bg-surface-card p-5">
+            <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
               <h3 className="mb-1 text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.importTitle")}
               </h3>
-              <p className="mb-3 text-xs text-gray-500">
+              <p className="mb-3 text-xs leading-snug text-gray-500 break-words">
                 {t("proxies.goCus.importDesc")}
               </p>
-              <div className="flex flex-col gap-2 sm:flex-row">
+              <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row">
                 <input
                   value={source}
                   onChange={(e) => setSource(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleImport()}
                   placeholder={t("proxies.goCus.importPlaceholder")}
                   spellCheck={false}
-                  className="flex-1 rounded-lg border border-border bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent"
+                  className="w-full min-w-0 flex-1 rounded-lg border border-border bg-surface-hover px-3 py-2 text-sm outline-none focus:border-accent"
                 />
                 <button
                   onClick={handleImport}
                   disabled={importing}
-                  className="flex items-center justify-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm transition-colors hover:bg-accent-hover disabled:opacity-50"
+                  className="flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-accent px-4 py-2 text-sm transition-colors hover:bg-accent-hover disabled:opacity-50"
                 >
                   {importing ? (
                     <Loader2 size={14} className="animate-spin" />
@@ -634,38 +642,37 @@ export default function GoCus() {
             </div>
 
             {/* 【APP50 任务5】官方精选一键模板库 */}
-            <div className="rounded-2xl border border-border bg-surface-card p-5">
+            <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
               <h3 className="mb-1 text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.templateLibTitle")}
               </h3>
-              <p className="mb-3 text-xs text-gray-500">
+              <p className="mb-3 text-xs leading-snug text-gray-500 break-words">
                 {t("proxies.goCus.templateLibDesc")}
               </p>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="grid w-full min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
                 {CUS_TEMPLATES.map((tpl) => (
                   <div
                     key={tpl.key}
-                    className="flex items-center justify-between gap-2 rounded-xl border border-border bg-surface-hover px-3 py-2.5"
+                    className="flex w-full min-w-0 items-start justify-between gap-2.5 overflow-hidden rounded-xl border border-border bg-surface-hover px-3 py-2.5 box-border"
                   >
-                    <div className="min-w-0">
-                      <p className="truncate text-xs font-semibold text-gray-200">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[14px] font-bold leading-snug text-gray-200 break-words">
                         {t(tpl.nameKey)}
                       </p>
-                      <p className="mt-0.5 line-clamp-2 text-[11px] leading-4 text-gray-500">
+                      <p className="mt-0.5 text-[11px] leading-4 text-gray-500 break-words">
                         {t(tpl.descKey)}
                       </p>
                     </div>
                     <button
                       onClick={() => void importTemplate(tpl)}
                       disabled={importingTpl === tpl.key}
-                      className="flex shrink-0 items-center gap-1 rounded-lg bg-accent px-2.5 py-1.5 text-[11px] text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+                      className="shrink-0 whitespace-nowrap rounded-lg bg-accent px-3 py-1.5 text-[12px] font-bold text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
                     >
-                      {importingTpl === tpl.key ? (
-                        <Loader2 size={12} className="animate-spin" />
-                      ) : (
-                        <Download size={12} />
-                      )}
-                      {t("proxies.goCus.templateImport")}
+                      {importingTpl === tpl.key
+                        ? t("proxies.goCus.templateImport")
+                        : importedTpls.includes(tpl.key)
+                          ? t("proxies.goCus.templateAdded")
+                          : t("proxies.goCus.templateImport")}
                     </button>
                   </div>
                 ))}
@@ -673,7 +680,7 @@ export default function GoCus() {
             </div>
 
             {settings.modules.length === 0 ? (
-              <div className="rounded-2xl border border-border bg-surface-card">
+              <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card box-border">
                 <EmptyState
                   icon={<Package size={28} />}
                   title={t("proxies.goCus.noModules")}
@@ -685,12 +692,12 @@ export default function GoCus() {
                 {settings.modules.map((m) => (
                   <div
                     key={m.id}
-                    className="rounded-2xl border border-border bg-surface-card p-5"
+                    className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border"
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <h3 className="truncate text-sm font-semibold text-gray-100">
+                    <div className="flex w-full min-w-0 items-start justify-between gap-2.5">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 flex-wrap items-center gap-2">
+                          <h3 className="text-[14px] font-bold leading-snug text-gray-100 break-words">
                             {m.name}
                           </h3>
                           <span
@@ -706,12 +713,12 @@ export default function GoCus() {
                           </span>
                         </div>
                         {m.desc && (
-                          <p className="mt-0.5 truncate text-xs text-gray-500">
+                          <p className="mt-0.5 text-xs leading-snug text-gray-500 break-words">
                             {m.desc}
                           </p>
                         )}
                         <p
-                          className="mt-1 truncate font-mono text-[11px] text-gray-600"
+                          className="mt-1 w-full min-w-0 break-all font-mono text-[11px] text-gray-600"
                           title={m.source}
                         >
                           {m.source.startsWith("http") ? m.source : "local"}
@@ -734,7 +741,7 @@ export default function GoCus() {
                               ? t("proxies.goCus.confirmDeleteAgain")
                               : t("proxies.goCus.deleteModule")
                           }
-                          className={`rounded p-1.5 transition-colors ${
+                          className={`shrink-0 rounded p-1.5 transition-colors ${
                             confirmingDeleteId === m.id
                               ? "bg-red-500/20 text-latency-bad ring-1 ring-red-500/40"
                               : "text-gray-500 hover:text-latency-bad"
@@ -744,7 +751,7 @@ export default function GoCus() {
                         </button>
                       </div>
                     </div>
-                    <div className="mt-3 grid grid-cols-4 gap-2">
+                    <div className="mt-3 grid w-full grid-cols-4 gap-2">
                       {[
                         { label: t("metric.rules"), value: m.stats.rules },
                         {
@@ -762,12 +769,14 @@ export default function GoCus() {
                       ].map((s) => (
                         <div
                           key={s.label}
-                          className="rounded-lg bg-surface-hover px-2 py-1.5 text-center"
+                          className="min-w-0 rounded-lg bg-surface-hover px-1.5 py-1.5 text-center"
                         >
                           <p className="text-sm font-semibold tabular-nums text-gray-200">
                             {s.value}
                           </p>
-                          <p className="text-[11px] text-gray-500">{s.label}</p>
+                          <p className="truncate text-[11px] text-gray-500">
+                            {s.label}
+                          </p>
                         </div>
                       ))}
                     </div>
@@ -779,9 +788,9 @@ export default function GoCus() {
         )}
 
         {/* ---------- 改写 ---------- */}
-        {subTab === "rewrites" && (
-          <div className="rounded-2xl border border-border bg-surface-card p-5">
-            <div className="mb-3 flex items-center justify-between">
+        {(subTab === "all" || subTab === "rewrites") && (
+          <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
+            <div className="mb-3 flex w-full min-w-0 flex-wrap items-center justify-between gap-1.5">
               <h3 className="text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.rewritesTitle", { count: rewrites.length })}
               </h3>
@@ -796,34 +805,36 @@ export default function GoCus() {
                 description={t("proxies.goCus.noRewritesDesc")}
               />
             ) : (
-              <div className="max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
+              <div className="max-h-[28rem] w-full min-w-0 space-y-1.5 overflow-y-auto pr-1">
                 {rewrites.map((r, i) => (
                   <div
                     key={`${r.pattern}-${i}`}
-                    className="flex items-center gap-3 rounded-lg bg-surface-hover px-3 py-2"
+                    className="w-full min-w-0 overflow-hidden rounded-lg bg-surface-hover px-3 py-2 box-border"
                   >
-                    <span
-                      className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${rewriteBadgeClass(r.action)}`}
-                    >
-                      {r.action}
-                    </span>
-                    <span
-                      className="min-w-0 flex-1 truncate font-mono text-xs text-gray-300"
+                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${rewriteBadgeClass(r.action)}`}
+                      >
+                        {r.action}
+                      </span>
+                      <span className="min-w-0 max-w-full truncate text-[11px] text-gray-600">
+                        {r.module}
+                      </span>
+                    </div>
+                    <p
+                      className="mt-1 w-full min-w-0 break-all font-mono text-xs text-gray-300"
                       title={r.pattern}
                     >
                       {r.pattern}
-                    </span>
+                    </p>
                     {r.target && (
-                      <span
-                        className="max-w-[30%] shrink-0 truncate text-[11px] text-accent"
+                      <p
+                        className="mt-0.5 w-full min-w-0 break-all text-[11px] text-accent"
                         title={r.target}
                       >
                         → {r.target}
-                      </span>
+                      </p>
                     )}
-                    <span className="shrink-0 text-[11px] text-gray-600">
-                      {r.module}
-                    </span>
                   </div>
                 ))}
               </div>
@@ -832,14 +843,14 @@ export default function GoCus() {
         )}
 
         {/* ---------- MitM ---------- */}
-        {subTab === "mitm" && (
+        {(subTab === "all" || subTab === "mitm") && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between rounded-2xl border border-border bg-surface-card p-5">
-              <div>
+            <div className="flex w-full max-w-full items-center justify-between overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
+              <div className="min-w-0 flex-1 pr-2">
                 <h3 className="text-sm font-semibold text-gray-100">
                   {t("proxies.goCus.tab.mitm")}
                 </h3>
-                <p className="mt-0.5 text-xs text-gray-500">
+                <p className="mt-0.5 text-[13px] leading-snug text-gray-500 break-words">
                   {t("proxies.goCus.mitmDesc")}
                 </p>
               </div>
@@ -850,7 +861,7 @@ export default function GoCus() {
               />
             </div>
 
-            <div className="rounded-2xl border border-border bg-surface-card p-5">
+            <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
               <h3 className="mb-3 text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.mitmHostsTitle", { count: mitmHosts.length })}
               </h3>
@@ -859,11 +870,11 @@ export default function GoCus() {
                   {t("proxies.goCus.noMitmHosts")}
                 </p>
               ) : (
-                <div className="flex flex-wrap gap-1.5">
+                <div className="flex w-full min-w-0 flex-wrap gap-1.5">
                   {mitmHosts.map((h) => (
                     <span
                       key={h}
-                      className="rounded-md bg-surface-hover px-2 py-1 font-mono text-[11px] text-gray-300"
+                      className="max-w-full break-all rounded-md bg-surface-hover px-2 py-1 font-mono text-[11px] text-gray-300"
                     >
                       {h}
                     </span>
@@ -872,10 +883,10 @@ export default function GoCus() {
               )}
             </div>
 
-            <div className="space-y-4 rounded-2xl border border-border bg-surface-card p-5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <ShieldCheck size={16} className="text-accent" />
+            <div className="w-full max-w-full space-y-4 overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
+              <div className="flex w-full min-w-0 flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <ShieldCheck size={16} className="shrink-0 text-accent" />
                   <h3 className="text-sm font-semibold text-gray-100">
                     {t("proxies.goCus.caTitle")}
                   </h3>
@@ -883,7 +894,7 @@ export default function GoCus() {
                 <button
                   onClick={loadCa}
                   disabled={caBusy}
-                  className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs transition-colors hover:bg-accent-hover disabled:opacity-50"
+                  className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-accent px-3 py-1.5 text-xs transition-colors hover:bg-accent-hover disabled:opacity-50"
                 >
                   {caBusy ? (
                     <Loader2 size={13} className="animate-spin" />
@@ -896,19 +907,19 @@ export default function GoCus() {
 
               {ca && (
                 <div className="space-y-3">
-                  <div>
+                  <div className="w-full min-w-0">
                     <p className="mb-1 text-xs text-gray-500">
                       {t("proxies.goCus.caFingerprint")}
                     </p>
-                    <p className="break-all rounded-lg bg-surface-hover px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-300">
+                    <p className="w-full min-w-0 break-all rounded-lg bg-surface-hover px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-300">
                       {ca.fingerprint}
                     </p>
                   </div>
-                  <div>
+                  <div className="w-full min-w-0">
                     <p className="mb-1 text-xs text-gray-500">
                       {t("proxies.goCus.caInstallUrl")}
                     </p>
-                    <div className="flex items-center gap-2">
+                    <div className="flex w-full min-w-0 flex-wrap items-center gap-2">
                       <a
                         href={ca.installUrl}
                         target="_blank"
@@ -922,28 +933,30 @@ export default function GoCus() {
                         onClick={() =>
                           copyText(ca.installUrl, t("proxies.goCus.installCopied"))
                         }
-                        className="flex shrink-0 items-center gap-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 transition-colors hover:text-gray-100"
+                        className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 transition-colors hover:text-gray-100"
                       >
                         <Copy size={13} />
                         {t("proxies.goCus.copyInstall")}
                       </button>
                     </div>
                   </div>
-                  <label className="flex cursor-pointer items-center gap-2 text-xs text-gray-300">
+                  <label className="flex w-full min-w-0 cursor-pointer items-start gap-2 text-xs leading-snug text-gray-300">
                     <input
                       type="checkbox"
                       checked={settings.caInstalled}
                       onChange={(e) =>
                         persist({ ...settings, caInstalled: e.target.checked })
                       }
-                      className="h-4 w-4 accent-indigo-500"
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500"
                     />
-                    {t("proxies.goCus.caTrusted")}
+                    <span className="min-w-0 break-words">
+                      {t("proxies.goCus.caTrusted")}
+                    </span>
                   </label>
                 </div>
               )}
 
-              <p className="text-[11px] leading-relaxed text-gray-500">
+              <p className="text-[11px] leading-relaxed text-gray-500 break-words">
                 {t("proxies.goCus.caHint")}
               </p>
             </div>
@@ -951,9 +964,9 @@ export default function GoCus() {
         )}
 
         {/* ---------- 脚本 ---------- */}
-        {subTab === "scripts" && (
-          <div className="rounded-2xl border border-border bg-surface-card p-5">
-            <div className="mb-3 flex items-center justify-between">
+        {(subTab === "all" || subTab === "scripts") && (
+          <div className="w-full max-w-full overflow-hidden rounded-2xl border border-border bg-surface-card p-5 box-border">
+            <div className="mb-3 flex w-full min-w-0 flex-wrap items-center justify-between gap-1.5">
               <h3 className="text-sm font-semibold text-gray-100">
                 {t("proxies.goCus.scriptsTitle", { count: scripts.length })}
               </h3>
@@ -968,11 +981,11 @@ export default function GoCus() {
                 description={t("proxies.goCus.noScriptsDesc")}
               />
             ) : (
-              <div className="max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
+              <div className="max-h-[28rem] w-full min-w-0 space-y-1.5 overflow-y-auto pr-1">
                 {scripts.map((s, i) => (
                   <div
                     key={`${s.scriptPath}-${i}`}
-                    className="flex items-center gap-3 rounded-lg bg-surface-hover px-3 py-2"
+                    className="flex w-full min-w-0 items-start gap-2 overflow-hidden rounded-lg bg-surface-hover px-3 py-2 box-border"
                   >
                     <span
                       className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${scriptBadgeClass(s.type)}`}
@@ -980,26 +993,30 @@ export default function GoCus() {
                       {s.type}
                     </span>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-xs text-gray-200">{s.name}</p>
+                      <p className="text-xs leading-snug text-gray-200 break-words">
+                        {s.name}
+                      </p>
                       {s.pattern && (
                         <p
-                          className="truncate font-mono text-[11px] text-gray-500"
+                          className="w-full min-w-0 break-all font-mono text-[11px] text-gray-500"
                           title={s.pattern}
                         >
                           {s.pattern}
                         </p>
                       )}
+                      <button
+                        onClick={() =>
+                          copyText(s.scriptPath, t("proxies.goCus.scriptPathCopied"))
+                        }
+                        title={t("proxies.goCus.clickToCopy", { path: s.scriptPath })}
+                        className="flex w-full min-w-0 items-center gap-1 text-left text-[11px] text-gray-400 transition-colors hover:text-accent"
+                      >
+                        <Copy size={11} className="shrink-0" />
+                        <span className="min-w-0 break-all font-mono">
+                          {s.scriptPath}
+                        </span>
+                      </button>
                     </div>
-                    <button
-                      onClick={() =>
-                        copyText(s.scriptPath, t("proxies.goCus.scriptPathCopied"))
-                      }
-                      title={t("proxies.goCus.clickToCopy", { path: s.scriptPath })}
-                      className="flex max-w-[40%] shrink-0 items-center gap-1 text-[11px] text-gray-400 transition-colors hover:text-accent"
-                    >
-                      <Copy size={11} className="shrink-0" />
-                      <span className="truncate font-mono">{s.scriptPath}</span>
-                    </button>
                     <span className="shrink-0 text-[11px] text-gray-600">
                       {s.module}
                     </span>
@@ -1007,7 +1024,7 @@ export default function GoCus() {
                 ))}
               </div>
             )}
-            <p className="mt-4 text-[11px] leading-relaxed text-gray-500">
+            <p className="mt-4 text-[11px] leading-relaxed text-gray-500 break-words">
               {t("proxies.goCus.scriptAlphaNote")}
             </p>
           </div>

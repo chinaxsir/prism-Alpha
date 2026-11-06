@@ -35,6 +35,14 @@ pub struct CoreStatusDto {
     /// 内核未运行时 Dashboard「当前节点」卡也展示上次选中的真实节点名，
     /// 不再显示「—」死状态。
     pub selected_node: Option<String>,
+    /// 【APP54 任务1】是否有任一启用 Go Lan 档案处于「⚡ 局域网直连」状态
+    pub go_lan_any_direct: bool,
+    /// 【APP54 任务1】档案 id → 是否直连（Dashboard/设置页副标题数据源）
+    pub go_lan_profile_direct_map: std::collections::HashMap<String, bool>,
+    /// 【APP54 任务4】全量测速进度
+    pub delay_progress: crate::core::state::ProbeProgress,
+    /// 【APP54 任务4】Go AIM 探测进度
+    pub aim_progress: crate::core::state::ProbeProgress,
 }
 
 /// 内核信息（设置页 / 下载向导用）
@@ -993,6 +1001,32 @@ pub async fn get_core_status(
     // 若为「剩余流量：96GB」等假节点或已不存在，自动替换为真实节点并落盘。
     ensure_valid_selected_node(state.inner());
 
+    // 【APP54 任务1】Go Lan 直连状态随状态查询一起下发（Dashboard 副标题 /
+    // 设置页徽章无需额外 IPC 往返）。未启用 Go Lan 时零开销直接返回空表。
+    let lan = state.go_lan.read().clone();
+    let (go_lan_any_direct, go_lan_profile_direct_map) = if lan.enabled {
+        let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
+        let profiles = crate::core::go_lan::enabled_profiles(&lan);
+        let map: std::collections::HashMap<String, bool> = {
+            let phys = physical.clone();
+            tokio::task::spawn_blocking(move || {
+                profiles
+                    .into_iter()
+                    .map(|(_, p)| {
+                        let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
+                        (p.id.clone(), hit)
+                    })
+                    .collect::<std::collections::HashMap<String, bool>>()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let any = map.values().any(|v| *v);
+        (any, map)
+    } else {
+        (false, std::collections::HashMap::new())
+    };
+
     Ok(CoreStatusDto {
         status: *state.status.read(),
         mode: *state.mode.read(),
@@ -1001,6 +1035,10 @@ pub async fn get_core_status(
         main_selector: state.main_selector.read().clone(),
         outbound_mode: state.settings.read().outbound_mode,
         selected_node: state.settings.read().selected_node.clone(),
+        go_lan_any_direct,
+        go_lan_profile_direct_map,
+        delay_progress: state.delay_progress.lock().clone(),
+        aim_progress: state.aim_progress.lock().clone(),
     })
 }
 
@@ -1031,6 +1069,11 @@ pub async fn set_mode(
         return Ok(());
     }
     *state.mode.write() = mode;
+    // 【APP54 任务3】规则模块：运行模式切换
+    crate::core::logger::info(
+        crate::core::logger::MOD_RULE,
+        &format!("运行模式切换: {prev:?} → {mode:?}"),
+    );
 
     // 持久化到 settings.json，重启应用后恢复同一模式（仪表盘显示才有权威来源）
     let mut settings = state.settings.read().clone();
@@ -1083,6 +1126,19 @@ pub async fn set_outbound_mode(
     state
         .save_settings(snapshot)
         .map_err(|e| format!("保存设置失败: {e}"))?;
+    // 【APP54 任务3】规则模块：出站模式切换
+    crate::core::logger::info(
+        crate::core::logger::MOD_RULE,
+        &format!(
+            "出站模式切换: {}（{}）",
+            match mode {
+                OutboundMode::Rule => "规则",
+                OutboundMode::Global => "全局",
+                OutboundMode::Direct => "直连",
+            },
+            if *state.status.read() == CoreStatus::Running { "热切换" } else { "已保存" }
+        ),
+    );
 
     if *state.status.read() == CoreStatus::Running {
         let mode_str = match mode {
@@ -2244,6 +2300,288 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
 }
 
 /// 【APP44 任务1.3】内核未运行时的真实测速：DoH / 系统 DNS 解析节点服务器
+/// 【APP54 任务2】全局节点域名预解析缓存（系统 DNS + 阿里/腾讯 DoH）。
+/// 一次全量测速只解析去重后的服务器域名（20 路并发），失败不缓存。
+static NODE_DNS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>>> =
+    std::sync::OnceLock::new();
+
+fn node_dns_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>> {
+    NODE_DNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 解析节点服务器真实 IPv4（系统 DNS 优先，再回退阿里 DoH 223.5.5.5、
+/// 腾讯 DoH 1.12.12.12），结果写入 NODE_DNS_CACHE 供后续测速直接命中。
+async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
+    let key = server.trim().to_ascii_lowercase();
+    if let Ok(ip) = key.parse::<std::net::Ipv4Addr>() {
+        return if is_virtual_speedtest_ip(std::net::IpAddr::V4(ip)) {
+            Vec::new()
+        } else {
+            vec![ip]
+        };
+    }
+    if let Ok(cache) = node_dns_cache().lock()
+        && let Some(hit) = cache.get(&key).filter(|v| !v.is_empty())
+    {
+        return hit.clone();
+    }
+    let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
+    // 1) 系统 DNS
+    if let Ok(addrs) = tokio::net::lookup_host((server, 443)).await {
+        for addr in addrs {
+            if let std::net::IpAddr::V4(ip) = addr.ip()
+                && !is_virtual_speedtest_ip(addr.ip())
+                && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    // 2) DoH 兜底（阿里 / 腾讯），JSON 接口返回 Answer 数组
+    if out.is_empty() {
+        let client = SPEEDTEST_DOH_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(2500))
+                .connect_timeout(std::time::Duration::from_millis(1500))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
+        for endpoint in ["https://223.5.5.5/resolve", "https://1.12.12.12/resolve"] {
+            if let Ok(resp) = client
+                .get(endpoint)
+                .query(&[("name", server), ("type", "A")])
+                .send()
+                .await
+                && let Ok(json) = resp.json::<serde_json::Value>().await
+                && let Some(answers) = json.get("Answer").and_then(|a| a.as_array())
+            {
+                for a in answers {
+                    if let Some(ip) = a
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                        && !is_virtual_speedtest_ip(std::net::IpAddr::V4(ip))
+                        && !out.contains(&ip)
+                    {
+                        out.push(ip);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+    }
+    if !out.is_empty()
+        && let Ok(mut cache) = node_dns_cache().lock()
+    {
+        cache.insert(key, out.clone());
+    }
+    out
+}
+
+/// 依次尝试预解析 IP 的 TCP 握手（单 IP 2000ms 超时）
+async fn tcp_connect_ips(
+    ips: &[std::net::Ipv4Addr],
+    port: u16,
+    timeout_ms: u32,
+) -> Option<u64> {
+    for ip in ips.iter().take(4) {
+        let start = std::time::Instant::now();
+        let fut = tokio::net::TcpStream::connect(std::net::SocketAddr::from((*ip, port)));
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut).await
+        {
+            return Some(start.elapsed().as_millis().max(1) as u64);
+        }
+    }
+    None
+}
+
+/// 【APP54 任务2/4】全量测速：100% 覆盖全部节点并升序持久化。
+/// - 第一步：去重服务器域名 20 路并发预解析（系统 DNS + 阿里/腾讯 DoH）；
+/// - 第二步：20 路并发滑动窗口逐节点测速（运行中 Clash API 2200ms，
+///   失败/未运行回退预解析 IPv4 TCP 2000ms，超时重试 1 次）；
+/// - 每节点写入延迟缓存（超时记 0），每 6 个落盘，每 3 个推送增量；
+/// - 完成后未手动选点则自动切换到最低延迟节点。
+/// 任何情况下都绝不清空已有延迟缓存（切页/启停/重启不丢失）。
+#[tauri::command]
+pub async fn test_all_delays(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let nodes = collect_cached_proxies(&state);
+    if nodes.is_empty() {
+        return Err("节点列表为空，请先刷新订阅".into());
+    }
+    let running = *state.status.read() == CoreStatus::Running;
+    let total = nodes.len();
+    // 初始化进度并广播
+    {
+        let mut p = state.delay_progress.lock();
+        p.running = true;
+        p.done = 0;
+        p.total = total;
+        p.unlocked_count = 0;
+        p.recompute();
+        let snapshot = p.clone();
+        drop(p);
+        let _ = app.emit("delays://progress", &snapshot);
+    }
+    crate::core::logger::info(
+        crate::core::logger::MOD_NODE,
+        &format!("开始全量测速：共 {total} 个节点（{}）", if running { "内核实测" } else { "离线 TCP" }),
+    );
+
+    // 第一步：20 路并发预解析去重域名
+    {
+        let mut unique: Vec<String> = nodes.iter().map(|n| n.server.clone()).collect();
+        unique.sort();
+        unique.dedup();
+        use futures_util::StreamExt;
+        let mut stream = futures_util::stream::iter(unique.into_iter())
+            .map(|server| async move { resolve_server_ipv4s(&server).await })
+            .buffer_unordered(20);
+        while stream.next().await.is_some() {}
+    }
+
+    // 第二步：20 路并发滑动窗口测速
+    let api = state.kernel_api();
+    let mut all: Vec<(String, u32)> = Vec::with_capacity(total);
+    let mut batch: Vec<(String, u32)> = Vec::new();
+    let mut updates = serde_json::Map::new();
+    let mut done = 0usize;
+    {
+        use futures_util::StreamExt;
+        let mut stream = futures_util::stream::iter(nodes.into_iter())
+            .map(|n| {
+                let api = api.clone();
+                async move {
+                    let d = if running {
+                        // 内核运行：真实隧道 gstatic generate_204 2200ms
+                        if let Some(d) = api
+                            .test_delay(&n.name, "http://www.gstatic.com/generate_204", 2200)
+                            .await
+                            .filter(|d| *d > 0)
+                        {
+                            d as u32
+                        } else {
+                            // 失败回退预解析 IPv4 TCP 握手（2000ms，重试 1 次）
+                            let ips = resolve_server_ipv4s(&n.server).await;
+                            let mut d = 0u32;
+                            for _ in 0..2 {
+                                if let Some(v) = tcp_connect_ips(&ips, n.port, 2000).await {
+                                    d = v as u32;
+                                    break;
+                                }
+                            }
+                            d
+                        }
+                    } else {
+                        // 未运行：直接 IPv4 + 端口 TCP 握手（2000ms，重试 1 次）
+                        let ips = resolve_server_ipv4s(&n.server).await;
+                        let mut d = 0u32;
+                        for _ in 0..2 {
+                            if let Some(v) = tcp_connect_ips(&ips, n.port, 2000).await {
+                                d = v as u32;
+                                break;
+                            }
+                        }
+                        d
+                    };
+                    (n.name, d)
+                }
+            })
+            .buffer_unordered(20);
+        while let Some((name, d)) = stream.next().await {
+            done += 1;
+            all.push((name.clone(), d));
+            batch.push((name.clone(), d));
+            updates.insert(name, serde_json::json!(d));
+            let percent = ((done.min(total) * 100) / total) as u8;
+            let _ = app.emit(
+                "delays://progress",
+                serde_json::json!({
+                    "running": true,
+                    "done": done,
+                    "total": total,
+                    "percent": percent,
+                    "unlockedCount": 0,
+                }),
+            );
+            if done % 3 == 0 || done == total {
+                let _ = app.emit("delays://updated", serde_json::Value::Object(updates.clone()));
+            }
+            if batch.len() >= 6 || done == total {
+                state.record_node_delays(std::mem::take(&mut batch));
+            }
+        }
+    }
+
+    // 自动选点：用户未手动锁定 → 最低延迟（仅实测 > 0）
+    let best = all
+        .iter()
+        .filter(|(_, d)| *d > 0)
+        .min_by_key(|(_, d)| *d)
+        .map(|(n, d)| (n.clone(), *d));
+    if !*state.user_manually_selected_node.read()
+        && let Some((best_name, best_delay)) = best.clone()
+    {
+        let mut settings = state.settings.read().clone();
+        if settings.selected_node.as_deref() != Some(best_name.as_str()) {
+            settings.selected_node = Some(best_name.clone());
+            settings.user_manually_selected_node = false;
+            if let Err(e) = state.save_settings(settings) {
+                tracing::warn!("[APP54] 测速自动选点落盘失败: {e}");
+            }
+        }
+        if running {
+            let group = state.main_selector.read().clone();
+            if let Some(group) = group {
+                let _ = api.select_proxy(&group, &best_name).await;
+                let _ = api.select_proxy("GLOBAL", &best_name).await;
+            }
+        }
+        let _ = app.emit("proxies://changed", ());
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!("全量测速完成，自动选择最低延迟节点「{best_name}」({best_delay}ms)"),
+        );
+    } else {
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!("全量测速完成，共 {total} 个节点（用户手动锁定，未自动切换）"),
+        );
+    }
+
+    // 完成态进度 + 全量落盘
+    state.record_node_delays(all.iter().cloned());
+    {
+        let mut p = state.delay_progress.lock();
+        p.running = false;
+        p.done = total;
+        p.total = total;
+        p.percent = 100;
+        let snapshot = p.clone();
+        drop(p);
+        let _ = app.emit("delays://progress", &snapshot);
+    }
+    let _ = app.emit(
+        "delays://updated",
+        serde_json::Value::Object(
+            all.iter()
+                .map(|(n, d)| (n.clone(), serde_json::json!(d)))
+                .collect(),
+        ),
+    );
+
+    Ok(serde_json::Value::Object(
+        all.into_iter()
+            .map(|(n, d)| (n, serde_json::json!(d)))
+            .collect(),
+    ))
+}
+
 /// 域名 → 过滤 FakeIP 与虚拟网段 → 真实 TCP 握手计时。
 /// 仅在 VPN 未运行时调用（TUN 开启时握手指向 utun，延迟全是假的）。
 #[tauri::command]
@@ -2425,10 +2763,35 @@ pub async fn save_custom_rules(
             }
         })
         .collect();
+    // 【APP54 任务3】规则模块：保存后输出真实汇总（按类型计数）
+    {
+        let mut by_type: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for r in &filtered {
+            let kind = r.split(',').next().unwrap_or("UNKNOWN").trim().to_string();
+            *by_type.entry(kind).or_insert(0) += 1;
+        }
+        let summary: Vec<String> = by_type
+            .iter()
+            .map(|(k, v)| format!("{k}×{v}"))
+            .collect();
+        crate::core::logger::info(
+            crate::core::logger::MOD_RULE,
+            &format!(
+                "规则已保存：共 {} 条（{}），出站模式: {:?}",
+                filtered.len(),
+                if summary.is_empty() { "无".to_string() } else { summary.join("、") },
+                state.settings.read().outbound_mode
+            ),
+        );
+    }
     crate::core::store::save_custom_rules(&state.data_dir, &filtered)
         .map_err(|e| format!("保存自定义规则失败: {e}"))?;
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await?;
+        crate::core::logger::info(
+            crate::core::logger::MOD_KERNEL,
+            "规则变更已热重载内核配置（无需重新启动 VPN）",
+        );
     }
     Ok(())
 }
@@ -3561,7 +3924,49 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
         return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
     let lan = state.go_lan.read().clone();
-    serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
+    let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
+    // 【APP54 任务1】每个档案注入运行时 isDirect（同网段命中或 35ms 内网网关可达）
+    let direct_map: std::collections::HashMap<String, bool> = {
+        let profiles = crate::core::go_lan::enabled_profiles(&lan);
+        let phys = physical.clone();
+        tokio::task::spawn_blocking(move || {
+            profiles
+                .into_iter()
+                .map(|(_, p)| {
+                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
+                    (p.id.clone(), hit)
+                })
+                .collect::<std::collections::HashMap<String, bool>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let mut value = serde_json::to_value(&lan).map_err(|e| sanitize_err(&e.to_string()))?;
+    let mut any_direct = false;
+    if let Some(profiles) = value.get_mut("profiles").and_then(|v| v.as_array_mut()) {
+        for p in profiles.iter_mut() {
+            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let is_direct = direct_map.get(&id).copied().unwrap_or(false);
+            if is_direct {
+                any_direct = true;
+            }
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert("isDirect".into(), serde_json::json!(is_direct));
+            }
+        }
+    }
+    let direct_map_json: serde_json::Map<String, serde_json::Value> = direct_map
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::json!(v)))
+        .collect();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("goLanAnyDirect".into(), serde_json::json!(any_direct));
+        obj.insert(
+            "goLanProfileDirectMap".into(),
+            serde_json::Value::Object(direct_map_json),
+        );
+    }
+    Ok(value)
 }
 
 /// 【APP-11 任务1.3 / APP40 任务2】为每路启用档案推导探测目标网关
@@ -3732,46 +4137,54 @@ pub async fn get_go_lan_status(
     let lan = state.go_lan.read().clone();
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
+    // 【APP54 任务1】直连判定含 35ms 同步 TCP 探针，放 blocking 线程执行，
+    // 避免阻塞 tokio runtime；判定结果同时供 profile.isDirect / anyDirect 使用。
+    let direct_map: std::collections::HashMap<String, bool> = {
+        let profiles = crate::core::go_lan::enabled_profiles(&lan);
+        let phys = physical.clone();
+        tokio::task::spawn_blocking(move || {
+            profiles
+                .into_iter()
+                .map(|(tag, p)| {
+                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
+                    (tag, hit)
+                })
+                .collect::<std::collections::HashMap<String, bool>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
     let mut items: Vec<serde_json::Value> = Vec::new();
     let mut any_on_demand_direct = false;
     let mut profile_states = serde_json::Map::new();
+    let mut profile_direct_map = serde_json::Map::new();
     for (tag, profile) in crate::core::go_lan::enabled_profiles(&lan) {
-        let mut direct_hit = crate::core::go_lan::evaluate_profile_lan_direct_state(&profile, &physical);
-        // 【APP53 任务1.3】跨 VLAN 但同物理局域网路由可达：快速探测网关
-        // （lan_cidrs 的 .1/.254 或 probe_target）150ms 内 TCP 可达也判定直连
-        if !direct_hit && !physical.is_empty() && profile.bypass_on_local_lan {
-            if let Some(gw) = crate::core::go_lan::gateway_candidates_from_candidates(&profile, &lan) {
-                if tokio::time::timeout(
-                    std::time::Duration::from_millis(150),
-                    tokio::net::TcpStream::connect(&gw),
-                )
-                .await
-                .is_ok_and(|r| r.is_ok())
-                {
-                    direct_hit = true;
-                }
-            }
-        }
+        let direct_hit = direct_map.get(&tag).copied().unwrap_or(false);
         let (tunnel, direct) =
             crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
-        let mut bypassed = if direct_hit { direct.clone() } else { direct };
+        let mut bypassed = direct.clone();
         if bypassed.is_empty() {
             if let Some(cidrs) = ios_bypass.iter().find(|(t, _)| t == &tag).map(|(_, c)| c) {
                 bypassed = cidrs.clone();
             }
         }
-        let state_str = if bypassed.is_empty() { "tunnel" } else { "direct" };
+        let state_str = if direct_hit || !bypassed.is_empty() {
+            "direct"
+        } else {
+            "tunnel"
+        };
         if state_str == "direct" {
             any_on_demand_direct = true;
         }
         profile_states.insert(profile.id.clone(), serde_json::json!(state_str));
+        profile_direct_map.insert(profile.id.clone(), serde_json::json!(direct_hit));
         items.push(serde_json::json!({
             "tag": tag,
             "id": profile.id,
             "name": profile.name,
             "enabled": profile.enabled,
             "onDemand": profile.bypass_on_local_lan,
-            "isDirect": state_str == "direct",
+            "isDirect": direct_hit,
             "state": state_str,
             "bypassCidrs": bypassed,
             "tunnelCidrs": tunnel,
@@ -3779,12 +4192,15 @@ pub async fn get_go_lan_status(
     }
     for profile in lan.profiles.iter().filter(|p| !p.enabled) {
         profile_states.insert(profile.id.clone(), serde_json::json!("off"));
+        profile_direct_map.insert(profile.id.clone(), serde_json::json!(false));
     }
     Ok(serde_json::json!({
         "profiles": items,
         "physicalIps": physical.iter().map(|ip| ip.to_string()).collect::<Vec<String>>(),
         "anyOnDemandDirect": any_on_demand_direct,
+        "goLanAnyDirect": any_on_demand_direct,
         "profileStates": profile_states,
+        "goLanProfileDirectMap": profile_direct_map,
     }))
 }
 

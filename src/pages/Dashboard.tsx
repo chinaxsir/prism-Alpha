@@ -99,6 +99,8 @@ export default function Dashboard() {
   const aim = useCoreStore((s) => s.goAimStatus);
   const lan = useCoreStore((s) => s.goLanSettings);
   const cus = useCoreStore((s) => s.goCusSettings);
+  // 【APP54 任务5】Go AIM 实时进度（全局 store，事件驱动）
+  const aimProgress = useCoreStore((s) => s.aimProgress);
   // 【APP40 任务2】内网档案运行状态（⚡同网段直连 / 🔒隧道）
   const [lanState, setLanState] = useState<GoLanStatus | null>(null);
 
@@ -308,10 +310,29 @@ export default function Dashboard() {
   }, []);
 
   // 【APP40 任务2】Go Lan 档案状态：任一档案启停变化时刷新 ⚡/🔒 徽章
+  // 【APP54 任务1】物理网络切换（连上家里/公司 Wi-Fi）后必须尽快显示直连，
+  // 因此启用期间每 3s 轻量刷新一次后端注入的 isDirect（未启用时零开销跳过）
   useEffect(() => {
-    getGoLanStatus()
-      .then(setLanState)
-      .catch(() => setLanState(null));
+    if (!lan?.enabled) {
+      setLanState(null);
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      getGoLanStatus()
+        .then((s) => {
+          if (!cancelled) setLanState(s);
+        })
+        .catch(() => {
+          if (!cancelled) setLanState(null);
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [lan?.enabled, lan?.profiles]);
 
   // 【APP51 任务1.3】全开关 0ms 乐观 UI：先同步改前端状态，再异步落盘；
@@ -441,34 +462,47 @@ export default function Dashboard() {
   };
 
   // ---- Pro 引擎矩阵状态文案（ipa-8：横向通栏卡片，一行完整状态信息） ----
-  const aimUnlocked = aim
-    ? Object.values(aim.results).filter((r) => r.aiUnlocked || r.mediaUnlocked)
-        .length
-    : 0;
-  // APP-5 任务3：Go AIM 状态副标题严格区分「手动锁定」与「自动优选」
+  // APP-5 任务3：Go AIM 状态副标题严格区分「手动锁定」与「自动优选」；
+  // 【APP54 任务5】探测中优先展示实时进度（位置 C）
+  const aimRated = Object.keys(aim?.results ?? {}).length;
+  const aimRunning = aimProgress.running || Boolean(aim?.probing);
   const aimStatus = aim?.enabled
-    ? aim.pinnedNode
-      ? t("dashboard.aim.pinned", { node: aim.pinnedNode })
-      : t("dashboard.aim.locked", {
-          node: aim.lockedNode || currentNode || "—",
-          count: aimUnlocked,
+    ? aimRunning
+      ? t("dashboard.aim.progress", {
+          done: aimProgress.done,
+          total: aimProgress.total || aimRated,
+          percent: aimProgress.percent,
+          unlocked: aimProgress.unlockedCount,
         })
+      : aim.pinnedNode
+        ? t("dashboard.aim.pinned", { node: aim.pinnedNode })
+        : t("dashboard.aim.rated", {
+            node: aim.lockedNode || currentNode || "—",
+            rated: aimRated,
+            total: aimProgress.total || aimRated,
+          })
     : t("dashboard.aim.idle");
   // 【APP23 任务1.2】字段缺失兜底：goLanSettings 任一层为 undefined 时
   // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
   const lanCidrs = lan?.lanCidrs ?? [];
-  // 【APP40 任务2】多档案副标题：已启用: 家里 (⚡同网段直连) · 公司 (🔒隧道已连接)
+  // 【APP40 任务2】多档案副标题：已启用: 家里 (⚡ 直连) · 公司 (🔒 隧道)
+  // 【APP54 任务1】直连判定以后端注入的 isDirect / goLanProfileDirectMap 为准，
+  // 不再依赖旧的 profileStates 字符串字段（VPN 开启后仍能正确显示物理网段直连）
   const enabledLanProfiles = (lan?.profiles ?? []).filter((p) => p.enabled);
+  const lanDirectMap = lanState?.goLanProfileDirectMap ?? {};
   const lanStatus =
     enabledLanProfiles.length > 0
       ? t("dashboard.lan.profiles", {
           profiles: enabledLanProfiles
             .map((p) => {
               const st = lanState?.profiles.find((x) => x.id === p.id);
-              const badge =
-                st?.state === "direct"
-                  ? t("goLan.statusDirect")
-                  : t("goLan.statusTunnel");
+              const isDirect =
+                lanDirectMap[p.id] === true ||
+                st?.isDirect === true ||
+                st?.state === "direct";
+              const badge = isDirect
+                ? t("goLan.statusDirect")
+                : t("goLan.statusTunnel");
               return `${p.name} (${badge})`;
             })
             .join(" · "),
@@ -654,7 +688,10 @@ export default function Dashboard() {
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
           badge={
-            proUnlocked && lanState?.anyOnDemandDirect
+            proUnlocked &&
+            (lanState?.goLanAnyDirect ??
+              lanState?.anyOnDemandDirect ??
+              Object.values(lanDirectMap).some(Boolean))
               ? t("dashboard.lan.directBadge")
               : undefined
           }
