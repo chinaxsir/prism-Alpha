@@ -13,6 +13,7 @@
 //! iOS 端 PacketTunnelProvider 会做"智能同网段防环回"：本机 Wi-Fi IP 落在
 //! lan_cidrs 内时自动把这些规则的出站改为直连。
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::AppHandle;
@@ -231,6 +232,109 @@ impl GoLanProfile {
             .unwrap_or(false);
         has_cidrs && (has_uri || has_wg)
     }
+}
+
+/// 【APP52 任务3】标准 WireGuard 配置完整性校验：
+/// - endpoint host 非空（域名或 IPv4）+ 端口非 0；
+/// - local_address 必须是合法 IPv4 CIDR（如 10.0.0.2/32）；
+/// - private_key / peer_public_key Base64 解码后必须为 32 字节；
+/// - 可选 pre_shared_key 若非空，解码后也必须为 32 字节；
+/// - lan_cidrs 至少包含一个合法 IPv4 网段。
+/// 任一不满足即视为非标准配置：绝不进入隧道、绝不重启内核。
+pub fn is_valid_standard_wg_config(profile: &GoLanProfile) -> bool {
+    let Some(wg) = profile.wg_config.as_ref() else {
+        return false;
+    };
+    if wg.server.trim().is_empty() || wg.server_port == 0 {
+        return false;
+    }
+    if !is_valid_ipv4_cidr(&wg.local_ip) {
+        return false;
+    }
+    if !is_base64_key_32(&wg.private_key) || !is_base64_key_32(&wg.peer_public_key) {
+        return false;
+    }
+    if let Some(psk) = wg.pre_shared_key.as_deref()
+        && !psk.trim().is_empty()
+        && !is_base64_key_32(psk)
+    {
+        return false;
+    }
+    profile.lan_cidrs.iter().any(|c| is_valid_ipv4_cidr(c))
+}
+
+/// 合法 IPv4 地址（四段 0-255）
+fn is_valid_ipv4(s: &str) -> bool {
+    s.trim().parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+/// 合法 IPv4 CIDR（base 必须是 IPv4，prefix 0..=32）
+fn is_valid_ipv4_cidr(s: &str) -> bool {
+    let s = s.trim();
+    let Some((base, prefix)) = s.split_once('/') else {
+        return false;
+    };
+    if !is_valid_ipv4(base) {
+        return false;
+    }
+    prefix.parse::<u8>().map(|p| p <= 32).unwrap_or(false)
+}
+
+/// Base64 解码后是否正好 32 字节（WireGuard 密钥标准长度）
+fn is_base64_key_32(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    STANDARD
+        .decode(s)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+}
+
+/// 【APP52 任务3】「有效启用隧道」快照：仅包含 enabled 且配置真正可用的档案。
+/// 保存前后快照相等 → 本次保存不改变实际隧道结构，只写 settings.json，
+/// 严禁 vpn_reload / 内核重启。
+pub fn valid_enabled_tunnel_snapshot(settings: &GoLanSettings) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let top_enabled = settings.enabled;
+    for (tag, p) in enabled_profiles(settings) {
+        if !p.enabled {
+            continue;
+        }
+        let has_uri = !p.node_uri.trim().is_empty();
+        let has_valid_wg = is_valid_standard_wg_config(&p);
+        if !has_uri && !has_valid_wg {
+            continue;
+        }
+        let wg = p
+            .wg_config
+            .as_ref()
+            .map(|w| {
+                format!(
+                    "{}:{}|{}|{}|{}|{}|{}",
+                    w.server,
+                    w.server_port,
+                    w.local_ip,
+                    w.private_key,
+                    w.peer_public_key,
+                    w.pre_shared_key.clone().unwrap_or_default(),
+                    w.mtu
+                )
+            })
+            .unwrap_or_default();
+        out.push(format!(
+            "{top_enabled}|{tag}|{}|{}|{}|{}|{}|{}",
+            p.id,
+            p.bypass_on_local_lan,
+            profile_route_cidrs(&p).join(","),
+            p.local_wifi_ssid,
+            p.probe_target,
+            if has_uri { p.node_uri.trim() } else { wg.as_str() }
+        ));
+    }
+    out.sort();
+    out
 }
 
 /// 【APP40 任务2】档案 id 净化（仅保留 ASCII 字母数字 / - / _）
@@ -3626,7 +3730,114 @@ mod tests {
         assert!(tunnel.contains(&"192.168.10.0/24".to_string()));
     }
 
-    /// 多档案运行时元数据（供 iOS 扩展侧车 golan_profiles.json）。
+    /// 【APP52 任务3】第二条启用隧道命中本机局域网时也必须全局直连
+    #[test]
+    fn test_second_enabled_tunnel_triggers_on_demand_direct() {
+        let home = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 60);
+        let office = sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 62);
+        let physical: Vec<std::net::Ipv4Addr> = vec!["10.8.0.20".parse().unwrap()];
+        // 第一条不命中 → 走隧道；第二条命中 → 直连
+        let (t_home, d_home) = split_profile_cidrs_for_on_demand(&home, &physical);
+        assert!(d_home.is_empty());
+        assert!(t_home.contains(&"192.168.10.0/24".to_string()));
+        let (t_office, d_office) = split_profile_cidrs_for_on_demand(&office, &physical);
+        assert!(
+            d_office.contains(&"10.8.0.0/24".to_string()),
+            "direct={d_office:?} tunnel={t_office:?}"
+        );
+        assert!(!t_office.contains(&"10.8.0.0/24".to_string()));
+        let any_direct = !d_home.is_empty() || !d_office.is_empty();
+        assert!(any_direct, "任一启用隧道命中即 any_on_demand_direct=true");
+    }
+
+    /// 【APP52 任务3】空白 / 非标准 WireGuard 配置必须判为无效
+    #[test]
+    fn test_is_valid_standard_wg_config_rejects_blank_and_nonstandard() {
+        // 完全空白档案（新增空白档案默认 enabled=false）
+        let blank = GoLanProfile {
+            id: "blank".into(),
+            name: String::new(),
+            enabled: false,
+            bypass_on_local_lan: false,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: Vec::new(),
+            wg_config: None,
+            node_uri: String::new(),
+            probe_target: String::new(),
+        };
+        assert!(!is_valid_standard_wg_config(&blank));
+
+        // endpoint 为空 / 端口为 0
+        let mut p = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 60);
+        assert!(is_valid_standard_wg_config(&p), "样例档案本身应合法");
+        let mut wg = p.wg_config.clone().unwrap();
+        wg.server = String::new();
+        p.wg_config = Some(wg.clone());
+        assert!(!is_valid_standard_wg_config(&p));
+        wg.server = "home.example.com".into();
+        wg.server_port = 0;
+        p.wg_config = Some(wg.clone());
+        assert!(!is_valid_standard_wg_config(&p));
+
+        // local_ip 不是 IPv4 CIDR
+        wg.server_port = 51820;
+        wg.local_ip = "10.196.0.2".into();
+        p.wg_config = Some(wg.clone());
+        assert!(!is_valid_standard_wg_config(&p));
+
+        // 私钥不是 32 字节 Base64
+        wg.local_ip = "10.196.0.2/32".into();
+        wg.private_key = "not-a-key".into();
+        p.wg_config = Some(wg.clone());
+        assert!(!is_valid_standard_wg_config(&p));
+
+        // psk 非空但长度不对
+        wg.private_key = test_key(60);
+        wg.pre_shared_key = Some("short".into());
+        p.wg_config = Some(wg.clone());
+        assert!(!is_valid_standard_wg_config(&p));
+
+        // 内网网段全部非法
+        wg.pre_shared_key = None;
+        p.wg_config = Some(wg);
+        p.lan_cidrs = vec!["not-a-cidr".into()];
+        assert!(!is_valid_standard_wg_config(&p));
+    }
+
+    /// 【APP52 任务3】新增空白档案前后快照相等 → 保存只写 settings.json，
+    /// 不得触发 vpn_reload / 内核重启（此处验证快照比较为 true）。
+    #[test]
+    fn test_blank_profile_keeps_tunnel_snapshot_unchanged() {
+        let mut lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![sample_profile(
+                "home",
+                "家里",
+                &["192.168.10.0/24"],
+                "10.196.0.2/32",
+                60,
+            )],
+            ..Default::default()
+        };
+        lan.active_profile_id = "home".into();
+        let before = valid_enabled_tunnel_snapshot(&lan);
+        lan.profiles.push(GoLanProfile {
+            id: "blank".into(),
+            name: "新档案".into(),
+            enabled: false,
+            bypass_on_local_lan: false,
+            local_wifi_ssid: String::new(),
+            lan_cidrs: Vec::new(),
+            wg_config: None,
+            node_uri: String::new(),
+            probe_target: String::new(),
+        });
+        let after = valid_enabled_tunnel_snapshot(&lan);
+        assert_eq!(before, after, "空白档案不得改变有效启用隧道快照");
+        assert!(!before.is_empty());
+    }
+
+
     #[test]
     fn test_profiles_metadata() {
         let lan = GoLanSettings {

@@ -253,6 +253,22 @@ pub fn start_probe(app: AppHandle) {
                 let best = pick_best(&state.aim_results.read())
                     .map(|r| r.node_name)
                     .unwrap_or_else(|| "无".to_string());
+                // 【APP52 任务1】探测结果 + 最优节点异步落盘（node_metrics_cache.json），
+                // 切换页面 / 重启 APP 后节点页徽章与排序不丢失
+                {
+                    let snapshot = state.aim_results.read().clone();
+                    let best_node = pick_best(&snapshot).map(|r| r.node_name);
+                    // 同时把探测延迟并入持久化 delays（0 延迟节点不覆盖已有值）
+                    let delays: Vec<(String, u32)> = snapshot
+                        .values()
+                        .filter(|r| r.probed && r.delay_ms > 0)
+                        .map(|r| (r.node_name.clone(), r.delay_ms as u32))
+                        .collect();
+                    if !delays.is_empty() {
+                        state.record_node_delays(delays);
+                    }
+                    state.record_aim_results(&snapshot, best_node.as_deref());
+                }
                 tracing::info!(
                     "[go-aim] 全量真实探测完成，共 {count} 个节点参与评级，最优节点: {best}"
                 );
@@ -926,10 +942,11 @@ async fn lock_node(
     // 只切内核策略组不写它会导致界面长期停留在旧节点（如 电信-LAX-01）。
     // 注意：go_aim_pinned_node（用户手动指定）绝不能被自动选点覆盖，
     // 否则手动模式被永久抹掉（指定节点复活后也无法恢复）。
-    *state.user_manually_selected_node.write() = None;
+    *state.user_manually_selected_node.write() = false;
     {
         let mut settings = state.settings.read().clone();
         settings.selected_node = Some(best.node_name.clone());
+        settings.user_manually_selected_node = false;
         if let Err(e) = state.save_settings(settings) {
             tracing::warn!("[go-aim] 保存 selected_node 失败: {e}");
         }

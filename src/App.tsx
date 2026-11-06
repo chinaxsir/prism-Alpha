@@ -306,28 +306,48 @@ export default function App() {
       store.setTrafficRate(e.payload.up, e.payload.down);
       store.pushTraffic(e.payload.up, e.payload.down);
     });
+    // 【APP52 任务2】后台遥测常驻广播：600ms 一轮、EMA 平滑后的真实速率，
+    // 切页 / 系统后台 / 停启 VPN 均持续推送，仪表盘速率零延迟刷新不卡死。
+    const telemetry = listen<{
+      up: number;
+      down: number;
+      today?: number;
+      running?: boolean;
+      selectedNode?: string | null;
+    }>("telemetry://tick", (e) => {
+      const store = useCoreStore.getState();
+      store.setTrafficRate(e.payload.up ?? 0, e.payload.down ?? 0);
+      if (typeof e.payload.today === "number") store.setTodayBytes(e.payload.today);
+    });
     const memory = listen<{ inuse: number }>("memory://tick", (e) => {
       useCoreStore.getState().setMemoryUsage(e.payload.inuse);
     });
     return () => {
       traffic.then((fn) => fn());
+      telemetry.then((fn) => fn());
       memory.then((fn) => fn());
     };
   }, []);
 
-  // 前后台省电（【APP49 任务6】）：隐藏（锁屏/切 App）时彻底清理轮询
-  // 定时器不再唤醒 JS 线程；切回前台瞬间立即补拉一次快照再恢复 2s 定时。
+  // 【APP52 任务2】全局常驻轮询：800ms 定时器任何时候都不暂停（切换页面、
+  // 系统后台、停启 VPN 均继续），移除 document.hidden 暂停逻辑；
+  // focus / visibilitychange 立即补拉一次，切回前台 0 延迟对齐速率与曲线。
   const appVisible = useAppVisible();
   useEffect(() => {
-    // 上报后端：后台时暂停事件推送与连接聚合，切回前台立即恢复
+    // 上报后端：仍用于连接聚合的省电策略，但绝不暂停前端轮询
     void setAppForeground(appVisible).catch(() => undefined);
-    if (!appVisible) return;
     // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
     // refreshRuntime 会先查状态并触发后端自动接管。
     void refreshRuntime();
-    // 【APP51 任务2】全局唯一 1000ms 定时器（可见时），速率与曲线每秒刷新
-    const id = window.setInterval(() => void refreshRuntime(), 1000);
-    return () => window.clearInterval(id);
+    const id = window.setInterval(() => void refreshRuntime(), 800);
+    const onWake = () => void refreshRuntime();
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
   }, [appVisible, refreshRuntime]);
 
   // 系统 VPN 被撤销（Android onRevoke：用户在系统设置关闭 / 其他 VPN 抢占）

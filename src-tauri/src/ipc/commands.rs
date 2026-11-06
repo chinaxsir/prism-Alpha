@@ -69,6 +69,24 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     // 【APP33 任务3.1】启动前纠偏 selected_node：若残留「剩余流量」等假
     // 节点，立即替换为真实节点并落盘，避免仪表盘与内核默认节点不一致。
     ensure_valid_selected_node(state);
+    // 【APP52 任务4】[节点识别] 阶段一：启动前确认选中节点与主选择组，
+    // 后续 [握手阶段]/[连接成功]/[流量开始转发] 均围绕该节点记录。
+    {
+        let node = state
+            .settings
+            .read()
+            .selected_node
+            .clone()
+            .unwrap_or_else(|| "自动（等待测速）".into());
+        let group = state.main_selector.read().clone().unwrap_or_else(|| "Proxy".into());
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!(
+                "{} 选中节点「{node}」，主选择组「{group}」",
+                crate::core::logger::PHASE_NODE_IDENT
+            ),
+        );
+    }
     // 幂等：启动含下载内核/构建配置等长耗时步骤，期间重复点击或前端自动
     // 重试会再次进入本函数。只有一个调用完成 Stopped/Error -> Starting，
     // 其余若已在 Starting（启动进行中）或 Running（已启动）直接成功返回，
@@ -92,6 +110,22 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
     state
         .transition(CoreStatus::Running)
         .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP52 任务4】[连接成功] 阶段三：内核已 Running，开始接管流量
+    {
+        let node = state
+            .settings
+            .read()
+            .selected_node
+            .clone()
+            .unwrap_or_else(|| "自动".into());
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!(
+                "{} 内核已运行，当前节点「{node}」开始接管流量",
+                crate::core::logger::PHASE_CONNECTED
+            ),
+        );
+    }
     // 【APP48 任务3】内核运行中：授权请求优先借道本地混合代理穿透阻断
     crate::core::license::set_local_mixed_port(state.settings.read().mixed_port);
 
@@ -352,6 +386,15 @@ async fn apply_prepared(
     *state.api_addr.write() = api_addr.clone();
     *state.api_secret.write() = api_secret.clone();
     tracing::info!("clash api listening on {api_addr}");
+    // 【APP52 任务4】[握手阶段] 发起：记录内核进程启动与 Clash API 接管
+    crate::core::logger::info(
+        crate::core::logger::MOD_NODE,
+        &format!(
+            "{} 发起内核握手：Clash API {api_addr}",
+            crate::core::logger::PHASE_HANDSHAKE
+        ),
+    );
+    let handshake_started = std::time::Instant::now();
 
     let kernel_config = KernelConfig {
         binary_path: binary_path.clone(),
@@ -389,7 +432,17 @@ async fn apply_prepared(
             built.final_group
         );
     }
-    *state.main_selector.write() = main;
+    *state.main_selector.write() = main.clone();
+    // 【APP52 任务4】[握手阶段] RTT 完成：内核 API 已应答并解析出主选择组
+    crate::core::logger::info(
+        crate::core::logger::MOD_NODE,
+        &format!(
+            "{} RTT 完成：{}ms，主选择组 {}",
+            crate::core::logger::PHASE_HANDSHAKE,
+            handshake_started.elapsed().as_millis(),
+            main.as_deref().unwrap_or("未解析")
+        ),
+    );
 
     // 出站模式同步（build 157）：内核启动后 Clash API 默认为 rule，用户
     // 保存的全局/直连必须立即 PATCH 生效，否则显示与实际路由脱节
@@ -663,10 +716,11 @@ fn ensure_valid_selected_node(state: &AppState) -> Option<String> {
         if let Some(pick) = valid.first() {
             let mut settings = state.settings.read().clone();
             settings.selected_node = Some(pick.clone());
+            settings.user_manually_selected_node = false;
             if let Err(e) = state.save_settings(settings) {
                 tracing::error!("save corrected selected_node failed: {e}");
             }
-            *state.user_manually_selected_node.write() = Some(pick.clone());
+            *state.user_manually_selected_node.write() = false;
             tracing::info!("[APP33] selected_node 纠偏：{:?} -> {}", cur, pick);
             return Some(pick.clone());
         }
@@ -1068,12 +1122,15 @@ pub async fn select_proxy(
     }
     // 【APP26 任务2.3】记录「用户已手动选点」：此后启动 / 关闭 Go AIM 时的
     // 自动最低延迟优选不再覆盖用户的选择
-    *state.user_manually_selected_node.write() = Some(name.clone());
+    *state.user_manually_selected_node.write() = true;
     // 【APP33 任务3.1】持久化选中节点到 settings.json，重启后仪表盘恢复同一节点
     {
         let mut settings = state.settings.read().clone();
-        if settings.selected_node.as_deref() != Some(name.as_str()) {
+        if settings.selected_node.as_deref() != Some(name.as_str())
+            || !settings.user_manually_selected_node
+        {
             settings.selected_node = Some(name.clone());
+            settings.user_manually_selected_node = true;
             if let Err(e) = state.save_settings(settings) {
                 tracing::error!("save selected_node failed: {e}");
             }
@@ -2001,6 +2058,10 @@ pub struct CachedProxyDto {
     pub port: u16,
     /// 来源订阅 URL（用于 UI 分组）
     pub from_subscription: String,
+    /// 【APP52 任务1】持久化的最近一次真实延迟：
+    /// None = 从未测速；Some(0) = 超时；Some(d>0) = 实测延迟
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<u32>,
 }
 
 /// 内核未运行时从订阅缓存读取节点列表（节点页预览）
@@ -2059,6 +2120,7 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
                         server,
                         port,
                         from_subscription: r.url.clone(),
+                        delay: None,
                     });
                 }
             }
@@ -2096,9 +2158,19 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
                     server,
                     port,
                     from_subscription: r.url.clone(),
+                    delay: None,
                 });
             }
         }
+    }
+    // 【APP52 任务1】注入持久化延迟并全局按延迟升序排列：
+    // 实测 >0 升序 → 未测速居中 → 超时(0) 置底。切换页面 / 重启 APP 后顺序不变。
+    {
+        let delays = state.node_metrics.read().delays.clone();
+        for p in out.iter_mut() {
+            p.delay = delays.get(&p.name).copied();
+        }
+        out.sort_by_key(|p| crate::core::state::node_delay_sort_key(p.delay));
     }
     out
 }
@@ -2128,6 +2200,12 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
         valid_names.iter().map(|s| s.as_str()).collect();
     // 代数自增：旧探测任务立即失效
     state.aim_generation.fetch_add(1, Ordering::AcqRel);
+    // 【APP52 任务1】持久化指标缓存同步清理已失效节点（刷新/删除订阅时）
+    {
+        let valid_owned: std::collections::HashSet<String> =
+            valid_names.iter().cloned().collect();
+        state.retain_node_metrics(&valid_owned);
+    }
 
     // 1) 清除失效节点的探测缓存
     {
@@ -2182,6 +2260,7 @@ pub async fn test_cached_proxies(
     use futures_util::StreamExt;
     const BATCH: usize = 32;
     let mut map = serde_json::Map::new();
+    let mut all_delays: Vec<(String, u32)> = Vec::new();
     for batch in nodes.chunks(BATCH) {
         let results: Vec<(String, Option<u64>)> =
             futures_util::stream::iter(batch.iter().cloned())
@@ -2193,9 +2272,27 @@ pub async fn test_cached_proxies(
                 .collect()
                 .await;
         for (name, delay) in results {
+            // 【APP52 任务1】完整记录成功与超时（0），供节点页排序与持久化
+            let d = delay.unwrap_or(0);
+            all_delays.push((name.clone(), d as u32));
             if let Some(d) = delay {
                 map.insert(name, serde_json::json!(d));
             }
+        }
+    }
+    // 【APP52 任务1】测速结果持久化 + 自动选最低延迟节点（用户未手动指定时）
+    state.record_node_delays(all_delays.iter().cloned());
+    if !*state.user_manually_selected_node.read()
+        && let Some((best, _)) = all_delays.iter().filter(|(_, d)| *d > 0).min_by_key(|(_, d)| *d)
+    {
+        let mut settings = state.settings.read().clone();
+        if settings.selected_node.as_deref() != Some(best.as_str()) {
+            settings.selected_node = Some(best.clone());
+            settings.user_manually_selected_node = false;
+            if let Err(e) = state.save_settings(settings) {
+                tracing::warn!("[APP52] 离线测速自动选点落盘失败: {e}");
+            }
+            let _ = state.app_handle.emit("proxies://changed", ());
         }
     }
     Ok(serde_json::Value::Object(map))
@@ -2871,6 +2968,157 @@ pub async fn get_traffic_stats(
     }))
 }
 
+/// 【APP52 任务2】常驻后台遥测协程：600ms 一轮，VPN 运行中无条件探测
+/// `/connections`（1200ms 硬超时）。切换页面、切到系统后台都不停止；
+/// 速率经 EMA(0.65/0.35) 平滑，raw==0 且上次 <1KB/s 时归零，杜绝尾巴
+/// 抖动与「速率卡死」。每个 tick 广播 `telemetry://tick`，前端仪表盘零延迟
+/// 刷新，并在此处记录「[流量开始转发]」四阶段日志（每个节点会话仅一次）。
+pub fn spawn_background_telemetry_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut logged_node: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let state = app.state::<AppState>();
+            let today = crate::core::store::today_total_bytes(&state.data_dir)
+                .max(*state.today_bytes_cache.read());
+            let selected = state.settings.read().selected_node.clone();
+            let running = *state.status.read() == CoreStatus::Running;
+            if !running {
+                logged_node = None;
+                let _ = app.emit(
+                    "telemetry://tick",
+                    serde_json::json!({
+                        "down": 0,
+                        "up": 0,
+                        "today": today,
+                        "running": false,
+                        "selectedNode": selected,
+                    }),
+                );
+                continue;
+            }
+
+            let api = state.kernel_api();
+            let Ok(conn_json) = api.get_connections_with_timeout(1200).await else {
+                // 探测失败：沿用上次速率（不做衰减、绝不归零闪断）
+                let (down, up) = state
+                    .last_traffic_sample
+                    .lock()
+                    .map(|s| (s.3, s.4))
+                    .unwrap_or((0, 0));
+                let _ = app.emit(
+                    "telemetry://tick",
+                    serde_json::json!({
+                        "down": down, "up": up, "today": today,
+                        "running": true, "selectedNode": selected,
+                    }),
+                );
+                continue;
+            };
+
+            let total_down = conn_json
+                .get("downloadTotal")
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                .unwrap_or(0);
+            let total_up = conn_json
+                .get("uploadTotal")
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                .unwrap_or(0);
+
+            let (down, up) = {
+                let now = std::time::Instant::now();
+                let mut sample = state.last_traffic_sample.lock();
+                match *sample {
+                    Some((prev_t, prev_down, prev_up, last_down, last_up)) => {
+                        let dt = now.duration_since(prev_t).as_secs_f64();
+                        let (down, up) = if dt < 0.25 {
+                            // 高频采样（<250ms）：沿用上次平滑值
+                            (last_down, last_up)
+                        } else {
+                            let raw_down = if total_down >= prev_down {
+                                ((total_down - prev_down) as f64 / dt) as f64
+                            } else {
+                                0.0
+                            };
+                            let raw_up = if total_up >= prev_up {
+                                ((total_up - prev_up) as f64 / dt) as f64
+                            } else {
+                                0.0
+                            };
+                            // EMA 平滑：0.65 * prev + 0.35 * raw
+                            let smooth_down = if raw_down == 0.0 && last_down < 1024 {
+                                0.0
+                            } else {
+                                0.65 * last_down as f64 + 0.35 * raw_down
+                            };
+                            let smooth_up = if raw_up == 0.0 && last_up < 1024 {
+                                0.0
+                            } else {
+                                0.65 * last_up as f64 + 0.35 * raw_up
+                            };
+                            (smooth_down as u64, smooth_up as u64)
+                        };
+                        *sample = Some((now, total_down, total_up, down, up));
+                        (down, up)
+                    }
+                    None => {
+                        *sample = Some((now, total_down, total_up, 0, 0));
+                        (0, 0)
+                    }
+                }
+            };
+
+            // 【APP52 任务4】[流量开始转发]：选中节点会话内首次出现真实
+            // download/upload 流量时记录一次（first_host + ip + 速率），
+            // 节点切换或内核重启后重置，绝不刷屏。
+            if let Some(conns) = conn_json.get("connections").and_then(|v| v.as_array()) {
+                let first = conns.iter().find(|c| {
+                    let dl = c.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ul = c.get("upload").and_then(|v| v.as_u64()).unwrap_or(0);
+                    dl > 0 || ul > 0
+                });
+                if let Some(c) = first {
+                    let node_name = selected.clone().unwrap_or_else(|| "自动".into());
+                    if logged_node.as_deref() != Some(node_name.as_str()) {
+                        let meta = c.get("metadata").cloned().unwrap_or_default();
+                        let host = meta
+                            .get("host")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let dest_ip = meta
+                            .get("destinationIP")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        crate::core::logger::info(
+                            crate::core::logger::MOD_NODE,
+                            &format!(
+                                "{} 节点「{node_name}」首条流量 host={} ip={} ↓{} ↑{} B/s",
+                                crate::core::logger::PHASE_FORWARDING,
+                                if host.is_empty() { "-" } else { host },
+                                if dest_ip.is_empty() { "-" } else { dest_ip },
+                                down,
+                                up
+                            ),
+                        );
+                        logged_node = Some(node_name);
+                    }
+                }
+            }
+
+            let _ = app.emit(
+                "telemetry://tick",
+                serde_json::json!({
+                    "down": down,
+                    "up": up,
+                    "today": today,
+                    "running": true,
+                    "selectedNode": selected,
+                }),
+            );
+        }
+    });
+}
+
 /// 运行时统计快照：今日流量 / 实时速率 / 60s 曲线 / 活跃连接 / 分析聚合。
 /// 数据由 events.rs 的内核数据流实时维护在 AppState，前端无需轮询内核。
 /// 【APP51 任务2】每次拉快照无条件 GET /connections（1500ms 硬超时）：
@@ -2916,10 +3164,21 @@ pub async fn get_runtime_snapshot(
                     // 高频重复调用：沿用缓存，绝不返回 0,0
                     (last_down, last_up)
                 } else if dt <= 10.0 && total_down >= prev_down && total_up >= prev_up {
-                    (
-                        ((total_down - prev_down) as f64 / dt) as u64,
-                        ((total_up - prev_up) as f64 / dt) as u64,
-                    )
+                    // 【APP52 任务2】与后台遥测一致的 EMA(0.65/0.35) 平滑，
+                    // 避免快照与 telemetry://tick 两路速率互相覆盖造成抖动。
+                    let raw_down = (total_down - prev_down) as f64 / dt;
+                    let raw_up = (total_up - prev_up) as f64 / dt;
+                    let smooth_down = if raw_down == 0.0 && last_down < 1024 {
+                        0.0
+                    } else {
+                        0.65 * last_down as f64 + 0.35 * raw_down
+                    };
+                    let smooth_up = if raw_up == 0.0 && last_up < 1024 {
+                        0.0
+                    } else {
+                        0.65 * last_up as f64 + 0.35 * raw_up
+                    };
+                    (smooth_down as u64, smooth_up as u64)
                 } else if dt <= 10.0 {
                     // 内核重启导致总量归零：本轮真实速率为 0
                     (0, 0)
@@ -3043,11 +3302,48 @@ pub async fn get_lan_ip() -> Result<Option<String>, String> {
 pub async fn get_proxy_groups(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    state
+    let mut resp = state
         .kernel_api()
         .get_proxies()
         .await
-        .map_err(|e| sanitize_err(&e.to_string()))
+        .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP52 任务1】后端双重排序（所有用户含非 Pro）：
+    // 内核 history 末条延迟优先，缺失时用持久化缓存；
+    // 每个策略组 all 数组按「>0 升序 → 未测速 → 0 超时」重排，
+    // 并下发 prismDelays 供前端在内核重启后仍能恢复延迟显示。
+    let mut effective: std::collections::HashMap<String, u32> =
+        state.node_metrics.read().delays.clone();
+    if let Some(proxies) = resp.get("proxies").and_then(|v| v.as_object()) {
+        for (name, info) in proxies {
+            if let Some(d) = info
+                .get("history")
+                .and_then(|h| h.as_array())
+                .and_then(|a| a.last())
+                .and_then(|e| e.get("delay"))
+                .and_then(|d| d.as_u64())
+            {
+                effective.insert(name.clone(), d as u32);
+            }
+        }
+    }
+    if let Some(proxies) = resp.get_mut("proxies").and_then(|v| v.as_object_mut()) {
+        for info in proxies.values_mut() {
+            let Some(all) = info.get_mut("all").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            all.sort_by_key(|item| {
+                let name = item.as_str().unwrap_or("");
+                crate::core::state::node_delay_sort_key(effective.get(name).copied())
+            });
+        }
+    }
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert(
+            "prismDelays".into(),
+            serde_json::to_value(&effective).unwrap_or_default(),
+        );
+    }
+    Ok(resp)
 }
 
 #[tauri::command]
@@ -3143,6 +3439,9 @@ pub async fn set_go_aim_enabled(
     settings.go_aim_enabled = enabled;
     // 关键：无论开关方向，一律清空手动指定节点，恢复自动优选
     settings.go_aim_pinned_node = None;
+    // 【APP52 任务1】重开 Go AIM = 回到自动选点模式，允许按最低延迟重新指定
+    settings.user_manually_selected_node = false;
+    *state.user_manually_selected_node.write() = false;
     state
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
@@ -3214,7 +3513,13 @@ pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Res
         return Err("请先启动代理内核后再执行 Go AIM 真实节点检测".into());
     }
     let already = state.aim_probing.load(std::sync::atomic::Ordering::Acquire);
+    // 【APP52 任务1】手动重测 = 回到自动选点模式：清空手动标记，
+    // 本轮探测完成后按最低延迟重新自动选点。
     if !already {
+        let mut settings = state.settings.read().clone();
+        settings.user_manually_selected_node = false;
+        *state.user_manually_selected_node.write() = false;
+        let _ = state.save_settings(settings);
         crate::core::go_aim::start_probe(app);
     }
     Ok(already)
@@ -3229,6 +3534,8 @@ pub async fn clear_go_aim_pinned_node(app: AppHandle, state: State<'_, AppState>
     }
     let mut settings = state.settings.read().clone();
     settings.go_aim_pinned_node = None;
+    settings.user_manually_selected_node = false;
+    *state.user_manually_selected_node.write() = false;
     state
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
@@ -3334,10 +3641,30 @@ pub async fn save_go_lan_settings(
         serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
     // 【APP40 任务2】保存前自动迁移旧版单配置 → 多路档案，并校正档案 id
     crate::core::go_lan::normalize_go_lan_settings(&mut lan);
+    // 【APP52 任务3】标准 WireGuard 完整性硬校验：启用档案若是 WG 隧道
+    // （无分享链接）但 endpoint/私钥/CIDR 非标准 → 拒绝启用，绝不进入隧道。
+    if lan.enabled && lan.mode == "manual" {
+        for (_, profile) in crate::core::go_lan::enabled_profiles(&lan) {
+            if profile.node_uri.trim().is_empty()
+                && let Some(_wg) = profile.wg_config.as_ref()
+                && !crate::core::go_lan::is_valid_standard_wg_config(&profile)
+            {
+                return Err(format!(
+                    "内网档案「{}」的 WireGuard 配置不完整或格式非标准（endpoint/端口、IPv4 CIDR、32 字节 Base64 密钥、有效内网网段均为必填）",
+                    profile.name
+                ));
+            }
+        }
+    }
     // APP 任务5 后端兜底：未配置完整参数时严禁启用
     if lan.enabled && !crate::core::go_lan::is_configured(&lan) {
         return Err("请先填写完整的回家节点参数与内网网段后再启用 Go Lan".into());
     }
+    // 【APP52 任务3】保存前后「有效启用隧道」快照比较：完全相等时只写
+    // settings.json + 持久化，绝不触发 vpn_reload / 内核重启。
+    let prev_tunnel_snapshot = crate::core::go_lan::valid_enabled_tunnel_snapshot(&state.go_lan.read());
+    let next_tunnel_snapshot = crate::core::go_lan::valid_enabled_tunnel_snapshot(&lan);
+    let tunnels_unchanged = prev_tunnel_snapshot == next_tunnel_snapshot;
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
 
@@ -3364,9 +3691,10 @@ pub async fn save_go_lan_settings(
         serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
     );
 
-    // 运行中 → 后台异步重建内核配置生效（iOS 会重启扩展加载 go-lan-home），
-    // 不阻塞前端保存响应
-    if *state.status.read() == CoreStatus::Running {
+    // 运行中且隧道结构确有变化 → 后台异步重建内核配置生效；
+    // 【APP52 任务3】快照相等（如新增空白档案 / 仅改名）只写 settings.json，
+    // 严禁 vpn_reload / 重启内核，避免无意义断网。
+    if *state.status.read() == CoreStatus::Running && !tunnels_unchanged {
         let app_clone = app.clone();
         let lan_clone = lan.clone();
         tauri::async_runtime::spawn(async move {
@@ -3402,6 +3730,10 @@ pub async fn get_go_lan_status(
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
     let mut items: Vec<serde_json::Value> = Vec::new();
+    // 【APP52 任务3】全局 On-Demand 判定：任一启用隧道命中本机局域网即 true；
+    // profile_states 为每个档案输出 direct / tunnel / off，供仪表盘与弹窗展示。
+    let mut any_on_demand_direct = false;
+    let mut profile_states = serde_json::Map::new();
     for (tag, profile) in crate::core::go_lan::enabled_profiles(&lan) {
         let (tunnel, direct) =
             crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
@@ -3412,6 +3744,10 @@ pub async fn get_go_lan_status(
             }
         }
         let state_str = if bypassed.is_empty() { "tunnel" } else { "direct" };
+        if state_str == "direct" {
+            any_on_demand_direct = true;
+        }
+        profile_states.insert(profile.id.clone(), serde_json::json!(state_str));
         items.push(serde_json::json!({
             "tag": tag,
             "id": profile.id,
@@ -3423,9 +3759,14 @@ pub async fn get_go_lan_status(
             "tunnelCidrs": tunnel,
         }));
     }
+    for profile in lan.profiles.iter().filter(|p| !p.enabled) {
+        profile_states.insert(profile.id.clone(), serde_json::json!("off"));
+    }
     Ok(serde_json::json!({
         "profiles": items,
         "physicalIps": physical.iter().map(|ip| ip.to_string()).collect::<Vec<String>>(),
+        "anyOnDemandDirect": any_on_demand_direct,
+        "profileStates": profile_states,
     }))
 }
 

@@ -72,6 +72,10 @@ pub fn run() {
                 &format!("Prism 启动，版本 {}（{}）", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
             );
 
+            // 【APP52 任务2】常驻后台遥测：600ms 采样 + telemetry://tick，
+            // 切换页面/系统后台/停启 VPN 都不中断（仅运行中真实探测）。
+            ipc::commands::spawn_background_telemetry_worker(app.handle().clone());
+
             // 移动端平台初始化：Android 注册 libbox/JNI VPN 回调
             #[cfg(any(target_os = "android", target_os = "ios"))]
             if let Err(e) = platform::mobile_init(app.handle()) {

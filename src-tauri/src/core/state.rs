@@ -112,6 +112,12 @@ pub struct UserSettings {
     /// 「当前节点」长期残留假节点名。
     #[serde(default)]
     pub selected_node: Option<String>,
+    /// 【APP52 任务1】用户是否手动点选过节点（默认 false）。
+    /// false = 自动模式：重启 Go AIM / 重新测速后自动把最低延迟节点设为
+    /// selected_node；true = 手动模式：自动选点绝不覆盖用户选择。
+    /// 仅 select_proxy 命令置 true；重开 Go AIM / 重测速时复位 false。
+    #[serde(default)]
+    pub user_manually_selected_node: bool,
     /// 界面语言（system | zh | en；随设置表单一起落盘）
     #[serde(default = "default_system")]
     pub language: String,
@@ -156,6 +162,7 @@ impl Default for UserSettings {
             go_aim_enabled: false,
             go_aim_pinned_node: None,
             selected_node: None,
+            user_manually_selected_node: false,
             language: "system".to_string(),
             theme: "system".to_string(),
             auto_update_subs_daily: true,
@@ -249,6 +256,27 @@ pub struct AnalyticsAgg {
     pub last_total_up: u64,
 }
 
+/// 【APP52 任务1】节点测速 / Go AIM 探测持久化缓存（`node_metrics_cache.json`）。
+/// 切换页面、停止/启动 VPN、重启 APP 都绝不清空；仅 refresh_subscription /
+/// delete_subscription 清理对应已失效节点。启动时恢复到内存，供节点页在
+/// 内核未运行时仍显示上次真实延迟与 AI/流媒体徽章。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedNodeMetrics {
+    /// 节点名 → 最近一次真实延迟（0 = 超时，前端排序时置底）
+    #[serde(default)]
+    pub delays: HashMap<String, u32>,
+    /// 节点名 → Go AIM 评级结果
+    #[serde(default)]
+    pub aim_results: HashMap<String, super::go_aim::AimNodeResult>,
+    /// Go AIM 当前最优节点
+    #[serde(default)]
+    pub aim_best_node: Option<String>,
+    /// 最近更新时间（Unix 秒）
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
 /// 跨 IPC 共享的全局状态
 pub struct AppState {
     /// 应用句柄：状态流转后广播 core://status，前端无需轮询即可对齐
@@ -279,9 +307,11 @@ pub struct AppState {
     /// 内核启动后自动对该组测速并切换至延迟最低的可用节点。
     pub main_selector: RwLock<Option<String>>,
     /// 【APP26 任务2.3】用户是否手动点选过节点（仅 select_proxy 命令写入）。
-    /// None = 从未手动指定 → 未开启 Go AIM 时启动后自动选最低延迟节点；
-    /// Some = 用户已手动指定 → 自动优选不再覆盖用户选择
-    pub user_manually_selected_node: RwLock<Option<String>>,
+    /// 【APP52 任务1】bool 语义：false = 自动选点模式；true = 用户手动指定，
+    /// 自动最低延迟选点不再覆盖用户选择。
+    pub user_manually_selected_node: RwLock<bool>,
+    /// 【APP52 任务1】节点测速 / Go AIM 探测持久化缓存（磁盘 + 内存双份）
+    pub node_metrics: RwLock<PersistedNodeMetrics>,
     /// 当前 Pro 授权状态（启动时由 license 缓存恢复；后台校验后刷新）
     pub entitlement: RwLock<super::license::EntitlementStatus>,
     /// entitlement 的会话签名（防内存篡改：status 被改写后签名校验失败）
@@ -361,6 +391,11 @@ impl AppState {
             entitlement.expires_at,
             entitlement.last_verified_at,
         );
+        // 【APP52 任务1】启动恢复节点测速/Go AIM 持久化缓存
+        let node_metrics = load_node_metrics(&data_dir);
+        let restored_aim = node_metrics.aim_results.clone();
+        let restored_best = node_metrics.aim_best_node.clone();
+        let manual_node = settings.user_manually_selected_node;
         Self {
             app_handle,
             data_dir: data_dir.clone(),
@@ -375,13 +410,14 @@ impl AppState {
             api_secret: RwLock::new(String::new()),
             kernel_version: RwLock::new(None),
             main_selector: RwLock::new(None),
-            user_manually_selected_node: RwLock::new(None),
+            user_manually_selected_node: RwLock::new(manual_node),
+            node_metrics: RwLock::new(node_metrics),
             entitlement: RwLock::new(entitlement),
             entitlement_sign: RwLock::new(entitlement_sign),
             proxy_backup: RwLock::new(None),
-            aim_results: RwLock::new(std::collections::HashMap::new()),
+            aim_results: RwLock::new(restored_aim),
             aim_probing: std::sync::atomic::AtomicBool::new(false),
-            aim_locked_node: RwLock::new(None),
+            aim_locked_node: RwLock::new(restored_best),
             aim_monitor_started: std::sync::atomic::AtomicBool::new(false),
             aim_generation: std::sync::atomic::AtomicU64::new(0),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
@@ -585,6 +621,67 @@ impl AppState {
         })
     }
 
+    /// 【APP52 任务1】写入一批节点延迟（0 = 超时），并异步落盘。
+    /// 说明：切换页面 / 停止启动 VPN / 重启 APP 都不会清空本缓存，
+    /// 只有订阅刷新或删除时由 purge 清理已失效节点。
+    pub fn record_node_delays<I>(&self, items: I)
+    where
+        I: IntoIterator<Item = (String, u32)>,
+    {
+        {
+            let mut metrics = self.node_metrics.write();
+            for (name, delay) in items {
+                metrics.delays.insert(name, delay);
+            }
+            metrics.updated_at = now_unix();
+        }
+        self.persist_node_metrics();
+    }
+
+    /// 【APP52 任务1】写入 Go AIM 探测结果（含最优节点），异步落盘。
+    pub fn record_aim_results(
+        &self,
+        results: &HashMap<String, super::go_aim::AimNodeResult>,
+        best: Option<&str>,
+    ) {
+        {
+            let mut metrics = self.node_metrics.write();
+            metrics.aim_results = results.clone();
+            metrics.aim_best_node = best.map(str::to_string);
+            metrics.updated_at = now_unix();
+        }
+        self.persist_node_metrics();
+    }
+
+    /// 【APP52 任务1】订阅刷新/删除后只保留仍存在的节点，并异步落盘。
+    pub fn retain_node_metrics(&self, valid: &std::collections::HashSet<String>) {
+        {
+            let mut metrics = self.node_metrics.write();
+            metrics.delays.retain(|name, _| valid.contains(name));
+            metrics.aim_results.retain(|name, _| valid.contains(name));
+            if metrics
+                .aim_best_node
+                .as_ref()
+                .is_some_and(|n| !valid.contains(n))
+            {
+                metrics.aim_best_node = None;
+            }
+            metrics.updated_at = now_unix();
+        }
+        self.persist_node_metrics();
+    }
+
+    /// 异步落盘节点指标缓存（小文件原子写，绝不阻塞 UI 线程）
+    pub fn persist_node_metrics(&self) {
+        let snapshot = self.node_metrics.read().clone();
+        let data_dir = self.data_dir.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = save_node_metrics(&data_dir, &snapshot) {
+                tracing::warn!("[node-metrics] 持久化失败: {e}");
+            }
+        });
+    }
+
     /// 内核工作目录（config.json / profile.yaml / kernel.log 所在）
     pub fn work_dir(&self) -> PathBuf {
         self.data_dir.join("kernel")
@@ -666,6 +763,33 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 当前 Unix 秒时间戳（节点指标缓存 updated_at 用）
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 【APP52 任务1】读取节点指标缓存；文件缺失/损坏一律回退空缓存，绝不阻塞启动
+pub fn load_node_metrics(data_dir: &std::path::Path) -> PersistedNodeMetrics {
+    let path = data_dir.join("node_metrics_cache.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return PersistedNodeMetrics::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// 【APP52 任务1】原子写入节点指标缓存（先 .tmp 再 rename）
+pub fn save_node_metrics(
+    data_dir: &std::path::Path,
+    metrics: &PersistedNodeMetrics,
+) -> anyhow::Result<()> {
+    let path = data_dir.join("node_metrics_cache.json");
+    let bytes = serde_json::to_vec_pretty(metrics)?;
+    super::store::atomic_write(&path, &bytes)
+}
+
 /// 供 IPC 层使用：判断端口是否可绑定
 pub fn is_port_free(host: &str, port: u16) -> bool {
     std::net::TcpListener::bind((host, port)).is_ok()
@@ -685,5 +809,71 @@ pub fn pick_api_addr() -> String {
             tracing::error!("failed to allocate api port: {e}");
             super::kernel::PREFERRED_API_ADDR.to_string()
         }
+    }
+}
+
+/// 【APP52 任务1】节点延迟统一排序键（后端 get_proxies / 前端 Proxies 双重排序）：
+/// - 实测 delay > 0：分组 0，按延迟升序
+/// - 未测速(None)：分组 1，居中
+/// - 超时(delay == 0)：分组 2，置底
+pub fn node_delay_sort_key(delay: Option<u32>) -> (u8, u32) {
+    match delay {
+        Some(d) if d > 0 => (0, d),
+        None => (1, 0),
+        _ => (2, 0),
+    }
+}
+
+#[cfg(test)]
+mod app52_tests {
+    use super::*;
+
+    #[test]
+    fn test_node_delay_sort_key_order() {
+        let mut items = vec![
+            ("timeout".to_string(), Some(0)),
+            ("untested".to_string(), None),
+            ("slow".to_string(), Some(300)),
+            ("fast".to_string(), Some(80)),
+        ];
+        items.sort_by_key(|(_, d)| node_delay_sort_key(*d));
+        let order: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, vec!["fast", "slow", "untested", "timeout"]);
+    }
+
+    /// 【APP52 任务1】PersistedNodeMetrics 写入后必须能原样恢复
+    #[test]
+    fn test_persisted_node_metrics_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism_app52_metrics_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut metrics = PersistedNodeMetrics {
+            updated_at: 123,
+            aim_best_node: Some("HK-01".into()),
+            ..Default::default()
+        };
+        metrics.delays.insert("HK-01".into(), 45);
+        metrics.delays.insert("US-02".into(), 0);
+        save_node_metrics(&dir, &metrics).unwrap();
+        let restored = load_node_metrics(&dir);
+        assert_eq!(restored.delays.get("HK-01"), Some(&45));
+        assert_eq!(restored.delays.get("US-02"), Some(&0));
+        assert_eq!(restored.aim_best_node.as_deref(), Some("HK-01"));
+        assert_eq!(restored.updated_at, 123);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_missing_metrics_cache_falls_back_to_empty() {
+        let dir = std::env::temp_dir().join("prism_app52_missing_metrics");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = load_node_metrics(&dir);
+        assert!(m.delays.is_empty());
+        assert!(m.aim_results.is_empty());
     }
 }

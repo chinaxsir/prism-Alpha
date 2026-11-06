@@ -24,6 +24,8 @@ pub fn is_uri_list(text: &str) -> bool {
             || l.starts_with("hy://")
             || l.starts_with("tuic://")
             || l.starts_with("anytls://")
+            || l.starts_with("wireguard://")
+            || l.starts_with("wg://")
             || l.starts_with("socks5://")
             || l.starts_with("socks://")
     })
@@ -47,6 +49,8 @@ pub fn parse_line(line: &str) -> Result<Option<Value>> {
         "hysteria" | "hy" => parse_hysteria(rest)?,
         "tuic" => parse_tuic(rest)?,
         "anytls" => parse_anytls(rest)?,
+        // 【APP52 任务5】WireGuard 分享链接全字段映射
+        "wireguard" | "wg" => parse_wireguard(rest)?,
         "socks5" | "socks" => parse_socks(rest)?,
         _ => bail!("不支持的协议：{scheme}"),
     };
@@ -674,6 +678,70 @@ fn parse_anytls(rest: &str) -> Result<Value> {
     }
     Ok(node)
 }
+
+/// wireguard://privatekey@host:port?publickey=...&address=10.0.0.2/32&mtu=1280&presharedkey=...&reserved=1,2,3#name
+/// 【APP52 任务5】WireGuard 全字段映射：私钥/对端公钥/本端地址/MTU/PSK/reserved
+fn parse_wireguard(rest: &str) -> Result<Value> {
+    let (addr_query, name) = rest.split_once('#').unwrap_or((rest, ""));
+    let (addr, query) = addr_query.split_once('?').unwrap_or((addr_query, ""));
+    let (private_key, hostport) = addr
+        .rsplit_once('@')
+        .context("WireGuard 缺少 privatekey@host")?;
+    let (server, port) = split_host_port(hostport)?;
+    let name = decode_name(name);
+    let private_key = decode_name(private_key);
+
+    let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
+    let public_key = params
+        .get("publickey")
+        .or_else(|| params.get("peer_public_key"))
+        .or_else(|| params.get("public-key"))
+        .cloned()
+        .unwrap_or_default();
+    if public_key.is_empty() {
+        bail!("WireGuard 分享链接缺少 publickey");
+    }
+    let address = params
+        .get("address")
+        .or_else(|| params.get("ip"))
+        .cloned()
+        .unwrap_or_default();
+
+    let mut node = json!({
+        "name": name,
+        "type": "wireguard",
+        "server": server,
+        "port": port,
+        "private-key": private_key,
+        "public-key": public_key,
+    });
+    if !address.is_empty() {
+        node["ip"] = json!(address);
+    }
+    if let Some(psk) = params
+        .get("presharedkey")
+        .or_else(|| params.get("preshared_key"))
+        .or_else(|| params.get("psk"))
+        .cloned()
+        && !psk.is_empty()
+    {
+        node["preshared-key"] = json!(psk);
+    }
+    if let Some(mtu) = params.get("mtu").and_then(|v| v.parse::<u32>().ok()) {
+        node["mtu"] = json!(mtu);
+    }
+    if let Some(reserved) = params.get("reserved") {
+        let bytes: Vec<u8> = reserved
+            .split(',')
+            .filter_map(|v| v.trim().parse::<u8>().ok())
+            .collect();
+        if bytes.len() == 3 {
+            node["reserved"] = json!(bytes);
+        }
+    }
+    Ok(node)
+}
+
 
 /// hysteria://host:port?auth=<password>&peer=<sni>&insecure=1#name
 /// （Hysteria 1 分享链接；与 hysteria2 的密码在 userinfo 不同，这里认证在 query）

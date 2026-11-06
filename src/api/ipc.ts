@@ -166,9 +166,17 @@ export const getProxyGroups = () => invoke("get_proxy_groups");
 
 /// 内核未运行时从订阅缓存读取节点列表（节点页预览）
 export const getCachedProxies = () =>
-  invoke<Array<{ name: string; kind: string; server: string; port: number; fromSubscription: string }>>(
-    "get_cached_proxies"
-  );
+  invoke<
+    Array<{
+      name: string;
+      kind: string;
+      server: string;
+      port: number;
+      fromSubscription: string;
+      /** 【APP52 任务1】持久化延迟：undefined=未测速；0=超时；>0=实测 */
+      delay?: number;
+    }>
+  >("get_cached_proxies");
 
 /// 【APP44 任务1.3】内核未运行时的真实测速（DoH + TCP 握手），返回 name→delay
 export const testCachedProxies = (timeoutMs?: number) =>
@@ -326,12 +334,18 @@ export interface GoLanProfileStatus {
 export interface GoLanStatus {
   profiles: GoLanProfileStatus[];
   physicalIps: string[];
+  /** 【APP52 任务3】任一启用隧道命中本机局域网 → 仪表盘翠绿胶囊 */
+  anyOnDemandDirect?: boolean;
+  /** 【APP52 任务3】档案 id → direct / tunnel / off */
+  profileStates?: Record<string, "direct" | "tunnel" | "off">;
 }
 export const getGoLanStatus = async (): Promise<GoLanStatus> => {
   const raw = await invoke<GoLanStatus>("get_go_lan_status");
   return {
     profiles: Array.isArray(raw?.profiles) ? raw.profiles : [],
     physicalIps: Array.isArray(raw?.physicalIps) ? raw.physicalIps : [],
+    anyOnDemandDirect: raw?.anyOnDemandDirect === true,
+    profileStates: raw?.profileStates ?? {},
   };
 };
 

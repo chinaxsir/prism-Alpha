@@ -653,6 +653,11 @@ export default function Dashboard() {
           status={proUnlocked ? lanStatus : t("pro.lockedTap")}
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
+          badge={
+            proUnlocked && lanState?.anyOnDemandDirect
+              ? t("dashboard.lan.directBadge")
+              : undefined
+          }
           onToggle={toggleLan}
           action={
             proUnlocked ? (
@@ -695,7 +700,8 @@ export default function Dashboard() {
               <Activity size={13} className="text-latency-good" />
               {t("metric.download")}
             </div>
-            <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono tracking-tight">
+            {/* 【APP52 任务2】固定最小宽度 + 等宽数字：速率刷新时容器不抖动 */}
+            <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono tracking-tight min-w-[7.5rem] whitespace-nowrap transition-all duration-150">
               {formatSpeed(downSpeed)}
             </div>
           </div>
@@ -704,7 +710,7 @@ export default function Dashboard() {
               <Activity size={13} className="text-accent" />
               {t("metric.upload")}
             </div>
-            <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono tracking-tight">
+            <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono tracking-tight min-w-[7.5rem] whitespace-nowrap transition-all duration-150">
               {formatSpeed(upSpeed)}
             </div>
           </div>
@@ -802,6 +808,7 @@ function EngineCard({
   action,
   locked = false,
   tone,
+  badge,
 }: {
   icon: ReactNode;
   name: string;
@@ -813,6 +820,8 @@ function EngineCard({
   locked?: boolean;
   /** 【APP47 任务2.3】模块标题彩色文字类（如 text-surge-green） */
   tone?: string;
+  /** 【APP52 任务3】标题旁状态胶囊（Go Lan 局域网直连） */
+  badge?: string;
 }) {
   return (
     <div
@@ -838,6 +847,11 @@ function EngineCard({
           <span className="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-glass text-text-muted whitespace-nowrap">
             {tag}
           </span>
+          {badge ? (
+            <span className="shrink-0 px-2 py-0.5 rounded-md text-[12px] font-bold bg-[#24B414]/15 text-[#24B414] dark:text-[#30D158] whitespace-nowrap">
+              ⚡ {badge}
+            </span>
+          ) : null}
         </div>
         {/* 【APP47 任务2.3】状态副标题 14px medium 深色正文，最多两行完整展示 */}
         <div

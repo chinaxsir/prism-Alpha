@@ -193,8 +193,24 @@ export default function Proxies() {
       if (coreStatusRef.current === "running") {
         const resp = (await getProxyGroups()) as {
           proxies?: Record<string, ProxyEntry>;
+          /** 【APP52 任务1】后端持久化延迟（节点名 → 最近真实延迟） */
+          prismDelays?: Record<string, number>;
         };
         const map = resp.proxies ?? {};
+        // 【APP52 任务1】内核重启会清空 history：先用持久化缓存补齐延迟，
+        // 有实时 history 的节点以 history 为准，保证延迟显示/排序不丢失。
+        if (resp.prismDelays) {
+          setDelays((prev) => {
+            const next = { ...prev };
+            for (const [name, d] of Object.entries(resp.prismDelays ?? {})) {
+              const hist = map[name]?.history ?? [];
+              const fresh = hist.length ? hist[hist.length - 1]?.delay : undefined;
+              if (typeof fresh === "number" && fresh > 0) next[name] = fresh;
+              else if (!(name in next) && d > 0) next[name] = d;
+            }
+            return next;
+          });
+        }
 
         const groupName = preferred || mainSelectorRef.current;
         const group = map[groupName];
@@ -244,8 +260,17 @@ export default function Proxies() {
         }));
       setNodes(entries);
       setCurrent("");
-      setDelays({});
-      setFailed(new Set());
+      // 【APP52 任务1】恢复持久化延迟：实测 >0 进 delays，0 进 failed，
+      // 未测速保持 undefined（排序居中），停止/重启 APP 后依旧按延迟升序。
+      const persistedDelays: Record<string, number> = {};
+      const persistedFailed = new Set<string>();
+      for (const p of list) {
+        if (typeof p.delay !== "number") continue;
+        if (p.delay > 0) persistedDelays[p.name] = p.delay;
+        else persistedFailed.add(p.name);
+      }
+      setDelays(persistedDelays);
+      setFailed(persistedFailed);
     } catch (e) {
       console.error("load cached proxies failed:", e);
       setNodes([]);

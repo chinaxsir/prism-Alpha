@@ -32,6 +32,13 @@ pub const MOD_GO_AIM: &str = "GoAim";
 pub const MOD_GO_CUS: &str = "GoCus";
 pub const MOD_SUB: &str = "Sub";
 pub const MOD_PRO: &str = "Pro";
+/// 【APP52 任务4】节点生命周期日志分类
+pub const MOD_NODE: &str = "Node";
+/// 【APP52 任务4】节点连接四阶段生命周期日志前缀（顺序固定，供日志检索）
+pub const PHASE_NODE_IDENT: &str = "[节点识别]";
+pub const PHASE_HANDSHAKE: &str = "[握手阶段]";
+pub const PHASE_CONNECTED: &str = "[连接成功]";
+pub const PHASE_FORWARDING: &str = "[流量开始转发]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -635,7 +642,10 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::{is_benign_close_line, is_noise_eperm_line};
+    use super::{
+        is_benign_close_line, is_noise_eperm_line, MOD_NODE, PHASE_CONNECTED, PHASE_FORWARDING,
+        PHASE_HANDSHAKE, PHASE_NODE_IDENT,
+    };
 
     /// 【APP39 任务2.2】正常关闭/策略拦截日志必须被识别并丢弃，不再显示 ERROR
     #[test]
@@ -684,5 +694,23 @@ mod tests {
         assert!(!is_noise_eperm_line(
             "✅ 内网检测成功: 已到达 10.1.8.1:5000（端口开放，延迟 12 ms）"
         ));
+    }
+
+    /// 【APP52 任务4】四阶段日志前缀必须齐全、互不重复且分类为 Node
+    #[test]
+    fn test_four_phase_logs_complete() {
+        let phases = [
+            PHASE_NODE_IDENT,
+            PHASE_HANDSHAKE,
+            PHASE_CONNECTED,
+            PHASE_FORWARDING,
+        ];
+        for p in phases {
+            assert!(!p.is_empty());
+            assert!(p.starts_with('[') && p.ends_with(']'));
+        }
+        let unique: std::collections::HashSet<_> = phases.iter().collect();
+        assert_eq!(unique.len(), 4, "四阶段前缀必须唯一");
+        assert_eq!(MOD_NODE, "Node");
     }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ClipboardPaste, Home, Plus, Trash2, X } from "lucide-react";
+import { ClipboardPaste, Home, Plus, RotateCcw, Trash2, X } from "lucide-react";
 import { toast } from "@/components/ui/Toast";
 import Switch from "@/components/ui/Switch";
 import { useCoreStore } from "@/stores/core";
@@ -102,6 +102,30 @@ const splitCidrsText = (raw: string): string[] =>
     .split(/[\r\n,;，；\s]+/)
     .map((l) => cleanInput(l))
     .filter(Boolean);
+
+/** 【APP52 任务3】合法 IPv4 CIDR（前端与后端 is_valid_standard_wg_config 对齐） */
+const IPV4_CIDR_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+/** Base64 解码后是否严格 32 字节（WireGuard Curve25519 密钥） */
+function isBase64Key32(v: string): boolean {
+  const s = v.trim();
+  if (!s) return false;
+  try {
+    return atob(s).length === 32;
+  } catch {
+    return false;
+  }
+}
+
+/** 【APP52 任务3】标准 WireGuard 表单完整性校验：任一项不满足 → 禁止启用，
+ *  绝不允许自动重启底层内核（后端快照比对 + 前端前置拦截双保险）。 */
+function isStandardWgForm(f: GoLanForm): boolean {
+  if (!f.wgServer.trim() || f.wgServerPort <= 0) return false;
+  if (!IPV4_CIDR_RE.test(f.wgLocalIp.trim())) return false;
+  if (!isBase64Key32(f.wgPrivateKey) || !isBase64Key32(f.wgPeerPublicKey))
+    return false;
+  if (f.wgPreSharedKey.trim() && !isBase64Key32(f.wgPreSharedKey)) return false;
+  return splitCidrsText(f.lanCidrs).some((c) => IPV4_CIDR_RE.test(c));
+}
 
 /// 【APP40 任务2】把一路档案 + 全局设置填入编辑表单
 function applyProfileToForm(p: GoLanProfile, s: GoLanSettings): GoLanForm {
@@ -381,6 +405,8 @@ export default function GoLanModal({ open, onClose }: Props) {
   // 【APP51 任务4】清空 / 删除取消一切二次确认：单击立即执行并落盘
   // 【APP14 任务1】客户端私钥明文/密文切换，方便核对一键识别是否完整
   const [showPrivKey, setShowPrivKey] = useState(false);
+  /** 【APP52 任务3】非标准 WG 配置的内联红色提示（尝试启用/保存时点亮） */
+  const [wgHint, setWgHint] = useState(false);
 
   /** 当前档案的运行状态徽章（⚡ 直连中 / 🔒 隧道） */
   const statusOf = (id: string): GoLanStatus["profiles"][number] | undefined =>
@@ -533,6 +559,17 @@ export default function GoLanModal({ open, onClose }: Props) {
   /** 【APP51 任务4】开关 0ms 乐观切换 + 自动落盘（启用 / On-Demand 共用） */
   const patchAndSave = (p: Partial<GoLanForm>) => {
     const nextForm = { ...form, ...p };
+    // 【APP52 任务3】非标准 WG 配置严禁启用，绝不触发后端内核重启
+    if (
+      p.enabled === true &&
+      nextForm.mode === "manual" &&
+      nextForm.method === "wg" &&
+      !isStandardWgForm(nextForm)
+    ) {
+      setWgHint(true);
+      toast.error(t("goLan.errNotStandardWg"));
+      return;
+    }
     setForm(nextForm);
     const nextProfiles =
       profiles.length > 0
@@ -723,6 +760,16 @@ export default function GoLanModal({ open, onClose }: Props) {
           : [];
     // 必填校验（仅校验当前档案）
     if (list.length > 0) {
+      // 【APP52 任务3】已启用且为标准 WG 模式时，配置必须完整合法
+      if (
+        current.enabled &&
+        form.mode === "manual" &&
+        form.method === "wg" &&
+        !isStandardWgForm(form)
+      ) {
+        setWgHint(true);
+        return toast.error(t("goLan.errNotStandardWg"));
+      }
       if (form.mode === "manual" && form.method === "wg") {
         if (!form.wgServer.trim()) return toast.error(t("goLan.errServerRequired"));
         if (!form.wgPrivateKey.trim())
@@ -820,16 +867,18 @@ export default function GoLanModal({ open, onClose }: Props) {
 
         {/* 【APP40 任务2】内网档案 Tabs（家里 / 公司 / 工作室……） */}
         <div className="rounded-xl border border-border bg-surface-hover/40 p-2">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-medium text-gray-400">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="text-[13px] font-bold tracking-tight text-text-muted">
               {t("goLan.profiles")}
             </span>
-            {/* 【APP51 任务4】单击即清空并落盘，无二次确认 */}
+            {/* 【APP52 任务3】胶囊按钮（对齐 Surge 视觉规范）：单击即清空并落盘 */}
             <button
+              type="button"
               onClick={() => void clearCurrentProfile()}
-              className="rounded px-1.5 py-0.5 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1 text-[12px] font-bold text-red-600 transition-all hover:bg-red-500/15 active:opacity-75 dark:text-red-400"
             >
-              {t("goLan.clearCurrent")}
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span>{t("goLan.clearCurrent")}</span>
             </button>
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
@@ -1130,6 +1179,12 @@ export default function GoLanModal({ open, onClose }: Props) {
             onChange={(v) => patchAndSave({ enabled: v })}
           />
         </div>
+        {/* 【APP52 任务3】非标准 WireGuard 配置内联红色提示 */}
+        {wgHint && form.mode === "manual" && form.method === "wg" && !isStandardWgForm(form) && (
+          <p className="px-1 text-[11px] font-medium leading-relaxed text-red-500 dark:text-red-400">
+            {t("goLan.errNotStandardWg")}
+          </p>
+        )}
 
         {/* 【APP50 任务2】On-Demand 局域网直连：自适应高度两行卡片，
             标题与开关一行、完整说明文字独占一行，杜绝边框压住文字 */}

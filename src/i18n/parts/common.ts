@@ -165,6 +165,8 @@ const zh: Record<string, string> = {
   "goLan.clearAll": "一键清空",
   "goLan.clearAllConfirm": "确认清空全部内网档案？此操作不可撤销。",
   "goLan.clearCurrent": "清空当前配置",
+  "goLan.errNotStandardWg":
+    "WireGuard 配置非标准：请完整填写 Endpoint/端口、合法 IPv4 CIDR、32 字节 Base64 私钥与公钥、有效内网网段后再启用",
   "goLan.clearCurrentConfirm": "确认清空当前档案的全部字段？将立即保存。",
   "goLan.deleteProfile": "删除该档案",
   "goLan.profileName": "档案名称",
@@ -512,6 +514,8 @@ const en: Record<string, string> = {
   "goLan.clearAll": "Clear All",
   "goLan.clearAllConfirm": "Clear all intranet profiles? This cannot be undone.",
   "goLan.clearCurrent": "Clear Current",
+  "goLan.errNotStandardWg":
+    "Invalid WireGuard config: fill Endpoint/port, valid IPv4 CIDR, 32-byte Base64 keys and LAN subnet before enabling",
   "goLan.clearCurrentConfirm": "Clear all fields of the current profile? This will be saved immediately.",
   "goLan.deleteProfile": "Delete Profile",
   "goLan.profileName": "Profile Name",

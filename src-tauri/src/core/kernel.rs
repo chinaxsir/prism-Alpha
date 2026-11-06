@@ -1074,11 +1074,29 @@ impl KernelApi {
         //    指定节点时，自动选中实测 delay > 0 且延迟最低的节点
         //    （排除内置出站与嵌套策略组）。
         if let Some(app) = app {
+            // 【APP52 任务1】完整测速结果（含超时=0）异步落盘，节点页/仪表盘
+            // 在内核重启或 APP 重启后继续显示上次真实延迟与升序排列。
+            {
+                let st = app.state::<crate::core::state::AppState>();
+                let delays: Vec<(String, u32)> = members
+                    .iter()
+                    .map(|m| {
+                        let d = map.get(m).and_then(|v| v.as_u64()).unwrap_or(0);
+                        (m.clone(), d as u32)
+                    })
+                    .collect();
+                st.record_node_delays(delays);
+                // 【APP52 任务1】用户主动重测 = 回到自动选点模式
+                *st.user_manually_selected_node.write() = false;
+                let mut settings = st.settings.read().clone();
+                settings.user_manually_selected_node = false;
+                let _ = st.save_settings(settings);
+            }
             let (aim_on, manual) = {
                 let st = app.state::<crate::core::state::AppState>();
                 (
                     st.settings.read().go_aim_enabled,
-                    st.user_manually_selected_node.read().is_some(),
+                    *st.user_manually_selected_node.read(),
                 )
             };
             if !aim_on && !manual {
@@ -1110,6 +1128,16 @@ impl KernelApi {
                     let _ = self.select_proxy(&group_tag, &best_node).await;
                     let _ = self.select_proxy("GLOBAL", &best_node).await;
                     let _ = self.close_all_connections().await;
+                    // 【APP52 任务1】自动选点结果同步 settings.selected_node 并落盘
+                    let st = app.state::<crate::core::state::AppState>();
+                    let mut settings = st.settings.read().clone();
+                    if settings.selected_node.as_deref() != Some(best_node.as_str()) {
+                        settings.selected_node = Some(best_node.clone());
+                        settings.user_manually_selected_node = false;
+                        if let Err(e) = st.save_settings(settings) {
+                            tracing::warn!("[url_test] 自动选点落盘失败: {e}");
+                        }
+                    }
                     let _ = app.emit("proxies://changed", serde_json::json!({}));
                 }
             }
@@ -1131,9 +1159,17 @@ impl KernelApi {
     pub async fn get_connections(&self) -> Result<serde_json::Value> {
         // 【APP51 任务2】超时放宽到 1500ms：Windows 内核首次响应常超过 800ms，
         // 过短超时会让仪表盘误判「内核未运行」并导致速率卡死
+        self.get_connections_with_timeout(1500).await
+    }
+
+    /// 【APP52 任务2】可指定超时的 /connections 探测（后台遥测协程用 1200ms）
+    pub async fn get_connections_with_timeout(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
         Ok(self
             .authed(shared_client().get(format!("{}/connections", self.base)))
-            .timeout(Duration::from_millis(1500))
+            .timeout(Duration::from_millis(timeout_ms))
             .send()
             .await?
             .json::<serde_json::Value>()
