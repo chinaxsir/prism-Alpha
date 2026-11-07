@@ -300,6 +300,9 @@ export interface GoLanSettings {
   deviceCode: string;
   cachedManagedOutbound?: unknown | null;
   homeName?: string | null;
+  /** 【APP56 任务3】档案 id → 本档案自身网段是否命中物理 WiFi（严禁跨档案聚合） */
+  goLanProfileDirectMap?: Record<string, boolean>;
+  goLanAnyDirect?: boolean;
 }
 
 /** 规范化单个档案：字段缺失时给出合法默认值，避免渲染期 undefined 崩溃 */
@@ -342,6 +345,12 @@ export const normalizeGoLanSettings = (raw: GoLanSettings | null): GoLanSettings
     deviceCode: typeof r.deviceCode === "string" ? r.deviceCode : "",
     cachedManagedOutbound: r.cachedManagedOutbound ?? null,
     homeName: r.homeName ?? null,
+    // 【APP56 任务3】保留后端逐档案直连映射（UI 只读本档案 id 对应值）
+    goLanProfileDirectMap:
+      r.goLanProfileDirectMap && typeof r.goLanProfileDirectMap === "object"
+        ? r.goLanProfileDirectMap
+        : {},
+    goLanAnyDirect: r.goLanAnyDirect === true,
   };
 };
 

@@ -408,10 +408,6 @@ export default function GoLanModal({ open, onClose }: Props) {
   /** 【APP52 任务3】非标准 WG 配置的内联红色提示（尝试启用/保存时点亮） */
   const [wgHint, setWgHint] = useState(false);
 
-  /** 当前档案的运行状态徽章（⚡ 直连中 / 🔒 隧道） */
-  const statusOf = (id: string): GoLanStatus["profiles"][number] | undefined =>
-    status?.profiles.find((p) => p.id === id);
-
   /** 把当前表单回写进 profiles（切换标签/保存前调用） */
   const mergeActiveForm = (list: GoLanProfile[]): GoLanProfile[] =>
     list.map((p) => (p.id === form.id ? formToProfile(form, p) : p));
@@ -883,13 +879,12 @@ export default function GoLanModal({ open, onClose }: Props) {
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
             {profiles.map((p) => {
-              const st = statusOf(p.id);
-              // 【APP55 任务3】多隧道精准直连：仅当本档案开启 On-Demand 且
-              // 自身网段命中才显示 ⚡，未命中的隧道保持 🔒
+              // 【APP55 任务3 / APP56 任务3】多隧道精准直连：严格只读本档案 id
+              // 对应的直连结果，禁止全局 goLanAnyDirect 串染到其它隧道
               const direct = Boolean(
-                p.bypassOnLocalLan &&
-                  (status?.goLanProfileDirectMap?.[p.id] === true ||
-                    st?.isDirect === true)
+                p.enabled &&
+                  p.bypassOnLocalLan &&
+                  status?.goLanProfileDirectMap?.[p.id] === true,
               );
               const on = p.id === form.id ? form.enabled : p.enabled;
               return (
@@ -915,7 +910,7 @@ export default function GoLanModal({ open, onClose }: Props) {
                       {t("goLan.statusDirect")}
                     </span>
                   )}
-                  {on && !direct && st && (
+                  {on && !direct && status && (
                     <span className="whitespace-nowrap text-sky-300">
                       {t("goLan.statusTunnel")}
                     </span>

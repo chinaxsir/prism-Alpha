@@ -23,8 +23,15 @@ function loadNodeMetricsMirror(): NodeMetricsMirror {
     const raw = localStorage.getItem(NODE_METRICS_KEY);
     if (!raw) return { delays: {}, updatedAt: 0 };
     const parsed = JSON.parse(raw) as Partial<NodeMetricsMirror>;
-    const delays =
+    const src =
       parsed.delays && typeof parsed.delays === "object" ? parsed.delays : {};
+    // 【APP56 任务2】初始化读取时清除历史 `< 5 ms` 虚假延迟（回环 / FakeIP）
+    const delays: Record<string, number> = {};
+    for (const [name, d] of Object.entries(src)) {
+      if (typeof d !== "number") continue;
+      if (d > 0 && d < 5) continue;
+      delays[name] = d;
+    }
     return { delays, updatedAt: parsed.updatedAt ?? 0 };
   } catch {
     return { delays: {}, updatedAt: 0 };
@@ -436,8 +443,13 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   setSubscriptions: (subscriptions) => set({ subscriptions }),
 
   mergeNodeDelays: (next) => {
-    if (Object.keys(next).length === 0) return;
-    const merged = { ...get().nodeDelays, ...next };
+    // 【APP56 任务2】写入前再次拦截 `< 5 ms` 假值，保证镜像永不存 1ms
+    const clean: Record<string, number> = {};
+    for (const [name, d] of Object.entries(next)) {
+      if (typeof d === "number" && !(d > 0 && d < 5)) clean[name] = d;
+    }
+    if (Object.keys(clean).length === 0) return;
+    const merged = { ...get().nodeDelays, ...clean };
     set({ nodeDelays: merged });
     saveNodeMetricsMirror(merged);
   },

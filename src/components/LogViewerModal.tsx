@@ -29,14 +29,10 @@ import {
  * - 打开期间每 2 秒自动轮询
  */
 
-/** 「仅看异常」分类的内部标识（非后端模块名） */
-const ERRORS_FILTER = "__errors__";
-
-/** 【APP55 任务5】精确分类筛选胶囊：全部 / 内核 / 节点 / 规则 /
- *  Go AIM / Go Lan / Go Cus / 订阅 / 仅看异常。
- *  value 与后端 module 字段严格一一对应，禁止前端模糊归类。 */
-const CATEGORY_TABS: { key: string; value: string | null; labelKey: string }[] = [
-  { key: "all", value: null, labelKey: "logs.filterAll" },
+/** 【APP56 任务4】固定 7 个独立分类标签（无「全部」混合视图）：
+ *  内核（默认选中）/ 节点 / 规则 / Go AIM / Go Lan / Go Cus / 订阅。
+ *  value 与后端强制分类后的 module 字段严格一一对应。 */
+const CATEGORY_TABS: { key: string; value: string; labelKey: string }[] = [
   { key: "kernel", value: "Kernel", labelKey: "logs.filterKernel" },
   { key: "node", value: "Node", labelKey: "logs.filterNode" },
   { key: "rule", value: "Rule", labelKey: "logs.filterRule" },
@@ -44,7 +40,17 @@ const CATEGORY_TABS: { key: string; value: string | null; labelKey: string }[] =
   { key: "golan", value: "GoLan", labelKey: "logs.filterGoLan" },
   { key: "gocus", value: "GoCus", labelKey: "logs.filterGoCus" },
   { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
-  { key: "errors", value: ERRORS_FILTER, labelKey: "logs.filterErrors" },
+];
+
+/** 导出章节标题（与后端 export_logs 章节完全一致） */
+const EXPORT_SECTIONS: { value: string; title: string }[] = [
+  { value: "Kernel", title: "=== [内核 Kernel] ===" },
+  { value: "Node", title: "=== [节点 Node] ===" },
+  { value: "Rule", title: "=== [规则 Rule] ===" },
+  { value: "GoAIM", title: "=== [Go AIM] ===" },
+  { value: "GoLan", title: "=== [Go Lan] ===" },
+  { value: "GoCus", title: "=== [Go Cus] ===" },
+  { value: "Sub", title: "=== [订阅 Sub] ===" },
 ];
 
 interface LogViewerModalProps {
@@ -106,7 +112,8 @@ export default function LogViewerModal({
   refreshSignal = 0,
 }: LogViewerModalProps) {
   const { t } = useTranslation();
-  const [activeModule, setActiveModule] = useState<string | null>(initialModule);
+  // 【APP56 任务4】默认选中「内核」，不存在「全部」混合视图
+  const [activeModule, setActiveModule] = useState<string>(initialModule ?? "Kernel");
   const [entries, setEntries] = useState<AppLogEntry[]>([]);
   const [totalBytes, setTotalBytes] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -131,20 +138,23 @@ export default function LogViewerModal({
     [],
   );
 
-  /** 【APP55 任务5】严格分类：仅异常按 WARN/ERROR 级别过滤，
-   *  其余类别要求 module 与分类值完全相等（大小写不敏感） */
-  const visibleEntries = useMemo(() => {
-    if (activeModule === ERRORS_FILTER) {
-      return entries.filter((e) =>
-        /^(WARN|ERROR)$/i.test((e.level ?? "").trim())
-      );
+  /** 【APP56 任务4】列表 100% 仅渲染 `entry.module === activeModule` 的日志：
+   *  7 个分类互不混杂，绝不做模糊包含或兜底展示 */
+  const visibleEntries = useMemo(
+    () => entries.filter((e) => (e.module ?? "Kernel").trim() === activeModule),
+    [entries, activeModule],
+  );
+
+  /** 每个分类标签的实时条数（来自同一次全量拉取） */
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const tab of CATEGORY_TABS) counts[tab.value] = 0;
+    for (const e of entries) {
+      const key = (e.module ?? "Kernel").trim();
+      if (key in counts) counts[key] += 1;
     }
-    if (activeModule === null) return entries;
-    const target = activeModule.toLowerCase();
-    return entries.filter(
-      (e) => (e.module ?? "Kernel").trim().toLowerCase() === target
-    );
-  }, [entries, activeModule]);
+    return counts;
+  }, [entries]);
 
   // 打开期间每 2 秒轮询（activeModule/refreshSignal 变化时立即重拉）
   useEffect(() => {
@@ -185,11 +195,16 @@ export default function LogViewerModal({
     lines.push(t("logs.exportHeader"));
     lines.push(t("logs.exportTime", { time: ts }));
     lines.push(t("logs.exportCount", { count: entries.length }));
-    if (activeModule) lines.push(t("logs.exportModule", { module: activeModule }));
     lines.push("===============================================");
     lines.push("");
-    for (const e of entries) {
-      lines.push(`[${e.timestamp}][${e.level}][${e.module}] ${e.message}`);
+    // 【APP56 任务4】导出严格按 7 个分类分章节，杜绝跨分类混杂
+    for (const section of EXPORT_SECTIONS) {
+      lines.push(section.title);
+      for (const e of entries) {
+        if ((e.module ?? "Kernel").trim() !== section.value) continue;
+        lines.push(`[${e.timestamp}][${e.level}][${e.module}] ${e.message}`);
+      }
+      lines.push("");
     }
     const exportText = lines.join("\n");
 
@@ -287,21 +302,23 @@ export default function LogViewerModal({
           </div>
         </div>
 
-        {/* 分类筛选 chips（全部/内核/Go Lan/Go AIM/订阅/仅看异常）：
-            flex-wrap 自动换行，最右侧标签不被截断 */}
-        <div className="flex shrink-0 flex-wrap gap-1.5 border-b border-border px-3 py-2 text-xs">
+        {/* 【APP56 任务4】固定 7 个独立分类标签（无「全部」），每个标签显示实时条数 */}
+        <div className="grid shrink-0 grid-cols-4 gap-1.5 border-b border-border px-3 py-2 text-xs">
           {CATEGORY_TABS.map((tab) => (
             <button
               key={tab.key}
               onClick={() => setActiveModule(tab.value)}
               className={clsx(
-                "shrink-0 rounded-full px-3 py-1 transition-colors",
+                "flex min-w-0 items-center justify-center gap-1 rounded-full px-2 py-1 transition-colors",
                 activeModule === tab.value
                   ? "bg-accent text-white"
                   : "bg-surface-hover text-gray-400 hover:text-gray-200",
               )}
             >
-              {t(tab.labelKey)}
+              <span className="truncate">{t(tab.labelKey)}</span>
+              <span className="shrink-0 rounded-full bg-black/20 px-1.5 py-0.5 text-[10px] leading-none">
+                {categoryCounts[tab.value] ?? 0}
+              </span>
             </button>
           ))}
         </div>

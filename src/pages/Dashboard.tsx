@@ -506,10 +506,10 @@ export default function Dashboard() {
       ? t("dashboard.lan.profiles", {
           profiles: enabledLanProfiles
             .map((p) => {
-              const st = lanState?.profiles.find((x) => x.id === p.id);
-              const isDirect =
-                p.bypassOnLocalLan === true &&
-                (lanDirectMap[p.id] === true || st?.isDirect === true);
+              // 【APP56 任务3】严格只读本档案 id 的直连结果，禁止任何跨档案聚合
+              const isDirect = Boolean(
+                p.enabled && p.bypassOnLocalLan && lanDirectMap[p.id] === true,
+              );
               const badge = isDirect
                 ? t("goLan.statusDirect")
                 : t("goLan.statusTunnel");

@@ -507,74 +507,6 @@ pub fn split_profile_cidrs_for_on_demand(
     (tunnel, direct)
 }
 
-/// 【APP53 任务1.3】同步判定：档案是否应标记为「局域网直连」（CIDR 匹配 + bypass 开关）。
-/// 网关可达性探测（跨 VLAN 场景）由调用方在 async 上下文中额外补充检测。
-pub fn evaluate_profile_lan_direct_state(
-    profile: &GoLanProfile,
-    phys_wifi_ips: &[std::net::Ipv4Addr],
-) -> bool {
-    if !profile.enabled || !profile.bypass_on_local_lan {
-        return false;
-    }
-    let (_tunnel, direct) = split_profile_cidrs_for_on_demand(profile, phys_wifi_ips);
-    !direct.is_empty()
-}
-
-/// 从 CIDR 生成常见网关候选（.1 / .254）
-fn gateway_candidates_from_cidr(cidr: &str) -> Option<String> {
-    let (base, _prefix) = cidr.split_once('/')?;
-    let mut parts = base.split('.').filter_map(|p| p.parse::<u8>().ok()).collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return None;
-    }
-    let last = parts[3];
-    let candidates = match last {
-        0..=2 => [1u8, 254],
-        _ => [1, 254],
-    };
-    for c in candidates {
-        parts[3] = c;
-        let s = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3]);
-        if s != base {
-            return Some(s);
-        }
-    }
-    None
-}
-
-/// 【APP53 任务1.3】跨档案聚合网关候选（优先 probe_target，否则 lan_cidrs 的网关）。
-pub fn gateway_candidates_from_candidates(
-    profile: &GoLanProfile,
-    _lan_settings: &GoLanSettings,
-) -> Option<std::net::SocketAddr> {
-    let default_port: u16 = 5000;
-    if !profile.probe_target.trim().is_empty() {
-        let (h, p) = split_host_port_safe(&profile.probe_target, default_port);
-        if let Ok(addr) = format!("{h}:{p}").parse::<std::net::SocketAddr>() {
-            return Some(addr);
-        }
-    }
-    for cidr in crate::core::go_lan::profile_route_cidrs(profile) {
-        if let Some(gw_host) = gateway_candidates_from_cidr(&cidr) {
-            if let Ok(addr) = format!("{gw_host}:{default_port}").parse::<std::net::SocketAddr>() {
-                return Some(addr);
-            }
-        }
-    }
-    None
-}
-
-/// "host:port" 安全拆分：非法 host 返回 ("", default_port)
-fn split_host_port_safe(target: &str, default_port: u16) -> (String, u16) {
-    if let Some((h, p)) = target.rsplit_once(':') {
-        let h = h.trim().to_string();
-        let port = p.parse::<u16>().unwrap_or(default_port);
-        (h, port)
-    } else {
-        (target.trim().to_string(), default_port)
-    }
-}
-
 /// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4。
 /// 过滤 utun / tun / ppp / wg / loopback / 172.19.0.x / 169.254.x.x /
 /// WireGuard 虚拟地址 10.196.0.2 与 fake-ip 198.18/15。
@@ -752,70 +684,47 @@ fn is_virtual_iface_name(name: &str) -> bool {
     .any(|k| n.starts_with(k))
 }
 
-/// 【APP54 任务1】判定档案是否应标记「⚡ 直连」：
-/// - 条件 A：本机物理局域网地址命中该档案内网网段（同子网直连）；
-/// - 条件 B：跨 VLAN 但物理局域网内可达——探针目标/网关在 35ms 内 TCP 可达，
-///   且目标必须是私网地址（公网目标绝不触发直连）。
-/// 同步实现：35ms 上限，最多若干候选，调用方应在 blocking 线程执行。
+/// 【APP56 任务3】100% 精确、无交叉污染的单隧道直连判定：
+/// 只认「该隧道自身配置的 lan_cidrs」与本机物理局域网地址的同网段命中，
+/// 严禁读取全局运行时状态、网关 TCP 探测、其他隧道或顶层网段。
 pub fn is_profile_lan_direct_active(
     profile: &GoLanProfile,
     physical_wifi_ips: &[std::net::Ipv4Addr],
 ) -> bool {
+    // 1. 该隧道自身已启用且自身开启 On-Demand 局域网直连
     if !profile.enabled || !profile.bypass_on_local_lan {
         return false;
     }
-    let (_tunnel, direct) = split_profile_cidrs_for_on_demand(profile, physical_wifi_ips);
-    if !direct.is_empty() {
-        return true;
-    }
-    // 条件 B 依赖本机确实存在物理局域网地址（否则只有 TUN 地址，探测无意义）
+    // 2. 本机必须真的连接在物理 Wi-Fi / 以太网（蜂窝数据下为空）
     if physical_wifi_ips.is_empty() {
         return false;
     }
-    let default_port: u16 = 5000;
-    let mut targets: Vec<std::net::SocketAddr> = Vec::new();
-    if !profile.probe_target.trim().is_empty() {
-        let (host, port) = split_host_port_safe(&profile.probe_target, default_port);
-        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
-            && is_private_lan_target(ip)
-        {
-            targets.push(std::net::SocketAddr::from((ip, port)));
+    // 该隧道自身的 WG 虚拟接口 IP（10.196.0.x 之类），用于跳过虚拟握手网段
+    let wg_virtual_ip: Option<std::net::Ipv4Addr> = profile
+        .wg_config
+        .as_ref()
+        .and_then(|wg| wg.local_ip.split(',').next())
+        .and_then(|s| s.trim().split('/').next())
+        .and_then(|ip_str| ip_str.trim().parse::<std::net::Ipv4Addr>().ok());
+
+    // 3. 严格只检查当前这一个 profile 自己配置的 lan_cidrs
+    for cidr_raw in &profile.lan_cidrs {
+        let cidr = cidr_raw.trim();
+        if cidr.is_empty() {
+            continue;
         }
-    }
-    for cidr in profile_route_cidrs(profile) {
-        if let Some(gw) = gateway_candidates_from_cidr(&cidr)
-            && let Ok(ip) = gw.parse::<std::net::Ipv4Addr>()
-            && is_private_lan_target(ip)
+        if let Some(virt_ip) = wg_virtual_ip
+            && ipv4_in_any_cidr(virt_ip, std::slice::from_ref(&cidr.to_string()))
         {
-            targets.push(std::net::SocketAddr::from((ip, default_port)));
+            continue;
         }
-    }
-    for addr in targets {
-        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(35))
-            .is_ok()
-        {
-            return true;
+        for &wifi_ip in physical_wifi_ips {
+            if ipv4_in_any_cidr(wifi_ip, std::slice::from_ref(&cidr.to_string())) {
+                return true;
+            }
         }
     }
     false
-}
-
-/// 私网探测目标（排除 loopback / 链路本地 / fake-ip / WG 虚拟地址 / 公网）
-fn is_private_lan_target(ip: std::net::Ipv4Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
-        return false;
-    }
-    let o = ip.octets();
-    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-        return false;
-    }
-    if o[0] == 172 && o[1] == 19 {
-        return false;
-    }
-    if ip.to_string() == "10.196.0.2" {
-        return false;
-    }
-    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]) || (o[0] == 192 && o[1] == 168))
 }
 
 /// 【APP44 任务6】判定是否可作为「本机局域网地址」展示 / 用于 On-Demand 判定：
@@ -2941,7 +2850,6 @@ pub async fn sync_managed(app: &AppHandle) -> Result<GoLanSettings, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     /// 生成确定性的合法 32 字节 WireGuard 密钥（标准 44 位 Base64）
     fn test_key(seed: u8) -> String {

@@ -805,13 +805,27 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 【APP52 任务1】读取节点指标缓存；文件缺失/损坏一律回退空缓存，绝不阻塞启动
+/// 【APP56 任务2】虚假延迟清洗：`0 < delay < 5` 必为本机回环 / FakeIP 假值，
+/// 一律归为超时 0，杜绝列表出现 `1 ms`。
+pub fn sanitize_fake_delay(delay: u32) -> u32 {
+    if delay > 0 && delay < 5 { 0 } else { delay }
+}
+
+/// 【APP52 任务1】读取节点指标缓存；文件缺失/损坏一律回退空缓存，绝不阻塞启动。
+/// 【APP56 任务2】加载时立即清洗历史 `< 5 ms` 的虚假延迟（回环 SYN-ACK 假值）。
 pub fn load_node_metrics(data_dir: &std::path::Path) -> PersistedNodeMetrics {
     let path = data_dir.join("node_metrics_cache.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return PersistedNodeMetrics::default();
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    let mut metrics: PersistedNodeMetrics = serde_json::from_str(&text).unwrap_or_default();
+    metrics
+        .delays
+        .retain(|_, d| *d == 0 || *d >= 5);
+    for d in metrics.delays.values_mut() {
+        *d = sanitize_fake_delay(*d);
+    }
+    metrics
 }
 
 /// 【APP52 任务1】原子写入节点指标缓存（先 .tmp 再 rename）
@@ -926,8 +940,9 @@ mod app52_tests {
         let mut metrics = PersistedNodeMetrics::default();
         for i in 0..102u32 {
             let name = format!("node-{i:03}");
-            // 每 10 个制造一个超时（0），其余给出 1..=102ms 的真实延迟
-            let delay = if i % 10 == 9 { 0 } else { i + 1 };
+            // 每 10 个制造一个超时（0），其余给出 5..=106ms 的真实延迟
+            // （【APP56 任务2】`< 5ms` 一律视为虚假延迟，加载时清洗）
+            let delay = if i % 10 == 9 { 0 } else { i + 5 };
             metrics.delays.insert(name, delay);
         }
         save_node_metrics(&dir, &metrics).unwrap();
@@ -944,6 +959,38 @@ mod app52_tests {
         assert!(keys.windows(2).take(91).all(|w| w[0] <= w[1]), "升序稳定");
         assert_eq!(keys.iter().filter(|d| **d == 0).count(), 10, "超时节点置底");
         assert_eq!(node_delay_sort_key(None), (1, 0), "未测速居中");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【APP56 任务2】`0 < delay < 5` 的虚假延迟（本机回环 SYN-ACK / FakeIP）
+    /// 加载时必须被清洗为超时 0，列表中绝不再出现 `1 ms`。
+    #[test]
+    fn test_sub_five_ms_fake_delay_is_purged_on_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism_app56_fake_delay_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut metrics = PersistedNodeMetrics::default();
+        metrics.delays.insert("fake-1ms".into(), 1);
+        metrics.delays.insert("fake-4ms".into(), 4);
+        metrics.delays.insert("real-5ms".into(), 5);
+        metrics.delays.insert("real-120ms".into(), 120);
+        metrics.delays.insert("timeout".into(), 0);
+        save_node_metrics(&dir, &metrics).unwrap();
+        let restored = load_node_metrics(&dir);
+        assert!(!restored.delays.contains_key("fake-1ms"));
+        assert!(!restored.delays.contains_key("fake-4ms"));
+        assert_eq!(restored.delays.get("real-5ms"), Some(&5));
+        assert_eq!(restored.delays.get("real-120ms"), Some(&120));
+        assert_eq!(restored.delays.get("timeout"), Some(&0));
+        assert_eq!(sanitize_fake_delay(1), 0);
+        assert_eq!(sanitize_fake_delay(4), 0);
+        assert_eq!(sanitize_fake_delay(5), 5);
+        assert_eq!(sanitize_fake_delay(0), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

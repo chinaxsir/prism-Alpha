@@ -2222,7 +2222,15 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
     // 【APP52 任务1】注入持久化延迟并全局按延迟升序排列：
     // 实测 >0 升序 → 未测速居中 → 超时(0) 置底。切换页面 / 重启 APP 后顺序不变。
     {
-        let delays = state.node_metrics.read().delays.clone();
+        // 【APP56 任务2】下发前清洗 `< 5 ms` 虚假延迟（回环 SYN-ACK / FakeIP）
+        let delays: std::collections::HashMap<String, u32> = state
+            .node_metrics
+            .read()
+            .delays
+            .iter()
+            .filter(|(_, d)| **d == 0 || **d >= 5)
+            .map(|(n, d)| (n.clone(), *d))
+            .collect();
         for p in out.iter_mut() {
             p.delay = delays.get(&p.name).copied();
         }
@@ -2380,28 +2388,23 @@ async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
     out
 }
 
-/// 依次尝试预解析 IP 的 TCP 握手（单 IP 2000ms 超时）
-async fn tcp_connect_ips(
-    ips: &[std::net::Ipv4Addr],
-    port: u16,
-    timeout_ms: u32,
-) -> Option<u64> {
-    for ip in ips.iter().take(4) {
-        let start = std::time::Instant::now();
-        let fut = tokio::net::TcpStream::connect(std::net::SocketAddr::from((*ip, port)));
-        if let Ok(Ok(_)) =
-            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut).await
-        {
-            return Some(start.elapsed().as_millis().max(1) as u64);
+/// 【APP56 任务2】预览 / Clash API 未命中时的真实公网 TLS 握手测速（重试 1 次）。
+/// 任何 `< 5 ms` 结果都会被 `measure_tls_handshake_delay` 拒绝，最终记为超时 0。
+async fn measure_tls_fallback(n: &CachedProxyDto, timeout_ms: u64) -> u32 {
+    let ips = resolve_server_ipv4s(&n.server).await;
+    for _ in 0..2 {
+        if let Some(v) = measure_tls_handshake_delay(&ips, n.port, &n.server, timeout_ms).await {
+            return v as u32;
         }
     }
-    None
+    0
 }
 
 /// 【APP54 任务2/4】全量测速：100% 覆盖全部节点并升序持久化。
-/// - 第一步：去重服务器域名 20 路并发预解析（系统 DNS + 阿里/腾讯 DoH）；
-/// - 第二步：20 路并发滑动窗口逐节点测速（运行中 Clash API 2200ms，
-///   失败/未运行回退预解析 IPv4 TCP 2000ms，超时重试 1 次）；
+/// - 第一步：去重服务器域名 20 路并发预解析（系统 DNS + 阿里/腾讯 DoH，
+///   只保留通过 `is_valid_public_server_ipv4` 校验的真实公网地址）；
+/// - 第二步：20 路并发滑动窗口逐节点测速（运行中 Clash API 2500ms，
+///   失败/未运行回退「真实公网 IP + TLS ClientHello 握手」3000ms，超时重试 1 次）；
 /// - 每节点写入延迟缓存（超时记 0），每 6 个落盘，每 3 个推送增量；
 /// - 完成后未手动选点则自动切换到最低延迟节点。
 /// 任何情况下都绝不清空已有延迟缓存（切页/启停/重启不丢失）。
@@ -2458,36 +2461,19 @@ pub async fn test_all_delays(
                 let api = api.clone();
                 async move {
                     let d = if running {
-                        // 内核运行：真实隧道 gstatic generate_204 2200ms
+                        // 内核运行：真实隧道 gstatic generate_204 2500ms；
+                        // `< 5 ms` 视为假值不采纳，回退 TLS 真握手
                         if let Some(d) = api
-                            .test_delay(&n.name, "http://www.gstatic.com/generate_204", 2200)
+                            .test_delay(&n.name, "http://www.gstatic.com/generate_204", 2500)
                             .await
-                            .filter(|d| *d > 0)
+                            .filter(|d| *d >= 5)
                         {
                             d as u32
                         } else {
-                            // 失败回退预解析 IPv4 TCP 握手（2000ms，重试 1 次）
-                            let ips = resolve_server_ipv4s(&n.server).await;
-                            let mut d = 0u32;
-                            for _ in 0..2 {
-                                if let Some(v) = tcp_connect_ips(&ips, n.port, 2000).await {
-                                    d = v as u32;
-                                    break;
-                                }
-                            }
-                            d
+                            measure_tls_fallback(&n, 3000).await
                         }
                     } else {
-                        // 未运行：直接 IPv4 + 端口 TCP 握手（2000ms，重试 1 次）
-                        let ips = resolve_server_ipv4s(&n.server).await;
-                        let mut d = 0u32;
-                        for _ in 0..2 {
-                            if let Some(v) = tcp_connect_ips(&ips, n.port, 2000).await {
-                                d = v as u32;
-                                break;
-                            }
-                        }
-                        d
+                        measure_tls_fallback(&n, 3000).await
                     };
                     (n.name, d)
                 }
@@ -2636,19 +2622,36 @@ pub async fn test_cached_proxies(
     Ok(serde_json::Value::Object(map))
 }
 
+/// 【APP56 任务2】严格公网服务器 IPv4 校验：只接受真实公网地址。
+/// 排除 loopback / private / link-local / unspecified / broadcast，
+/// 以及 FakeIP 198.18.0.0/15、CGNAT 100.64.0.0/10、TUN 172.19.0.0/16。
+/// 测速只允许连接通过本校验的地址——本机内存里完成握手的假地址一律拒绝。
+fn is_valid_public_server_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    if ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+    {
+        return false;
+    }
+    if (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+    {
+        return false;
+    }
+    if o[0] == 172 && o[1] == 19 {
+        return false;
+    }
+    true
+}
+
 /// FakeIP / TUN / WireGuard 虚拟网段判定（测速解析结果必须经此过滤，
 /// 否则 198.18.x.x 会给出 2ms 假延迟）
 fn is_virtual_speedtest_ip(ip: std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            if v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() {
-                return true;
-            }
-            let o = v4.octets();
-            (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || (o[0] == 172 && o[1] == 19)
-                || (o[0] == 10 && o[1] == 196)
-        }
+        std::net::IpAddr::V4(v4) => !is_valid_public_server_ipv4(v4),
         std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
     }
 }
@@ -2711,25 +2714,97 @@ async fn resolve_real_ipv4s(
     out
 }
 
+/// 【APP56 任务2】构造最小 TLS 1.2 ClientHello（携带 SNI）。
+/// 仅用于向真实公网服务器发起一次真实握手往返，不校验证书。
+fn build_tls_client_hello(sni: &str) -> Vec<u8> {
+    let host = if sni.trim().is_empty() { "localhost" } else { sni.trim() };
+    let host_bytes = host.as_bytes();
+    // SNI extension body: server_name_list
+    let mut sni_ext = Vec::with_capacity(host_bytes.len() + 5);
+    let list_len = (host_bytes.len() + 3) as u16;
+    sni_ext.extend_from_slice(&list_len.to_be_bytes());
+    sni_ext.push(0x00); // host_name
+    sni_ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+    sni_ext.extend_from_slice(host_bytes);
+    // extension: type 0x0000 (server_name) + len
+    let mut extensions = Vec::with_capacity(sni_ext.len() + 4);
+    extensions.extend_from_slice(&0u16.to_be_bytes());
+    extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&sni_ext);
+
+    let mut body = Vec::with_capacity(64 + extensions.len());
+    body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+    body.extend_from_slice(&[0x11u8; 32]); // client random（内容无需真实）
+    body.push(0x00); // session id length
+    let suites: &[u8] = &[
+        0xc0, 0x2f, 0xc0, 0x2b, 0xc0, 0x30, 0xc0, 0x2c, 0xcc, 0xa8, 0x13, 0x01, 0x13, 0x02,
+    ];
+    body.extend_from_slice(&(suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(suites);
+    body.push(0x01); // compression methods length
+    body.push(0x00); // null compression
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::with_capacity(body.len() + 4);
+    handshake.push(0x01); // client_hello
+    let blen = body.len() as u32;
+    handshake.push((blen >> 16) as u8);
+    handshake.push((blen >> 8) as u8);
+    handshake.push(blen as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::with_capacity(handshake.len() + 5);
+    record.push(0x16); // handshake record
+    record.extend_from_slice(&[0x03, 0x01]); // record version
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// 【APP56 任务2】真实公网 TCP + TLS 握手往返测速（严禁产生 `< 5 ms` 假值）：
+/// 1. 按顺序尝试预解析出的合法公网 IPv4（最多 4 个）；
+/// 2. TCP 建连后立即发送 TLS ClientHello，读取服务端返回的首个 TLS 记录字节，
+///    确保数据包真正跨越公网到达远端并返回，而非本机网卡伪造的 SYN-ACK；
+/// 3. 总耗时 `< 5 ms`（低于物理光纤极限的本机回环真值）一律拒绝并记为超时。
+async fn measure_tls_handshake_delay(
+    ips: &[std::net::Ipv4Addr],
+    port: u16,
+    sni: &str,
+    timeout_ms: u64,
+) -> Option<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hello = build_tls_client_hello(sni);
+    for ip in ips.iter().take(4) {
+        let start = std::time::Instant::now();
+        let addr = std::net::SocketAddr::from((*ip, port));
+        let probe = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+            stream.write_all(&hello).await.ok()?;
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await.ok()?;
+            if n == 0 { None } else { Some(()) }
+        };
+        if let Ok(Some(())) =
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), probe).await
+        {
+            let ms = start.elapsed().as_millis() as u64;
+            // 硬性防假校验：低于 5ms 视为本机回环 / FakeIP 干扰，不予采纳
+            if ms >= 5 {
+                return Some(ms);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn measure_offline_node_delay(
     server: &str,
     port: u16,
     timeout_ms: u32,
 ) -> Option<u64> {
     let ips = resolve_real_ipv4s(server, port, timeout_ms).await;
-    for ip in ips.into_iter().take(4) {
-        let start = std::time::Instant::now();
-        let fut = tokio::net::TcpStream::connect(std::net::SocketAddr::from((ip, port)));
-        if let Ok(Ok(_)) = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms as u64),
-            fut,
-        )
-        .await
-        {
-            return Some(start.elapsed().as_millis().max(1) as u64);
-        }
-    }
-    None
+    measure_tls_handshake_delay(&ips, port, server, timeout_ms as u64).await
 }
 
 /// 获取自定义规则（规则页编辑器；Clash 行格式，顺序即优先级）
@@ -3694,6 +3769,8 @@ pub async fn get_proxy_groups(
             }
         }
     }
+    // 【APP56 任务2】下发前清洗 `< 5 ms` 虚假延迟（本机回环 / FakeIP）
+    effective.retain(|_, d| *d == 0 || *d >= 5);
     if let Some(proxies) = resp.get_mut("proxies").and_then(|v| v.as_object_mut()) {
         for info in proxies.values_mut() {
             let Some(all) = info.get_mut("all").and_then(|v| v.as_array_mut()) else {
@@ -4512,5 +4589,54 @@ mod app51_tests {
         );
         assert_eq!(fallback_selected_node(None, &valid).as_deref(), Some("香港01"));
         assert_eq!(fallback_selected_node(Some("任意"), &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod app56_tests {
+    use super::{build_tls_client_hello, is_valid_public_server_ipv4};
+    use std::net::Ipv4Addr;
+
+    /// 【APP56 任务2】测速防假：回环 / 私有 / 链路本地 / FakeIP / CGNAT / TUN
+    /// 地址一律不得作为测速目标，杜绝本机内存握手产生 `1 ms`。
+    #[test]
+    fn test_speedtest_rejects_fake_and_loopback_ipv4() {
+        for ip in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "198.18.0.1",
+            "198.19.0.1",
+            "100.64.0.1",
+            "172.19.0.1",
+            "255.255.255.255",
+        ] {
+            let addr: Ipv4Addr = ip.parse().unwrap();
+            assert!(
+                !is_valid_public_server_ipv4(addr),
+                "{ip} 必须被判定为不可用于测速"
+            );
+        }
+        for ip in ["1.1.1.1", "223.5.5.5", "8.8.8.8", "104.16.0.1"] {
+            let addr: Ipv4Addr = ip.parse().unwrap();
+            assert!(is_valid_public_server_ipv4(addr), "{ip} 是合法公网地址");
+        }
+    }
+
+    /// 【APP56 任务2】ClientHello 结构合法：TLS handshake record + 携带 SNI 主机名。
+    #[test]
+    fn test_tls_client_hello_contains_sni() {
+        let hello = build_tls_client_hello("example.com");
+        assert_eq!(hello[0], 0x16, "必须是 TLS handshake record");
+        assert_eq!(hello[1], 0x03, "TLS record major version");
+        let len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(len, hello.len() - 5, "record length 必须与负载一致");
+        assert!(
+            hello.windows(11).any(|w| w == b"example.com"),
+            "ClientHello 必须携带 SNI 主机名"
+        );
     }
 }

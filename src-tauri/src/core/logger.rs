@@ -114,6 +114,82 @@ fn now_timestamp() -> String {
     beijing_now_string()
 }
 
+/// 【APP56 任务4】统一强制分类归属器：无论调用方传入什么 `raw_category`，
+/// 每条日志只能且必须归入唯一一个精准分类（严禁混在 Kernel 一起输出）：
+/// - `"GoLan"`：raw=GoLan，或消息含 Go Lan / GoLan / go-lan / wireguard /
+///   内网 / 隧道 / On-Demand；
+/// - `"GoAIM"`：raw=GoAIM，或消息含 Go AIM / GoAIM / AIM / GO-AIM-PROBE /
+///   aim-probe / AI/流媒体 / 解锁；
+/// - `"GoCus"`：raw=GoCus，或消息含 Go Cus / GoCus / 覆写 / 去广告 / 模板；
+/// - `"Rule"`：raw=Rule，或消息含 `[规则` / 规则命中 / 路由规则 / 分流模式 /
+///   match rule / `route(`；
+/// - `"Node"`：raw=Node，或消息含 `[节点` / `[握手` / `[连接成功]` /
+///   `[流量开始转发]` / 测速 / outbound/vless|trojan|vmess|shadowsocks|hysteria|tuic；
+/// - `"Sub"`：raw=Sub，或消息含 订阅 / `[Sub]`；
+/// - `"Kernel"`：其余纯内核启停 / TUN 网卡 / DNS / 底层状态日志。
+pub fn enforce_strict_log_category(raw_category: &str, message: &str) -> &'static str {
+    let raw = raw_category.trim();
+    let lower = message.to_lowercase();
+    let hit = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+
+    // 1. GoLan（优先级最高：隧道/内网日志常带 wireguard 字样）
+    if raw.eq_ignore_ascii_case(MOD_GO_LAN)
+        || hit(&["go lan", "golan", "go-lan", "wireguard", "内网", "隧道", "on-demand"])
+    {
+        return MOD_GO_LAN;
+    }
+    // 2. Go AIM
+    if raw.eq_ignore_ascii_case(MOD_GO_AIM)
+        || hit(&[
+            "go aim",
+            "goaim",
+            "aim",
+            "go-aim-probe",
+            "aim-probe",
+            "ai/流媒体",
+            "解锁",
+        ])
+    {
+        return MOD_GO_AIM;
+    }
+    // 3. Go Cus
+    if raw.eq_ignore_ascii_case(MOD_GO_CUS)
+        || hit(&["go cus", "gocus", "覆写", "去广告", "模板"])
+    {
+        return MOD_GO_CUS;
+    }
+    // 4. Rule
+    if raw.eq_ignore_ascii_case(MOD_RULE)
+        || hit(&["[规则", "规则命中", "路由规则", "分流模式", "match rule", "route("])
+    {
+        return MOD_RULE;
+    }
+    // 5. Node
+    if raw.eq_ignore_ascii_case(MOD_NODE)
+        || hit(&[
+            "[节点",
+            "[握手",
+            "[连接成功]",
+            "[流量开始转发]",
+            "测速",
+            "outbound/vless",
+            "outbound/trojan",
+            "outbound/vmess",
+            "outbound/shadowsocks",
+            "outbound/hysteria",
+            "outbound/tuic",
+        ])
+    {
+        return MOD_NODE;
+    }
+    // 6. Sub
+    if raw.eq_ignore_ascii_case(MOD_SUB) || hit(&["订阅", "[sub]"]) {
+        return MOD_SUB;
+    }
+    // 7. Kernel（兜底：纯内核进程启停 / TUN 网卡 / DNS / 底层状态）
+    MOD_KERNEL
+}
+
 /// 追加一条日志（内存环形缓冲 + 追加写持久化文件）
 fn push_entry(level: &str, module: &str, message: &str) {
     // 单条消息截断到 2000 字符，防止异常刷屏吃满缓冲
@@ -122,6 +198,8 @@ fn push_entry(level: &str, module: &str, message: &str) {
     } else {
         message.to_string()
     };
+    // 【APP56 任务4】写内存缓冲前强制归入唯一分类（严禁 Kernel 混装）
+    let module = enforce_strict_log_category(module, &message);
     let entry = LogEntry {
         id: 0,
         timestamp: now_timestamp(),
@@ -467,7 +545,9 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
             continue;
         }
         // 【APP55 任务5】外部日志行精确归类（GoLan/GoAIM/GoCus/Rule/Node/Sub/Kernel）
-        let (module, classified) = classify_external_log_line(line);
+        let (raw_module, classified) = classify_external_log_line(line);
+        // 【APP56 任务4】再经强制分类器兜底，保证唯一分类
+        let module = enforce_strict_log_category(raw_module, &classified);
         let lower = line.to_lowercase();
         let level = if lower.contains("error") || lower.contains("fatal") || lower.contains("失败") {
             "ERROR"
@@ -579,11 +659,15 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
         && let Ok(st) = mutex.lock()
     {
         for e in &st.entries {
+            // 【APP56 任务4】返回前端前再统一归类，历史日志同样严格分区
+            let mut entry = e.clone();
+            entry.module =
+                enforce_strict_log_category(&entry.module, &entry.message).to_string();
             let matched = module_filter
-                .map(|f| e.module == f)
+                .map(|f| entry.module == f)
                 .unwrap_or(true);
             if matched {
-                mem_entries.push(e.clone());
+                mem_entries.push(entry);
             }
         }
         if let Some(p) = &st.file_path {
@@ -592,7 +676,9 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
         drop(st);
         let mut ext = Vec::new();
         collect_kernel_and_extension_logs(data_dir, &mut ext, &seq);
-        for e in ext {
+        for mut e in ext {
+            // 【APP56 任务4】外部日志同样按唯一分类下发
+            e.module = enforce_strict_log_category(&e.module, &e.message).to_string();
             let matched = module_filter
                 .map(|f| e.module == f)
                 .unwrap_or(true);
@@ -759,11 +845,34 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
     ));
     out.push_str("说明: WireGuard 密钥与 License Key 已自动脱敏\n");
     out.push_str("===============================================\n\n");
-    for e in &payload.entries {
-        out.push_str(&format!(
-            "[{}][{}][{}] {}\n",
-            e.timestamp, e.level, e.module, sanitize_sensitive(&e.message)
-        ));
+    // 【APP56 任务4】导出严格按 7 个分类分章节，彻底杜绝不同模块日志混杂
+    const SECTIONS: &[(&str, &str)] = &[
+        (MOD_KERNEL, "=== [内核 Kernel] ==="),
+        (MOD_NODE, "=== [节点 Node] ==="),
+        (MOD_RULE, "=== [规则 Rule] ==="),
+        (MOD_GO_AIM, "=== [Go AIM] ==="),
+        (MOD_GO_LAN, "=== [Go Lan] ==="),
+        (MOD_GO_CUS, "=== [Go Cus] ==="),
+        (MOD_SUB, "=== [订阅 Sub] ==="),
+    ];
+    for (module, title) in SECTIONS {
+        if module_filter.is_some_and(|f| f != *module) {
+            continue;
+        }
+        let rows: Vec<&LogEntry> = payload
+            .entries
+            .iter()
+            .filter(|e| e.module == *module)
+            .collect();
+        out.push_str(title);
+        out.push('\n');
+        for e in rows {
+            out.push_str(&format!(
+                "[{}][{}][{}] {}\n",
+                e.timestamp, e.level, e.module, sanitize_sensitive(&e.message)
+            ));
+        }
+        out.push('\n');
     }
     out
 }
@@ -771,10 +880,41 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        beijing_now_string, classify_external_log_line, is_benign_close_line, is_noise_eperm_line,
-        strip_leading_datetime, MOD_GO_AIM, MOD_GO_CUS, MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE,
-        MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING, PHASE_HANDSHAKE, PHASE_NODE_IDENT,
+        beijing_now_string, classify_external_log_line, enforce_strict_log_category,
+        is_benign_close_line, is_noise_eperm_line, strip_leading_datetime, MOD_GO_AIM, MOD_GO_CUS,
+        MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING,
+        PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
+
+    /// 【APP56 任务4】强制分类器：7 类日志零交叉混杂，任何 raw_category
+    /// 都不得把节点/规则/Go AIM/Go Lan/Go Cus/订阅日志混进 Kernel。
+    #[test]
+    fn test_enforce_strict_log_category_isolated() {
+        let cases: [(&str, &str, &str); 14] = [
+            ("Kernel", "节点测速完成，自动选择最低延迟节点", MOD_NODE),
+            ("Kernel", "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_RULE),
+            ("Kernel", "[GoAIM] probe gpt unlocked", MOD_GO_AIM),
+            ("Kernel", "Go Lan 隧道握手完成 go-lan-home", MOD_GO_LAN),
+            ("Kernel", "Go Cus 去广告模板已加载", MOD_GO_CUS),
+            ("Kernel", "订阅更新完成 18/20", MOD_SUB),
+            ("Kernel", "start inbound/tun[tun-in]: create tun", MOD_KERNEL),
+            ("GoAIM", "任意内容", MOD_GO_AIM),
+            ("GoLan", "任意内容", MOD_GO_LAN),
+            ("GoCus", "任意内容", MOD_GO_CUS),
+            ("Rule", "任意内容", MOD_RULE),
+            ("Node", "任意内容", MOD_NODE),
+            ("Sub", "任意内容", MOD_SUB),
+            ("Pro", "授权校验通过", MOD_KERNEL),
+        ];
+        let allowed = [
+            MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
+        ];
+        for (raw, message, want) in cases {
+            let got = enforce_strict_log_category(raw, message);
+            assert_eq!(got, want, "raw={raw} message={message}");
+            assert!(allowed.contains(&got), "必须是唯一 7 分类之一");
+        }
+    }
 
     /// 【APP55 任务5】外部日志行必须精确落入单一类别，禁止一律归 Kernel
     #[test]

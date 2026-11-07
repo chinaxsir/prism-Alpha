@@ -487,13 +487,19 @@ export default function Settings() {
               ? `${t("pro.configured")}: ${
                   (goLanCfg?.profiles ?? [])
                     .filter((p) => p.enabled)
-                    .map((p) =>
-                      `${p.name} (${
-                        p.bypassOnLocalLan && p.isDirect
+                    .map((p) => {
+                      // 【APP56 任务3】严格只读本档案 id 的直连结果，禁止全局串染
+                      const isDirect = Boolean(
+                        p.enabled &&
+                          p.bypassOnLocalLan &&
+                          goLanCfg?.goLanProfileDirectMap?.[p.id] === true,
+                      );
+                      return `${p.name} (${
+                        isDirect
                           ? t("goLan.statusDirect")
                           : t("goLan.statusTunnel")
-                      })`
-                    )
+                      })`;
+                    })
                     .join(" · ") ||
                   `${goLanCfg?.wgConfig?.server}:${goLanCfg?.wgConfig?.serverPort} · ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
                 }`
