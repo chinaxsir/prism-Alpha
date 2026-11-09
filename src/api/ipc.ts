@@ -60,6 +60,10 @@ export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");
 /// 前后台切换上报：后台时后端暂停高频事件推送与连接聚合，降低待机功耗
 export const setAppForeground = (foreground: boolean) =>
   invoke<void>("set_app_foreground", { foreground });
+/// 【APP58 任务2.2】原生打开外链：iOS 由 UIApplication 在系统浏览器打开，
+/// 其余平台走系统默认浏览器
+export const openExternalUrl = (url: string) =>
+  invoke<void>("open_external_url", { url });
 export const setMode = (mode: RunMode) => invoke<void>("set_mode", { mode });
 export const setOutboundMode = (mode: OutboundMode) =>
   invoke<void>("set_outbound_mode", { mode });

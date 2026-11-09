@@ -114,102 +114,25 @@ fn now_timestamp() -> String {
     beijing_now_string()
 }
 
-/// 【APP56 任务4 / APP57 任务4】统一强制分类归属器：每条日志只能且必须
-/// 归入唯一一个精准分类，且**绝不允许关键词猜测**：
-/// - 调用方显式传入 7 个合法分类之一（Kernel / Node / Rule / GoAIM /
-///   GoLan / GoCus / Sub）→ 直接采用，非法值一律归 Kernel；
-/// - 传入 Kernel（典型为 sing-box 底层 stdout 日志）→ 只认**显式标签 / 前缀**：
-///   `[节点识别]` `[握手阶段]` `[节点握手]` `[连接成功]` `[流量开始转发]`
-///   `[测速]` / `outbound/<协议>` → Node；`[规则` `路由规则` `分流模式`
-///   `规则命中` / `match rule` → Rule；`[GoAIM]` `GO-AIM-PROBE` → GoAIM；
-///   `[GoLan]` `[GoLan-Ext]` `outbound/wireguard` → GoLan；`[GoCus]` → GoCus；
-///   `[Sub]` → Sub；
-/// - 其余（DNS / TUN / 路由表 / 进程启停等）一律 Kernel。
-/// 关键修复：DNS 失败日志即使包含节点域名，也绝不会再被误归为 Node。
-pub fn enforce_strict_log_category(raw_category: &str, message: &str) -> &'static str {
-    let raw = raw_category.trim();
-    // 1. 显式模块标签优先，且只接受 7 类合法值
-    if raw.eq_ignore_ascii_case(MOD_NODE) {
-        return MOD_NODE;
+/// 【APP58 任务5】唯一强制分类归属器（第一道铁闸）：每条日志只能且必须归入
+/// 7 个合法分类之一（Kernel / Node / Rule / GoAIM / GoLan / GoCus / Sub）：
+/// - 显式模块名先归一化（`Go Lan`→GoLan、`Go AIM`→GoAIM、`Go Cus`→GoCus）；
+/// - 非法 / 空值一律降级为 Kernel；
+/// - **绝不读取 message 内容做任何关键词猜测**：sing-box 原生日志即使正文里
+///   出现 `go-lan-home`、`match rule`、节点域名等字样，也不会被篡改成
+///   GoLan / Rule / Node，彻底杜绝跨分类污染。
+pub fn enforce_strict_log_category(raw_category: &str, _message: &str) -> &'static str {
+    let compact = raw_category.trim().to_lowercase().replace(' ', "");
+    match compact.as_str() {
+        "kernel" => MOD_KERNEL,
+        "node" => MOD_NODE,
+        "rule" => MOD_RULE,
+        "goaim" => MOD_GO_AIM,
+        "golan" => MOD_GO_LAN,
+        "gocus" => MOD_GO_CUS,
+        "sub" => MOD_SUB,
+        _ => MOD_KERNEL,
     }
-    if raw.eq_ignore_ascii_case(MOD_RULE) {
-        return MOD_RULE;
-    }
-    if raw.eq_ignore_ascii_case(MOD_GO_AIM) {
-        return MOD_GO_AIM;
-    }
-    if raw.eq_ignore_ascii_case(MOD_GO_LAN) {
-        return MOD_GO_LAN;
-    }
-    if raw.eq_ignore_ascii_case(MOD_GO_CUS) {
-        return MOD_GO_CUS;
-    }
-    if raw.eq_ignore_ascii_case(MOD_SUB) {
-        return MOD_SUB;
-    }
-
-    // 2. raw 为 Kernel / 未知：只按显式标签与前缀识别，禁止关键词劫持
-    let lower = message.to_lowercase();
-    let trimmed = message.trim_start();
-
-    // Go Lan：显式模块标签与 WG 底层出站日志
-    if lower.contains("[golan]")
-        || lower.contains("[go lan]")
-        || lower.contains("[golan-ext]")
-        || lower.contains("outbound/wireguard")
-        || trimmed.starts_with("go-lan-")
-    {
-        return MOD_GO_LAN;
-    }
-    // Go AIM：显式模块标签与探测通道标记
-    if lower.contains("[goaim]")
-        || lower.contains("[go aim]")
-        || lower.contains("go-aim-probe")
-        || lower.contains("aim-probe-in")
-    {
-        return MOD_GO_AIM;
-    }
-    // Go Cus：显式模块标签
-    if lower.contains("[gocus]") || lower.contains("[go cus]") {
-        return MOD_GO_CUS;
-    }
-    // 订阅：显式标签
-    if lower.contains("[sub]") {
-        return MOD_SUB;
-    }
-    // 规则：显式前缀 / 标签 / 内核路由匹配行
-    if trimmed.starts_with("[规则")
-        || lower.contains("[rule]")
-        || trimmed.starts_with("路由规则")
-        || trimmed.starts_with("分流模式")
-        || trimmed.starts_with("规则命中")
-        || lower.contains("match rule")
-        || lower.contains("route(")
-    {
-        return MOD_RULE;
-    }
-    // 节点：仅节点生命周期显式前缀，或 outbound/<协议> 底层日志
-    if trimmed.starts_with("[节点识别]")
-        || trimmed.starts_with("[握手阶段]")
-        || trimmed.starts_with("[节点握手]")
-        || trimmed.starts_with("[连接成功]")
-        || trimmed.starts_with("[流量开始转发]")
-        || trimmed.starts_with("[测速]")
-        || lower.contains("[node]")
-        || trimmed.starts_with("outbound/vless")
-        || trimmed.starts_with("outbound/trojan")
-        || trimmed.starts_with("outbound/vmess")
-        || trimmed.starts_with("outbound/shadowsocks")
-        || trimmed.starts_with("outbound/hysteria")
-        || trimmed.starts_with("outbound/tuic")
-        || trimmed.starts_with("outbound/anytls")
-        || trimmed.starts_with("outbound/socks")
-    {
-        return MOD_NODE;
-    }
-
-    // 3. Kernel（兜底：纯内核进程启停 / TUN 网卡 / DNS / 底层状态）
-    MOD_KERNEL
 }
 
 /// 追加一条日志（内存环形缓冲 + 追加写持久化文件）
@@ -283,46 +206,24 @@ pub fn error(module: &str, message: impl AsRef<str>) {
     push_entry("ERROR", module, message.as_ref());
 }
 
-/// 【APP55 任务5】外部日志行（sing-box kernel.log / iOS extension.log）→
-/// 精确单一类别归属 + 剥离冗余前缀。严禁把 Go Lan / Go AIM / 规则 / 节点
-/// 日志一律塞进 Kernel：
-/// - [GoLan-Ext] / [GoLan] / go-lan- / outbound/wireguard → GoLan
-/// - [GoAIM] / GO-AIM-PROBE / aim-probe-in → GoAim
-/// - [GoCus] → GoCus
-/// - [Rule] / route( / match rule → Rule
-/// - [Node] / outbound/vless|trojan|vmess|shadowsocks|hysteria2|tuic → Node
-/// - [Sub] → Sub
-/// - 其余纯内核启停、DNS 与系统网卡日志 → Kernel
+/// 【APP58 任务5】外部日志文件（sing-box kernel.log / iOS extension.log）
+/// 分类铁闸（第二道）：**只认显式标签，绝不按正文关键词猜测**：
+/// - 显式 `[GoLan-Ext]` / `[GoLan]` 标签，或 sing-box 明确属于
+///   `outbound/wireguard` 的日志 → GoLan；
+/// - 其余全部（`dns:`、`inbound/tun`、`started`、进程启停、路由表等，
+///   哪怕正文里出现 go-lan-home / match rule / 节点域名）→ Kernel。
+/// 原生 sing-box 日志永远不会产出 Node / Rule / Sub / GoAIM / GoCus。
 pub fn classify_external_log_line(raw_line: &str) -> (&'static str, String) {
     let lower = raw_line.to_lowercase();
     let module = if lower.contains("[golan-ext]")
         || lower.contains("[golan]")
-        || lower.contains("go-lan-")
         || lower.contains("outbound/wireguard")
-        || lower.contains("go-lan-home")
     {
         MOD_GO_LAN
-    } else if lower.contains("[goaim]") || lower.contains("go-aim-probe") || lower.contains("aim-probe-in") {
-        MOD_GO_AIM
-    } else if lower.contains("[gocus]") {
-        MOD_GO_CUS
-    } else if lower.contains("[rule]") || lower.contains("route(") || lower.contains("match rule") {
-        MOD_RULE
-    } else if lower.contains("[node]")
-        || lower.contains("outbound/vless")
-        || lower.contains("outbound/trojan")
-        || lower.contains("outbound/vmess")
-        || lower.contains("outbound/shadowsocks")
-        || lower.contains("outbound/hysteria2")
-        || lower.contains("outbound/tuic")
-    {
-        MOD_NODE
-    } else if lower.contains("[sub]") {
-        MOD_SUB
     } else {
         MOD_KERNEL
     };
-    // 【APP55 任务5】GoLan 扩展日志剥离 `[GoLan-Ext]` 前缀，正文更干净
+    // GoLan 扩展日志剥离 `[GoLan-Ext]` 前缀，正文更干净
     let message = if module == MOD_GO_LAN {
         let trimmed = raw_line.trim_start();
         match trimmed.get(..11) {
@@ -674,6 +575,10 @@ fn collect_kernel_and_extension_logs(
 /// 读取日志（module_filter: Some("GoLan") 等按模块过滤；None 返回全部）。
 /// 自动合并内核日志与 iOS 扩展日志（外部来源排在内存条目之后）。
 pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> LogsPayload {
+    // 【APP58 任务5】筛选条件也强制归一化为 7 类合法值之一，非法/未知 → Kernel，
+    // 与列表、徽章使用同一投影结果
+    let filter: Option<&'static str> =
+        module_filter.map(|f| enforce_strict_log_category(f, ""));
     let mut mem_entries: Vec<LogEntry> = Vec::new();
     let mut file_bytes = 0usize;
     let seq = AtomicU64::new(u64::MAX / 2); // 外部日志 id 从高位段分配，避免与内存条目冲突
@@ -685,9 +590,7 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
             let mut entry = e.clone();
             entry.module =
                 enforce_strict_log_category(&entry.module, &entry.message).to_string();
-            let matched = module_filter
-                .map(|f| entry.module == f)
-                .unwrap_or(true);
+            let matched = filter.map(|f| entry.module == f).unwrap_or(true);
             if matched {
                 mem_entries.push(entry);
             }
@@ -701,9 +604,7 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
         for mut e in ext {
             // 【APP56 任务4】外部日志同样按唯一分类下发
             e.module = enforce_strict_log_category(&e.module, &e.message).to_string();
-            let matched = module_filter
-                .map(|f| e.module == f)
-                .unwrap_or(true);
+            let matched = filter.map(|f| e.module == f).unwrap_or(true);
             if matched {
                 mem_entries.push(e);
             }
@@ -920,27 +821,30 @@ mod tests {
         PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
 
-    /// 【APP57 任务4】强制分类器：显式模块优先；Kernel 底层日志只按显式
-    /// 标签 / 前缀升级分类，DNS 行即使含节点域名也必须留在 Kernel。
+    /// 【APP58 任务5】强制分类器（第一道铁闸）：显式模块名先归一化；
+    /// **绝不读取 message 做关键词猜测**，Kernel 底层日志无论正文含什么
+    /// 标签 / 域名一律留在 Kernel。
     #[test]
     fn test_enforce_strict_log_category_isolated() {
-        let cases: [(&str, &str, &str); 16] = [
-            ("Kernel", "[测速] 节点测速完成，自动选择最低延迟节点", MOD_NODE),
-            ("Kernel", "节点测速完成，自动选择最低延迟节点", MOD_KERNEL),
+        let cases: [(&str, &str, &str); 18] = [
+            ("Kernel", "[测速] 节点测速完成，自动选择最低延迟节点", MOD_KERNEL),
+            ("Kernel", "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_KERNEL),
+            ("Kernel", "[GoAIM] probe gpt unlocked", MOD_KERNEL),
+            ("Kernel", "[GoLan] 隧道握手完成 go-lan-home", MOD_KERNEL),
+            ("Kernel", "[GoCus] 去广告模板已加载", MOD_KERNEL),
+            ("Kernel", "[Sub] 订阅更新完成 18/20", MOD_KERNEL),
             ("Kernel", "dns: exchange failed: timeout for hk1.company-example.com", MOD_KERNEL),
-            ("Kernel", "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_RULE),
-            ("Kernel", "[GoAIM] probe gpt unlocked", MOD_GO_AIM),
-            ("Kernel", "[GoLan] 隧道握手完成 go-lan-home", MOD_GO_LAN),
-            ("Kernel", "Go Lan 隧道握手完成 go-lan-home", MOD_KERNEL),
-            ("Kernel", "[GoCus] 去广告模板已加载", MOD_GO_CUS),
-            ("Kernel", "Go Cus 去广告模板已加载", MOD_KERNEL),
-            ("Kernel", "[Sub] 订阅更新完成 18/20", MOD_SUB),
             ("Kernel", "start inbound/tun[tun-in]: create tun", MOD_KERNEL),
+            ("Go Lan", "任意内容", MOD_GO_LAN),
+            ("Go AIM", "任意内容", MOD_GO_AIM),
+            ("Go Cus", "任意内容", MOD_GO_CUS),
+            ("golan", "任意内容", MOD_GO_LAN),
             ("GoAIM", "任意内容", MOD_GO_AIM),
-            ("GoLan", "任意内容", MOD_GO_LAN),
-            ("GoCus", "任意内容", MOD_GO_CUS),
             ("Node", "任意内容", MOD_NODE),
+            ("Rule", "任意内容", MOD_RULE),
+            ("Sub", "任意内容", MOD_SUB),
             ("Pro", "授权校验通过", MOD_KERNEL),
+            ("", "任意内容", MOD_KERNEL),
         ];
         let allowed = [
             MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
@@ -961,24 +865,27 @@ mod tests {
         assert_eq!(safe_truncate_str("", 0), "");
     }
 
-    /// 【APP55 任务5】外部日志行必须精确落入单一类别，禁止一律归 Kernel
+    /// 【APP58 任务5】外部日志行（第二道铁闸）：只认显式 GoLan 标签与
+    /// `outbound/wireguard`，原生 sing-box 日志一律 Kernel
     #[test]
     fn test_classify_external_log_line_categories() {
         let cases = [
             ("[GoLan-Ext] 内网直连探测 10.10.10.253:8001 可达", MOD_GO_LAN),
             ("[GoLan] profile home bypass on local lan", MOD_GO_LAN),
             ("outbound/wireguard[home]: handshake complete", MOD_GO_LAN),
-            ("[GoAIM] probe gpt unlocked", MOD_GO_AIM),
-            ("GO-AIM-PROBE-IN: 已进入探测通道", MOD_GO_AIM),
-            ("[GoCus] 模块已加载: AdBlock", MOD_GO_CUS),
-            ("[Rule] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_RULE),
-            ("match rule: DOMAIN,www.apple.com,DIRECT", MOD_RULE),
-            ("[Node] HK-01 握手成功 32ms", MOD_NODE),
-            ("outbound/vless[HK1]: connected", MOD_NODE),
-            ("outbound/hysteria2[US2]: connected", MOD_NODE),
-            ("[Sub] 订阅更新完成 18/20", MOD_SUB),
+            ("[GoAIM] probe gpt unlocked", MOD_KERNEL),
+            ("GO-AIM-PROBE-IN: 已进入探测通道", MOD_KERNEL),
+            ("[GoCus] 模块已加载: AdBlock", MOD_KERNEL),
+            ("[Rule] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_KERNEL),
+            ("match rule: DOMAIN,www.apple.com,DIRECT", MOD_KERNEL),
+            ("[Node] HK-01 握手成功 32ms", MOD_KERNEL),
+            ("outbound/vless[HK1]: connected", MOD_KERNEL),
+            ("outbound/hysteria2[US2]: connected", MOD_KERNEL),
+            ("[Sub] 订阅更新完成 18/20", MOD_KERNEL),
             ("start inbound/tun[tun-in]: create tun", MOD_KERNEL),
             ("router: loaded 102 rules", MOD_KERNEL),
+            // 正文出现 go-lan-home 字样也不得被劫持为 GoLan
+            ("INFO outbound/vless[HK1]: dial go-lan-home", MOD_KERNEL),
         ];
         for (line, want) in cases {
             assert_eq!(classify_external_log_line(line).0, want, "line={line}");

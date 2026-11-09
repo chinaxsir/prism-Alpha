@@ -51,12 +51,13 @@ const zh: Record<string, string> = {
   "settings.closeConnsDesc": "切换节点后断开现有连接，新策略立即生效",
 
   // ---- 关于 & 帮助 ----
-  "settings.aboutHelp": "关于 & 帮助",
+  "settings.aboutHelp": "关于帮助",
   "settings.aboutHelpDesc": "官方文档与问题反馈入口",
-  "settings.helpSite": "官网",
-  "settings.helpGroup": "用户群组",
-  "settings.helpFeedback": "反馈问题",
-  "settings.helpGuide": "功能指南",
+  "settings.helpGuide": "用户指南",
+  "settings.helpTerms": "服务条款",
+  "settings.helpPrivacy": "隐私政策",
+  "settings.helpChannel": "官方频道",
+  "settings.appVersion": "软件版本",
 
   // ---- 代理内核 ----
   "settings.kernel": "代理内核",
@@ -150,12 +151,13 @@ const en: Record<string, string> = {
   "settings.closeConnsDesc": "Drop existing connections when switching nodes",
 
   // ---- About & Help ----
-  "settings.aboutHelp": "About & Help",
+  "settings.aboutHelp": "About Help",
   "settings.aboutHelpDesc": "Official docs and support entry points",
-  "settings.helpSite": "Website",
-  "settings.helpGroup": "Community",
-  "settings.helpFeedback": "Feedback",
   "settings.helpGuide": "User Guide",
+  "settings.helpTerms": "Terms of Service",
+  "settings.helpPrivacy": "Privacy Policy",
+  "settings.helpChannel": "Official Channel",
+  "settings.appVersion": "App Version",
 
   "settings.kernel": "Proxy Kernel",
   "settings.kernelVersion": "Kernel Version",

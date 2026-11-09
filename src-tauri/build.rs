@@ -45,6 +45,7 @@ fn main() {
                 "_prism_ios_upgrade_selfheal",
                 "_prism_ios_get_device_id",
                 "_prism_ios_app_group_dir",
+                "_prism_ios_open_url",
             ] {
                 println!("cargo:rustc-link-arg=-Wl,-U,{sym}");
             }

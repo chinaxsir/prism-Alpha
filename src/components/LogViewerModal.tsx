@@ -42,6 +42,46 @@ const CATEGORY_TABS: { key: string; value: string; labelKey: string }[] = [
   { key: "sub", value: "Sub", labelKey: "logs.filterSub" },
 ];
 
+const CATEGORY_VALUES = new Set(CATEGORY_TABS.map((t) => t.value));
+
+/** 【APP58 任务5】日志分类归一化：显式分类只允许 7 类合法值；
+ *  `Go Lan` / `Go AIM` / `Go Cus` 去空格统一成 GoLan / GoAIM / GoCus；
+ *  未知分类一律落到 Kernel。**绝不读取 message 内容猜测分类**。 */
+function normalizeCat(raw?: string | null): string {
+  const s = (raw ?? "").trim();
+  if (CATEGORY_VALUES.has(s)) return s;
+  const compact = s.toLowerCase().replace(/\s+/g, "");
+  switch (compact) {
+    case "kernel":
+      return "Kernel";
+    case "node":
+    case "节点":
+      return "Node";
+    case "rule":
+    case "规则":
+      return "Rule";
+    case "golan":
+      return "GoLan";
+    case "goaim":
+      return "GoAIM";
+    case "gocus":
+      return "GoCus";
+    case "sub":
+    case "subscription":
+    case "订阅":
+      return "Sub";
+    default:
+      return "Kernel";
+  }
+}
+
+/** 完整投影：`projectCategory(e.module)` → 必定是 7 类之一。
+ *  过滤、计数、徽章文字 / 颜色全部使用同一个投影值，保证「筛选=徽章」。 */
+function projectCategory(raw?: string | null): string {
+  const normalized = normalizeCat(raw);
+  return CATEGORY_VALUES.has(normalized) ? normalized : "Kernel";
+}
+
 /** 导出章节标题（与后端 export_logs 章节完全一致） */
 const EXPORT_SECTIONS: { value: string; title: string }[] = [
   { value: "Kernel", title: "=== [内核 Kernel] ===" },
@@ -138,20 +178,19 @@ export default function LogViewerModal({
     [],
   );
 
-  /** 【APP56 任务4】列表 100% 仅渲染 `entry.module === activeModule` 的日志：
-   *  7 个分类互不混杂，绝不做模糊包含或兜底展示 */
+  /** 【APP56 任务4 / APP58 任务5】列表 100% 仅渲染投影后分类等于 activeModule
+   *  的日志：7 个分类互不混杂，绝不做模糊包含或兜底展示 */
   const visibleEntries = useMemo(
-    () => entries.filter((e) => (e.module ?? "Kernel").trim() === activeModule),
+    () => entries.filter((e) => projectCategory(e.module) === activeModule),
     [entries, activeModule],
   );
 
-  /** 每个分类标签的实时条数（来自同一次全量拉取） */
+  /** 每个分类标签的实时条数（与列表使用完全相同的投影分类） */
   const categoryCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const tab of CATEGORY_TABS) counts[tab.value] = 0;
     for (const e of entries) {
-      const key = (e.module ?? "Kernel").trim();
-      if (key in counts) counts[key] += 1;
+      counts[projectCategory(e.module)] += 1;
     }
     return counts;
   }, [entries]);
@@ -197,12 +236,14 @@ export default function LogViewerModal({
     lines.push(t("logs.exportCount", { count: entries.length }));
     lines.push("===============================================");
     lines.push("");
-    // 【APP56 任务4】导出严格按 7 个分类分章节，杜绝跨分类混杂
+    // 【APP56 任务4 / APP58 任务5】导出严格按 7 个分类分章节，
+    // 分类使用与列表/徽章完全一致的 projectCategory 投影
     for (const section of EXPORT_SECTIONS) {
       lines.push(section.title);
       for (const e of entries) {
-        if ((e.module ?? "Kernel").trim() !== section.value) continue;
-        lines.push(`[${e.timestamp}][${e.level}][${e.module}] ${e.message}`);
+        const cat = projectCategory(e.module);
+        if (cat !== section.value) continue;
+        lines.push(`[${e.timestamp}][${e.level}][${cat}] ${e.message}`);
       }
       lines.push("");
     }
@@ -351,8 +392,10 @@ export default function LogViewerModal({
             </div>
           ) : (
             visibleEntries.map((e) => {
+              // 【APP58 任务5】徽章与筛选使用同一个投影分类，颜色同源
+              const displayModule = projectCategory(e.module);
               const msg =
-                e.module === "Kernel" ? stripKernelHeader(e.message) : e.message;
+                displayModule === "Kernel" ? stripKernelHeader(e.message) : e.message;
               return (
                 <div
                   key={e.id}
@@ -372,10 +415,10 @@ export default function LogViewerModal({
                       <span
                         className={clsx(
                           "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
-                          moduleBadge(e.module),
+                          moduleBadge(displayModule),
                         )}
                       >
-                        {e.module}
+                        {displayModule}
                       </span>
                     </div>
                     {/* 【APP54 任务3】北京时间戳（UTC+8，后端已统一转换）；日志区为深色底，固定浅色等宽加粗 */}

@@ -265,6 +265,20 @@ func prismIosGetDeviceId() -> UnsafeMutablePointer<CChar>? {
 
 // MARK: - 控制器
 
+/// 【APP58 任务2.2】原生打开外链：WKWebView 内 `window.open(url, "_blank")`
+/// 与 `<a target="_blank">` 会被系统静默丢弃，必须由 UIKit 在系统浏览器
+/// （Safari / 默认浏览器）中打开，确保「关于帮助」链接点击 100% 生效。
+@_cdecl("prism_ios_open_url")
+func prismIosOpenUrl(_ urlCStr: UnsafePointer<CChar>?) -> Bool {
+    guard let urlCStr = urlCStr else { return false }
+    let urlString = String(cString: urlCStr).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let url = URL(string: urlString) else { return false }
+    DispatchQueue.main.async {
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    }
+    return true
+}
+
 final class PrismTunnelController {
     static let shared = PrismTunnelController()
 

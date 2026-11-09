@@ -34,6 +34,10 @@ mod sys {
         /// 返回 App Group（group.com.prism.proxy）共享容器路径（APP6 任务1）；
         /// nilptr 表示 Swift 侧拿不到
         pub fn prism_ios_app_group_dir() -> *const std::os::raw::c_char;
+        /// 【APP58 任务2.2】用系统浏览器（UIApplication.open）打开外链：
+        /// 返回 true = 已派发；WKWebView 的 window.open 会被系统丢弃，
+        /// 必须走原生打开才能在 iOS 上真正跳转
+        pub fn prism_ios_open_url(url: *const std::os::raw::c_char) -> bool;
     }
 }
 
@@ -66,6 +70,9 @@ mod sys {
     }
     pub unsafe fn prism_ios_app_group_dir() -> *const c_char {
         std::ptr::null()
+    }
+    pub unsafe fn prism_ios_open_url(_url: *const c_char) -> bool {
+        false
     }
 }
 
@@ -149,6 +156,16 @@ pub fn app_group_dir() -> Option<String> {
         let cstr = std::ffi::CStr::from_ptr(p);
         Some(cstr.to_string_lossy().into_owned())
     }
+}
+
+/// 【APP58 任务2.2】iOS 原生打开外链：WKWebView 内 `window.open` 与
+/// `target="_blank"` 会被系统静默丢弃，必须由 Swift 侧
+/// `UIApplication.shared.open` 在系统浏览器中打开。
+pub fn open_url(url: &str) -> bool {
+    let Ok(cc) = CString::new(url) else {
+        return false;
+    };
+    unsafe { sys::prism_ios_open_url(cc.as_ptr()) }
 }
 
 

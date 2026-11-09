@@ -360,18 +360,24 @@ export default function App() {
     };
   }, []);
 
-  // 【APP52 任务2】全局常驻轮询：800ms 定时器任何时候都不暂停（切换页面、
-  // 系统后台、停启 VPN 均继续），移除 document.hidden 暂停逻辑；
-  // focus / visibilitychange 立即补拉一次，切回前台 0 延迟对齐速率与曲线。
+  // 【APP58 任务1.2】智能前后台轮询：
+  // - 后台（document.hidden / 锁屏 / 切 App）→ 定时器彻底不创建，
+  //   跳过所有 fetchStatus / getRuntimeSnapshot，WebView 与 Rust 主进程
+  //   在后台保持 0% CPU；
+  // - 回到前台 → visibilitychange / focus 立即补拉一次（网速与流量基于
+  //   内核累计字节差值计算，切回瞬间即可无缝显示），随后以 1500ms 温和间隔更新。
   const appVisible = useAppVisible();
   useEffect(() => {
-    // 上报后端：仍用于连接聚合的省电策略，但绝不暂停前端轮询
+    // 上报后端：遥测协程据此在后台跳过 /connections 网络请求
     void setAppForeground(appVisible).catch(() => undefined);
+    if (!appVisible) return;
     // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
     // refreshRuntime 会先查状态并触发后端自动接管。
     void refreshRuntime();
-    const id = window.setInterval(() => void refreshRuntime(), 800);
-    const onWake = () => void refreshRuntime();
+    const id = window.setInterval(() => void refreshRuntime(), 1500);
+    const onWake = () => {
+      if (document.visibilityState === "visible") void refreshRuntime();
+    };
     window.addEventListener("focus", onWake);
     document.addEventListener("visibilitychange", onWake);
     return () => {

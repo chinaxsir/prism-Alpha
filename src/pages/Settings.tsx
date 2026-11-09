@@ -17,8 +17,7 @@ import {
   Palette,
   FileTerminal,
   Rss,
-  Users,
-  Bug,
+  Send,
   BookOpen,
 } from "lucide-react";
 
@@ -32,6 +31,7 @@ import {
   saveGoLanSettings,
   isGoLanConfigured,
   clearAppLogs,
+  openExternalUrl,
   type GoLanSettings,
 } from "@/api/ipc";
 import type { RunMode, UserSettings } from "@/stores/core";
@@ -49,19 +49,37 @@ import { usePrefsStore, type Language, type ThemePref } from "@/stores/prefs";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
-/// 【APP57 任务5】关于 & 帮助：四个官方入口
+/// 【APP58 任务2.2】关于帮助：四个官方入口（全部走原生打开，iOS 100% 生效）
 const HELP_LINKS = [
-  { labelKey: "settings.helpSite", url: "https://github.com/chinaxsir/Prism", Icon: Globe },
-  { labelKey: "settings.helpGroup", url: "https://github.com/chinaxsir/Prism/discussions", Icon: Users },
-  { labelKey: "settings.helpFeedback", url: "https://github.com/chinaxsir/Prism/issues", Icon: Bug },
-  { labelKey: "settings.helpGuide", url: "https://github.com/chinaxsir/Prism#readme", Icon: BookOpen },
+  {
+    labelKey: "settings.helpGuide",
+    url: "https://prism.sarl/guide",
+    Icon: BookOpen,
+  },
+  {
+    labelKey: "settings.helpTerms",
+    url: "https://prism.sarl/terms",
+    Icon: ShieldAlert,
+  },
+  {
+    labelKey: "settings.helpPrivacy",
+    url: "https://prism.sarl/privacy",
+    Icon: Lock,
+  },
+  {
+    labelKey: "settings.helpChannel",
+    url: "https://t.me/prism_proxy",
+    Icon: Send,
+  },
 ] as const;
 
-/// 桌面端走 Tauri shell 打开系统浏览器；移动端权限缺失时回落 window.open
+/// 原生级打开外链：iOS 由 UIApplication 在系统浏览器打开；其余平台由
+/// Rust 调系统默认浏览器。任何失败回落 window.location.assign（同窗口导航
+/// 在 WKWebView / 桌面 WebView 中都可用，不会被 system 静默丢弃）。
 function openHelpLink(url: string) {
-  import("@tauri-apps/plugin-shell")
-    .then((m) => m.open(url))
-    .catch(() => window.open(url, "_blank", "noopener,noreferrer"));
+  openExternalUrl(url).catch(() => {
+    window.location.assign(url);
+  });
 }
 
 /// 接入模式图标
@@ -101,6 +119,14 @@ export default function Settings() {
   const [proManageOpen, setProManageOpen] = useState(false);
   // 【APP6 任务1.2】运行日志弹窗
   const [logViewerOpen, setLogViewerOpen] = useState(false);
+  // 【APP58 任务2.2】软件版本：运行时从 Tauri 读取当前真实版本，杜绝写死漂移
+  const [appVersion, setAppVersion] = useState("0.3.91");
+  useEffect(() => {
+    import("@tauri-apps/api/app")
+      .then((m) => m.getVersion())
+      .then((v) => setAppVersion(v))
+      .catch(() => undefined);
+  }, []);
   const proUnlocked = useProStore((s) => s.unlocked);
   const entitlement = useProStore((s) => s.entitlement);
   // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
@@ -478,12 +504,11 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Go Lan · 回家网络（Pro 门控）：【APP-5 任务3】与 Dashboard 引擎卡 100% 一致 */}
+      {/* Go Lan · 回家网络（Pro 门控）：【APP58 任务2.1】背景/透明度与下方
+          设置卡 100% 统一，未解锁时也不再变灰、不再有悬浮高光 */}
       <div
         id="go-lan-card"
-        className={`card-sheen rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3 ${
-          !proUnlocked ? "opacity-50 select-none" : ""
-        }`}
+        className="rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3"
       >
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -603,7 +628,8 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 【APP57 任务5】关于 & 帮助：四个带图标的文字链接按钮，替代原「代理内核」卡片 */}
+      {/* 【APP57 任务5 / APP58 任务2.2】关于 & 帮助：版本信息 + 四个官方入口，
+          全部经 Rust 原生打开，iOS WKWebView 也能 100% 调起系统浏览器 */}
       <div className="rounded-xl border border-border bg-surface px-4 py-3 space-y-3">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
@@ -615,6 +641,23 @@ export default function Settings() {
             </div>
             <div className="text-[11px] text-text-muted truncate">
               {t("settings.aboutHelpDesc")}
+            </div>
+          </div>
+        </div>
+        {/* 【APP58 任务2.2】版本信息（链接上方）：软件版本运行时读取，内核版本固定展示 */}
+        <div className="grid grid-cols-2 gap-2 rounded-lg bg-surface-hover/60 px-2 py-2">
+          <div className="min-w-0 text-center">
+            <div className="text-[10px] text-text-muted">{t("settings.appVersion")}</div>
+            <div className="text-xs font-semibold text-text mt-0.5">
+              v{appVersion}
+            </div>
+          </div>
+          <div className="min-w-0 text-center">
+            <div className="text-[10px] text-text-muted">
+              {t("settings.kernelVersion")}
+            </div>
+            <div className="text-xs font-semibold text-text mt-0.5">
+              sing-box v1.11.3
             </div>
           </div>
         </div>

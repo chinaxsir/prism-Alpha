@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  AppWindow,
   Check,
   Copy,
   Fingerprint,
@@ -10,7 +9,6 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { getVersion } from "@tauri-apps/api/app";
 import clsx from "clsx";
 
 import { getDeviceId, type EntitlementState } from "@/api/ipc";
@@ -21,8 +19,10 @@ import { useTranslation } from "@/i18n";
 /** 【APP-12 任务2.3】Prism Pro 授权信息弹窗
  *
  * 承载原 Settings 页 PRISM PRO 大表格的全部内容：
- * 设备 ID（带复制）/ APP 版本 / 当前方案 / 到期时间（含剩余）/ 设备名额 / 上次校验，
+ * 设备 ID（带复制）/ 订阅方案 / 到期时间（含剩余）/ 设备名额 / 上次校验，
  * 底部保留「校验授权」「反向激活」两个操作。
+ * 【APP58 任务3】移除 APP 版本行（版本号已在设置页「关于帮助」展示），
+ * 「当前方案」统一更名为「订阅方案」。
  */
 
 /** 授权状态 → 文案 key 与状态点颜色 */
@@ -104,7 +104,6 @@ export default function ProManageModal({ open, onClose }: Props) {
   const refreshPro = useProStore((s) => s.refresh);
   const deactivatePro = useProStore((s) => s.deactivate);
   const [deviceId, setDeviceId] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState<string>("");
 
   // 【APP-4 任务2】剩余天数：订阅版在到期时间旁展示
   const remainDays = (() => {
@@ -122,9 +121,6 @@ export default function ProManageModal({ open, onClose }: Props) {
     getDeviceId()
       .then(setDeviceId)
       .catch((e) => console.error("get device id failed:", e));
-    getVersion()
-      .then(setAppVersion)
-      .catch((e) => console.error("get app version failed:", e));
   }, [open]);
 
   const copyDeviceId = async () => {
@@ -259,12 +255,6 @@ export default function ProManageModal({ open, onClose }: Props) {
             </span>
           </button>
 
-          {/* APP 版本：当前安装的 Prism 版本号 */}
-          <DetailRow
-            icon={<AppWindow size={16} className="text-gray-400" />}
-            title={t("pro.appVersion")}
-            value={appVersion ? `v${appVersion}` : "—"}
-          />
           <DetailRow
             icon={<Sparkles size={16} className="text-accent" />}
             iconBg="bg-accent/10"

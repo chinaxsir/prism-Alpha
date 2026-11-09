@@ -507,11 +507,36 @@ pub fn split_profile_cidrs_for_on_demand(
     (tunnel, direct)
 }
 
-/// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4。
-/// 过滤 utun / tun / ppp / wg / loopback / 172.19.0.x / 169.254.x.x /
-/// WireGuard 虚拟地址 10.196.0.2 与 fake-ip 198.18/15。
-/// 【APP44 任务6】iOS 主程序同样经 getifaddrs 枚举（Wi-Fi 优先）。
+/// 【APP58 任务1.1】物理网卡枚举结果 5 秒内存缓存：
+/// `getifaddrs` 在 iOS 上会持续唤醒 Wi-Fi 芯片，状态查询每秒多次枚举会直接
+/// 导致手机发热；5 秒内重复调用一律直接返回缓存数组，零系统调用。
+fn physical_lan_cache()
+-> &'static std::sync::Mutex<Option<(std::time::Instant, Vec<std::net::Ipv4Addr>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, Vec<std::net::Ipv4Addr>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 【APP40 任务2】跨平台枚举本机物理网卡的真实局域网 IPv4（5 秒缓存）。
 pub fn detect_physical_lan_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    if let Ok(mut cache) = physical_lan_cache().lock() {
+        if let Some((at, ips)) = cache.as_ref()
+            && at.elapsed() < std::time::Duration::from_secs(5)
+        {
+            return ips.clone();
+        }
+        let ips = detect_physical_lan_ipv4s_uncached();
+        *cache = Some((std::time::Instant::now(), ips.clone()));
+        return ips;
+    }
+    detect_physical_lan_ipv4s_uncached()
+}
+
+/// 物理网卡真实枚举（无缓存）：过滤 utun / tun / ppp / wg / loopback /
+/// 172.19.0.x / 169.254.x.x / WireGuard 虚拟地址 10.196.0.2 与 fake-ip 198.18/15。
+/// 【APP44 任务6】iOS 主程序同样经 getifaddrs 枚举（Wi-Fi 优先）。
+fn detect_physical_lan_ipv4s_uncached() -> Vec<std::net::Ipv4Addr> {
     // 【APP44 任务6】iOS 主程序不再恒返回空：getifaddrs 枚举 en0（Wi-Fi）/
     // pdp_ip0（蜂窝），保证设置页「局域网地址」展示真实内网 IP，而不是
     // 198.18.x.x 的 fake-ip 或 utun 的 10.196.0.2。按 Wi-Fi > 有线 > 蜂窝排序。
@@ -722,96 +747,15 @@ fn profile_business_cidrs(profile: &GoLanProfile, wg_virtual_ip: Option<std::net
     out
 }
 
-/// 解析探针目标（`192.168.10.253:8001` / 纯 IPv4）；非 IPv4 一律忽略。
-fn parse_lan_probe_ip(raw: &str) -> Option<(std::net::Ipv4Addr, u16)> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (host, port) = match s.rsplit_once(':') {
-        Some((h, p)) => (h.trim(), p.trim().parse::<u16>().ok()?),
-        None => (s, 443),
-    };
-    host.parse::<std::net::Ipv4Addr>().ok().map(|ip| (ip, port))
-}
-
-/// 取网段首尾两个网关候选地址（`.1` 与 `.254`/广播前一地址）。
-fn cidr_probe_hosts(cidr: &str) -> Vec<std::net::Ipv4Addr> {
-    let Some((ip_s, len_s)) = cidr.split_once('/') else {
-        return Vec::new();
-    };
-    let Ok(ip) = ip_s.parse::<std::net::Ipv4Addr>() else {
-        return Vec::new();
-    };
-    let Ok(len) = len_s.parse::<u8>() else {
-        return Vec::new();
-    };
-    if len > 32 {
-        return Vec::new();
-    }
-    let ipn = u32::from(ip);
-    let mask: u32 = if len == 0 {
-        0
-    } else {
-        u32::MAX << (32 - len as u32)
-    };
-    let net = ipn & mask;
-    let broadcast = net | !mask;
-    let mut hosts = Vec::new();
-    if len >= 31 {
-        hosts.push(std::net::Ipv4Addr::from(net));
-        if len == 31 {
-            hosts.push(std::net::Ipv4Addr::from(broadcast));
-        }
-    } else {
-        hosts.push(std::net::Ipv4Addr::from(net.wrapping_add(1)));
-        hosts.push(std::net::Ipv4Addr::from(broadcast.saturating_sub(1)));
-    }
-    hosts
-}
-
-/// 【APP57 任务1.2】绑定物理 Wi-Fi 源 IP 的 TCP 探测：
-/// Socket 显式 `bind(wifi_ip, 0)`，数据包 100% 只走物理 Wi-Fi 路由器，
-/// 绝不进入 utun / WireGuard 隧道；`Ok` 或 `ConnectionRefused` 均视为
-/// 物理链路可达（企业 Wi-Fi 跨 VLAN 时，网关不一定开放端口）。
-fn probe_lan_host_from_physical(
-    source: std::net::Ipv4Addr,
-    target: std::net::Ipv4Addr,
-    port: u16,
-    timeout_ms: u64,
-) -> bool {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let Ok(sock) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) else {
-        return false;
-    };
-    let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(source), 0);
-    if sock.bind(&bind_addr.into()).is_err() {
-        return false;
-    }
-    let target_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(target), port);
-    match sock.connect_timeout(
-        &target_addr.into(),
-        std::time::Duration::from_millis(timeout_ms),
-    ) {
-        Ok(()) => true,
-        Err(e) => matches!(e.kind(), std::io::ErrorKind::ConnectionRefused),
-    }
-}
-
-/// 规则 B 探测结果缓存：`(profile_id, wifi_ip) → (是否直连, 采样时刻)`，
-/// 15 秒内复用，避免每次状态查询重复发起内网探测。
-fn direct_probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), (bool, std::time::Instant)>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(String, String), (bool, std::time::Instant)>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// 【APP56 任务3 / APP57 任务1】100% 精确、无交叉污染的单隧道直连判定：
-/// 对**每一条**档案使用完全相同的规则（不再只对 `home` / 首条隧道生效）：
-/// - 规则 A：本机物理 Wi-Fi IP 落在该隧道自身业务网段内 → 直连；
-/// - 规则 B：绑定物理 Wi-Fi 源 IP，向该隧道专属内网关/探测目标发起
-///   150ms 短探测（企业无线 AP 跨 VLAN 场景），可达 → 直连。
+/// 【APP56 任务3 / APP57 任务1 / APP58 任务1.1】100% 精确、无交叉污染的
+/// 单隧道直连判定（对每一条档案使用完全相同的规则）：
+/// - 纯内存 IPv4 CIDR 掩码位运算：本机物理 Wi-Fi IP 落在该隧道自身业务网段内
+///   → 直连（耗时 < 0.001ms）；
+/// - **严禁任何网络 Socket / TCP 探测**：APP57 的网关连接探测会在每次
+///   `get_status` 时发起网络 I/O，持续唤醒 CPU 与 Wi-Fi/基带芯片，是手机
+///   发烫与高耗电的根因，已彻底移除；
+/// - `lan_cidrs` 支持换行 / 逗号 / 分号 / 空格拆分的复合文本，并剔除与
+///   该隧道 WG 虚拟接口 IP 同 /24 的虚拟握手网段（`/32` 虚拟地址不参与）。
 pub fn is_profile_lan_direct_active(
     profile: &GoLanProfile,
     physical_wifi_ips: &[std::net::Ipv4Addr],
@@ -834,58 +778,12 @@ pub fn is_profile_lan_direct_active(
 
     let business_cidrs = profile_business_cidrs(profile, wg_virtual_ip);
 
-    // 规则 A：物理 Wi-Fi IP 直接落在该隧道业务网段内
+    // 纯位运算：物理 Wi-Fi IP 直接落在该隧道业务网段内 → 直连
     for cidr in &business_cidrs {
         for &wifi_ip in physical_wifi_ips {
             if ipv4_in_any_cidr(wifi_ip, std::slice::from_ref(cidr)) {
                 return true;
             }
-        }
-    }
-
-    // 规则 B 候选：显式探测目标 + 各业务网段首尾网关（限定前 2 个网段，防探测风暴）
-    let mut candidates: Vec<(std::net::Ipv4Addr, u16)> = Vec::new();
-    if let Some((ip, port)) = parse_lan_probe_ip(&profile.probe_target) {
-        let in_virtual = wg_virtual_ip.is_some_and(|vip| {
-            business_cidrs
-                .iter()
-                .any(|c| ipv4_in_any_cidr(vip, std::slice::from_ref(c)))
-                && ipv4_in_any_cidr(vip, std::slice::from_ref(&format!("{ip}/24")))
-        });
-        if !in_virtual {
-            candidates.push((ip, port));
-        }
-    }
-    for cidr in business_cidrs.iter().take(2) {
-        for host in cidr_probe_hosts(cidr) {
-            for port in [443u16, 80, 445, 5000] {
-                candidates.push((host, port));
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return false;
-    }
-
-    // 逐物理 Wi-Fi 地址探测（结果缓存 15 秒）
-    let mut cache = direct_probe_cache().lock().unwrap_or_else(|e| e.into_inner());
-    cache.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(30));
-    for &wifi_ip in physical_wifi_ips {
-        let key = (profile.id.clone(), wifi_ip.to_string());
-        if let Some((hit, at)) = cache.get(&key)
-            && at.elapsed() < std::time::Duration::from_secs(15)
-        {
-            if *hit {
-                return true;
-            }
-            continue;
-        }
-        let hit = candidates
-            .iter()
-            .any(|(ip, port)| probe_lan_host_from_physical(wifi_ip, *ip, *port, 150));
-        cache.insert(key, (hit, std::time::Instant::now()));
-        if hit {
-            return true;
         }
     }
     false

@@ -1063,6 +1063,51 @@ pub fn set_app_foreground(foreground: bool, state: State<'_, AppState>) {
         .store(foreground, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// 【APP58 任务2.2】原生级跨平台打开外链：
+/// iOS WKWebView 会丢弃 `window.open` / `target="_blank"`，必须由 Swift
+/// `UIApplication.shared.open` 在系统浏览器打开；其余平台走系统默认浏览器。
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    let target = url.trim().to_string();
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        return Err("Invalid URL".into());
+    }
+    #[cfg(target_os = "ios")]
+    {
+        if crate::platform::ios::open_url(&target) {
+            return Ok(());
+        }
+        return Err("open url failed".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&target).spawn();
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", target.as_str()])
+            .spawn();
+        return Ok(());
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = std::process::Command::new("am")
+            .args([
+                "start",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                target.as_str(),
+            ])
+            .spawn();
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_mode(
     requested_mode: RunMode,
@@ -3425,21 +3470,26 @@ pub async fn get_traffic_stats(
     }))
 }
 
-/// 【APP52 任务2】常驻后台遥测协程：600ms 一轮，VPN 运行中无条件探测
-/// `/connections`（1200ms 硬超时）。切换页面、切到系统后台都不停止；
-/// 速率经 EMA(0.65/0.35) 平滑，raw==0 且上次 <1KB/s 时归零，杜绝尾巴
-/// 抖动与「速率卡死」。每个 tick 广播 `telemetry://tick`，前端仪表盘零延迟
-/// 刷新，并在此处记录「[流量开始转发]」四阶段日志（每个节点会话仅一次）。
+/// 【APP52 任务2 / APP58 任务1.2】常驻后台遥测协程：1500ms 一轮低功耗采样；
+/// APP 处于后台（锁屏 / 切到其他 App）时**完全跳过 `/connections` 网络请求**，
+/// 只复用上次缓存速率广播，让 Rust 主进程在后台保持近乎 0% CPU；
+/// 回到前台后下一轮立即恢复真实采样。速率经 EMA(0.65/0.35) 平滑，
+/// raw==0 且上次 <1KB/s 时归零，杜绝尾巴抖动与「速率卡死」。
+/// 每个 tick 广播 `telemetry://tick`，前端仪表盘零延迟刷新，并在此处记录
+/// 「[流量开始转发]」四阶段日志（每个节点会话仅一次）。
 pub fn spawn_background_telemetry_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut logged_node: Option<String> = None;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             let state = app.state::<AppState>();
             let today = crate::core::store::today_total_bytes(&state.data_dir)
                 .max(*state.today_bytes_cache.read());
             let selected = state.settings.read().selected_node.clone();
             let running = *state.status.read() == CoreStatus::Running;
+            let foreground = state
+                .app_in_foreground
+                .load(std::sync::atomic::Ordering::Relaxed);
             if !running {
                 logged_node = None;
                 let _ = app.emit(
@@ -3450,6 +3500,23 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                         "today": today,
                         "running": false,
                         "selectedNode": selected,
+                    }),
+                );
+                continue;
+            }
+
+            // 【APP58 任务1.2】后台休眠：不发起任何网络请求，只广播缓存速率
+            if !foreground {
+                let (down, up) = state
+                    .last_traffic_sample
+                    .lock()
+                    .map(|s| (s.3, s.4))
+                    .unwrap_or((0, 0));
+                let _ = app.emit(
+                    "telemetry://tick",
+                    serde_json::json!({
+                        "down": down, "up": up, "today": today,
+                        "running": true, "selectedNode": selected,
                     }),
                 );
                 continue;
@@ -3586,8 +3653,9 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
 pub async fn get_runtime_snapshot(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // 【APP57 任务3.3】遥测请求节流：1 秒内最多拉取一次 /connections，
-    // 期间直接复用上次结果；原子开关防止并发重复请求造成后台流量风暴。
+    // 【APP57 任务3.3 / APP58 任务1.2】遥测请求节流：1.5 秒内最多拉取一次
+    // `/connections`，期间直接复用上次结果；原子开关防止并发重复请求造成
+    // 后台流量风暴与手机发热。
     static FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static LAST_FETCH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now_ms = std::time::SystemTime::now()
@@ -3595,7 +3663,7 @@ pub async fn get_runtime_snapshot(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let due = now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed))
-        >= 1000
+        >= 1500
         && FETCHING
             .compare_exchange(
                 false,

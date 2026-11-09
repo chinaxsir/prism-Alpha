@@ -87,10 +87,11 @@ func applyIosMemoryLimit() {
 	if runtime.GOOS != "ios" {
 		return
 	}
-	// 【APP57 任务3.1】内存硬约束：GC 40% + 26MiB 上限（远低于 iOS 50MiB
-	// Jetsam 红线），为扩展进程留足安全余量，彻底避免后台被系统强杀。
-	debug.SetGCPercent(40)
-	debug.SetMemoryLimit(26 * 1024 * 1024) // 26 MiB < iOS 50MiB Jetsam 硬红线
+	// 【APP58 任务1.3】省电与安全平衡：GC 85% + 36MiB 上限。APP57 的
+	// 40% / 26MiB 过于激进，频繁 GC 会持续占用 CPU 导致手机发热；
+	// 36 MiB 仍安全低于 iOS 50MiB Jetsam 硬红线。
+	debug.SetGCPercent(85)
+	debug.SetMemoryLimit(36 * 1024 * 1024) // 36 MiB < iOS 50MiB Jetsam 上限
 }
 
 func init() {
