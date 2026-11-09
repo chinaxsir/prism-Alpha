@@ -19,6 +19,7 @@ import {
   Rss,
   Send,
   BookOpen,
+  Ticket,
 } from "lucide-react";
 
 import {
@@ -65,6 +66,11 @@ const HELP_LINKS = [
     labelKey: "settings.helpPrivacy",
     url: "https://prism.sarl/privacy",
     Icon: Lock,
+  },
+  {
+    labelKey: "settings.helpTickets",
+    url: "https://prism.sarl/tickets",
+    Icon: Ticket,
   },
   {
     labelKey: "settings.helpChannel",
@@ -504,11 +510,11 @@ export default function Settings() {
         )}
       </SettingsGroup>
 
-      {/* Go Lan · 回家网络（Pro 门控）：【APP58 任务2.1】背景/透明度与下方
-          设置卡 100% 统一，未解锁时也不再变灰、不再有悬浮高光 */}
+      {/* Go Lan · 回家网络（Pro 门控）：【APP59】背景改为 bg-surface-card，
+          与下方各设置板块完全一致（浅色主题下同为白色卡片） */}
       <div
         id="go-lan-card"
-        className="rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3"
+        className="rounded-xl border border-border bg-surface-card px-4 py-3 flex items-center justify-between gap-3"
       >
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -628,10 +634,10 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 【APP57 任务5 / APP58 任务2.2】关于 & 帮助：版本信息 + 四个官方入口，
-          全部经 Rust 原生打开，iOS WKWebView 也能 100% 调起系统浏览器 */}
-      <div className="rounded-xl border border-border bg-surface px-4 py-3 space-y-3">
-        <div className="flex items-center gap-2.5">
+      {/* 【APP59】关于帮助：全部竖版排列（版本信息在上、链接逐行在下），
+          背景与设置页其他板块一致；所有链接经 Rust 原生打开，iOS 100% 生效 */}
+      <div className="rounded-xl border border-border bg-surface-card px-4 py-3 space-y-2">
+        <div className="flex items-center gap-2.5 pb-1">
           <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
             <BookOpen size={16} className="text-surge-purple" />
           </div>
@@ -644,30 +650,23 @@ export default function Settings() {
             </div>
           </div>
         </div>
-        {/* 【APP58 任务2.2】版本信息（链接上方）：软件版本运行时读取，内核版本固定展示 */}
-        <div className="grid grid-cols-2 gap-2 rounded-lg bg-surface-hover/60 px-2 py-2">
-          <div className="min-w-0 text-center">
-            <div className="text-[10px] text-text-muted">{t("settings.appVersion")}</div>
-            <div className="text-xs font-semibold text-text mt-0.5">
-              v{appVersion}
-            </div>
-          </div>
-          <div className="min-w-0 text-center">
-            <div className="text-[10px] text-text-muted">
-              {t("settings.kernelVersion")}
-            </div>
-            <div className="text-xs font-semibold text-text mt-0.5">
-              sing-box v1.11.3
-            </div>
-          </div>
+        {/* 版本信息：竖版两行，标签左 / 数值右 */}
+        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
+          <span className="text-xs text-text-muted">{t("settings.appVersion")}</span>
+          <span className="text-xs font-semibold text-text">v{appVersion}</span>
         </div>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
+          <span className="text-xs text-text-muted">{t("settings.kernelVersion")}</span>
+          <span className="text-xs font-semibold text-text">v1.11.3</span>
+        </div>
+        {/* 帮助入口：竖版逐行，图标 + 文字格式完全统一 */}
+        <div className="flex flex-col gap-2 pt-0.5">
           {HELP_LINKS.map(({ labelKey, url, Icon }) => (
             <button
               key={labelKey}
               type="button"
               onClick={() => openHelpLink(url)}
-              className="flex min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 hover:text-white transition-colors"
+              className="flex w-full min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 hover:text-white transition-colors"
             >
               <Icon size={14} className="shrink-0 text-accent" />
               <span className="truncate">{t(labelKey)}</span>

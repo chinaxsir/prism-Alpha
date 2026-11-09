@@ -56,6 +56,7 @@ const zh: Record<string, string> = {
   "settings.helpGuide": "用户指南",
   "settings.helpTerms": "服务条款",
   "settings.helpPrivacy": "隐私政策",
+  "settings.helpTickets": "提交工单",
   "settings.helpChannel": "官方频道",
   "settings.appVersion": "软件版本",
 
@@ -156,6 +157,7 @@ const en: Record<string, string> = {
   "settings.helpGuide": "User Guide",
   "settings.helpTerms": "Terms of Service",
   "settings.helpPrivacy": "Privacy Policy",
+  "settings.helpTickets": "Submit Ticket",
   "settings.helpChannel": "Official Channel",
   "settings.appVersion": "App Version",
 
