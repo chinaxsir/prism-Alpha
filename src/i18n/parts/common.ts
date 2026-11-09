@@ -246,7 +246,7 @@ const zh: Record<string, string> = {
   "pro.alphaSyncOff": "内测授权不包含订阅云端同步",
   "pro.alphaNoUnbind": "内测 Key 仅绑 1 台设备，解绑请联系管理员",
   "pro.licenseLabel": "License Key（必填）",
-  "pro.licensePlaceholder": "ASKC-XXXX-XXXX-XXXX-XXXX 或 A-XXXX-XXXX-XXXX",
+  "pro.licensePlaceholder": "你获取到的许可密钥",
   "pro.emailLabel": "注册邮箱（必填）",
   "pro.emailPlaceholder": "请输入获取授权时绑定的账号邮箱",
   "pro.emailInvalid": "邮箱格式不正确，请检查后重试",
@@ -604,7 +604,7 @@ const en: Record<string, string> = {
   "pro.alphaNoUnbind":
     "Alpha key binds 1 device only; contact the administrator to unbind",
   "pro.licenseLabel": "License Key (required)",
-  "pro.licensePlaceholder": "ASKC-XXXX-XXXX-XXXX-XXXX or A-XXXX-XXXX-XXXX",
+  "pro.licensePlaceholder": "The license key you received",
   "pro.emailLabel": "Account Email (required)",
   "pro.emailPlaceholder": "Enter the email bound to your license",
   "pro.emailInvalid": "Invalid email format, please check and retry",

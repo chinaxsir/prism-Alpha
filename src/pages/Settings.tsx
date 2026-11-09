@@ -650,14 +650,14 @@ export default function Settings() {
             </div>
           </div>
         </div>
-        {/* 版本信息：竖版两行，标签左 / 数值右 */}
+        {/* 版本信息：竖版两行，标签左 / 数值右；字号与设置页其他模块一致 */}
         <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
-          <span className="text-xs text-text-muted">{t("settings.appVersion")}</span>
-          <span className="text-xs font-semibold text-text">v{appVersion}</span>
+          <span className="text-sm text-text-muted">{t("settings.appVersion")}</span>
+          <span className="text-sm font-semibold text-text">v{appVersion}</span>
         </div>
         <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
-          <span className="text-xs text-text-muted">{t("settings.kernelVersion")}</span>
-          <span className="text-xs font-semibold text-text">v1.11.3</span>
+          <span className="text-sm text-text-muted">{t("settings.kernelVersion")}</span>
+          <span className="text-sm font-semibold text-text">v1.11.3</span>
         </div>
         {/* 帮助入口：竖版逐行，图标 + 文字格式完全统一 */}
         <div className="flex flex-col gap-2 pt-0.5">
@@ -666,7 +666,7 @@ export default function Settings() {
               key={labelKey}
               type="button"
               onClick={() => openHelpLink(url)}
-              className="flex w-full min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 hover:text-white transition-colors"
+              className="flex w-full min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-sm text-gray-300 hover:text-white transition-colors"
             >
               <Icon size={14} className="shrink-0 text-accent" />
               <span className="truncate">{t(labelKey)}</span>
