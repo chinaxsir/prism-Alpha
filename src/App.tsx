@@ -345,12 +345,18 @@ export default function App() {
     const aimProgress = listen<ProbeProgress>("aim://progress", (e) => {
       if (e.payload) useCoreStore.getState().setAimProgress(e.payload);
     });
+    // 【APP57 任务2】后端在启动 / 停止 / 重启 / 内核计数器归零时广播，
+    // 前端立即清空分析统计，避免旧数据残留或显示旧会话排行
+    const analyticsReset = listen("analytics://reset", () => {
+      useCoreStore.getState().resetAnalytics();
+    });
     return () => {
       traffic.then((fn) => fn());
       telemetry.then((fn) => fn());
       memory.then((fn) => fn());
       delayProgress.then((fn) => fn());
       aimProgress.then((fn) => fn());
+      analyticsReset.then((fn) => fn());
     };
   }, []);
 

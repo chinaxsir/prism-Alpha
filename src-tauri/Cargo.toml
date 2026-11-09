@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.3.89"
+version = "0.3.90"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"
@@ -54,6 +54,8 @@ http-body-util = "0.1"
 # Misc
 anyhow = "1.0"
 base64 = "0.22"
+# 【APP57 任务1】Go Lan 直连判定：绑定物理 Wi-Fi 源 IP 的内网网关 TCP 探测
+socket2 = "0.6"
 thiserror = "1.0"
 jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4"] }

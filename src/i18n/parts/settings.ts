@@ -50,6 +50,14 @@ const zh: Record<string, string> = {
   "settings.closeConns": "切换策略时关闭连接",
   "settings.closeConnsDesc": "切换节点后断开现有连接，新策略立即生效",
 
+  // ---- 关于 & 帮助 ----
+  "settings.aboutHelp": "关于 & 帮助",
+  "settings.aboutHelpDesc": "官方文档与问题反馈入口",
+  "settings.helpSite": "官网",
+  "settings.helpGroup": "用户群组",
+  "settings.helpFeedback": "反馈问题",
+  "settings.helpGuide": "功能指南",
+
   // ---- 代理内核 ----
   "settings.kernel": "代理内核",
   "settings.kernelVersion": "内核版本",
@@ -140,6 +148,14 @@ const en: Record<string, string> = {
   "settings.blockQuicDesc": "Drop UDP/443 to force TCP fallback",
   "settings.closeConns": "Close connections on switch",
   "settings.closeConnsDesc": "Drop existing connections when switching nodes",
+
+  // ---- About & Help ----
+  "settings.aboutHelp": "About & Help",
+  "settings.aboutHelpDesc": "Official docs and support entry points",
+  "settings.helpSite": "Website",
+  "settings.helpGroup": "Community",
+  "settings.helpFeedback": "Feedback",
+  "settings.helpGuide": "User Guide",
 
   "settings.kernel": "Proxy Kernel",
   "settings.kernelVersion": "Kernel Version",

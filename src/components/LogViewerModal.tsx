@@ -302,25 +302,42 @@ export default function LogViewerModal({
           </div>
         </div>
 
-        {/* 【APP56 任务4】固定 7 个独立分类标签（无「全部」），每个标签显示实时条数 */}
-        <div className="grid shrink-0 grid-cols-4 gap-1.5 border-b border-border px-3 py-2 text-xs">
-          {CATEGORY_TABS.map((tab) => (
-            <button
-              key={tab.key}
-              onClick={() => setActiveModule(tab.value)}
-              className={clsx(
-                "flex min-w-0 items-center justify-center gap-1 rounded-full px-2 py-1 transition-colors",
-                activeModule === tab.value
-                  ? "bg-accent text-white"
-                  : "bg-surface-hover text-gray-400 hover:text-gray-200",
-              )}
-            >
-              <span className="truncate">{t(tab.labelKey)}</span>
-              <span className="shrink-0 rounded-full bg-black/20 px-1.5 py-0.5 text-[10px] leading-none">
-                {categoryCounts[tab.value] ?? 0}
-              </span>
-            </button>
-          ))}
+        {/* 【APP56 任务4 / APP57 任务4】固定 7 个独立分类标签（无「全部」），
+            上下两行 4 + 3 排布，任何标签都不省略、不截断，并显示真实条数 */}
+        <div className="shrink-0 space-y-1.5 border-b border-border px-3 py-2">
+          {(() => {
+            const ordered = [...CATEGORY_TABS].sort(
+              (a, b) =>
+                (categoryCounts[b.value] ?? 0) - (categoryCounts[a.value] ?? 0),
+            );
+            const renderTab = (tab: (typeof CATEGORY_TABS)[number]) => (
+              <button
+                key={tab.key}
+                onClick={() => setActiveModule(tab.value)}
+                className={clsx(
+                  "flex min-w-0 items-center justify-center gap-1 rounded-full px-2 py-1 text-xs transition-colors",
+                  activeModule === tab.value
+                    ? "bg-accent text-white"
+                    : "bg-surface-hover text-gray-400 hover:text-gray-200",
+                )}
+              >
+                <span className="whitespace-nowrap">{t(tab.labelKey)}</span>
+                <span className="shrink-0 rounded-full bg-black/20 px-1.5 py-0.5 text-[10px] leading-none">
+                  {categoryCounts[tab.value] ?? 0}
+                </span>
+              </button>
+            );
+            return (
+              <>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {ordered.slice(0, 4).map(renderTab)}
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {ordered.slice(4).map(renderTab)}
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         {/* 日志列表：每条为上下两行全宽卡片 */}

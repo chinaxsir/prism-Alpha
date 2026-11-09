@@ -879,12 +879,13 @@ export default function GoLanModal({ open, onClose }: Props) {
           </div>
           <div className="no-scrollbar flex items-center gap-1.5 overflow-x-auto pb-0.5">
             {profiles.map((p) => {
-              // 【APP55 任务3 / APP56 任务3】多隧道精准直连：严格只读本档案 id
-              // 对应的直连结果，禁止全局 goLanAnyDirect 串染到其它隧道
+              // 【APP55 任务3 / APP57 任务1.3】多隧道精准直连：只读本档案
+              // 自身的直连结果，兼容 id / 名称双键，禁止全局状态串染
               const direct = Boolean(
                 p.enabled &&
                   p.bypassOnLocalLan &&
-                  status?.goLanProfileDirectMap?.[p.id] === true,
+                  (status?.goLanProfileDirectMap?.[p.id] === true ||
+                    status?.goLanProfileDirectMap?.[p.name] === true),
               );
               const on = p.id === form.id ? form.enabled : p.enabled;
               return (

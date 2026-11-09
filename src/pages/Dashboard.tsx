@@ -397,6 +397,8 @@ export default function Dashboard() {
     try {
       if (running) {
         await stopCore();
+        // 【APP57 任务2】停止即清空分析统计，页面立即归零
+        useCoreStore.getState().resetAnalytics();
         setStatus("stopped");
         setUptime(0);
         useCoreStore.getState().setStartedAtMs(null);
@@ -409,6 +411,8 @@ export default function Dashboard() {
         setManualStartFailed(false);
         setStatus("starting");
         await startCore();
+        // 【APP57 任务2】新会话启动即清空上一会话的分析统计
+        useCoreStore.getState().resetAnalytics();
         setStatus("running");
       }
     } catch (e) {
@@ -506,9 +510,12 @@ export default function Dashboard() {
       ? t("dashboard.lan.profiles", {
           profiles: enabledLanProfiles
             .map((p) => {
-              // 【APP56 任务3】严格只读本档案 id 的直连结果，禁止任何跨档案聚合
+              // 【APP56 任务3 / APP57 任务1.3】严格只读本档案自身的直连结果，
+              // 支持 id 与名称双键查找，仍禁止任何跨档案聚合
               const isDirect = Boolean(
-                p.enabled && p.bypassOnLocalLan && lanDirectMap[p.id] === true,
+                p.enabled &&
+                  p.bypassOnLocalLan &&
+                  (lanDirectMap[p.id] === true || lanDirectMap[p.name] === true),
               );
               const badge = isDirect
                 ? t("goLan.statusDirect")

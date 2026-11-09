@@ -34,6 +34,26 @@ const TRAFFIC_HISTORY_CAP: usize = 60;
 /// 活跃 / 近期连接池容量（超出时优先淘汰最旧的已关闭连接）
 const CONN_POOL_CAP: usize = 300;
 
+/// 【APP57 任务3.3】分析聚合表容量上限：hosts / domains / ips / outbounds /
+/// rules / protocols 各自最多保留 800 条，超出按累计字节淘汰尾部，
+/// 内存占用恒定，后台再长时间运行也不会OOM。
+const ANALYTICS_MAP_CAP: usize = 800;
+
+/// 按 (up + down) 累计字节降序保留前 `ANALYTICS_MAP_CAP` 条，其余淘汰。
+fn trim_analytics_map(map: &mut std::collections::HashMap<String, AggStat>) {
+    if map.len() <= ANALYTICS_MAP_CAP {
+        return;
+    }
+    let mut keys: Vec<(u64, String)> = map
+        .iter()
+        .map(|(k, v)| (v.up.saturating_add(v.down), k.clone()))
+        .collect();
+    keys.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, key) in keys.into_iter().skip(ANALYTICS_MAP_CAP) {
+        map.remove(&key);
+    }
+}
+
 /// 启动全部内核事件流订阅，返回任务句柄（调用方在停止内核时 abort）
 pub fn spawn_all(
     api_addr: &str,
@@ -317,6 +337,28 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
     //    新 id 视为 count+1，随后刷新 last_seen（已消失的从 last_seen 移除）
     {
         let mut agg = state.analytics.write();
+        // 【APP57 任务2】内核 / 扩展重启导致累计字节数归零（downloadTotal +
+        // uploadTotal 小于上帧采样）时，立即清零本次会话分析统计，绝不把
+        // 旧会话数据继续累加到新会话（分流占比与 Top 主机名从 0 重新统计）。
+        if download_total < agg.last_total_down || upload_total < agg.last_total_up {
+            agg.hosts.clear();
+            agg.domains.clear();
+            agg.ips.clear();
+            agg.ip_to_domain.clear();
+            agg.outbounds.clear();
+            agg.rules.clear();
+            agg.protocols.clear();
+            agg.last_seen.clear();
+            agg.proxy_bytes = 0;
+            agg.direct_bytes = 0;
+            agg.lan_bytes = 0;
+            agg.last_total_down = download_total;
+            agg.last_total_up = upload_total;
+            crate::core::logger::info(
+                crate::core::logger::MOD_KERNEL,
+                "检测到内核累计流量归零，分析统计已重置并开始新会话统计",
+            );
+        }
         // 【APP51 任务3】本帧三分累加量 + 拦截量，用于总量差额兜底
         let mut proxy_inc = 0u64;
         let mut direct_inc = 0u64;
@@ -426,6 +468,17 @@ fn apply_connections_update(state: &AppState, value: &serde_json::Value, foregro
         agg.lan_bytes = agg.lan_bytes.saturating_add(lan_inc);
         agg.last_total_down = download_total;
         agg.last_total_up = upload_total;
+
+        // 【APP57 任务3.3】聚合表容量封顶，杜绝长期运行内存膨胀
+        trim_analytics_map(&mut agg.hosts);
+        trim_analytics_map(&mut agg.domains);
+        trim_analytics_map(&mut agg.ips);
+        trim_analytics_map(&mut agg.outbounds);
+        trim_analytics_map(&mut agg.rules);
+        trim_analytics_map(&mut agg.protocols);
+        if agg.ip_to_domain.len() > ANALYTICS_MAP_CAP {
+            agg.ip_to_domain.clear();
+        }
 
         agg.last_seen.retain(|id, _| incoming.contains_key(id));
         for (id, conn) in &incoming {

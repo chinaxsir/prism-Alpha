@@ -266,6 +266,8 @@ interface CoreState {
   setTodayBytes: (bytes: number) => void;
   setConnections: (list: ConnItem[]) => void;
   setAnalytics: (summary: AnalyticsSummary) => void;
+  /// 【APP57 任务2】内核启动 / 停止 / 重启时清空分析统计与主机映射缓存
+  resetAnalytics: () => void;
   /** 应用后端运行时快照（回前台/定时同步，保证数据无缝衔接） */
   applyRuntimeSnapshot: (snap: RuntimeSnapshot) => void;
   /** 内核停止时清空运行时数据 */
@@ -383,6 +385,23 @@ export const useCoreStore = create<CoreState>((set, get) => ({
     set({ connections, ...collectHostMappings(ipToDomain, domainToIp, connections) });
   },
   setAnalytics: (analytics) => set({ analytics }),
+  // 【APP57 任务2】收到 analytics://reset 或本端启停内核时，立即归零展示
+  resetAnalytics: () =>
+    set({
+      analytics: {
+        hosts: [],
+        domains: [],
+        ips: [],
+        outbounds: [],
+        rules: [],
+        protocols: [],
+        proxyBytes: 0,
+        directBytes: 0,
+        lanBytes: 0,
+      },
+      ipToDomain: {},
+      domainToIp: {},
+    }),
 
   applyRuntimeSnapshot: (snap) => {
     // 后端权威快照：60 秒曲线直接覆盖（后台期间由内核持续采样，无缝衔接）

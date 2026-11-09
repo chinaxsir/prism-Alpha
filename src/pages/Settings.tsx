@@ -3,13 +3,11 @@ import { useSearchParams } from "react-router-dom";
 import {
   Lock,
   ShieldAlert,
-  ShieldCheck,
   Sparkles,
   ChevronRight,
   Wifi,
   Network,
   Sliders,
-  Cpu,
   Power,
   Globe,
   Blocks,
@@ -19,11 +17,13 @@ import {
   Palette,
   FileTerminal,
   Rss,
+  Users,
+  Bug,
+  BookOpen,
 } from "lucide-react";
 
 import {
   getCoreStatus,
-  getKernelInfo,
   getLanIp,
   getSettings,
   saveSettings,
@@ -32,7 +32,6 @@ import {
   saveGoLanSettings,
   isGoLanConfigured,
   clearAppLogs,
-  type KernelInfo,
   type GoLanSettings,
 } from "@/api/ipc";
 import type { RunMode, UserSettings } from "@/stores/core";
@@ -49,6 +48,21 @@ import Switch from "@/components/ui/Switch";
 import { usePrefsStore, type Language, type ThemePref } from "@/stores/prefs";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
+
+/// 【APP57 任务5】关于 & 帮助：四个官方入口
+const HELP_LINKS = [
+  { labelKey: "settings.helpSite", url: "https://github.com/chinaxsir/Prism", Icon: Globe },
+  { labelKey: "settings.helpGroup", url: "https://github.com/chinaxsir/Prism/discussions", Icon: Users },
+  { labelKey: "settings.helpFeedback", url: "https://github.com/chinaxsir/Prism/issues", Icon: Bug },
+  { labelKey: "settings.helpGuide", url: "https://github.com/chinaxsir/Prism#readme", Icon: BookOpen },
+] as const;
+
+/// 桌面端走 Tauri shell 打开系统浏览器；移动端权限缺失时回落 window.open
+function openHelpLink(url: string) {
+  import("@tauri-apps/plugin-shell")
+    .then((m) => m.open(url))
+    .catch(() => window.open(url, "_blank", "noopener,noreferrer"));
+}
 
 /// 接入模式图标
 const RUN_MODE_ICON: Record<RunMode, typeof Wifi> = {
@@ -116,7 +130,6 @@ export default function Settings() {
     }
   }, [searchParams]);
 
-  const [kernelInfo, setKernelInfo] = useState<KernelInfo | null>(null);
   // 【APP-9 任务1.3】本机局域网 IP（allow_lan 开启后展示给其他设备配置代理）
   const [lanIp, setLanIp] = useState<string | null>(null);
 
@@ -168,9 +181,6 @@ export default function Settings() {
         }
       })
       .catch(() => undefined);
-    getKernelInfo()
-      .then(setKernelInfo)
-      .catch((e) => console.error(e));
   }, []);
 
   /// 【APP45 任务3】form 实时镜像（避免防抖闭包读取过期 state）
@@ -488,11 +498,13 @@ export default function Settings() {
                   (goLanCfg?.profiles ?? [])
                     .filter((p) => p.enabled)
                     .map((p) => {
-                      // 【APP56 任务3】严格只读本档案 id 的直连结果，禁止全局串染
+                      // 【APP56 任务3 / APP57 任务1.3】严格只读本档案自身结果，
+                      // 同时兼容 id 与名称两种映射键
                       const isDirect = Boolean(
                         p.enabled &&
                           p.bypassOnLocalLan &&
-                          goLanCfg?.goLanProfileDirectMap?.[p.id] === true,
+                          (goLanCfg?.goLanProfileDirectMap?.[p.id] === true ||
+                            goLanCfg?.goLanProfileDirectMap?.[p.name] === true),
                       );
                       return `${p.name} (${
                         isDirect
@@ -591,27 +603,35 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 【APP12 任务2】代理内核：干净单行展示，仅显示版本号 vX.Y.Z */}
-      <SettingsGroup title={t("settings.kernel")} icon={<Cpu size={18} />} iconColor="text-surge-purple">
-        <div className="flex items-center justify-between px-3 py-3">
-          <div className="flex items-center gap-3">
-            <RowIcon>
-              <ShieldCheck
-                size={16}
-                className={kernelInfo?.exists ? "text-latency-good" : "text-latency-bad"}
-              />
-            </RowIcon>
-            <div className="text-sm text-text">{t("settings.kernelVersion")}</div>
+      {/* 【APP57 任务5】关于 & 帮助：四个带图标的文字链接按钮，替代原「代理内核」卡片 */}
+      <div className="rounded-xl border border-border bg-surface px-4 py-3 space-y-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
+            <BookOpen size={16} className="text-surge-purple" />
           </div>
-          <div className="text-xs font-mono text-text-muted">
-            {kernelInfo?.exists && kernelInfo.version
-              ? `v${kernelInfo.version.trim().replace(/\s*[（(]内置[）)]/g, "").replace(/^v/i, "")}`
-              : kernelInfo?.exists
-                ? ""
-                : t("settings.kernelMissing")}
+          <div className="min-w-0">
+            <div className="font-semibold text-sm text-text">
+              {t("settings.aboutHelp")}
+            </div>
+            <div className="text-[11px] text-text-muted truncate">
+              {t("settings.aboutHelpDesc")}
+            </div>
           </div>
         </div>
-      </SettingsGroup>
+        <div className="grid grid-cols-2 gap-2">
+          {HELP_LINKS.map(({ labelKey, url, Icon }) => (
+            <button
+              key={labelKey}
+              type="button"
+              onClick={() => openHelpLink(url)}
+              className="flex min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-300 hover:text-white transition-colors"
+            >
+              <Icon size={14} className="shrink-0 text-accent" />
+              <span className="truncate">{t(labelKey)}</span>
+            </button>
+          ))}
+        </div>
+      </div>
 
       {/* Prism Pro：【APP-5 任务4】未激活展示 5 大模块引导，已激活极简单行 */}
       {!proUnlocked ? (

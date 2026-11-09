@@ -3,5 +3,5 @@
   "description": "移动端 StoreKit2 / Google Play Billing 权限",
   "platforms": ["iOS", "android"],
   "windows": ["main"],
-  "permissions": ["iap:default"]
+  "permissions": ["iap:default", "shell:allow-open"]
 }

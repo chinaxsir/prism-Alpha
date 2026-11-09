@@ -568,6 +568,28 @@ impl AppState {
         agg.protocols.clear();
     }
 
+    /// 【APP57 任务2】内核会话切换（启动 / 停止 / 重启 / 内核计数器归零）时
+    /// 清零全部分析统计：三分字节、主机 / 域名 / IP / 出站 / 规则 / 协议排行、
+    /// 连接差分工信与流量差分基准全部归零，新会话从 0 重新统计。
+    pub fn reset_analytics_session(&self) {
+        let mut agg = self.analytics.write();
+        agg.hosts.clear();
+        agg.domains.clear();
+        agg.ips.clear();
+        agg.ip_to_domain.clear();
+        agg.outbounds.clear();
+        agg.rules.clear();
+        agg.protocols.clear();
+        agg.last_seen.clear();
+        agg.proxy_bytes = 0;
+        agg.direct_bytes = 0;
+        agg.lan_bytes = 0;
+        agg.last_total_down = 0;
+        agg.last_total_up = 0;
+        drop(agg);
+        *self.last_traffic_sample.lock() = None;
+    }
+
     /// 构造运行时统计快照（供 get_runtime_snapshot IPC 返回）。
     /// todayBytes 取「落盘值」与「内存缓存」的较大者，避免落盘滞后导致回退。
     pub fn runtime_snapshot(&self) -> serde_json::Value {

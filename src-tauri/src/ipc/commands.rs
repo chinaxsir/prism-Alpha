@@ -107,6 +107,10 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
         return Err(sanitize_err(&e.to_string()));
     }
 
+    // 【APP57 任务2】新会话启动：清零上一会话的全部分析统计并通知前端从 0 展示
+    state.reset_analytics_session();
+    let _ = app.emit("analytics://reset", serde_json::json!({ "reason": "start" }));
+
     // 启动失败时统一回滚，避免半成品状态
     if let Err(e) = do_start(app, state).await {
         let _ = do_stop(state).await;
@@ -606,6 +610,9 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
         .transition(CoreStatus::Stopped)
         .map_err(|e| sanitize_err(&e.to_string()))?;
 
+    // 【APP57 任务2】重启会话：旧内核已停、统计已清零，通知前端立即重置
+    let _ = app.emit("analytics://reset", serde_json::json!({ "reason": "restart" }));
+
     // 4. 应用已校验的配置启动新内核；失败仍转 Error 允许重试
     state
         .transition(CoreStatus::Starting)
@@ -909,7 +916,7 @@ pub(crate) fn resolve_kernel_path(work_dir: &std::path::Path) -> anyhow::Result<
 }
 
 #[tauri::command]
-pub async fn stop_core(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn stop_core(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     // 幂等：停止需要等待内核退出（最长 5 秒），期间重复点击/退出清理
     // 会再次进入本函数。transition 内部持写锁，并发下只有一个调用能
     // 完成 Running -> Stopping，其余落入此分支直接忽略
@@ -931,6 +938,8 @@ pub async fn stop_core(state: State<'_, AppState>) -> Result<(), String> {
     state
         .transition(CoreStatus::Stopped)
         .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 【APP57 任务2】停止会话：分析统计已随 do_stop 清零，通知前端刷新
+    let _ = app.emit("analytics://reset", serde_json::json!({ "reason": "stop" }));
     Ok(())
 }
 
@@ -972,6 +981,8 @@ pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
         tracing::warn!("归档会话流量失败: {e}");
     }
     state.reset_runtime_stats();
+    // 【APP57 任务2】内核已停：本次会话分析统计清零（重启后从 0 重新统计）
+    state.reset_analytics_session();
     *state.today_bytes_cache.write() = crate::core::store::today_total_bytes(&state.data_dir);
     // 【APP48 任务3】内核已停：授权请求不再借道本地代理，回落到 DoH/直连
     crate::core::license::clear_local_mixed_port();
@@ -1010,13 +1021,16 @@ pub async fn get_core_status(
         let map: std::collections::HashMap<String, bool> = {
             let phys = physical.clone();
             tokio::task::spawn_blocking(move || {
-                profiles
-                    .into_iter()
-                    .map(|(_, p)| {
-                        let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
-                        (p.id.clone(), hit)
-                    })
-                    .collect::<std::collections::HashMap<String, bool>>()
+                // 【APP57 任务1.3】双键下发：id 与 name 均写入判定结果，
+                // 前端无论按 id 还是按名称取用都不会出现「只有 home 直连」错位
+                let mut map: std::collections::HashMap<String, bool> =
+                    std::collections::HashMap::new();
+                for (_, p) in profiles {
+                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
+                    map.insert(p.id.clone(), hit);
+                    map.insert(p.name.clone(), hit);
+                }
+                map
             })
             .await
             .unwrap_or_default()
@@ -3572,20 +3586,46 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
 pub async fn get_runtime_snapshot(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // 1. 无条件探测：内核 API 可访问即视为运行中（修复「内核未运行」误报）
-    let telemetry = async {
-        let conn_json = state.kernel_api().get_connections().await.ok()?;
-        let total_down = conn_json
-            .get("downloadTotal")
-            .and_then(|v| v.as_u64())
-            .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
-        let total_up = conn_json
-            .get("uploadTotal")
-            .and_then(|v| v.as_u64())
-            .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
-        Some((total_down, total_up))
-    }
-    .await;
+    // 【APP57 任务3.3】遥测请求节流：1 秒内最多拉取一次 /connections，
+    // 期间直接复用上次结果；原子开关防止并发重复请求造成后台流量风暴。
+    static FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LAST_FETCH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let due = now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed))
+        >= 1000
+        && FETCHING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok();
+
+    // 1. 到期才探测：内核 API 可访问即视为运行中（修复「内核未运行」误报）
+    let telemetry = if due {
+        LAST_FETCH_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        let fetched = async {
+            let conn_json = state.kernel_api().get_connections().await.ok()?;
+            let total_down = conn_json
+                .get("downloadTotal")
+                .and_then(|v| v.as_u64())
+                .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+            let total_up = conn_json
+                .get("uploadTotal")
+                .and_then(|v| v.as_u64())
+                .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+            Some((total_down, total_up))
+        }
+        .await;
+        FETCHING.store(false, std::sync::atomic::Ordering::Release);
+        fetched
+    } else {
+        None
+    };
 
     // 仅当处于 Stopped/Error 且内核 API 正常应答时自愈，避免干扰启动/停止中间态
     if telemetry.is_some() {
@@ -3597,7 +3637,13 @@ pub async fn get_runtime_snapshot(
     }
 
     let mut display: Option<(u64, u64)> = None;
-    if let Some((total_down, total_up)) = telemetry {
+    if !due {
+        // 1 秒内的重复调用：直接复用缓存速率，绝不重复请求、也不做衰减
+        display = state
+            .last_traffic_sample
+            .lock()
+            .map(|(_, _, _, speed_down, speed_up)| (speed_down, speed_up));
+    } else if let Some((total_down, total_up)) = telemetry {
         let now = std::time::Instant::now();
         let mut sample = state.last_traffic_sample.lock();
         let (speed_down, speed_up) = match *sample {
@@ -3646,8 +3692,8 @@ pub async fn get_runtime_snapshot(
         }
     }
 
-    // 2. 追加一条 60s 环形队列样本（每秒一条）
-    if let Some((down, up)) = display {
+    // 2. 追加一条 60s 环形队列样本（每秒最多一条，与节流同频）
+    if due && let Some((down, up)) = display {
         // 不引入 chrono：以 Unix 秒换算 HH:MM:SS（events.rs 同款）
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4008,13 +4054,15 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
         let profiles = crate::core::go_lan::enabled_profiles(&lan);
         let phys = physical.clone();
         tokio::task::spawn_blocking(move || {
-            profiles
-                .into_iter()
-                .map(|(_, p)| {
-                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
-                    (p.id.clone(), hit)
-                })
-                .collect::<std::collections::HashMap<String, bool>>()
+            // 【APP57 任务1.3】id 与 name 双键写入，杜绝档案名称键查询落空
+            let mut map: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            for (_, p) in profiles {
+                let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
+                map.insert(p.id.clone(), hit);
+                map.insert(p.name.clone(), hit);
+            }
+            map
         })
         .await
         .unwrap_or_default()
@@ -4256,6 +4304,8 @@ pub async fn get_go_lan_status(
         }
         profile_states.insert(profile.id.clone(), serde_json::json!(state_str));
         profile_direct_map.insert(profile.id.clone(), serde_json::json!(direct_hit));
+        // 【APP57 任务1.3】按名称同样下发，前端名称键查找也能命中
+        profile_direct_map.insert(profile.name.clone(), serde_json::json!(direct_hit));
         items.push(serde_json::json!({
             "tag": tag,
             "id": profile.id,
@@ -4271,6 +4321,7 @@ pub async fn get_go_lan_status(
     for profile in lan.profiles.iter().filter(|p| !p.enabled) {
         profile_states.insert(profile.id.clone(), serde_json::json!("off"));
         profile_direct_map.insert(profile.id.clone(), serde_json::json!(false));
+        profile_direct_map.insert(profile.name.clone(), serde_json::json!(false));
     }
     Ok(serde_json::json!({
         "profiles": items,

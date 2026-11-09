@@ -42,6 +42,30 @@ pub fn run() {
         .unwrap_or_else(|_| EnvFilter::new("info,want=off,mio=off,polling=off"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // 【APP57 任务3.2】全局 PANIC 兜底：任何线程 panic 都写入「内核」分类
+    // 日志（含文件与位置），后台崩溃不再静默消失，便于导出日志定位。
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        core::logger::error(
+            core::logger::MOD_KERNEL,
+            format!(
+                "应用 PANIC @ {location}: {}",
+                core::logger::safe_truncate_str(&payload, 500)
+            ),
+        );
+        default_panic_hook(info);
+    }));
+
     // 运行时安全自检（仅 Release 生效）：iOS 反调试附加、Android TracerPid 检测
     core::security::init_runtime_guard();
 

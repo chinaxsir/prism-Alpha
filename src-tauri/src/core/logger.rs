@@ -114,79 +114,101 @@ fn now_timestamp() -> String {
     beijing_now_string()
 }
 
-/// 【APP56 任务4】统一强制分类归属器：无论调用方传入什么 `raw_category`，
-/// 每条日志只能且必须归入唯一一个精准分类（严禁混在 Kernel 一起输出）：
-/// - `"GoLan"`：raw=GoLan，或消息含 Go Lan / GoLan / go-lan / wireguard /
-///   内网 / 隧道 / On-Demand；
-/// - `"GoAIM"`：raw=GoAIM，或消息含 Go AIM / GoAIM / AIM / GO-AIM-PROBE /
-///   aim-probe / AI/流媒体 / 解锁；
-/// - `"GoCus"`：raw=GoCus，或消息含 Go Cus / GoCus / 覆写 / 去广告 / 模板；
-/// - `"Rule"`：raw=Rule，或消息含 `[规则` / 规则命中 / 路由规则 / 分流模式 /
-///   match rule / `route(`；
-/// - `"Node"`：raw=Node，或消息含 `[节点` / `[握手` / `[连接成功]` /
-///   `[流量开始转发]` / 测速 / outbound/vless|trojan|vmess|shadowsocks|hysteria|tuic；
-/// - `"Sub"`：raw=Sub，或消息含 订阅 / `[Sub]`；
-/// - `"Kernel"`：其余纯内核启停 / TUN 网卡 / DNS / 底层状态日志。
+/// 【APP56 任务4 / APP57 任务4】统一强制分类归属器：每条日志只能且必须
+/// 归入唯一一个精准分类，且**绝不允许关键词猜测**：
+/// - 调用方显式传入 7 个合法分类之一（Kernel / Node / Rule / GoAIM /
+///   GoLan / GoCus / Sub）→ 直接采用，非法值一律归 Kernel；
+/// - 传入 Kernel（典型为 sing-box 底层 stdout 日志）→ 只认**显式标签 / 前缀**：
+///   `[节点识别]` `[握手阶段]` `[节点握手]` `[连接成功]` `[流量开始转发]`
+///   `[测速]` / `outbound/<协议>` → Node；`[规则` `路由规则` `分流模式`
+///   `规则命中` / `match rule` → Rule；`[GoAIM]` `GO-AIM-PROBE` → GoAIM；
+///   `[GoLan]` `[GoLan-Ext]` `outbound/wireguard` → GoLan；`[GoCus]` → GoCus；
+///   `[Sub]` → Sub；
+/// - 其余（DNS / TUN / 路由表 / 进程启停等）一律 Kernel。
+/// 关键修复：DNS 失败日志即使包含节点域名，也绝不会再被误归为 Node。
 pub fn enforce_strict_log_category(raw_category: &str, message: &str) -> &'static str {
     let raw = raw_category.trim();
-    let lower = message.to_lowercase();
-    let hit = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+    // 1. 显式模块标签优先，且只接受 7 类合法值
+    if raw.eq_ignore_ascii_case(MOD_NODE) {
+        return MOD_NODE;
+    }
+    if raw.eq_ignore_ascii_case(MOD_RULE) {
+        return MOD_RULE;
+    }
+    if raw.eq_ignore_ascii_case(MOD_GO_AIM) {
+        return MOD_GO_AIM;
+    }
+    if raw.eq_ignore_ascii_case(MOD_GO_LAN) {
+        return MOD_GO_LAN;
+    }
+    if raw.eq_ignore_ascii_case(MOD_GO_CUS) {
+        return MOD_GO_CUS;
+    }
+    if raw.eq_ignore_ascii_case(MOD_SUB) {
+        return MOD_SUB;
+    }
 
-    // 1. GoLan（优先级最高：隧道/内网日志常带 wireguard 字样）
-    if raw.eq_ignore_ascii_case(MOD_GO_LAN)
-        || hit(&["go lan", "golan", "go-lan", "wireguard", "内网", "隧道", "on-demand"])
+    // 2. raw 为 Kernel / 未知：只按显式标签与前缀识别，禁止关键词劫持
+    let lower = message.to_lowercase();
+    let trimmed = message.trim_start();
+
+    // Go Lan：显式模块标签与 WG 底层出站日志
+    if lower.contains("[golan]")
+        || lower.contains("[go lan]")
+        || lower.contains("[golan-ext]")
+        || lower.contains("outbound/wireguard")
+        || trimmed.starts_with("go-lan-")
     {
         return MOD_GO_LAN;
     }
-    // 2. Go AIM
-    if raw.eq_ignore_ascii_case(MOD_GO_AIM)
-        || hit(&[
-            "go aim",
-            "goaim",
-            "aim",
-            "go-aim-probe",
-            "aim-probe",
-            "ai/流媒体",
-            "解锁",
-        ])
+    // Go AIM：显式模块标签与探测通道标记
+    if lower.contains("[goaim]")
+        || lower.contains("[go aim]")
+        || lower.contains("go-aim-probe")
+        || lower.contains("aim-probe-in")
     {
         return MOD_GO_AIM;
     }
-    // 3. Go Cus
-    if raw.eq_ignore_ascii_case(MOD_GO_CUS)
-        || hit(&["go cus", "gocus", "覆写", "去广告", "模板"])
-    {
+    // Go Cus：显式模块标签
+    if lower.contains("[gocus]") || lower.contains("[go cus]") {
         return MOD_GO_CUS;
     }
-    // 4. Rule
-    if raw.eq_ignore_ascii_case(MOD_RULE)
-        || hit(&["[规则", "规则命中", "路由规则", "分流模式", "match rule", "route("])
+    // 订阅：显式标签
+    if lower.contains("[sub]") {
+        return MOD_SUB;
+    }
+    // 规则：显式前缀 / 标签 / 内核路由匹配行
+    if trimmed.starts_with("[规则")
+        || lower.contains("[rule]")
+        || trimmed.starts_with("路由规则")
+        || trimmed.starts_with("分流模式")
+        || trimmed.starts_with("规则命中")
+        || lower.contains("match rule")
+        || lower.contains("route(")
     {
         return MOD_RULE;
     }
-    // 5. Node
-    if raw.eq_ignore_ascii_case(MOD_NODE)
-        || hit(&[
-            "[节点",
-            "[握手",
-            "[连接成功]",
-            "[流量开始转发]",
-            "测速",
-            "outbound/vless",
-            "outbound/trojan",
-            "outbound/vmess",
-            "outbound/shadowsocks",
-            "outbound/hysteria",
-            "outbound/tuic",
-        ])
+    // 节点：仅节点生命周期显式前缀，或 outbound/<协议> 底层日志
+    if trimmed.starts_with("[节点识别]")
+        || trimmed.starts_with("[握手阶段]")
+        || trimmed.starts_with("[节点握手]")
+        || trimmed.starts_with("[连接成功]")
+        || trimmed.starts_with("[流量开始转发]")
+        || trimmed.starts_with("[测速]")
+        || lower.contains("[node]")
+        || trimmed.starts_with("outbound/vless")
+        || trimmed.starts_with("outbound/trojan")
+        || trimmed.starts_with("outbound/vmess")
+        || trimmed.starts_with("outbound/shadowsocks")
+        || trimmed.starts_with("outbound/hysteria")
+        || trimmed.starts_with("outbound/tuic")
+        || trimmed.starts_with("outbound/anytls")
+        || trimmed.starts_with("outbound/socks")
     {
         return MOD_NODE;
     }
-    // 6. Sub
-    if raw.eq_ignore_ascii_case(MOD_SUB) || hit(&["订阅", "[sub]"]) {
-        return MOD_SUB;
-    }
-    // 7. Kernel（兜底：纯内核进程启停 / TUN 网卡 / DNS / 底层状态）
+
+    // 3. Kernel（兜底：纯内核进程启停 / TUN 网卡 / DNS / 底层状态）
     MOD_KERNEL
 }
 
@@ -821,6 +843,17 @@ pub fn sanitize_sensitive(text: &str) -> String {
     out
 }
 
+/// 【APP57 任务3.2】安全截断：一律按 Unicode 字符边界截取，绝不按字节
+/// 索引（如 `&s[..n]`）切片，中文 / emoji 内容永不 panic。
+pub fn safe_truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
 /// 生成带设备环境头信息的格式化纯文本日志全文（供前端复制 / 导出 .log）
 pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> String {
     let payload = get_logs(data_dir, module_filter);
@@ -881,29 +914,32 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 mod tests {
     use super::{
         beijing_now_string, classify_external_log_line, enforce_strict_log_category,
-        is_benign_close_line, is_noise_eperm_line, strip_leading_datetime, MOD_GO_AIM, MOD_GO_CUS,
+        is_benign_close_line, is_noise_eperm_line, safe_truncate_str, strip_leading_datetime,
+        MOD_GO_AIM, MOD_GO_CUS,
         MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING,
         PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
 
-    /// 【APP56 任务4】强制分类器：7 类日志零交叉混杂，任何 raw_category
-    /// 都不得把节点/规则/Go AIM/Go Lan/Go Cus/订阅日志混进 Kernel。
+    /// 【APP57 任务4】强制分类器：显式模块优先；Kernel 底层日志只按显式
+    /// 标签 / 前缀升级分类，DNS 行即使含节点域名也必须留在 Kernel。
     #[test]
     fn test_enforce_strict_log_category_isolated() {
-        let cases: [(&str, &str, &str); 14] = [
-            ("Kernel", "节点测速完成，自动选择最低延迟节点", MOD_NODE),
+        let cases: [(&str, &str, &str); 16] = [
+            ("Kernel", "[测速] 节点测速完成，自动选择最低延迟节点", MOD_NODE),
+            ("Kernel", "节点测速完成，自动选择最低延迟节点", MOD_KERNEL),
+            ("Kernel", "dns: exchange failed: timeout for hk1.company-example.com", MOD_KERNEL),
             ("Kernel", "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_RULE),
             ("Kernel", "[GoAIM] probe gpt unlocked", MOD_GO_AIM),
-            ("Kernel", "Go Lan 隧道握手完成 go-lan-home", MOD_GO_LAN),
-            ("Kernel", "Go Cus 去广告模板已加载", MOD_GO_CUS),
-            ("Kernel", "订阅更新完成 18/20", MOD_SUB),
+            ("Kernel", "[GoLan] 隧道握手完成 go-lan-home", MOD_GO_LAN),
+            ("Kernel", "Go Lan 隧道握手完成 go-lan-home", MOD_KERNEL),
+            ("Kernel", "[GoCus] 去广告模板已加载", MOD_GO_CUS),
+            ("Kernel", "Go Cus 去广告模板已加载", MOD_KERNEL),
+            ("Kernel", "[Sub] 订阅更新完成 18/20", MOD_SUB),
             ("Kernel", "start inbound/tun[tun-in]: create tun", MOD_KERNEL),
             ("GoAIM", "任意内容", MOD_GO_AIM),
             ("GoLan", "任意内容", MOD_GO_LAN),
             ("GoCus", "任意内容", MOD_GO_CUS),
-            ("Rule", "任意内容", MOD_RULE),
             ("Node", "任意内容", MOD_NODE),
-            ("Sub", "任意内容", MOD_SUB),
             ("Pro", "授权校验通过", MOD_KERNEL),
         ];
         let allowed = [
@@ -914,6 +950,15 @@ mod tests {
             assert_eq!(got, want, "raw={raw} message={message}");
             assert!(allowed.contains(&got), "必须是唯一 7 分类之一");
         }
+    }
+
+    /// 【APP57 任务3.2】按字符截断：中文 / emoji 永不 panic、不产生半个字符
+    #[test]
+    fn test_safe_truncate_str_unicode() {
+        assert_eq!(safe_truncate_str("中文中文中文", 2), "中文…");
+        assert_eq!(safe_truncate_str("😀😀", 1), "😀…");
+        assert_eq!(safe_truncate_str("abc", 5), "abc");
+        assert_eq!(safe_truncate_str("", 0), "");
     }
 
     /// 【APP55 任务5】外部日志行必须精确落入单一类别，禁止一律归 Kernel
