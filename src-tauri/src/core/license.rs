@@ -235,6 +235,15 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
+/// 令牌 licenseRef = sha256(license_key.trim()) 前 8 字节的 16 位小写 hex。
+/// 哈希输入必须与请求体 `license_key` 完全一致：只允许 trim()，
+/// 严禁任何大小写转换（该字段用于确认令牌对应的正是用户输入的那个 Key）。
+fn license_ref(key: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(key.trim().as_bytes());
+    hex_lower(&h.finalize()[..8])
+}
+
 /// 平台硬件指纹原始串（送入 SHA-256 算 device_id）。
 /// 不同平台用各自权威系统标识：iOS identifierForVendor + hostname、
 /// Android ANDROID_ID + Build.MODEL、macOS IOPlatformUUID、Windows MachineGuid、
@@ -1021,7 +1030,7 @@ async fn fetch_status(base: &str, license_key: &str, data_dir: &Path) -> std::re
             &env,
             &device_id_str,
             "",
-            Some(license_key),
+            Some(&license_ref(license_key)),
             Some("status"),
             now,
         )
@@ -1207,14 +1216,13 @@ pub async fn activate(
     }
 
     // 【110.txt】激活响应签名信封验签（服务端新旧协议兼容：无 token 时记录 warn 继续）
-    let device_id_str = device_id(data_dir)?;
     if let Some(env) = data.token.as_ref() {
         let now = crate::core::ed25519_verify::unix_now();
         match crate::core::ed25519_verify::verify(
             env,
             &device_id_str,
             "",
-            Some(&license_key),
+            Some(&license_ref(&license_key)),
             Some("activation"),
             now,
         ) {
@@ -1628,5 +1636,18 @@ mod tests {
         assert!(!is_stealth_protected_host_or_ip("example.com"));
         assert!(!is_stealth_protected_host_or_ip("8.8.8.8"));
         assert!(stealth_ips_snapshot().iter().any(|ip| ip == "203.0.113.9"));
+    }
+
+    /// 服务端真实令牌中的 licenseRef 固定向量（已核对一致）
+    #[test]
+    fn license_ref_matches_server_fixed_vector() {
+        assert_eq!(license_ref("ASKC-LDP2-M4VT-ZSBU"), "02d716abf16c817c");
+    }
+
+    /// 只允许 trim，严禁大小写转换：哈希输入必须与请求体 license_key 完全一致
+    #[test]
+    fn license_ref_trims_but_preserves_case() {
+        assert_eq!(license_ref("  ASKC-LDP2-M4VT-ZSBU  "), "02d716abf16c817c");
+        assert_ne!(license_ref("askc-ldp2-m4vt-zsbu"), "02d716abf16c817c");
     }
 }
