@@ -789,6 +789,218 @@ pub fn is_profile_lan_direct_active(
     false
 }
 
+// ---------------------------------------------------------------- APP59 任务1
+// 全隧道直连状态：事件驱动缓存（网络 / 配置签名变化时才评估一次）
+
+type LanDirectMap = std::collections::HashMap<String, bool>;
+
+/// `(签名, 各隧道直连状态)`；签名 = 物理 Wi-Fi IP 集合 + 全部隧道直连相关配置。
+/// 只有签名变化（切 Wi-Fi / 改 Go Lan 配置）才会重新评估，日常读取为纯内存
+/// HashMap 克隆，0 网络 I/O、0 系统调用，不产生任何额外发热。
+static LAN_DIRECT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, LanDirectMap)>>> =
+    std::sync::OnceLock::new();
+
+fn lan_direct_cache() -> &'static std::sync::Mutex<Option<(String, LanDirectMap)>> {
+    LAN_DIRECT_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 直连状态签名：任意一条变化即视为「网络环境或配置已变」，需重算一次。
+fn lan_direct_signature(
+    settings: &GoLanSettings,
+    physical: &[std::net::Ipv4Addr],
+) -> String {
+    let mut sig = String::with_capacity(128);
+    for ip in physical {
+        sig.push_str(&ip.to_string());
+        sig.push(',');
+    }
+    sig.push('|');
+    for (tag, p) in enabled_profiles(settings) {
+        sig.push_str(&tag);
+        sig.push(':');
+        sig.push_str(&p.id);
+        sig.push('/');
+        sig.push_str(&p.name);
+        sig.push('|');
+        sig.push_str(if p.enabled { "1" } else { "0" });
+        sig.push_str(if p.bypass_on_local_lan { "1" } else { "0" });
+        sig.push('|');
+        sig.push_str(&profile_route_cidrs(&p).join(","));
+        sig.push('|');
+        sig.push_str(&p.probe_target);
+        sig.push('|');
+        sig.push_str(
+            p.wg_config
+                .as_ref()
+                .map(|w| w.local_ip.as_str())
+                .unwrap_or(""),
+        );
+        sig.push(';');
+    }
+    sig
+}
+
+/// 【APP59 任务1】全隧道无差别的真实直连状态表（`profile.id` 与
+/// `profile.name` 双键写入）。
+///
+/// 判定顺序（满足任一即为直连）：
+/// - 条件 1：物理 Wi-Fi IP 落在该隧道业务网段内（纯位运算，0 开销）；
+/// - 条件 2：跨 VLAN / 跨子网时，**仅在签名变化的那一次**绑定物理 Wi-Fi
+///   源 IP 对 `probe_target` / 网段网关做 150ms TCP 连通性校验；
+/// - 条件 3：配置侧由 `config_builder` 把命中网段置顶为 `direct` 出站，
+///   与这里的布尔值严格一致。
+pub fn lan_direct_state_map(settings: &GoLanSettings) -> LanDirectMap {
+    let physical = detect_physical_lan_ipv4s();
+    let sig = lan_direct_signature(settings, &physical);
+    if let Ok(cache) = lan_direct_cache().lock()
+        && let Some((cached_sig, map)) = cache.as_ref()
+        && *cached_sig == sig
+    {
+        return map.clone();
+    }
+
+    let mut map: LanDirectMap = LanDirectMap::new();
+    for (_, p) in enabled_profiles(settings) {
+        let direct = if !p.enabled {
+            false
+        } else if is_profile_lan_direct_active(&p, &physical) {
+            true
+        } else if p.bypass_on_local_lan {
+            probe_cross_vlan_direct(&p, &physical)
+        } else {
+            false
+        };
+        if !p.id.is_empty() {
+            map.insert(p.id.clone(), direct);
+        }
+        if !p.name.is_empty() {
+            map.insert(p.name.clone(), direct);
+        }
+    }
+    if let Ok(mut cache) = lan_direct_cache().lock() {
+        *cache = Some((sig, map.clone()));
+    }
+    map
+}
+
+/// 强制失效（保存 Go Lan 配置 / 启停 VPN 后调用），下次读取立即重算一次。
+pub fn invalidate_lan_direct_cache() {
+    if let Ok(mut cache) = lan_direct_cache().lock() {
+        *cache = None;
+    }
+}
+
+/// 条件 2：绑定本机物理 Wi-Fi 源 IP，对隧道探测目标做单次 TCP 可达性校验。
+/// 仅在同子网条件未命中且签名刚变化时执行（< 120ms），绝不进入轮询路径。
+fn probe_cross_vlan_direct(
+    profile: &GoLanProfile,
+    physical: &[std::net::Ipv4Addr],
+) -> bool {
+    if physical.is_empty() {
+        return false;
+    }
+    let targets = cross_vlan_probe_targets(profile);
+    for src in physical {
+        for dst in &targets {
+            if tcp_reachable_from_source(*src, *dst, std::time::Duration::from_millis(150)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 探测目标：优先显式 `probe_target`（host:port），否则取业务网段的
+/// `.1` / `.254` 网关 + 常用内网端口；总数上限 6 个，保证单次评估 < 1s。
+fn cross_vlan_probe_targets(profile: &GoLanProfile) -> Vec<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, SocketAddr};
+    let mut out: Vec<SocketAddr> = Vec::new();
+    if let Some(addr) = parse_lan_probe_socket(&profile.probe_target) {
+        out.push(addr);
+    }
+    const PORTS: [u16; 3] = [443, 80, 445];
+    let wg_virtual_ip = profile
+        .wg_config
+        .as_ref()
+        .and_then(|wg| wg.local_ip.split(',').next())
+        .and_then(|s| s.trim().split('/').next())
+        .and_then(|ip| ip.trim().parse::<Ipv4Addr>().ok());
+    for cidr in profile_business_cidrs(profile, wg_virtual_ip)
+        .into_iter()
+        .take(2)
+    {
+        let Some((base, prefix)) = cidr.split_once('/') else {
+            continue;
+        };
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            continue;
+        };
+        if prefix > 30 {
+            continue;
+        }
+        let Ok(base_ip) = base.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let o = base_ip.octets();
+        for host in [1u8, 254u8] {
+            let gw = Ipv4Addr::new(o[0], o[1], o[2], host);
+            for port in PORTS {
+                let addr = SocketAddr::from((gw, port));
+                if !out.contains(&addr) {
+                    out.push(addr);
+                }
+                if out.len() >= 6 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `192.168.10.253:8001` / `[fd00::1]:443` / 裸 `192.168.10.1` → SocketAddr
+fn parse_lan_probe_socket(raw: &str) -> Option<std::net::SocketAddr> {
+    use std::net::SocketAddr;
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Some((host, port)) = s.rsplit_once(':')
+        && let (Ok(ip), Ok(port)) = (
+            host.trim().parse::<std::net::Ipv4Addr>(),
+            port.trim().parse::<u16>(),
+        )
+    {
+        return Some(SocketAddr::from((ip, port)));
+    }
+    s.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|ip| SocketAddr::from((ip, 443)))
+}
+
+/// 绑定物理源 IP 的 TCP 连通性测试：`Ok` 或 `ConnectionRefused` 均视为
+/// 「目标就在当前物理局域网内」（后者说明主机可达但端口未监听）。
+fn tcp_reachable_from_source(
+    src: std::net::Ipv4Addr,
+    dst: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let Ok(socket) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) else {
+        return false;
+    };
+    if socket.bind(&std::net::SocketAddr::from((src, 0)).into()).is_err() {
+        return false;
+    }
+    match socket.connect_timeout(&dst.into(), timeout) {
+        Ok(()) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::ConnectionRefused,
+    }
+}
+
 /// 【APP44 任务6】判定是否可作为「本机局域网地址」展示 / 用于 On-Demand 判定：
 /// - 排除 loopback / 未指定 / 169.254 链路本地；
 /// - 排除 TUN fake-ip 段 198.18.0.0/15 与容器段 172.19.0.0/16、WG 虚拟地址；
@@ -3892,6 +4104,56 @@ mod tests {
         assert!(is_profile_lan_direct_active(&office, &hit2));
         let miss: Vec<std::net::Ipv4Addr> = vec!["192.168.99.5".parse().unwrap()];
         assert!(!is_profile_lan_direct_active(&office, &miss));
+    }
+
+    /// 【APP59 任务1】探测目标解析：显式 host:port / 裸 IP / 非法值
+    #[test]
+    fn test_parse_lan_probe_socket_formats() {
+        assert_eq!(
+            parse_lan_probe_socket("192.168.10.253:8001"),
+            Some("192.168.10.253:8001".parse().unwrap())
+        );
+        assert_eq!(
+            parse_lan_probe_socket("192.168.10.1"),
+            Some("192.168.10.1:443".parse().unwrap())
+        );
+        assert_eq!(parse_lan_probe_socket(""), None);
+        assert_eq!(parse_lan_probe_socket("not-a-host"), None);
+    }
+
+    /// 【APP59 任务1】跨 VLAN 探测目标：显式目标优先，其次网段 .1/.254 网关
+    #[test]
+    fn test_cross_vlan_probe_targets_prefers_explicit_and_gateways() {
+        let mut nidec =
+            sample_profile("nidec", "Nidec", &["10.31.2.0/23"], "10.196.0.3/32", 71);
+        nidec.probe_target = "10.31.2.253:8001".into();
+        let targets = cross_vlan_probe_targets(&nidec);
+        assert_eq!(targets.first().unwrap().to_string(), "10.31.2.253:8001");
+        assert!(targets.iter().any(|t| t.to_string() == "10.31.2.1:443"));
+        assert!(targets.iter().any(|t| t.to_string() == "10.31.2.254:80"));
+        assert!(
+            targets.len() <= 6,
+            "候选目标必须有上限，避免网络切换瞬间放大探测开销"
+        );
+    }
+
+    /// 【APP59 任务1】直连状态签名：仅在网络 / 配置变化时才失效重算
+    #[test]
+    fn test_lan_direct_signature_stable_until_config_changes() {
+        let home = sample_profile("home", "家里", &["10.10.10.0/24"], "10.196.0.2/32", 70);
+        let mut settings = GoLanSettings::default();
+        settings.enabled = true;
+        settings.profiles = vec![home];
+        let physical: Vec<std::net::Ipv4Addr> = vec!["10.10.10.20".parse().unwrap()];
+        let sig1 = lan_direct_signature(&settings, &physical);
+        assert_eq!(sig1, lan_direct_signature(&settings, &physical));
+        // 业务网段变化 → 签名必须变化
+        let mut changed = settings.clone();
+        changed.profiles[0].lan_cidrs = vec!["10.20.20.0/24".into()];
+        assert_ne!(sig1, lan_direct_signature(&changed, &physical));
+        // 物理 Wi-Fi 变化 → 签名必须变化
+        let other: Vec<std::net::Ipv4Addr> = vec!["192.168.1.8".parse().unwrap()];
+        assert_ne!(sig1, lan_direct_signature(&settings, &other));
     }
 
     /// 【APP54 任务1】条件 A：物理局域网地址命中档案网段 → 必须直连

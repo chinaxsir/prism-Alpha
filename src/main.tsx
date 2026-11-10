@@ -78,6 +78,33 @@ class RootErrorBoundary extends React.Component<
   }
 }
 
+/** 【APP59 任务3.2】前端防线（仅生产构建生效）：屏蔽右键菜单与开发者工具
+ *  快捷键（F12 / Ctrl+Shift+I|J|C / Cmd+Option+I|J|C），阻断「零门槛
+ *  篡改前端状态」的路径。业务功能与调试构建完全不受影响。 */
+function installFrontendGuard() {
+  // Vite 开发服务器（localhost / 127.0.0.1）下不介入，保证调试体验
+  const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1") return;
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      const key = e.key.toLowerCase();
+      const devtoolsCombo =
+        key === "f12" ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && (key === "i" || key === "j" || key === "c")) ||
+        (e.metaKey && e.altKey && (key === "i" || key === "j" || key === "c"));
+      if (devtoolsCombo) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    },
+    true,
+  );
+}
+
+installFrontendGuard();
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <RootErrorBoundary>

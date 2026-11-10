@@ -20,6 +20,8 @@ import {
   Send,
   BookOpen,
   Ticket,
+  Layers,
+  Cpu,
 } from "lucide-react";
 
 import {
@@ -50,30 +52,36 @@ import { usePrefsStore, type Language, type ThemePref } from "@/stores/prefs";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
-/// 【APP58 任务2.2】关于帮助：四个官方入口（全部走原生打开，iOS 100% 生效）
+/// 【APP58 任务2.2 / APP59 任务2.1】关于帮助：官方入口（全部走原生打开，
+/// iOS 100% 生效），每行带副标题，与「高级」设置行格式完全一致
 const HELP_LINKS = [
   {
     labelKey: "settings.helpGuide",
+    descKey: "settings.helpGuideDesc",
     url: "https://prism.sarl/guide",
     Icon: BookOpen,
   },
   {
     labelKey: "settings.helpTerms",
+    descKey: "settings.helpTermsDesc",
     url: "https://prism.sarl/terms",
     Icon: ShieldAlert,
   },
   {
     labelKey: "settings.helpPrivacy",
+    descKey: "settings.helpPrivacyDesc",
     url: "https://prism.sarl/privacy",
     Icon: Lock,
   },
   {
     labelKey: "settings.helpTickets",
+    descKey: "settings.helpTicketsDesc",
     url: "https://prism.sarl/tickets",
     Icon: Ticket,
   },
   {
     labelKey: "settings.helpChannel",
+    descKey: "settings.helpChannelDesc",
     url: "https://t.me/prism_proxy",
     Icon: Send,
   },
@@ -605,75 +613,79 @@ export default function Settings() {
         />
       </SettingsGroup>
 
-      {/* 【APP6 任务1.2】诊断与日志：全模块环形日志查看/导出/清空 */}
-      <div className="rounded-xl border border-border bg-surface px-4 py-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
-            <FileTerminal size={16} className="text-surge-purple" />
-          </div>
-          <div className="min-w-0">
-            <div className="font-semibold text-sm text-text">{t("logs.cardTitle")}</div>
-            <div className="text-[11px] text-text-muted truncate">{t("logs.cardDesc")}</div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => setLogViewerOpen(true)}
-            className="px-3 py-1.5 rounded-lg bg-surface-hover text-xs text-gray-300 hover:text-white transition-colors"
-          >
-            {t("logs.view")}
-          </button>
-          <button
-            type="button"
-            onClick={handleClearLogs}
-            className="px-3 py-1.5 rounded-lg bg-red-500/90 text-xs text-white hover:opacity-90 transition-colors"
-          >
-            {t("logs.clear")}
-          </button>
-        </div>
-      </div>
-
-      {/* 【APP59】关于帮助：全部竖版排列（版本信息在上、链接逐行在下），
-          背景与设置页其他板块一致；所有链接经 Rust 原生打开，iOS 100% 生效 */}
-      <div className="rounded-xl border border-border bg-surface-card px-4 py-3 space-y-2">
-        <div className="flex items-center gap-2.5 pb-1">
-          <div className="w-8 h-8 rounded-lg bg-surge-purple/15 flex items-center justify-center shrink-0">
-            <BookOpen size={16} className="text-surge-purple" />
-          </div>
-          <div className="min-w-0">
-            <div className="font-semibold text-sm text-text">
-              {t("settings.aboutHelp")}
-            </div>
-            <div className="text-[11px] text-text-muted truncate">
-              {t("settings.aboutHelpDesc")}
+      {/* 【APP59 任务2.1】关于帮助：与「高级」完全一致的 SettingsGroup 结构，
+          运行日志并入本卡片（查看 / 清空），下方为版本信息与官方入口 */}
+      <SettingsGroup
+        title={t("settings.aboutHelp")}
+        desc={t("settings.aboutHelpDesc")}
+        icon={<BookOpen size={17} />}
+      >
+        {/* 日志记录：查看 + 清空 */}
+        <div className="flex items-center justify-between gap-3 px-3 py-3 border-b border-border">
+          <div className="flex items-center gap-3 flex-1 min-w-0">
+            <RowIcon>
+              <FileTerminal size={14} className="text-surge-purple" />
+            </RowIcon>
+            <div className="min-w-0">
+              <div className="text-sm truncate">{t("logs.cardTitle")}</div>
+              <div className="text-[11px] text-gray-500 truncate">
+                {t("logs.cardDesc")}
+              </div>
             </div>
           </div>
-        </div>
-        {/* 版本信息：竖版两行，标签左 / 数值右；字号与设置页其他模块一致 */}
-        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
-          <span className="text-sm text-text-muted">{t("settings.appVersion")}</span>
-          <span className="text-sm font-semibold text-text">v{appVersion}</span>
-        </div>
-        <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-hover px-3 py-2">
-          <span className="text-sm text-text-muted">{t("settings.kernelVersion")}</span>
-          <span className="text-sm font-semibold text-text">v1.11.3</span>
-        </div>
-        {/* 帮助入口：竖版逐行，图标 + 文字格式完全统一 */}
-        <div className="flex flex-col gap-2 pt-0.5">
-          {HELP_LINKS.map(({ labelKey, url, Icon }) => (
+          <div className="flex items-center gap-2 shrink-0">
             <button
-              key={labelKey}
               type="button"
-              onClick={() => openHelpLink(url)}
-              className="flex w-full min-w-0 items-center gap-2 rounded-lg bg-surface-hover px-3 py-2 text-sm text-gray-300 hover:text-white transition-colors"
+              onClick={() => setLogViewerOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-glass text-xs text-gray-300 hover:text-white transition-colors"
             >
-              <Icon size={14} className="shrink-0 text-accent" />
-              <span className="truncate">{t(labelKey)}</span>
+              {t("logs.view")}
             </button>
-          ))}
+            <button
+              type="button"
+              onClick={handleClearLogs}
+              className="px-3 py-1.5 rounded-lg bg-red-500/90 text-xs text-white hover:opacity-90 transition-colors"
+            >
+              {t("logs.clear")}
+            </button>
+          </div>
         </div>
-      </div>
+
+        {/* 软件版本 / 内核版本（单行展示完整版本号） */}
+        <Row
+          icon={<Layers size={14} className="text-accent" />}
+          title={t("settings.appVersion")}
+          value={`v${appVersion}`}
+          valueClass="font-mono text-gray-300"
+        />
+        <Row
+          icon={<Cpu size={14} className="text-accent" />}
+          title={t("settings.kernelVersion")}
+          value="v1.11.3"
+          valueClass="font-mono text-gray-300"
+        />
+
+        {/* 官方入口：逐行竖版，标题 + 副标题 + 右侧箭头 */}
+        {HELP_LINKS.map(({ labelKey, descKey, url, Icon }) => (
+          <button
+            key={labelKey}
+            type="button"
+            onClick={() => openHelpLink(url)}
+            className="flex w-full items-center justify-between gap-3 px-3 py-3 border-b border-border last:border-0 text-left hover:bg-glass/40 transition-colors"
+          >
+            <div className="flex items-center gap-3 flex-1 min-w-0">
+              <RowIcon>
+                <Icon size={14} className="text-accent" />
+              </RowIcon>
+              <div className="min-w-0">
+                <div className="text-sm truncate">{t(labelKey)}</div>
+                <div className="text-[11px] text-gray-500 truncate">{t(descKey)}</div>
+              </div>
+            </div>
+            <ChevronRight size={14} className="shrink-0 text-gray-600" />
+          </button>
+        ))}
+      </SettingsGroup>
 
       {/* Prism Pro：【APP-5 任务4】未激活展示 5 大模块引导，已激活极简单行 */}
       {!proUnlocked ? (

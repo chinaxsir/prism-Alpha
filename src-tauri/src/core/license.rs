@@ -667,9 +667,12 @@ pub async fn doh_resolve_prism_ips() -> Vec<IpAddr> {
 /// Cloudflare 三家 DoH 取真实 IPv4（供订阅下载等场景绕过 DNS 污染）。
 pub async fn doh_resolve_ips(target_host: &str) -> Vec<IpAddr> {
     // (DoH 主机名, 其公网 IP, 路径)
-    const PROVIDERS: [(&str, &str, &str); 3] = [
+    // 【APP59 任务3.1】四家 DoH（阿里 / 腾讯 / Google / Cloudflare）轮询取源，
+    // 全部为公共 DoH 端点，绝不依赖任何特定 CDN 厂商的响应头做校验
+    const PROVIDERS: [(&str, &str, &str); 4] = [
         ("dns.alidns.com", "223.5.5.5", "/resolve"),
-        ("doh.pub", "1.12.12.12", "/dns-query"),
+        ("doh.pub", "119.29.29.29", "/dns-query"),
+        ("dns.google", "8.8.8.8", "/resolve"),
         ("cloudflare-dns.com", "1.1.1.1", "/dns-query"),
     ];
     let mut found: Vec<IpAddr> = Vec::new();

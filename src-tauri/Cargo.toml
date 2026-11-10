@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.3.91"
+version = "0.3.92"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"
@@ -54,7 +54,9 @@ http-body-util = "0.1"
 # Misc
 anyhow = "1.0"
 base64 = "0.22"
-# 【APP58 任务1.1】Go Lan 直连判定改为纯内存 CIDR 位运算，零网络探测
+# 【APP59 任务1】Go Lan 跨 VLAN 直连判定：仅在网络切换瞬间单次绑定物理
+# Wi-Fi 源 IP 做 150ms TCP 可达性校验（非轮询，日常 0 网络开销）
+socket2 = "0.6"
 thiserror = "1.0"
 jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4"] }

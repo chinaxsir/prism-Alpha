@@ -4,9 +4,12 @@
 //! 的运行日志，供「设置 -> 运行日志」与「Go Lan 实时日志」面板展示。
 //!
 //! 设计：
-//! - 内存 `VecDeque<LogEntry>` 环形缓冲，最多保留最近 800 条；
-//! - 持久化文件 `data_dir/prism_app.log`：超过 512 KB 自动截断保留最新一半，
-//!   绝不占用用户终端过多存储空间；
+//! - 【APP59 任务2.2】7 个分类物理隔离的环形队列，每个分类最多 150 条，
+//!   单一分类刷屏不会挤掉其他分类的日志；
+//! - 持久化文件 `data_dir/logs_v2.jsonl`（结构化 JSONL，每行
+//!   `{category, level, timestamp, message}`）：超过 512 KB 自动截断保留
+//!   最新一半，绝不占用用户终端过多存储空间；旧版纯文本 `prism_app.log`
+//!   在升级后首次启动时自动删除；
 //! - `get_app_logs` 时自动合并 sing-box 内核日志（kernel.log）与 iOS
 //!   App Group（group.com.prism.proxy）共享目录下的扩展诊断日志
 //!   （prism_error.txt / prism_work/box.log / vpn_trace.log），
@@ -20,10 +23,18 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-/// 内存环形缓冲上限（条）
+/// 内存环形缓冲上限（条，兼容旧常量；实际按分类分桶，见 PER_CATEGORY_MAX）
 pub const MAX_ENTRIES: usize = 800;
+/// 【APP59 任务2.2】每个分类独立环形队列的容量：7 个物理分桶各 150 条，
+/// 任一分类刷屏都不会挤掉其他分类的日志。
+pub const PER_CATEGORY_MAX: usize = 150;
 /// 持久化文件容量上限：512 KB（524,288 字节）
 pub const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
+
+/// 【APP59 任务2.2】结构化 JSONL 持久化文件名（旧版纯文本 prism_app.log
+/// 在升级首次启动时自动清理，防止历史混排数据继续被读出）。
+const JSONL_FILE_NAME: &str = "logs_v2.jsonl";
+const LEGACY_FILE_NAME: &str = "prism_app.log";
 
 /// 模块名常量（前端筛选标签与后端埋点保持一致）
 pub const MOD_GO_LAN: &str = "GoLan";
@@ -65,8 +76,10 @@ pub struct LogsPayload {
 
 struct LogState {
     seq: AtomicU64,
-    entries: VecDeque<LogEntry>,
-    /// 持久化文件路径（data_dir/prism_app.log；未 init 时为 None）
+    /// 【APP59 任务2.2】7 个物理隔离的分类环形队列：键恒为 7 个合法分类之一，
+    /// 前端按标签读取时只取对应桶，从数据结构底层杜绝跨标签混排。
+    buckets: std::collections::HashMap<&'static str, VecDeque<LogEntry>>,
+    /// 持久化文件路径（data_dir/logs_v2.jsonl；未 init 时为 None）
     file_path: Option<PathBuf>,
     /// 距上次磁盘容量检查累计写入条数（避免每条日志都 stat 文件）
     writes_since_check: u32,
@@ -87,10 +100,22 @@ fn state() -> Option<&'static Mutex<LogState>> {
 
 /// APP 启动时初始化（lib.rs setup 调用）：绑定持久化文件路径
 pub fn init(data_dir: &std::path::Path) {
+    // 【APP59 任务2.2】升级清理：旧版纯文本混排日志整体删除，
+    // 新会话只写结构化 JSONL，历史脏数据不会再被任何界面读出。
+    let legacy = data_dir.join(LEGACY_FILE_NAME);
+    if legacy.exists() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    let mut buckets = std::collections::HashMap::new();
+    for module in [
+        MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
+    ] {
+        buckets.insert(module, VecDeque::with_capacity(PER_CATEGORY_MAX));
+    }
     let _ = STATE.set(Mutex::new(LogState {
         seq: AtomicU64::new(1),
-        entries: VecDeque::with_capacity(MAX_ENTRIES),
-        file_path: Some(data_dir.join("prism_app.log")),
+        buckets,
+        file_path: Some(data_dir.join(JSONL_FILE_NAME)),
         writes_since_check: 0,
     }));
 }
@@ -158,9 +183,11 @@ fn push_entry(level: &str, module: &str, message: &str) {
     let id = st.seq.fetch_add(1, Ordering::Relaxed);
     let mut entry = entry;
     entry.id = id;
-    st.entries.push_back(entry.clone());
-    while st.entries.len() > MAX_ENTRIES {
-        st.entries.pop_front();
+    // 【APP59 任务2.2】写入对应分类的独立环形队列，单分类上限 150 条
+    let bucket = st.buckets.entry(module).or_default();
+    bucket.push_back(entry.clone());
+    while bucket.len() > PER_CATEGORY_MAX {
+        bucket.pop_front();
     }
     // 追加写磁盘（每 20 条做一次 512 KB 容量检查）
     st.writes_since_check += 1;
@@ -171,13 +198,19 @@ fn push_entry(level: &str, module: &str, message: &str) {
             st.writes_since_check = 0;
             truncate_log_file(&path);
         }
-        let line = format!(
-            "[{}][{}][{}] {}\n",
-            entry.timestamp, entry.level, entry.module, entry.message
-        );
+        // 【APP59 任务2.2】结构化 JSONL：每行一个独立日志对象，
+        // 字段固定 category / level / timestamp / message
+        let line = serde_json::json!({
+            "category": entry.module,
+            "level": entry.level,
+            "timestamp": entry.timestamp,
+            "message": entry.message,
+        })
+        .to_string();
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
         }
     }
 }
@@ -585,16 +618,34 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
     if let Some(mutex) = state()
         && let Ok(st) = mutex.lock()
     {
-        for e in &st.entries {
-            // 【APP56 任务4】返回前端前再统一归类，历史日志同样严格分区
-            let mut entry = e.clone();
-            entry.module =
-                enforce_strict_log_category(&entry.module, &entry.message).to_string();
-            let matched = filter.map(|f| entry.module == f).unwrap_or(true);
-            if matched {
+        // 【APP59 任务2.2】只从目标分类桶读取；无筛选时按 7 个分类依次汇总，
+        // 再按 id 还原时间顺序 —— 从物理存储层杜绝跨分类混排。
+        let mut buckets: Vec<&VecDeque<LogEntry>> = Vec::new();
+        match filter {
+            Some(f) => {
+                if let Some(b) = st.buckets.get(f) {
+                    buckets.push(b);
+                }
+            }
+            None => {
+                for module in [
+                    MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
+                ] {
+                    if let Some(b) = st.buckets.get(module) {
+                        buckets.push(b);
+                    }
+                }
+            }
+        }
+        for b in buckets {
+            for e in b {
+                let mut entry = e.clone();
+                entry.module =
+                    enforce_strict_log_category(&entry.module, &entry.message).to_string();
                 mem_entries.push(entry);
             }
         }
+        mem_entries.sort_by_key(|e| e.id);
         if let Some(p) = &st.file_path {
             file_bytes = std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
         }
@@ -639,7 +690,10 @@ pub fn clear_logs(data_dir: &std::path::Path) {
     if let Some(mutex) = state()
         && let Ok(mut st) = mutex.lock()
     {
-        st.entries.clear();
+        // 【APP59 任务2.2】7 个分类桶全部清空
+        for bucket in st.buckets.values_mut() {
+            bucket.clear();
+        }
         st.seq.store(1, Ordering::Relaxed);
         if let Some(p) = st.file_path.clone() {
             let _ = std::fs::write(&p, b"");

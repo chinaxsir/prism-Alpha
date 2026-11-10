@@ -1016,25 +1016,13 @@ pub async fn get_core_status(
     // 设置页徽章无需额外 IPC 往返）。未启用 Go Lan 时零开销直接返回空表。
     let lan = state.go_lan.read().clone();
     let (go_lan_any_direct, go_lan_profile_direct_map) = if lan.enabled {
-        let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
-        let profiles = crate::core::go_lan::enabled_profiles(&lan);
-        let map: std::collections::HashMap<String, bool> = {
-            let phys = physical.clone();
-            tokio::task::spawn_blocking(move || {
-                // 【APP57 任务1.3】双键下发：id 与 name 均写入判定结果，
-                // 前端无论按 id 还是按名称取用都不会出现「只有 home 直连」错位
-                let mut map: std::collections::HashMap<String, bool> =
-                    std::collections::HashMap::new();
-                for (_, p) in profiles {
-                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
-                    map.insert(p.id.clone(), hit);
-                    map.insert(p.name.clone(), hit);
-                }
-                map
-            })
-            .await
-            .unwrap_or_default()
-        };
+        // 【APP59 任务1】全隧道统一走事件驱动直连缓存（id + name 双键），
+        // 签名未变时纯内存读取，零网络探测。
+        let map = tokio::task::spawn_blocking(move || {
+            crate::core::go_lan::lan_direct_state_map(&lan)
+        })
+        .await
+        .unwrap_or_default();
         let any = map.values().any(|v| *v);
         (any, map)
     } else {
@@ -4116,21 +4104,11 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
         return Err("Go Lan 是 Pro 专属功能，请先激活授权".into());
     }
     let lan = state.go_lan.read().clone();
-    let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
-    // 【APP54 任务1】每个档案注入运行时 isDirect（同网段命中或 35ms 内网网关可达）
+    // 【APP59 任务1】全隧道事件驱动直连缓存（id + name 双键），不再逐档探测
     let direct_map: std::collections::HashMap<String, bool> = {
-        let profiles = crate::core::go_lan::enabled_profiles(&lan);
-        let phys = physical.clone();
+        let settings = lan.clone();
         tokio::task::spawn_blocking(move || {
-            // 【APP57 任务1.3】id 与 name 双键写入，杜绝档案名称键查询落空
-            let mut map: std::collections::HashMap<String, bool> =
-                std::collections::HashMap::new();
-            for (_, p) in profiles {
-                let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
-                map.insert(p.id.clone(), hit);
-                map.insert(p.name.clone(), hit);
-            }
-            map
+            crate::core::go_lan::lan_direct_state_map(&settings)
         })
         .await
         .unwrap_or_default()
@@ -4269,6 +4247,8 @@ pub async fn save_go_lan_settings(
     let tunnels_unchanged = prev_tunnel_snapshot == next_tunnel_snapshot;
     crate::core::go_lan::save(&state.data_dir, &lan)?;
     *state.go_lan.write() = lan.clone();
+    // 【APP59 任务1】配置变化后立即失效直连缓存，下一次状态查询重算一次
+    crate::core::go_lan::invalidate_lan_direct_cache();
 
     // 【APP30 任务3】保存即预热 Endpoint 域名解析（DoH 60s 缓存）：
     // 下次启动 build_config 直接命中缓存拿到最新 IPv4，避免扩展侧系统
@@ -4331,19 +4311,11 @@ pub async fn get_go_lan_status(
     let lan = state.go_lan.read().clone();
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
-    // 【APP54 任务1】直连判定含 35ms 同步 TCP 探针，放 blocking 线程执行，
-    // 避免阻塞 tokio runtime；判定结果同时供 profile.isDirect / anyDirect 使用。
+    // 【APP59 任务1】全隧道事件驱动直连缓存（id + name 双键），按档案取值
     let direct_map: std::collections::HashMap<String, bool> = {
-        let profiles = crate::core::go_lan::enabled_profiles(&lan);
-        let phys = physical.clone();
+        let settings = lan.clone();
         tokio::task::spawn_blocking(move || {
-            profiles
-                .into_iter()
-                .map(|(tag, p)| {
-                    let hit = crate::core::go_lan::is_profile_lan_direct_active(&p, &phys);
-                    (tag, hit)
-                })
-                .collect::<std::collections::HashMap<String, bool>>()
+            crate::core::go_lan::lan_direct_state_map(&settings)
         })
         .await
         .unwrap_or_default()
@@ -4353,7 +4325,9 @@ pub async fn get_go_lan_status(
     let mut profile_states = serde_json::Map::new();
     let mut profile_direct_map = serde_json::Map::new();
     for (tag, profile) in crate::core::go_lan::enabled_profiles(&lan) {
-        let direct_hit = direct_map.get(&tag).copied().unwrap_or(false);
+        // id / name 双键取值，任意一条隧道均独立判定
+        let direct_hit = direct_map.get(&profile.id).copied().unwrap_or(false)
+            || direct_map.get(&profile.name).copied().unwrap_or(false);
         let (tunnel, direct) =
             crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
         let mut bypassed = direct.clone();

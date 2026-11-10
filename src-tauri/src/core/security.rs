@@ -17,12 +17,18 @@ static SESSION_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new(
 
 /// 启动时调用一次：Release 下开启原生反调试，Debug 下为空操作。
 pub fn init_runtime_guard() {
-    #[cfg(all(not(debug_assertions), target_os = "ios"))]
+    #[cfg(all(not(debug_assertions), any(target_os = "ios", target_os = "macos")))]
     deny_attach();
 
     #[cfg(all(not(debug_assertions), target_os = "android"))]
-    if tracer_pid() != 0 {
-        mark_compromised("tracer");
+    {
+        if tracer_pid() != 0 {
+            mark_compromised("tracer");
+        }
+        // 【APP59 任务3.2】Frida 默认监听 27042/27043：端口可达即视为注入环境
+        if frida_default_port_open() {
+            mark_compromised("frida");
+        }
     }
 }
 
@@ -63,8 +69,8 @@ pub fn entitlement_signature(
     h
 }
 
-/// iOS：PT_DENY_ATTACH 阻止调试器附加（系统调用号在 Darwin 上恒为 31）。
-#[cfg(all(not(debug_assertions), target_os = "ios"))]
+/// iOS / macOS：PT_DENY_ATTACH 阻止调试器附加（系统调用号在 Darwin 上恒为 31）。
+#[cfg(all(not(debug_assertions), any(target_os = "ios", target_os = "macos")))]
 fn deny_attach() {
     const PT_DENY_ATTACH: std::ffi::c_int = 31;
     unsafe extern "C" {
@@ -98,4 +104,18 @@ fn tracer_pid() -> u32 {
                 .and_then(|v| v.trim().parse().ok())
         })
         .unwrap_or(0)
+}
+
+/// 【APP59 任务3.2】Frida 默认端口（27042 / 27043）本机可达性检查。
+#[cfg(all(not(debug_assertions), target_os = "android"))]
+fn frida_default_port_open() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    [27042u16, 27043u16].iter().any(|port| {
+        TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], *port)),
+            Duration::from_millis(50),
+        )
+        .is_ok()
+    })
 }
