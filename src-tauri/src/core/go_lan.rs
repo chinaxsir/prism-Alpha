@@ -2598,11 +2598,8 @@ fn wg_outbound_value(
     outbound["mtu"] = json!(mtu);
     outbound["connect_timeout"] = json!("5s");
     // 【APP60 任务3.4】workers 4：WireGuard 加解密分散到 4 个 worker，
-    // 多核并行，大文件传输吞吐不再被单核软中断打满；
-    // udp_fragment：蜂窝/PPPoE 路径 MTU 较小时内网大包不再被静默丢弃。
-    // （sing-box v1.11.3 wireguard 出站原生支持，均为合法字段）
+    // 多核并行，大文件传输吞吐不再被单核软中断打满
     outbound["workers"] = json!(4);
-    outbound["udp_fragment"] = json!(true);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(

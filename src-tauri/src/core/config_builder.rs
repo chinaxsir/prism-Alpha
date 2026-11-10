@@ -1302,9 +1302,6 @@ pub fn build(
             "sniff_timeout": "50ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
-            // 【APP60 任务3.3】允许 UDP 分片：大于 MTU 的 UDP 报文不再直接
-            // 丢弃，避免 QUIC / SMB over UDP 等场景静默丢包重传
-            "udp_fragment": true,
         });
         {
             let obj = tun.as_object_mut().expect("tun inbound is an object");

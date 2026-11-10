@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.3.93"
+version = "0.3.95"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"

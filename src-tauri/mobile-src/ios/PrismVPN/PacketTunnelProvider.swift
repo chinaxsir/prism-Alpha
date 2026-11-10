@@ -1533,10 +1533,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = false
                     // 【APP60 任务3.3】50ms 嗅探超时：非 HTTP 协议快速放行，
-                    // 避免拖慢首包；同时开启 UDP 分片（大 UDP 不再静默丢包）
+                    // 避免拖慢首包
                     inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
-                    inbounds[i]["udp_fragment"] = true
                 }
             }
             root["inbounds"] = inbounds
@@ -1728,10 +1727,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // connect_timeout 5s，避免连不上的内网端口挂起 2m7s。
                     outbounds[i]["mtu"] = 1280
                     outbounds[i]["connect_timeout"] = "5s"
-                    // 【APP60 任务3.4】iOS 扩展也同步：workers 4 多核并行、
-                    // udp_fragment 允许分片，大文件/蜂窝链路不再打满单核或丢包
+                    // 【APP60 任务3.4】iOS 扩展也同步：workers 4 多核并行
                     outbounds[i]["workers"] = 4
-                    outbounds[i]["udp_fragment"] = true
                     // 【APP31 任务1】物理网卡硬绑定兜底清理 inet4_bind_address
                     // / routing_mark，保留 bind_interface 让外层 UDP 直链。
                     outbounds[i].removeValue(forKey: "inet4_bind_address")

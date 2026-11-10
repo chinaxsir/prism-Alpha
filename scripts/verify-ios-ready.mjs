@@ -793,6 +793,37 @@ if (ICON_DIRS.length === 0) {
 }
 
 // ============================================================
+// 检查 12：【APP61】sing-box v1.11.3 未知字段门禁
+// 根因：sing-box v1.11.3 的 DisallowUnknownFields 解析器对未知字段
+// 直接 FATAL 崩溃（exit -2），曾因 tun-in 中写入 udp_fragment 导致
+// create vpn service: decode config: inbounds[1].udp_fragment
+// 内核启动秒崩。这里在 Rust 源码 + Swift 扩展侧同时硬拦截，
+// 任何 "udp_fragment" / "prism_" 自定义扩展字段残留立即阻断提交。
+// ============================================================
+console.log('\n--- 检查 12：sing-box v1.11.3 未知字段门禁 ---');
+const SB_CHECK_FILES = [
+  { rel: 'src-tauri/src/core/config_builder.rs', desc: 'config_builder' },
+  { rel: 'src-tauri/src/core/go_lan.rs', desc: 'go_lan' },
+  { rel: 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift', desc: 'PacketTunnelProvider' },
+];
+// 严禁出现的字段（全量扫描，包括注释和字符串字面量）
+const SB_BANNED_TOKENS = ['udp_fragment'];
+for (const { rel, desc } of SB_CHECK_FILES) {
+  const p = resolve(ROOT, rel);
+  let src = '';
+  try { src = readFileSync(p, 'utf8'); } catch { continue; }
+  for (const token of SB_BANNED_TOKENS) {
+    let idx = src.indexOf(token);
+    while (idx !== -1) {
+      const line = src.slice(0, idx).split('\n').length;
+      fail(`${desc} 第 ${line} 行：出现禁用字段 \`${token}\`——sing-box v1.11.3 不识别，会触发 decode config FATAL 崩溃！`);
+      break; // 同一文件每个 token 只报一次
+    }
+    if (idx === -1) pass(`${desc}: 无禁用字段 \`${token}\` ✓`);
+  }
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
