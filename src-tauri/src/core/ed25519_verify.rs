@@ -1,12 +1,14 @@
-//! 【110.txt】Ed25519 签名验签 + TLS SPKI pinning + 时钟回拨检测
+//! 【110.txt / 用户修正方案】Ed25519 严格验签 + 时钟回拨检测
 //!
-//! 统一的安全边界：
-//! - 内置公钥 XOR 混淆分散存放，运行时拼回；绝不从服务端拉取公钥；
-//! - 验签走 verify_strict（dalek 等价严格模式），直接对 payload 原始字节验签，
-//!   禁止 JSON 反序列化后再序列化导致字段顺序变动；
-//! - Claims 校验 deviceId / installId / kind / expiresAt / issuedAt 全部命中；
-//! - TLS 层额外 pin prism.sarl 的 SPKI（证书公钥指纹），只信任当前 pin 集合；
-//! - 时钟回拨检测：系统时间 < 上次记录 - 5 分钟 → 清除授权并要求重新激活。
+//! 验签固定 7 步，绝不做任何 JSON 重新序列化：
+//!   1. base64url 无 padding 解码 token.payload → payloadBytes（原始 JSON 字节，
+//!      不做任何 parse 成对象再 stringify 的动作）
+//!   2. base64url 无 padding 解码 token.signature → sig（必须正好 64 字节）
+//!   3. 内置公钥 prism-1 = 32 字节 raw，hex 见 PUBKEY_PRISM_1
+//!   4. Ed25519-Verifier.verify(sig, payloadBytes) == true 才继续
+//!   5. 验签通过后才 serde_json::from_slice(payloadBytes) 读 claims
+//!   6. 断点检查：payloadBytes 长度 150..=300，sig 必须 64 字节，公钥必须 32 字节
+//!   7. 单元测试用固定向量（base64url / hex / 临时密钥对自签）返回 true
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -18,71 +20,57 @@ use serde::{Deserialize, Serialize};
 use crate::core::logger::MOD_PRO;
 
 // ---------------------------------------------------------------- 内置公钥
-// 原始 keyId=prism-1，hex=53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9
-// 拆成三小段再 XOR 混淆：二进制里搜不到完整 hex 或 base64url 明文。
-const PUBKEY_XOR: u8 = 0xA5;
-// 段 1：11 字节
-const PUB_SEG1: [u8; 11] = [0x36, 0x97, 0x60, 0xEB, 0xF7, 0x93, 0xE8, 0x24, 0x65, 0x53, 0x9B];
-// 段 2：11 字节
-const PUB_SEG2: [u8; 11] = [0xE2, 0xDC, 0x1F, 0x28, 0x88, 0xBD, 0x8D, 0x10, 0xA5, 0x17, 0xC7];
-// 段 3：10 字节
-const PUB_SEG3: [u8; 10] = [0xCE, 0x75, 0xC2, 0x7E, 0xFC, 0x8B, 0x16, 0xD8, 0xF1, 0xC4];
-
-fn recover_pubkey() -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    for b in PUB_SEG1.iter().chain(PUB_SEG2.iter()).chain(PUB_SEG3.iter()) {
-        out[i] = b ^ PUBKEY_XOR;
-        i += 1;
-    }
-    out
-}
+// 生产公钥 prism-1（固定向量，不得变更）
+//   base64url (无 padding): UzKKqVLOFJuozWM2UGbkKDezvzMpn7crq019eMs0F_k
+//   hex:                    53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9
+//   raw bytes (32):         硬编码下方数组（不再混淆：还原逻辑曾出错导致验签直接失败）
+const PUBKEY_PRISM_1: [u8; 32] = [
+    0x53, 0x32, 0x8a, 0xa9, 0x52, 0xce, 0x14, 0x9b,
+    0xa8, 0xcd, 0x63, 0x36, 0x50, 0x66, 0xe4, 0x28,
+    0x37, 0xb3, 0xbf, 0x33, 0x29, 0x9f, 0xb7, 0x2b,
+    0xab, 0x4d, 0x7d, 0x78, 0xcb, 0x34, 0x17, 0xf9,
+];
 
 pub const PRISM_KEY_ID: &str = "prism-1";
 
-/// 运行时单例：[keyId -> Ed25519 VerifyingKey]。目前只有 prism-1，
-/// 未来轮换时只要在 recover_pubkey 旁边再塞一段混淆常量即可，运行期绝不替换。
-fn pubkey_map() -> &'static std::collections::HashMap<&'static str, VerifyingKey> {
-    static MAP: OnceLock<std::collections::HashMap<&'static str, VerifyingKey>> = OnceLock::new();
+/// 运行期单例：[keyId -> Ed25519 VerifyingKey]。当前只有 prism-1；
+/// 未来轮换时只需在本文件新增 PUBKEY_xxx 数组并补进 `init_key_map`。
+pub fn init_key_map() -> &'static std::collections::HashMap<&'static str, VerifyingKey> {
+    use std::collections::HashMap;
+    static MAP: OnceLock<HashMap<&'static str, VerifyingKey>> = OnceLock::new();
     MAP.get_or_init(|| {
-        let mut m = std::collections::HashMap::new();
-        let bytes = recover_pubkey();
-        if let Ok(key) = VerifyingKey::from_bytes(&bytes) {
-            m.insert(PRISM_KEY_ID, key);
+        let mut m = HashMap::new();
+        if let Ok(k) = VerifyingKey::from_bytes(&PUBKEY_PRISM_1) {
+            m.insert(PRISM_KEY_ID, k);
         }
         m
     })
 }
 
 // ---------------------------------------------------------------- SPKI pinning
-// prism.sarl 服务端证书 SPKI（SHA-256）。轮换时构建新版本随包更新；
-// 运行期直接比对服务端返回证书的 SPKI 是否在 PINNED_SPKI_SHA256 中。
 pub const PINNED_SPKI_SHA256: [&str; 1] = [
-    // prism.sarl 当前证书 SPKI SHA-256（占位；真实发布前由运维注入）
-    // "2f3f2a8c9a1d4e2f5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f89",
+    // prism.sarl 服务端证书 SPKI SHA-256（运维注入后替换）
     "0000000000000000000000000000000000000000000000000000000000000000",
 ];
 
-/// 证书校验：传入 DER 编码的 SPKI，校验 SHA-256 是否在 pin 集合里。
-/// 返回 `true` 才允许通过；`false` 视为中间人攻击。
+/// SPKI 证书 pinning：SHA-256(der) 在 PINNED_SPKI_SHA256 中才返回 true。
 pub fn verify_spki(der: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(der);
     let digest = h.finalize();
-    let hex = {
-        let mut s = String::with_capacity(64);
-        for b in digest {
-            s.push_str(&format!("{:02x}", b));
-        }
-        s
-    };
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
     PINNED_SPKI_SHA256.contains(&hex.as_str())
 }
 
 // ---------------------------------------------------------------- 信封与验签结果
 
-/// 服务端下发的 signed 信封（激活令牌 / 运行策略 / 订阅链接通用）
+/// 服务端下发的签名信封（激活令牌 / 运行策略 / 订阅链接通用；
+/// payload 必须是原始 JSON 的 base64url 无 padding，signature 是 Ed25519 签名的
+/// base64url 无 padding）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedEnvelope {
@@ -91,7 +79,7 @@ pub struct SignedEnvelope {
     /// 原始 JSON payload 的 base64url（无 padding）
     pub payload: String,
     pub signature: String,
-    /// 签名过期时间（Unix 秒）；payload 里也有一份，允许服务端冗余但必须一致
+    /// 签名过期时间（Unix 秒）；payload 内会有同字段
     pub token_expires_at: i64,
 }
 
@@ -118,17 +106,25 @@ pub struct TokenPayload {
 pub enum VerifyError {
     #[error("keyId 未知：{0}")]
     UnknownKeyId(String),
-    #[error("base64url 解码失败：{0}")]
-    B64(String),
-    #[error("Ed25519 签名校验失败")]
+    #[error("信封 algorithm 必须是 Ed25519，实际 {0}")]
+    WrongAlgorithm(String),
+    #[error("公钥长度异常：{0}（必须 32 字节）")]
+    PubKeyLength(usize),
+    #[error("payload base64url 解码失败：{0}")]
+    PayloadB64(String),
+    #[error("payload 长度异常：{0}（必须 150..=300 字节）")]
+    PayloadLength(usize),
+    #[error("signature base64url 解码失败：{0}")]
+    SigB64(String),
+    #[error("signature 长度异常：{0}（必须 64 字节）")]
+    SigLength(usize),
+    #[error("Ed25519 签名校验失败（payload 字节被篡改或公钥/签名不匹配）")]
     SignatureMismatch,
-    #[error("信封 algorithm 必须是 Ed25519")]
-    WrongAlgorithm,
-    #[error("payload JSON 无法解析：{0}")]
+    #[error("payload JSON 无法解析（验签虽通过，但结构不符合预期）：{0}")]
     PayloadJson(String),
-    #[error("令牌已过期（tokenExpiresAt={0}）")]
-    TokenExpired(i64),
-    #[error("令牌尚未生效（issuedAt={0}，now={1}）")]
+    #[error("令牌已过期（tokenExpiresAt={0}，now={1}）")]
+    TokenExpired(i64, i64),
+    #[error("令牌尚未生效（issuedAt={0}，now={1}，时钟宽容 5 分钟）")]
     TokenNotYetValid(i64, i64),
     #[error("deviceId 不匹配：令牌 {0} != 本机 {1}")]
     DeviceIdMismatch(String, String),
@@ -136,12 +132,13 @@ pub enum VerifyError {
     InstallIdMismatch(String, String),
     #[error("licenseRef 不匹配：令牌 {0} != 本地 {1}")]
     LicenseRefMismatch(String, String),
-    #[error("kind 不匹配：信封 kind={0}，期望 {1}")]
+    #[error("kind 不匹配：payload.kind={0}，期望 {1}")]
     KindMismatch(String, String),
 }
 
-/// 统一验签入口：输入 SignedEnvelope + 本机指纹 + kind（None 表示不校验 kind），
-/// 输出解析后的 TokenPayload 或错误。验签失败 → 调用方必须按「未授权」处理。
+/// 【方案 1-7】严格验签：绝不做任何 JSON 重新序列化。
+/// 输入 SignedEnvelope + 本机指纹 + 期望 kind + now(Unix 秒)。
+/// 成功返回解析后的 TokenPayload；失败返回 VerifyError（调用方必须按「未授权」处理）。
 pub fn verify(
     envelope: &SignedEnvelope,
     device_id: &str,
@@ -150,50 +147,71 @@ pub fn verify(
     expected_kind: Option<&str>,
     now: i64,
 ) -> std::result::Result<TokenPayload, VerifyError> {
-    // 1. 算法 + keyId
-    if envelope.algorithm != "Ed25519" {
-        return Err(VerifyError::WrongAlgorithm);
+    // 方案 3 前置：公钥长度兜底（理论上 VerifyingKey 构造时已校验）
+    if PUBKEY_PRISM_1.len() != 32 {
+        return Err(VerifyError::PubKeyLength(PUBKEY_PRISM_1.len()));
     }
-    let Some(key) = pubkey_map().get(envelope.key_id.as_str()) else {
+    let key_map = init_key_map();
+
+    // 方案 3 续：keyId 命中
+    let Some(key) = key_map.get(envelope.key_id.as_str()) else {
         return Err(VerifyError::UnknownKeyId(envelope.key_id.clone()));
     };
-    // 2. base64url 解码（无 padding）
-    let payload_bytes = base64_url_decode(&envelope.payload)
-        .map_err(|e| VerifyError::B64(format!("payload: {e}")))?;
-    let sig_bytes = base64_url_decode(&envelope.signature)
-        .map_err(|e| VerifyError::B64(format!("signature: {e}")))?;
-    let sig = Signature::from_slice(&sig_bytes).map_err(|e| VerifyError::B64(e.to_string()))?;
-    // 3. 严格验签 —— 直接对原始 payload 字节，绝不反序列化后再序列化
-    key.verify(&payload_bytes, &sig).map_err(|_| VerifyError::SignatureMismatch)?;
-    // 4. payload JSON 解析
+
+    // 方案 4 前置：algorithm 严格等于 "Ed25519"
+    if envelope.algorithm != "Ed25519" {
+        return Err(VerifyError::WrongAlgorithm(envelope.algorithm.clone()));
+    }
+
+    // 方案 1：base64url 无 padding 解码 payload → payloadBytes（原始 JSON 字节，
+    // 不做任何 parse 成对象再 stringify 的动作）
+    let payload_bytes =
+        base64url_no_pad_decode(&envelope.payload).map_err(VerifyError::PayloadB64)?;
+
+    // 方案 6：payload 长度 150..=300（异常直接拒绝，避免大包绕过）
+    if !(150..=300).contains(&payload_bytes.len()) {
+        return Err(VerifyError::PayloadLength(payload_bytes.len()));
+    }
+
+    // 方案 2：base64url 无 padding 解码 signature → sig_bytes（必须正好 64 字节）
+    let sig_bytes =
+        base64url_no_pad_decode(&envelope.signature).map_err(VerifyError::SigB64)?;
+    if sig_bytes.len() != 64 {
+        return Err(VerifyError::SigLength(sig_bytes.len()));
+    }
+
+    // 方案 4：Ed25519-Verifier.verify(sig, payloadBytes) == true 才继续
+    let sig = Signature::from_slice(&sig_bytes)
+        .map_err(|e| VerifyError::SigB64(e.to_string()))?;
+    key.verify(&payload_bytes, &sig)
+        .map_err(|_| VerifyError::SignatureMismatch)?;
+
+    // 方案 5：验签通过后才把 payloadBytes 解析成 JSON 读取 claims
     let claims: TokenPayload = serde_json::from_slice(&payload_bytes)
         .map_err(|e| VerifyError::PayloadJson(e.to_string()))?;
-    // 5. tokenExpiresAt：信封和 payload 都得检查
+
+    // 后续 claims 校验：只用于业务判断，不参与验签
     let exp = claims
         .token_expires_at
         .unwrap_or(envelope.token_expires_at);
     if now >= exp {
-        return Err(VerifyError::TokenExpired(exp));
+        return Err(VerifyError::TokenExpired(exp, now));
     }
-    // 6. issuedAt 时钟宽容 5 分钟
     if let Some(iat) = claims.issued_at {
         if now + 300 < iat {
             return Err(VerifyError::TokenNotYetValid(iat, now));
         }
     }
-    // 7. deviceId
     if let Some(d) = &claims.device_id {
         if d != device_id {
             return Err(VerifyError::DeviceIdMismatch(d.clone(), device_id.into()));
         }
     }
-    // 8. installId
     if let Some(i) = &claims.install_id {
         if i != install_id {
             return Err(VerifyError::InstallIdMismatch(i.clone(), install_id.into()));
         }
     }
-    // 9. licenseRef（sync_links 专用）
     if let Some(ref_key) = license_ref {
         if let Some(lr) = &claims.license_ref {
             if lr != ref_key {
@@ -201,13 +219,13 @@ pub fn verify(
             }
         }
     }
-    // 10. kind（期望 kind 与 payload.kind 必须一致）
     if let Some(expected) = expected_kind {
         let actual = claims.kind.as_deref().unwrap_or("");
         if actual != expected {
             return Err(VerifyError::KindMismatch(actual.into(), expected.into()));
         }
     }
+
     crate::core::logger::info(
         MOD_PRO,
         &format!(
@@ -220,16 +238,12 @@ pub fn verify(
     Ok(claims)
 }
 
-fn base64_url_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
-    let padded = match s.len() % 4 {
-        2 => format!("{s}=="),
-        3 => format!("{s}="),
-        _ => s.into(),
-    };
-    // base64 0.22 用 base64_url_no_pad，但上面已经补 padding，用 base64_url
+/// base64url (RFC 4648 §5) 无 padding 解码：
+/// 只接受 `-` `_` 字符，拒绝 `+` `/` `=`；和 JWS / COSE 严格一致。
+pub fn base64url_no_pad_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE
-        .decode(padded.as_bytes())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
         .map_err(|e| e.to_string())
 }
 
@@ -237,16 +251,14 @@ fn base64_url_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 
 const CLOCK_CHECK_FILE: &str = ".prism_clock_last_check";
 
-/// 启动时调用：把当前时间写入 data_dir/.prism_clock_last_check。
-/// 下次启动读回；差值 < -300s 视为时钟回拨 → 调用方必须清空授权。
 pub fn check_clock_rollback(data_dir: &Path) -> bool {
     let now = unix_now();
     let file = data_dir.join(CLOCK_CHECK_FILE);
     let rolled = if let Ok(text) = std::fs::read_to_string(&file) {
-        text.trim().parse::<i64>().map(|stored| {
-            // 回拨 > 5 分钟才算；NTP 自动校时 ±1 分钟正常
-            now < stored - 300
-        }).unwrap_or(false)
+        text.trim()
+            .parse::<i64>()
+            .map(|stored| now < stored - 300) // 回拨 > 5 分钟才触发
+            .unwrap_or(false)
     } else {
         false
     };
@@ -259,4 +271,165 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------- 单元测试（用用户给定的固定向量）
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Signer, SigningKey};
+
+    /// 固定向量：用户指定的生产公钥 base64url / hex / raw bytes 三者必须一一对应
+    const PUBKEY_B64URL: &str = "UzKKqVLOFJuozWM2UGbkKDezvzMpn7crq019eMs0F_k";
+    const PUBKEY_HEX: &str = "53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9";
+
+    #[test]
+    fn test_pubkey_fixed_vector_decodes_to_32_bytes() {
+        let bytes = base64url_no_pad_decode(PUBKEY_B64URL).expect("base64url 解码应成功");
+        assert_eq!(bytes.len(), 32, "公钥必须正好 32 字节");
+        assert_eq!(
+            hex_encode(&bytes).to_ascii_lowercase(),
+            PUBKEY_HEX.to_ascii_lowercase(),
+            "base64url 解码出的字节必须等于用户给定的 hex"
+        );
+    }
+
+    #[test]
+    fn test_hardcoded_pubkey_matches_fixed_vector() {
+        // 硬编码的 PUBKEY_PRISM_1 必须等于用户给定的 hex → 防止混淆还原出错
+        assert_eq!(
+            hex_encode(&PUBKEY_PRISM_1).to_ascii_lowercase(),
+            PUBKEY_HEX.to_ascii_lowercase(),
+            "硬编码公钥必须精确匹配用户给定的 hex 固定向量"
+        );
+        // 硬编码公钥必须等于 base64url 解码结果
+        let from_b64 = base64url_no_pad_decode(PUBKEY_B64URL).unwrap();
+        assert_eq!(from_b64.as_slice(), PUBKEY_PRISM_1);
+    }
+
+    #[test]
+    fn test_verify_key_map_constructs_successfully() {
+        // 确保 init_key_map 能构造 VerifyingKey（dalek 的 Curve25519 合法性检查会拒绝
+        // 一些特殊形式，但生产公钥是标准 Ed25519 公钥，必须通过）
+        let map = init_key_map();
+        assert!(map.contains_key(PRISM_KEY_ID), "keyId prism-1 必须在 map 中");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_algorithm() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let vk = sk.verifying_key();
+        let payload = r#"{"kind":"activation","deviceId":"x","tokenExpiresAt":9999999999}"#;
+        let sig = sk.sign(payload.as_bytes());
+        let env = SignedEnvelope {
+            algorithm: "RS256".into(), // 必须是 Ed25519
+            key_id: PRISM_KEY_ID.into(),
+            payload: base64url_encode(payload.as_bytes()),
+            signature: base64url_encode(&sig.to_bytes()),
+            token_expires_at: 9999999999,
+        };
+        let r = verify(&env, "x", "", None, Some("activation"), 0);
+        assert!(matches!(r, Err(VerifyError::WrongAlgorithm(_))));
+        let _ = vk; // 抑制未使用告警
+    }
+
+    #[test]
+    fn test_verify_accepts_valid_signed_envelope_roundtrip() {
+        // 全链路自签验证：临时密钥对自签 payload → 临时 VerifyingKey 验签 == true
+        // （注：生产 verify 用的是全局 PUBKEY_PRISM_1，此处用临时密钥独立验证算法本身）
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let vk = sk.verifying_key();
+        let payload_bytes = br#"{"kind":"activation","deviceId":"dev-123","installId":"inst-abc","licenseRef":"LIC-001","issuedAt":1700000000,"tokenExpiresAt":9999999999,"plan":"pro","subscriptionActive":true}"#;
+        assert!(
+            (150..=300).contains(&payload_bytes.len()),
+            "测试 payload 必须落在 150..=300 范围（实际 {}）",
+            payload_bytes.len()
+        );
+        let sig = sk.sign(payload_bytes);
+        assert_eq!(sig.to_bytes().len(), 64, "签名必须正好 64 字节");
+        // 关键：临时公钥能验证自己签的 payload
+        assert!(
+            vk.verify(payload_bytes, &sig).is_ok(),
+            "Ed25519 自签信封必须能被同一密钥对的 VerifyingKey 验签通过"
+        );
+        // payload/sig 都通过 base64url 无 padding 解码再喂给 verify 也必须 OK
+        let env_payload = base64url_encode(payload_bytes);
+        let env_sig = base64url_encode(&sig.to_bytes());
+        assert_eq!(
+            base64url_no_pad_decode(&env_payload).unwrap().as_slice(),
+            payload_bytes,
+            "base64url 无 padding 往返必须无损还原 payloadBytes"
+        );
+        assert_eq!(
+            base64url_no_pad_decode(&env_sig).unwrap().as_slice(),
+            sig.to_bytes(),
+            "base64url 无 padding 往返必须无损还原 sig"
+        );
+    }
+
+    #[test]
+    fn test_payload_length_out_of_range_rejected() {
+        // payload 小于 150 字节必须被拒（长度边界检查优先于验签）
+        let short = b"{\"kind\":\"a\",\"d\":\"x\",\"t\":9999999999}";
+        assert!(short.len() < 150);
+        let env = SignedEnvelope {
+            algorithm: "Ed25519".into(),
+            key_id: PRISM_KEY_ID.into(),
+            payload: base64url_encode(short),
+            signature: base64url_encode(&[0u8; 64]),
+            token_expires_at: 9999999999,
+        };
+        let r = verify(&env, "x", "", None, Some("activation"), 0);
+        assert!(matches!(r, Err(VerifyError::PayloadLength(_))));
+    }
+
+    #[test]
+    fn test_sig_length_not_64_rejected() {
+        // signature 长度不是 64 字节必须被拒
+        let payload = r#"{"kind":"activation","deviceId":"device-abcdefghijklmnop","installId":"inst-abcdefghij","licenseRef":"LIC-001-ABCDEF","issuedAt":1700000000,"tokenExpiresAt":9999999999,"plan":"pro","subscriptionActive":true}"#;
+        assert!(
+            (150..=300).contains(&payload.len()),
+            "payload 必须落在 150..=300 范围（实际 {}）",
+            payload.len()
+        );
+        let sig_b64 = base64url_encode(&[0u8; 32]); // 32 ≠ 64
+        assert_eq!(sig_b64.len(), 43); // 32 字节 → 43 base64url 字符
+        let env = SignedEnvelope {
+            algorithm: "Ed25519".into(),
+            key_id: PRISM_KEY_ID.into(),
+            payload: base64url_encode(payload.as_bytes()),
+            signature: sig_b64,
+            token_expires_at: 9999999999,
+        };
+        let r = verify(&env, "x", "", None, Some("activation"), 0);
+        eprintln!("verify result: {:?}", r);
+        assert!(matches!(r, Err(VerifyError::SigLength(_))));
+    }
+
+    #[test]
+    fn test_tampered_payload_rejected() {
+        // payload 被篡改 → 签名不匹配
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let good = br#"{"kind":"activation","deviceId":"x","installId":"inst","licenseRef":"LIC","issuedAt":1700000000,"tokenExpiresAt":9999999999,"plan":"pro"}"#;
+        let bad = br#"{"kind":"activation","deviceId":"TAMPERED","installId":"inst","licenseRef":"LIC","issuedAt":1700000000,"tokenExpiresAt":9999999999,"plan":"pro"}"#;
+        let sig = sk.sign(good);
+        let vk = sk.verifying_key();
+        // 临时公钥验签（不影响全局）
+        assert!(vk.verify(bad, &sig).is_err(), "篡改后必须验签失败");
+        let _ = vk;
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+
+    fn base64url_encode(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
 }
