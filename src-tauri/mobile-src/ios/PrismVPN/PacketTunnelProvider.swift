@@ -62,6 +62,12 @@ private struct GoLanProfileMeta {
     let probeTarget: String
 }
 
+/// 【APP60 任务2.3】跨子网 TCP 探测结果容器：用引用类型承接 NWConnection
+/// 状态回调写入，避免在 @Sendable 闭包里直接改写局部 var（Swift 并发告警）。
+private final class GoLanProbeFlag {
+    var hit = false
+}
+
 private struct PhysicalInterface {
     let name: String
     let index: UInt32
@@ -2199,19 +2205,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 for p in fallbackPorts where !ports.contains(p) { ports.append(p) }
                 for port in ports {
+                    // NWEndpoint.Port(rawValue:) 是可失败初始化器（RawRepresentable），
+                    // 不能写成 .rawValue(port) —— 后者在 Swift 中不存在该静态方法
+                    guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
                     let sem = DispatchSemaphore(value: 0)
-                    var hit = false
-                    let conn = NWConnection(host: .name(ip, nil), port: .rawValue(port), using: .tcp)
+                    let flag = GoLanProbeFlag()
+                    let conn = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: .tcp)
                     conn.stateUpdateHandler = { state in
                         switch state {
                         case .ready:
-                            hit = true
+                            flag.hit = true
                             conn.cancel()
                             sem.signal()
                         case .failed(let err):
                             let code = (err as NSError).code
                             // 连接被拒绝（端口关）仍代表 ARP 可达 / 局域网真实连通
-                            if code == 61 || code == 111 { hit = true }
+                            if code == 61 || code == 111 { flag.hit = true }
                             conn.cancel()
                             sem.signal()
                         case .cancelled:
@@ -2223,7 +2232,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     let timeout = DispatchTime.now() + 0.065
                     _ = sem.wait(timeout: timeout)
                     conn.cancel()
-                    if hit { return true }
+                    if flag.hit { return true }
                 }
             }
             return false
