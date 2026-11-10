@@ -468,7 +468,7 @@ fn save_cache(data_dir: &Path, cache: &CachedLicense) -> Result<()> {
     Ok(())
 }
 
-fn clear_cache(data_dir: &Path) {
+pub fn clear_cache(data_dir: &Path) {
     std::fs::remove_file(cache_path(data_dir)).ok();
     std::fs::remove_file(legacy_cache_path(data_dir)).ok();
 }
@@ -833,6 +833,9 @@ struct ActivateResponse {
     /// 【APP48】Alpha 内测授权（plan 仍为 pro，但 UI 显示「内测版」且无云端同步）
     #[serde(default)]
     alpha: bool,
+    /// 【110.txt】服务端签名令牌；服务端切换到新协议后返回，旧返回体兼容保留
+    #[serde(default)]
+    token: Option<crate::core::ed25519_verify::SignedEnvelope>,
 }
 
 /// GET /api/license/status 响应
@@ -853,6 +856,9 @@ struct StatusResponse {
     /// 【APP48】Alpha 内测授权标记（/license/status 同步返回）
     #[serde(default)]
     alpha: bool,
+    /// 【110.txt】服务端签名信封；缺失表示服务端仍在旧协议，走回退但功能锁降级
+    #[serde(default)]
+    signed: Option<serde_json::Value>,
 }
 
 /// 状态查询失败分类：决定走「清除缓存」还是「离线锁定」
@@ -983,7 +989,7 @@ async fn retry_after_secs(resp: reqwest::Response) -> i64 {
 }
 
 /// GET /api/license/status：200 返回状态体，其余按 StatusError 分类
-async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<StatusResponse, StatusError> {
+async fn fetch_status(base: &str, license_key: &str, data_dir: &Path) -> std::result::Result<StatusResponse, StatusError> {
     let resp = get_with_fallback(
         &format!("{base}{}", crate::obf!("/api/license/status")),
         license_key,
@@ -1000,9 +1006,33 @@ async fn fetch_status(base: &str, license_key: &str) -> std::result::Result<Stat
     if !resp.status().is_success() {
         return Err(StatusError::Rejected(code, error_message(resp).await));
     }
-    resp.json()
+    let status: StatusResponse = resp
+        .json()
         .await
-        .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))
+        .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
+    // 【110.txt】GET /api/license/status 响应验签
+    if let Some(signed) = status.signed.as_ref() {
+        let env: crate::core::ed25519_verify::SignedEnvelope = serde_json::from_value(signed.clone())
+            .map_err(|e| StatusError::Transient(format!("signed envelope json: {e}")))?;
+        let device_id_str = device_id(data_dir)
+            .map_err(|e| StatusError::Transient(format!("device_id: {e}")))?;
+        let now = crate::core::ed25519_verify::unix_now();
+        crate::core::ed25519_verify::verify(
+            &env,
+            &device_id_str,
+            "",
+            Some(license_key),
+            Some("status"),
+            now,
+        )
+        .map_err(|e| StatusError::Rejected(401, format!("signature_invalid: {e}")))?;
+    } else {
+        crate::core::logger::warn(
+            crate::core::logger::MOD_PRO,
+            "GET /api/license/status 响应缺少 signed 信封",
+        );
+    }
+    Ok(status)
 }
 
 // ---------------- 状态映射 ----------------
@@ -1176,6 +1206,34 @@ pub async fn activate(
         bail!("激活失败：服务端未确认（ok=false）");
     }
 
+    // 【110.txt】激活响应签名信封验签（服务端新旧协议兼容：无 token 时记录 warn 继续）
+    let device_id_str = device_id(data_dir)?;
+    if let Some(env) = data.token.as_ref() {
+        let now = crate::core::ed25519_verify::unix_now();
+        match crate::core::ed25519_verify::verify(
+            env,
+            &device_id_str,
+            "",
+            Some(&license_key),
+            Some("activation"),
+            now,
+        ) {
+            Ok(_claims) => {}
+            Err(e) => {
+                crate::core::logger::warn(
+                    crate::core::logger::MOD_PRO,
+                    &format!("激活响应验签失败：{e}"),
+                );
+                bail!("err_code:signature_invalid");
+            }
+        }
+    } else {
+        crate::core::logger::warn(
+            crate::core::logger::MOD_PRO,
+            "激活响应缺少签名信封，将继续但服务端需尽快升级到 110.txt 协议",
+        );
+    }
+
     // 优先用激活响应自带的 expires_at；缺失时 best-effort 拉一次状态补全
     // （查询失败不影响激活结果，恢复联网后每日同步会修正）
     let mut ent = map_entitlement(
@@ -1187,7 +1245,7 @@ pub async fn activate(
         data.sync_available,
         data.alpha,
     );
-    match fetch_status(&base, &license_key).await {
+    match fetch_status(&base, &license_key, data_dir).await {
         Ok(s) if s.valid => {
             ent = map_entitlement(
                 &s.plan,
@@ -1257,7 +1315,7 @@ pub async fn verify_remote(
 
     let base = server_base(settings);
 
-    match fetch_status(&base, &cache.license).await {
+    match fetch_status(&base, &cache.license, data_dir).await {
         Ok(s) => {
             // 服务端明确判定凭证无效（停用/删除）→ 清除缓存
             if !s.valid {

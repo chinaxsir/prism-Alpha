@@ -95,6 +95,14 @@ pub fn run() {
                 core::logger::MOD_KERNEL,
                 &format!("Prism 启动，版本 {}（{}）", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
             );
+            // 【110.txt】时钟回拨检测：系统时间 < 上次记录 - 5 分钟 → 清授权
+            if core::ed25519_verify::check_clock_rollback(&data_dir) {
+                core::logger::warn(
+                    core::logger::MOD_PRO,
+                    "检测到系统时钟回拨超过 5 分钟，本地授权缓存已清除，请重启 APP 后重新激活",
+                );
+                core::license::clear_cache(&data_dir);
+            }
 
             // 【APP52 任务2】常驻后台遥测：600ms 采样 + telemetry://tick，
             // 切换页面/系统后台/停启 VPN 都不中断（仅运行中真实探测）。

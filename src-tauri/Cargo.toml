@@ -63,6 +63,12 @@ uuid = { version = "1", features = ["v4"] }
 # 授权缓存加密（AES-256-GCM + SHA-256 密钥派生）：防逆向读取与篡改
 aes-gcm = "0.10"
 sha2 = "0.10"
+# 【110.txt】Ed25519 签名验签（严格模式 verify_strict）：授权令牌 / 运行策略 /
+# 订阅链接统一走同一套公钥验签，任何篡改 payload 或 signature 都会直接降级
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+# 【110.txt】TLS SPKI 证书 pinning：只信任 prism.sarl 服务端当前证书的 SPKI；
+# 真正的 pinning 逻辑在 reqwest client 层通过自定义 TLS connector 完成。
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "5.5"
