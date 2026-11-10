@@ -85,6 +85,10 @@ const zh: Record<string, string> = {
   "engine.goLanTag": "回家内网直通",
   "engine.goCusTag": "覆写/改写/脚本",
   "engine.goLanProbe": "检测",
+  // 【APP60 任务1.1】蓝框功能简介：未开启/未激活时展示，替代「未激活 · Pro 专属」
+  "engine.goAim.desc": "自动优选解锁 AI 与流媒体的最低延迟节点",
+  "engine.goLan.desc": "异地组网直通家里与公司内网，同局域网自动直连",
+  "engine.goCus.desc": "自定义分流覆写、去广告拦截与脚本规则扩展",
 
   // ---- 运行日志（APP6 任务1/2） ----
   "logs.title": "运行日志",
@@ -438,6 +442,10 @@ const en: Record<string, string> = {
   "engine.goLanTag": "Intranet",
   "engine.goCusTag": "Modules",
   "engine.goLanProbe": "Probe",
+  // 【APP60 任务1.1】Feature summaries shown when locked / not enabled
+  "engine.goAim.desc": "Auto-select lowest latency nodes for AI & streaming",
+  "engine.goLan.desc": "Direct access to home & office LANs with auto local bypass",
+  "engine.goCus.desc": "Custom routing overrides, ad-blocking & script rules",
 
   // ---- Logs (APP6) ----
   "logs.title": "Runtime Logs",

@@ -481,6 +481,7 @@ export default function Dashboard() {
   // 【APP54 任务5】探测中优先展示实时进度（位置 C）
   const aimRated = Object.keys(aim?.results ?? {}).length;
   const aimRunning = aimProgress.running || Boolean(aim?.probing);
+  // 【APP60 任务1.1】未开启/未激活时展示核心功能简介，替代「未激活 · Pro 专属」
   const aimStatus = aim?.enabled
     ? aimRunning
       ? t("dashboard.aim.progress", {
@@ -496,7 +497,7 @@ export default function Dashboard() {
             rated: aimRated,
             total: aimProgress.total || aimRated,
           })
-    : t("dashboard.aim.idle");
+    : t("engine.goAim.desc");
   // 【APP23 任务1.2】字段缺失兜底：goLanSettings 任一层为 undefined 时
   // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
   const lanCidrs = lan?.lanCidrs ?? [];
@@ -506,7 +507,7 @@ export default function Dashboard() {
   const enabledLanProfiles = (lan?.profiles ?? []).filter((p) => p.enabled);
   const lanDirectMap = lanState?.goLanProfileDirectMap ?? {};
   const lanStatus =
-    enabledLanProfiles.length > 0
+    lan?.enabled && enabledLanProfiles.length > 0
       ? t("dashboard.lan.profiles", {
           profiles: enabledLanProfiles
             .map((p) => {
@@ -524,21 +525,21 @@ export default function Dashboard() {
             })
             .join(" · "),
         })
-      : lanCidrs.length > 0
+      : lan?.enabled && lanCidrs.length > 0
         ? t("dashboard.lan.configured", {
             mode: t(lan?.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
             cidrs: lanCidrs.join(", "),
           })
-        : t("dashboard.lan.unset");
+        : t("engine.goLan.desc");
   const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];
   const cusStatus =
-    cus && cus.modules.length > 0
+    cus?.enabled && cus.modules.length > 0
       ? t("dashboard.cus.enabled", {
           modules: cusEnabledModules.length,
           rewrites: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.rewrites ?? 0), 0),
           scripts: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.scripts ?? 0), 0),
         })
-      : t("dashboard.cus.unset");
+      : t("engine.goCus.desc");
 
   // Go AIM 开启时的「重测」：立即触发一轮评级探测（结果经 go-aim://updated 事件刷新）
   const runAimProbe = async () => {
@@ -550,7 +551,12 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="space-y-2.5">
+    // 【APP60 任务1.2】视口自适应弹性布局：顶部固定区 + 下部 flex-1 弹性撑满区，
+    // h-full 精确等于主滚动区可视高度（含安全区/底栏 padding），一屏撑满不溢出；
+    // 小屏设备内容超高时由外层 main（overflow-y-auto）安全微滚
+    <div className="flex h-full min-h-0 flex-col pb-2">
+      {/* 顶部固定区：标题 / 出站切换 / 主状态卡 / 当前节点·今日流量 */}
+      <div className="shrink-0 space-y-2.5">
       <h1 className="text-[22px] font-bold tracking-tight">{t("dashboard.title")}</h1>
 
       {/* 出站模式快捷切换（规则/全局/直连） */}
@@ -666,17 +672,21 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+      </div>
 
+      {/* 下部弹性撑满区（黄框）：4 个模块均分剩余纵向空间，
+          底部「下载/上传」卡下边缘对齐底栏上方，彻底消除留白且绝不超界 */}
+      <div className="mt-2.5 flex min-h-0 flex-1 flex-col gap-2.5">
       {/* Pro 引擎矩阵（Go AIM / Go Lan / Go Cus）
           【APP-13 任务3】未激活时不再整体折叠为横幅：三张功能卡原位展示并
           置灰，点击卡片弹出激活授权弹窗。功能入口位置固定，避免激活前后
           布局跳变，也让用户一眼看清 Pro 到底解锁了什么。 */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 flex-[3] min-h-0 auto-rows-fr">
         <EngineCard
           icon={<Crosshair size={16} className="text-surge-green" />}
           tone="text-surge-green"
           name={t("engine.goAim")}
-          status={proUnlocked ? aimStatus : t("pro.lockedTap")}
+          status={proUnlocked ? aimStatus : t("engine.goAim.desc")}
           enabled={proUnlocked && (aim?.enabled ?? false)}
           locked={!proUnlocked}
           onToggle={toggleAim}
@@ -699,7 +709,7 @@ export default function Dashboard() {
           icon={<Home size={16} className="text-surge-orange" />}
           tone="text-surge-orange"
           name={t("engine.goLan")}
-          status={proUnlocked ? lanStatus : t("pro.lockedTap")}
+          status={proUnlocked ? lanStatus : t("engine.goLan.desc")}
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
           onToggle={toggleLan}
@@ -718,7 +728,7 @@ export default function Dashboard() {
           icon={<Wand2 size={16} className="text-surge-purple" />}
           tone="text-surge-purple"
           name={t("engine.goCus")}
-          status={proUnlocked ? cusStatus : t("pro.lockedTap")}
+          status={proUnlocked ? cusStatus : t("engine.goCus.desc")}
           enabled={proUnlocked && (cus?.enabled ?? false)}
           locked={!proUnlocked}
           onToggle={toggleCus}
@@ -735,8 +745,9 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* 实时速率（合并卡片，左右分布） */}
-      <div className="card-sheen bg-surface-card rounded-2xl p-5 border border-border">
+      {/* 实时速率（合并卡片，左右分布）：【APP60 任务1.2】flex-1 均分黄框剩余空间，
+          下边缘对齐底栏上方，高度受 min/max 严格约束绝不超界 */}
+      <div className="card-sheen bg-surface-card rounded-2xl px-4 py-3 border border-border flex-1 min-h-[72px] max-h-[108px] flex flex-col justify-center">
         <div className="grid grid-cols-2 gap-4">
           <div>
             <div className="flex items-center gap-1.5 text-xs font-medium text-text-muted">
@@ -758,6 +769,7 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+      </div>
       </div>
 
       {/* 节点选择器弹窗：点击「当前节点」指标卡打开，按延迟从低到高排列 */}
@@ -863,7 +875,7 @@ function EngineCard({
 }) {
   return (
     <div
-      className={`card-sheen flex items-center justify-between gap-3 px-3.5 py-3 rounded-xl bg-surface-card border border-border transition-colors ${
+      className={`card-sheen flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-surface-card border border-border transition-colors min-h-[72px] max-h-[108px] ${
         // 【APP47 任务2.3】锁定时不再 opacity-50 整体变淡（文字发灰看不清），
         // 改为保持正常对比度，仅禁用点击与开关
         locked ? "select-none cursor-not-allowed" : "hover:border-accent/30"

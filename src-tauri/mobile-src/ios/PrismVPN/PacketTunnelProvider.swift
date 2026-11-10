@@ -58,6 +58,8 @@ private func startSystemPathMonitor() {
 private struct GoLanProfileMeta {
     let bypass: Bool
     let cidrs: [String]
+    // 【APP60 任务2.2】iOS 扩展跨子网探测需要知道档案的探测主机
+    let probeTarget: String
 }
 
 private struct PhysicalInterface {
@@ -951,7 +953,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let tag = item["tag"] as? String, !tag.isEmpty else { continue }
             let bypass = (item["bypassOnLocalLan"] as? Bool) ?? true
             let cidrs = (item["cidrs"] as? [String]) ?? []
-            out[tag] = GoLanProfileMeta(bypass: bypass, cidrs: cidrs)
+            let probeTarget = (item["probeTarget"] as? String) ?? ""
+            out[tag] = GoLanProfileMeta(bypass: bypass, cidrs: cidrs, probeTarget: probeTarget)
         }
         return out
     }
@@ -1523,8 +1526,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 绝不改写目标地址（否则会破坏 ip_cidr → go-lan-home 匹配）。
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = false
-                    inbounds[i]["sniff_timeout"] = "300ms"
+                    // 【APP60 任务3.3】50ms 嗅探超时：非 HTTP 协议快速放行，
+                    // 避免拖慢首包；同时开启 UDP 分片（大 UDP 不再静默丢包）
+                    inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
+                    inbounds[i]["udp_fragment"] = true
                 }
             }
             root["inbounds"] = inbounds
@@ -1716,6 +1722,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // connect_timeout 5s，避免连不上的内网端口挂起 2m7s。
                     outbounds[i]["mtu"] = 1280
                     outbounds[i]["connect_timeout"] = "5s"
+                    // 【APP60 任务3.4】iOS 扩展也同步：workers 4 多核并行、
+                    // udp_fragment 允许分片，大文件/蜂窝链路不再打满单核或丢包
+                    outbounds[i]["workers"] = 4
+                    outbounds[i]["udp_fragment"] = true
                     // 【APP31 任务1】物理网卡硬绑定兜底清理 inet4_bind_address
                     // / routing_mark，保留 bind_interface 让外层 UDP 直链。
                     outbounds[i].removeValue(forKey: "inet4_bind_address")
@@ -2039,6 +2049,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         dnsServers.append(contentsOf: preservedDnsServers)
         // dns-home 规则必须排在最前（位于 outbound:any 兜底规则之前）
         var dnsRules: [[String: Any]] = preservedDnsRules
+        // 【APP60 任务3.1】Swift 扩展侧默认只接管 IPv4（tun address 仅含
+        // 172.19.0.1/30），Safari 通过 SVCB/HTTPS(Type 64/65) 的 ipv6hint
+        // 绕过 ipv4_only 策略直连 IPv6 会触发 no route to host 风暴；
+        // _dns.resolver.arpa 是系统加密 DNS 发现查询，VPN 场景下无意义。
+        // 两种规则都在最顶部快速拦截，避免进入 dns-remote 空转。
+        dnsRules.insert(["query_type": ["SVCB", "HTTPS"], "action": "reject"], at: 0)
+        dnsRules.insert(["domain": ["_dns.resolver.arpa"], "action": "reject"], at: 0)
         dnsRules.append(contentsOf: [
             [
                 // 【APP14 任务4】节点域名解析（内核出站侧发起）直接走 dns-direct
@@ -2078,7 +2095,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "servers": dnsServers,
             "rules": dnsRules,
             "final": "dns-remote",
-            "strategy": "ipv4_only"
+            "strategy": "ipv4_only",
+            // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
+            // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路
+            "independent_cache": true
         ]
 
         // 4. 修正 route
@@ -2125,8 +2145,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         func classifyGoLanCidr(_ raw: String, tag: String) {
             let cidr = cleanCIDR(raw)
             guard !cidr.isEmpty else { return }
-            let bypassEnabled = goLanProfileMeta[tag]?.bypass ?? true
-            if bypassEnabled, let wifi = goLanWifiIP, ipv4InCidr(wifi, cidr) {
+            let meta = goLanProfileMeta[tag]
+            let bypassEnabled = meta?.bypass ?? true
+            guard bypassEnabled else { return }
+            // 【APP60 任务2.3】同子网（零 I/O 快路径）OR 跨子网 TCP 短探测（65ms，
+            // 扩展进程 Socket 天然走物理网卡）任一命中即判直连
+            let sameSubnet = goLanWifiIP.flatMap { ipv4InCidr($0, cidr) } ?? false
+            let probedDirect = sameSubnet || crossSubnetProbe(cidr: cidr, meta: meta)
+            if probedDirect {
                 if !onDemandBypassCidrs.contains(cidr) { onDemandBypassCidrs.append(cidr) }
                 var list = onDemandBypassByTag[tag] ?? []
                 if !list.contains(cidr) { list.append(cidr) }
@@ -2136,6 +2162,71 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if !list.contains(cidr) { list.append(cidr) }
                 goLanTunnelByTag[tag] = list
             }
+        }
+
+        // 【APP60 任务2.3】跨子网 TCP 短探测：仅在 Rust 签名变化（切 Wi-Fi / 改配置）
+        // 导致的 sanitize 阶段执行一次，结果按 (cidr, probeTarget) 签名缓存，
+        // 绝非轮询。NWConnection 天然走物理网卡（扩展进程），不经过 utun。
+        // Connected / ConnectionRefused 均视为局域网 L2/L3 真实可达。
+        func crossSubnetProbe(cidr: String, meta: GoLanProfileMeta?) -> Bool {
+            guard let prefix = parseIPv4Prefix(cidr), prefix.prefix <= 30 else { return false }
+            var candidates: [String] = []
+            // 优先：probeTarget 的 IP（如果它属于本网段）
+            if let probe = meta?.probeTarget, !probe.isEmpty {
+                let hostPart = probe.split(separator: ":").first.map { String($0) } ?? probe
+                let trimmed = hostPart.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+                if ipv4InCidr(trimmed, cidr) {
+                    candidates.append(trimmed)
+                }
+            }
+            // 其次：.1 / .254 网关（最多选 2 个）
+            let net = prefix.net
+            for last in [UInt32(1), UInt32(254)] {
+                if candidates.count >= 2 { break }
+                let gw = net | last
+                let gwIP = ipv4String(gw)
+                if !candidates.contains(gwIP) { candidates.append(gwIP) }
+            }
+            let fallbackPorts: [UInt16] = [80, 445, 443, 22]
+            for ip in candidates {
+                // 候选端口：probeTarget 自带端口优先（若它属于本网段），然后 fallback
+                var ports: [UInt16] = []
+                if let probe = meta?.probeTarget,
+                   let colon = probe.lastIndex(of: ":"),
+                   let p = UInt16(probe[probe.index(after: colon)...]),
+                   ipv4InCidr(String(probe[probe.startIndex..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[] ")), cidr) {
+                    ports.append(p)
+                }
+                for p in fallbackPorts where !ports.contains(p) { ports.append(p) }
+                for port in ports {
+                    let sem = DispatchSemaphore(value: 0)
+                    var hit = false
+                    let conn = NWConnection(host: .name(ip, nil), port: .rawValue(port), using: .tcp)
+                    conn.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            hit = true
+                            conn.cancel()
+                            sem.signal()
+                        case .failed(let err):
+                            let code = (err as NSError).code
+                            // 连接被拒绝（端口关）仍代表 ARP 可达 / 局域网真实连通
+                            if code == 61 || code == 111 { hit = true }
+                            conn.cancel()
+                            sem.signal()
+                        case .cancelled:
+                            sem.signal()
+                        default: break
+                        }
+                    }
+                    conn.start(queue: .global(qos: .background))
+                    let timeout = DispatchTime.now() + 0.065
+                    _ = sem.wait(timeout: timeout)
+                    conn.cancel()
+                    if hit { return true }
+                }
+            }
+            return false
         }
 
         for i in rules.indices {

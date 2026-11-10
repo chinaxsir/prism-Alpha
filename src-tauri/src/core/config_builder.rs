@@ -1253,8 +1253,8 @@ pub fn build(
         // 保证目标地址原样转发，自签名内网 HTTPS 不受影响。
         "sniff": true,
         "sniff_override_destination": false,
-        // 【APP48 任务1.2】嗅探超时统一 100ms，减少首包等待
-        "sniff_timeout": "100ms",
+        // 【APP60 任务3.3】嗅探超时 50ms：非 HTTP 协议快速放行，避免拖慢首包
+        "sniff_timeout": "50ms",
     }));
 
     // 桌面端仅 TUN 模式加 TUN 入站；移动端（iOS/Android）必须始终包含：
@@ -1297,11 +1297,14 @@ pub fn build(
             // 内网 ip_cidr → go-lan-home 匹配不被破坏。
             "sniff": true,
             "sniff_override_destination": false,
-            // 【APP48 任务1.2】嗅探超时 300ms → 100ms：缩短首包等待，
-            // 网页/小文件请求不再为等 SNI 多付 200ms 握手延迟。
-            "sniff_timeout": "100ms",
+            // 【APP60 任务3.3】嗅探超时 100ms → 50ms：非 HTTP 协议快速放行，
+            // 进一步压缩首包等待（网页/小文件请求不再为等 SNI 多付延迟）。
+            "sniff_timeout": "50ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
+            // 【APP60 任务3.3】允许 UDP 分片：大于 MTU 的 UDP 报文不再直接
+            // 丢弃，避免 QUIC / SMB over UDP 等场景静默丢包重传
+            "udp_fragment": true,
         });
         {
             let obj = tun.as_object_mut().expect("tun inbound is an object");
@@ -1385,6 +1388,20 @@ pub fn build(
         0,
         json!({ "outbound": "any", "server": "dns-direct" }),
     );
+    // 【APP60 任务3.1】SVCB/HTTPS 与 _dns.resolver.arpa 拦截必须排在所有规则
+    // **最顶部**（first-match 语义下精确匹配 query_type / domain），否则
+    // 会被 outbound:any 抢先吞掉。通过"反向 insert(0)"让 reject 规则最终
+    // 排在 index 0 和 1，outbound:any 挤到 index 2。
+    dns_rules.insert(
+        0,
+        json!({ "domain": ["_dns.resolver.arpa"], "action": "reject" }),
+    );
+    if !settings.ipv6 {
+        dns_rules.insert(
+            0,
+            json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }),
+        );
+    }
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
     // 【APP-11B 任务3】默认锁定纯 UDP/TCP 53 的 223.5.5.5：
@@ -1460,6 +1477,9 @@ pub fn build(
         "servers": dns_servers,
         "rules": dns_rules,
         "final": "dns-remote",
+        // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
+        // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路
+        "independent_cache": true,
         "strategy": if settings.ipv6 { "prefer_ipv4" } else { "ipv4_only" }
     });
 
@@ -1487,16 +1507,46 @@ pub fn build(
         }
     });
 
-    // 【APP48 任务1.3】route.rules 头部固定顺序（严格自上而下）：
-    // ① DNS 劫持（protocol dns / port 53 → dns-out）
-    // ② 853 拦截 + 公共 DNS 的 DoH/DoT 直连拦截
-    // ③ wg_server_ip/32 → direct 豁免（多路档案逐个豁免，必须早于 go-lan
-    //    回家规则，否则 WG 握手包被 ip_cidr 命中回家隧道形成环路）
-    // ④ ip_cidr: go_lan_cidrs → go-lan-*（必须在 QUIC 拦截之前！否则内网
-    //    NAS 的 UDP/443（SMB over QUIC、WebDAV、影视直连）会被 protocol
-    //    quic / udp 443 规则抢先 block，表现为「内网大文件传一半就断」）
-    // ⑤ QUIC 拦截（protocol quic / UDP 443，强制 Safari 走 TCP）
-    let mut head_rules: Vec<Value> = vec![
+    // 【APP60 任务3.2】route.rules 黄金顺序（严格自上而下）：
+    // ① On-Demand 局域网直连网段 → direct（最优先，命中即绕过一切隧道/代理）
+    // ② 各档案 WG 服务端公网 IP /32 → direct 豁免（必须先于 go-lan 隧道
+    //    网段，否则 WG 握手包被 ip_cidr 命中回家隧道形成环路）
+    // ③ go-lan-* 隧道网段 ip_cidr → go-lan-{tag}（必须在 QUIC 拦截与 DNS
+    //    劫持之前：内网 NAS 的 UDP/443 不能被 quic 规则误杀；本网段内的
+    //    DNS（如 192.168.10.1:53）也应留在隧道/局域网内而非被远端解析）
+    // ④ 协议规则：DNS 劫持（protocol dns / port 53 → dns-out）、853 拦截、
+    //    公共 DNS 的 DoH/DoT 直连拦截、QUIC 拦截（强制 Safari 走 TCP）
+    // ⑤ go-lan 域名后缀规则（置于 DNS 劫持之后，保证域名先被解析再按域名
+    //    分流进隧道）
+    let mut lan_ip_direct: Vec<Value> = Vec::new();
+    let mut lan_ip_tunnel: Vec<Value> = Vec::new();
+    let mut lan_other: Vec<Value> = Vec::new();
+    for r in go_lan_rules {
+        if r.get("ip_cidr").is_some() {
+            if r.get("outbound").and_then(Value::as_str) == Some("direct") {
+                lan_ip_direct.push(r);
+            } else {
+                lan_ip_tunnel.push(r);
+            }
+        } else {
+            lan_other.push(r);
+        }
+    }
+    let has_go_lan_rules = !lan_ip_tunnel.is_empty() || !lan_ip_direct.is_empty();
+    let mut head_rules: Vec<Value> = Vec::new();
+    // ① On-Demand 局域网直连
+    head_rules.append(&mut lan_ip_direct);
+    // ② WG 服务端公网 IP 直连豁免（防环路，必须先于隧道网段）
+    for ip in &wg_server_ips {
+        head_rules.push(json!({
+            "ip_cidr": [format!("{ip}/32")],
+            "outbound": "direct"
+        }));
+    }
+    // ③ go-lan-* 隧道网段
+    head_rules.append(&mut lan_ip_tunnel);
+    // ④ 协议规则
+    head_rules.extend([
         json!({ "protocol": "dns", "outbound": "dns-out" }),
         json!({ "port": 53, "outbound": "dns-out" }),
         json!({ "port": 853, "outbound": "block" }),
@@ -1505,22 +1555,15 @@ pub fn build(
             "port": [443, 853],
             "outbound": "block"
         }),
-    ];
-    for ip in &wg_server_ips {
-        head_rules.push(json!({
-            "ip_cidr": [format!("{ip}/32")],
-            "outbound": "direct"
-        }));
-    }
-    // 【APP48 任务1.3】回家规则前置：先于 QUIC/UDP443 拦截，保护内网 UDP 流量
-    let has_go_lan_rules = !go_lan_rules.is_empty();
-    head_rules.extend(go_lan_rules);
+    ]);
     // QUIC：tun-in 已关闭 sniff，仅靠 protocol 匹配无法识别，故同时用
     // UDP/443 兜底；必须排在 go-lan 之后（内网 UDP/443 不能被误杀）。
     if settings.block_quic || has_go_lan_rules {
         head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
         head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
     }
+    // ⑤ go-lan 域名后缀规则
+    head_rules.append(&mut lan_other);
     for (i, rule) in head_rules.into_iter().enumerate() {
         route_rules.insert(i, rule);
     }
@@ -3420,7 +3463,10 @@ rules:
             .iter()
             .position(|r| r.get("protocol").and_then(Value::as_str) == Some("dns"))
             .expect("必须存在 protocol dns 劫持规则");
-        assert_eq!(dns_pos, 4, "4 条 aim-probe 之后紧跟 protocol dns 劫持");
+        // 【APP60 任务3.2】黄金顺序 aim-probe(0-3) → On-Demand direct →
+        // WG 服务端豁免 → go-lan 隧道 → protocol dns。GoLanSettings::default()
+        // 下 On-Demand 空，wg_server 1 条，go-lan tunnel 1 条，故 dns_pos=6
+        assert_eq!(dns_pos, 6, "aim-probe + WG豁免 + go-lan隧道 之后才是 protocol dns");
         assert_eq!(rules[dns_pos + 1]["port"].as_u64(), Some(53), "缺 port 53 劫持");
         assert_eq!(rules[dns_pos + 2]["port"].as_u64(), Some(853), "缺 853 拦截");
         let wg_pos = rules
@@ -3609,8 +3655,8 @@ rules:
         );
         assert_eq!(
             tun["sniff_timeout"].as_str(),
-            Some("100ms"),
-            "【APP48】tun-in 嗅探超时必须为 100ms"
+            Some("50ms"),
+            "【APP60 任务3.3】tun-in 嗅探超时已压缩为 50ms（原 100ms）"
         );
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启被动嗅探");
         assert_eq!(
@@ -3939,8 +3985,13 @@ rules:
         )
         .expect("build must succeed");
         let rules = built.config["dns"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["outbound"], "any");
-        assert_eq!(rules[0]["server"], "dns-direct");
+        // 【APP60 任务3.1】最顶部是 reject SVCB/HTTPS 和 _dns.resolver.arpa，
+        // outbound:any 已被挤到后面——改为查找而非固定 index
+        let outbound_any = rules
+            .iter()
+            .find(|r| r.get("outbound").and_then(Value::as_str) == Some("any"))
+            .expect("必须存在 outbound:any → dns-direct 规则");
+        assert_eq!(outbound_any["server"], "dns-direct");
         let servers = built.config["dns"]["servers"].as_array().unwrap();
         let direct = servers
             .iter()
@@ -4132,9 +4183,16 @@ rules:
             assert_eq!(o["tls"]["server_name"], "update.microsoft.com");
         }
 
-        // DNS：首条 outbound:any → dns-direct，dns-remote 经 Proxy 出境
-        assert_eq!(built.config["dns"]["rules"][0]["outbound"], "any");
-        assert_eq!(built.config["dns"]["rules"][0]["server"], "dns-direct");
+        // DNS：存在 outbound:any → dns-direct，dns-remote 经 Proxy 出境
+        // 【APP60 任务3.1】最顶部已改为 reject SVCB/HTTPS + _dns.resolver.arpa，
+        // outbound:any 不再是 index 0，改为 find 查找
+        let outbound_any = built.config["dns"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["outbound"].as_str() == Some("any"))
+            .expect("必须存在 outbound:any → dns-direct");
+        assert_eq!(outbound_any["server"], "dns-direct");
         let dns_servers = built.config["dns"]["servers"].as_array().unwrap();
         let remote = dns_servers
             .iter()
@@ -4261,8 +4319,14 @@ rules:
             .expect("dns-direct-tcp 备用服务器缺失");
         assert_eq!(direct_tcp["address"].as_str(), Some("tcp://119.29.29.29"));
         assert_eq!(direct_tcp["detour"].as_str(), Some("direct"));
-        let first_rule = &built.config["dns"]["rules"][0];
-        assert_eq!(first_rule["outbound"].as_str(), Some("any"));
-        assert_eq!(first_rule["server"].as_str(), Some("dns-direct"));
+        // 【APP60 任务3.1】最顶部已改为 reject SVCB/HTTPS + _dns.resolver.arpa，
+        // outbound:any 不再是 index 0
+        let outbound_any = built.config["dns"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["outbound"].as_str() == Some("any"))
+            .expect("必须存在 outbound:any → dns-direct");
+        assert_eq!(outbound_any["server"].as_str(), Some("dns-direct"));
     }
 }

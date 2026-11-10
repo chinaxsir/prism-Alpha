@@ -3610,7 +3610,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "prism-proxy"
-version = "0.3.92"
+version = "0.3.93"
 dependencies = [
  "aes-gcm",
  "anyhow",

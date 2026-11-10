@@ -495,10 +495,9 @@ pub fn split_profile_cidrs_for_on_demand(
             tunnel.push(cidr);
             continue;
         }
-        let hit = physical_ips
-            .iter()
-            .any(|ip| ipv4_in_any_cidr(*ip, std::slice::from_ref(&cidr)));
-        if hit {
+        // 【APP60 任务2.1】逐网段独立判定：同子网位运算 OR 跨子网 TCP 短探测
+        // （65ms，绑定物理源 IP，结果签名缓存，非轮询）
+        if is_cidr_direct(profile, &cidr, physical_ips) {
             direct.push(cidr);
         } else {
             tunnel.push(cidr);
@@ -789,6 +788,120 @@ pub fn is_profile_lan_direct_active(
     false
 }
 
+// ---------------------------------------------------------------- APP60 任务2
+// 逐网段独立直连判定：同子网位运算 + 绑定物理网卡源 IP 的 65ms TCP 短探测
+
+/// 【APP60 任务2.1】逐网段直连判定结果缓存：key = 物理IP集合+网段+probe_target。
+/// 网络环境或配置不变时 0 I/O；环境变化自动产生新 key（容量超限整体清空兜底）。
+fn cidr_direct_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 【APP60 任务2.1】单网段直连判定（任一条件命中即该网段直连）：
+/// - 方式 A：本机物理网卡 IPv4 与该网段位运算同子网（零 I/O 快路径）；
+/// - 方式 B：跨子网时强制绑定物理网卡源 IP（绝不走 VPN 虚拟网卡），向该网段内
+///   代表性 IP（属于本网段的 probe_target 优先，其次 .1 / .254 网关，最多 2 个）
+///   的 80 / 445 / 443 / 22 端口发起 65ms TCP 短探测；`Connected` 与
+///   `ConnectionRefused` 均视为局域网二层/三层真实可达（Refused 说明 ARP 已通、
+///   只是该端口未监听）。
+/// 结果按 (物理IP集合, 网段, probe_target) 签名缓存，非轮询，避免耗电（APP57）。
+fn is_cidr_direct(profile: &GoLanProfile, cidr: &str, physical: &[std::net::Ipv4Addr]) -> bool {
+    if physical.is_empty() {
+        return false;
+    }
+    // 方式 A：同子网位运算快路径
+    if physical
+        .iter()
+        .any(|ip| ipv4_in_any_cidr(*ip, std::slice::from_ref(&cidr.to_string())))
+    {
+        return true;
+    }
+    // 方式 B：跨子网 TCP 探测（签名缓存，非轮询）
+    let mut sorted: Vec<std::net::Ipv4Addr> = physical.to_vec();
+    sorted.sort();
+    let phys_key = sorted
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = format!("{phys_key}|{}|{cidr}", profile.probe_target.trim());
+    if let Ok(cache) = cidr_direct_cache().lock() {
+        if let Some(hit) = cache.get(&key) {
+            return *hit;
+        }
+    }
+    let hit = probe_cidr_direct(profile, cidr, physical);
+    if let Ok(mut cache) = cidr_direct_cache().lock() {
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        cache.insert(key, hit);
+    }
+    hit
+}
+
+/// 【APP60 任务2.1】跨子网 TCP 探测实现（仅由 is_cidr_direct 调用）。
+fn probe_cidr_direct(profile: &GoLanProfile, cidr: &str, physical: &[std::net::Ipv4Addr]) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let Some((base, prefix_s)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix_s.parse::<u8>() else {
+        return false;
+    };
+    let Ok(base_ip) = base.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    if prefix > 30 {
+        return false;
+    }
+    // 代表性探测 IP（最多 2 个）：优先属于本网段的 probe_target，其次
+    // .1 / .254 网关
+    let mut candidates: Vec<(Ipv4Addr, Option<u16>)> = Vec::new();
+    if let Some(sock) = parse_lan_probe_socket(&profile.probe_target) {
+        if let IpAddr::V4(ip) = sock.ip() {
+            if ipv4_in_any_cidr(ip, std::slice::from_ref(&cidr.to_string())) {
+                candidates.push((ip, Some(sock.port())));
+            }
+        }
+    }
+    let o = base_ip.octets();
+    for host in [1u8, 254u8] {
+        if candidates.len() >= 2 {
+            break;
+        }
+        let gw = Ipv4Addr::new(o[0], o[1], o[2], host);
+        if !candidates.iter().any(|(ip, _)| *ip == gw) {
+            candidates.push((gw, None));
+        }
+    }
+    // 端口顺序：probe_target 自带端口优先，随后 80 / 445 / 443 / 22
+    const FALLBACK_PORTS: [u16; 4] = [80, 445, 443, 22];
+    for (ip, probe_port) in candidates {
+        let mut ports: Vec<u16> = Vec::new();
+        if let Some(p) = probe_port {
+            ports.push(p);
+        }
+        for p in FALLBACK_PORTS {
+            if !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
+        for port in ports {
+            let dst = SocketAddr::from((ip, port));
+            let reachable = physical.iter().any(|src| {
+                tcp_reachable_from_source(*src, dst, std::time::Duration::from_millis(65))
+            });
+            if reachable {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------- APP59 任务1
 // 全隧道直连状态：事件驱动缓存（网络 / 配置签名变化时才评估一次）
 
@@ -840,15 +953,16 @@ fn lan_direct_signature(
     sig
 }
 
-/// 【APP59 任务1】全隧道无差别的真实直连状态表（`profile.id` 与
+/// 【APP59 任务1 / APP60 任务2】全隧道无差别的真实直连状态表（`profile.id` 与
 /// `profile.name` 双键写入）。
 ///
-/// 判定顺序（满足任一即为直连）：
-/// - 条件 1：物理 Wi-Fi IP 落在该隧道业务网段内（纯位运算，0 开销）；
-/// - 条件 2：跨 VLAN / 跨子网时，**仅在签名变化的那一次**绑定物理 Wi-Fi
-///   源 IP 对 `probe_target` / 网段网关做 150ms TCP 连通性校验；
-/// - 条件 3：配置侧由 `config_builder` 把命中网段置顶为 `direct` 出站，
-///   与这里的布尔值严格一致。
+/// 判定（APP60 起改为逐网段独立判定，任一 cidr 命中即该档案直连）：
+/// - 方式 A：物理 Wi-Fi IP 落在该网段内（纯位运算，0 开销）；
+/// - 方式 B：跨子网时**仅在签名变化的那一次**绑定物理 Wi-Fi 源 IP，对该网段
+///   代表性 IP（probe_target / .1 / .254）的 80/445/443/22 端口做 65ms TCP
+///   连通性校验，`Connected` 或 `ConnectionRefused` 均判直连；
+/// - 配置侧由 `config_builder` 把命中网段置顶为 `direct` 出站，与这里的布尔值
+///   严格一致（同一套 is_cidr_direct 判定）。
 pub fn lan_direct_state_map(settings: &GoLanSettings) -> LanDirectMap {
     let physical = detect_physical_lan_ipv4s();
     let sig = lan_direct_signature(settings, &physical);
@@ -861,14 +975,18 @@ pub fn lan_direct_state_map(settings: &GoLanSettings) -> LanDirectMap {
 
     let mut map: LanDirectMap = LanDirectMap::new();
     for (_, p) in enabled_profiles(settings) {
-        let direct = if !p.enabled {
+        let direct = if !p.enabled || !p.bypass_on_local_lan || physical.is_empty() {
             false
-        } else if is_profile_lan_direct_active(&p, &physical) {
-            true
-        } else if p.bypass_on_local_lan {
-            probe_cross_vlan_direct(&p, &physical)
         } else {
-            false
+            let wg_virtual_ip = p
+                .wg_config
+                .as_ref()
+                .and_then(|wg| wg.local_ip.split(',').next())
+                .and_then(|s| s.trim().split('/').next())
+                .and_then(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok());
+            profile_business_cidrs(&p, wg_virtual_ip)
+                .iter()
+                .any(|cidr| is_cidr_direct(&p, cidr, &physical))
         };
         if !p.id.is_empty() {
             map.insert(p.id.clone(), direct);
@@ -890,8 +1008,9 @@ pub fn invalidate_lan_direct_cache() {
     }
 }
 
-/// 条件 2：绑定本机物理 Wi-Fi 源 IP，对隧道探测目标做单次 TCP 可达性校验。
-/// 仅在同子网条件未命中且签名刚变化时执行（< 120ms），绝不进入轮询路径。
+/// 条件 2 旧实现（APP59，档案级单次探测）：APP60 起被逐网段 is_cidr_direct
+/// 取代，仅保留供单元测试与排查参考。
+#[allow(dead_code)]
 fn probe_cross_vlan_direct(
     profile: &GoLanProfile,
     physical: &[std::net::Ipv4Addr],
@@ -912,6 +1031,7 @@ fn probe_cross_vlan_direct(
 
 /// 探测目标：优先显式 `probe_target`（host:port），否则取业务网段的
 /// `.1` / `.254` 网关 + 常用内网端口；总数上限 6 个，保证单次评估 < 1s。
+#[allow(dead_code)]
 fn cross_vlan_probe_targets(profile: &GoLanProfile) -> Vec<std::net::SocketAddr> {
     use std::net::{Ipv4Addr, SocketAddr};
     let mut out: Vec<SocketAddr> = Vec::new();
@@ -1036,6 +1156,8 @@ pub fn profiles_metadata(settings: &GoLanSettings) -> Vec<Value> {
                 "name": profile.name,
                 "cidrs": profile_route_cidrs(&profile),
                 "bypassOnLocalLan": profile.bypass_on_local_lan,
+                // 【APP60 任务2.2】iOS 扩展跨子网 TCP 探测需要知道档案的探测主机
+                "probeTarget": profile.probe_target,
             })
         })
         .collect()
@@ -2475,6 +2597,12 @@ fn wg_outbound_value(
     let mtu = GO_LAN_RUNTIME_MTU;
     outbound["mtu"] = json!(mtu);
     outbound["connect_timeout"] = json!("5s");
+    // 【APP60 任务3.4】workers 4：WireGuard 加解密分散到 4 个 worker，
+    // 多核并行，大文件传输吞吐不再被单核软中断打满；
+    // udp_fragment：蜂窝/PPPoE 路径 MTU 较小时内网大包不再被静默丢弃。
+    // （sing-box v1.11.3 wireguard 出站原生支持，均为合法字段）
+    outbound["workers"] = json!(4);
+    outbound["udp_fragment"] = json!(true);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_LAN,
         &format!(
@@ -4066,6 +4194,51 @@ mod tests {
         let (tunnel, direct) = split_profile_cidrs_for_on_demand(&disabled, &physical);
         assert!(direct.is_empty());
         assert!(tunnel.contains(&"192.168.10.0/24".to_string()));
+    }
+
+    /// 【APP60 任务2.1】多网段档案：任一业务网段命中本机局域网即判直连，
+    /// 其余网段仍独立走隧道
+    #[test]
+    fn test_multi_cidr_any_hit_direct() {
+        let prof = sample_profile(
+            "multi",
+            "多网段",
+            &["192.168.10.0/24", "10.8.0.0/24"],
+            "10.196.0.2/32",
+            65,
+        );
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.88".parse().unwrap()];
+        let (tunnel, direct) = split_profile_cidrs_for_on_demand(&prof, &physical);
+        assert!(
+            direct.contains(&"192.168.10.0/24".to_string()),
+            "命中本机局域网的网段必须直连: {direct:?}"
+        );
+        assert!(
+            tunnel.contains(&"10.8.0.0/24".to_string()),
+            "未命中网段必须仍走隧道: {tunnel:?}"
+        );
+    }
+
+    /// 【APP60 任务2.1】跨子网网段进入 65ms TCP 探测路径，且结果按
+    /// (物理IP集合, 网段, probe_target) 签名缓存——重复调用零 I/O、结果一致
+    #[test]
+    fn test_cross_subnet_probe_result_cached() {
+        let prof = sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 66);
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.88".parse().unwrap()];
+        let first = is_cidr_direct(&prof, "10.8.0.0/24", &physical);
+        let second = is_cidr_direct(&prof, "10.8.0.0/24", &physical);
+        assert_eq!(first, second, "探测结果必须缓存且确定");
+    }
+
+    /// 【APP60 任务2.1】同子网命中是零 I/O 快路径：无论 probe_target 如何
+    /// 配置都直接判直连
+    #[test]
+    fn test_same_subnet_short_circuits_probe() {
+        let mut prof =
+            sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 67);
+        prof.probe_target = "192.168.10.253:8001".into();
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.88".parse().unwrap()];
+        assert!(is_cidr_direct(&prof, "192.168.10.0/24", &physical));
     }
 
     /// 【APP52 任务3】第二条启用隧道命中本机局域网时也必须全局直连

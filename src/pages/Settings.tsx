@@ -530,9 +530,11 @@ export default function Settings() {
             <span className="font-semibold text-sm text-text">{t("engine.goLan")}</span>
           </div>
           <div className="text-xs text-text-muted mt-1 leading-relaxed break-words">
+            {/* 【APP60 任务1.1】未激活/未开启/未配置时统一显示 Go Lan 功能简介，
+                已开启时显示各隧道实时 (⚡ 直连) / (🔒 隧道) 状态 */}
             {!proUnlocked
-              ? t("pro.lockedTap")
-              : goLanConfigured
+              ? t("engine.goLan.desc")
+              : goLanCfg?.enabled && goLanConfigured
               ? `${t("pro.configured")}: ${
                   (goLanCfg?.profiles ?? [])
                     .filter((p) => p.enabled)
@@ -554,7 +556,7 @@ export default function Settings() {
                     .join(" · ") ||
                   `${goLanCfg?.wgConfig?.server}:${goLanCfg?.wgConfig?.serverPort} · ${(goLanCfg?.lanCidrs ?? []).join(", ")}`
                 }`
-              : t("pro.notConfigured")}
+              : t("engine.goLan.desc")}
           </div>
         </div>
         <div className="flex items-center gap-2.5 shrink-0">

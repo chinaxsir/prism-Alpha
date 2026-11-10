@@ -4311,11 +4311,26 @@ pub async fn get_go_lan_status(
     let lan = state.go_lan.read().clone();
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
-    // 【APP59 任务1】全隧道事件驱动直连缓存（id + name 双键），按档案取值
-    let direct_map: std::collections::HashMap<String, bool> = {
+    // 【APP59 任务1 / APP60 任务2】全隧道事件驱动直连缓存（id + name 双键）+
+    // 逐网段 split 全部放进 spawn_blocking：跨子网 TCP 探测（65ms）只在签名
+    // 变化时发生，且绝不阻塞 async executor。
+    let (direct_map, splits): (
+        std::collections::HashMap<String, bool>,
+        std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+    ) = {
         let settings = lan.clone();
+        let phys = physical.clone();
         tokio::task::spawn_blocking(move || {
-            crate::core::go_lan::lan_direct_state_map(&settings)
+            let map = crate::core::go_lan::lan_direct_state_map(&settings);
+            let splits = crate::core::go_lan::enabled_profiles(&settings)
+                .into_iter()
+                .map(|(tag, p)| {
+                    let (t, d) =
+                        crate::core::go_lan::split_profile_cidrs_for_on_demand(&p, &phys);
+                    (tag, (t, d))
+                })
+                .collect();
+            (map, splits)
         })
         .await
         .unwrap_or_default()
@@ -4328,8 +4343,7 @@ pub async fn get_go_lan_status(
         // id / name 双键取值，任意一条隧道均独立判定
         let direct_hit = direct_map.get(&profile.id).copied().unwrap_or(false)
             || direct_map.get(&profile.name).copied().unwrap_or(false);
-        let (tunnel, direct) =
-            crate::core::go_lan::split_profile_cidrs_for_on_demand(&profile, &physical);
+        let (tunnel, direct) = splits.get(&tag).cloned().unwrap_or_default();
         let mut bypassed = direct.clone();
         if bypassed.is_empty() {
             if let Some(cidrs) = ios_bypass.iter().find(|(t, _)| t == &tag).map(|(_, c)| c) {
