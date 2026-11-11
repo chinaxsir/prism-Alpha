@@ -7,6 +7,7 @@ import {
   X,
 } from "lucide-react";
 import clsx from "clsx";
+import { invoke } from "@tauri-apps/api/core";
 import { toast } from "@/components/ui/Toast";
 import { useTranslation } from "@/i18n";
 import {
@@ -83,17 +84,6 @@ function projectCategory(raw?: string | null): string {
   return CATEGORY_VALUES.has(normalized) ? normalized : "Kernel";
 }
 
-/** 导出章节标题（与后端 export_logs 章节完全一致） */
-const EXPORT_SECTIONS: { value: string; title: string }[] = [
-  { value: "Kernel", title: "=== [内核 Kernel] ===" },
-  { value: "Node", title: "=== [节点 Node] ===" },
-  { value: "Rule", title: "=== [规则 Rule] ===" },
-  { value: "GoAIM", title: "=== [Go AIM] ===" },
-  { value: "GoLan", title: "=== [Go Lan] ===" },
-  { value: "GoCus", title: "=== [Go Cus] ===" },
-  { value: "Sub", title: "=== [订阅 Sub] ===" },
-];
-
 interface LogViewerModalProps {
   open: boolean;
   onClose: () => void;
@@ -162,6 +152,8 @@ export default function LogViewerModal({
   const [totalBytes, setTotalBytes] = useState(0);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  /** 【APP63 任务2.2】导出成功提示条（翠绿色） */
+  const [exportedTip, setExportedTip] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   /** 【APP62 任务4】拉取分类聚合日志：失败自动重试 3 次（指数退避），
@@ -230,85 +222,35 @@ export default function LogViewerModal({
     onClose();
   };
 
-  /** 【IPA9 任务1.3】iOS WKWebView 不支持 <a download> Blob 下载，且
-   *  await 异步之后调用剪贴板会被 iOS 系统拦截。改为在点击瞬间同步
-   *  基于已加载 entries 构造导出文本，直接写入剪贴板并调起原生分享。 */
+  /** 【APP63 任务2.2】零闪退导出：彻底移除 Blob URL / <a download> /
+   *  navigator 分享面板 API（三者都会让 iOS WKWebView 崩溃）。改为：
+   *  1. 调后端 export_diagnostic_logs（iOS 原生分享 + 剪贴板兜底，
+   *     桌面写入 Downloads）；
+   *  2. 前端 navigator.clipboard 冗余复制；
+   *  3. 顶部翠绿色成功提示条。 */
   const handleExport = async () => {
+    if (exporting) return;
     if (logs.length === 0) {
       toast.error(t("logs.exportEmpty"));
       return;
     }
-    const now = new Date();
-    const pad = (n: number) => String(n).padStart(2, "0");
-    const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-    const lines: string[] = [];
-    lines.push(t("logs.exportHeader"));
-    lines.push(t("logs.exportTime", { time: ts }));
-    lines.push(t("logs.exportCount", { count: logs.length }));
-    lines.push("===============================================");
-    lines.push("");
-    // 【APP56 任务4 / APP58 任务5】导出严格按 7 个分类分章节，
-    // 分类使用与列表/徽章完全一致的 projectCategory 投影
-    for (const section of EXPORT_SECTIONS) {
-      lines.push(section.title);
-      for (const e of logs) {
-        const cat = projectCategory(e.module);
-        if (cat !== section.value) continue;
-        lines.push(`[${e.timestamp}][${e.level}][${cat}] ${e.message}`);
-      }
-      lines.push("");
-    }
-    const exportText = lines.join("\n");
-
-    // 第 1 步：优先使用异步剪贴板（https / localhost 可用）；
-    // textarea + execCommand 仅作兜底，避免污染 iOS Undo Paste 历史栈
-    let copied = false;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(exportText);
-        copied = true;
-      }
-    } catch {
-      copied = false;
-    }
-    if (!copied) {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = exportText;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
-        copied = document.execCommand("copy");
-        document.body.removeChild(ta);
-      } catch {
-        copied = false;
-      }
-    }
-
-    // 第 2 步：iOS 原生分享面板 / 桌面端 Blob 下载
-    if (navigator.share) {
-      navigator
-        .share({ title: "Prism-Logs.txt", text: exportText })
-        .catch(() => {});
-    } else {
-      const blob = new Blob([exportText], {
-        type: "text/plain;charset=utf-8",
-      });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `prism-logs-${ts.replace(/[: ]/g, "-")}.log`;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
-
-    // 第 3 步：按钮反馈
     setExporting(true);
-    window.setTimeout(() => setExporting(false), 2500);
-    toast.success(t("logs.exportCopied"));
+    try {
+      const text = await invoke<string>("export_diagnostic_logs");
+      try {
+        await navigator.clipboard?.writeText(text);
+      } catch {
+        // 剪贴板不可用时忽略：iOS 原生层已在主线程写入剪贴板
+      }
+      setExportedTip(true);
+      window.setTimeout(() => setExportedTip(false), 4000);
+      toast.success(t("logs.exported"));
+    } catch (e) {
+      console.error("[LogViewer] 导出诊断日志失败:", e);
+      toast.error(String(e));
+    } finally {
+      setExporting(false);
+    }
   };
 
   /** 【IPA9 任务1.2】清空日志：调用后端 clear_app_logs 后立即把前端
@@ -355,6 +297,13 @@ export default function LogViewerModal({
             </button>
           </div>
         </div>
+
+        {/* 【APP63 任务2.2】导出成功提示条（翠绿色，4 秒自动消失） */}
+        {exportedTip && (
+          <div className="shrink-0 border-b border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-[12px] font-medium leading-relaxed text-emerald-300">
+            ✅ 诊断日志已导出（已同步复制到剪贴板，可直接粘贴或通过系统面板保存）
+          </div>
+        )}
 
         {/* 【APP56 任务4 / APP57 任务4】固定 7 个独立分类标签（无「全部」），
             上下两行 4 + 3 排布，任何标签都不省略、不截断，并显示真实条数 */}

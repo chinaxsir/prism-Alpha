@@ -1525,7 +1525,7 @@ fn count_nodes_in_text(text: &str) -> usize {
 /// 客户端只下发自家格式（Surge INI / Loon INI / Karing JSON），统一由
 /// subscription::parse_subscription_content 六格式解析器消化。
 const SUBSCRIPTION_UAS: [&str; 7] = [
-    "Clash.Meta/v1.18.3 mihomo/1.18.3 Prism/0.3.69 sing-box/1.11.3",
+    "Clash.Meta/v1.18.3 mihomo/1.18.3 Prism/0.3.69 sing-box/1.11.15",
     "v2rayN/6.45",
     "Surge/5.8.0",
     "Loon/800",
@@ -4735,6 +4735,34 @@ pub async fn export_app_logs(
         &state.data_dir,
         module_filter.as_deref(),
     ))
+}
+
+/// 【APP63 任务2.2】零闪退诊断日志导出：
+/// - 汇总全部 7 个分类桶，生成带北京时间头部的标准文本；
+/// - iOS：交给 Swift 原生层（剪贴板兜底 + 主线程安全分享）；
+/// - 桌面：写入 `Downloads/prism-diagnostic-log.txt`。
+/// 同时把全文返回前端，供剪贴板冗余兜底。
+#[tauri::command]
+pub async fn export_diagnostic_logs(state: State<'_, AppState>) -> Result<String, String> {
+    let text = crate::core::logger::export_diagnostic_text(&state.data_dir);
+
+    #[cfg(target_os = "ios")]
+    {
+        let _ = crate::platform::ios::share_text_file("prism-diagnostic-log.txt", &text);
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let dir = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join("Downloads"))
+            .unwrap_or_else(|| state.data_dir.clone());
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("prism-diagnostic-log.txt");
+        std::fs::write(&path, text.as_bytes())
+            .map_err(|e| format!("写入导出日志失败：{e}"))?;
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

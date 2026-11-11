@@ -1033,6 +1033,11 @@ pub fn build(
         }
     }
 
+    // 【APP63 任务1.2】出站类型白名单门禁：先剔除内核不支持的类型
+    // （如 anytls），再做出站依赖完整性校验，确保 decode config 永不
+    // 因 unknown outbound type 崩溃。
+    purge_invalid_outbound_types(&mut outbounds, &mut node_tags, &mut warnings);
+
     // 【APP33 任务2】出站依赖完整性闭环校验器：对所有 selector/urltest
     // 策略组的 outbounds 与 default 做最终兜底清洗，100% 杜绝
     // dependency[xxx] not found for outbound[yyy] 启动崩溃。
@@ -1917,6 +1922,110 @@ fn parse_bandwidth(raw: &Option<String>) -> Option<u32> {
         .and_then(|head| head.parse::<u32>().ok())
 }
 
+/// 【APP63 任务1.2】sing-box 1.11.x 原生支持的出站类型白名单。
+///
+/// 任何不在该集合中的 type（如 `anytls`——1.12+ 才注册）都会让内核在
+/// `decode config` 阶段直接 FATAL：`unknown outbound type: xxx`，
+/// 整个 VPN 启动崩溃。因此生成配置前必须强制净化 outbounds。
+pub(crate) const VALID_SINGBOX_OUTBOUND_TYPES: &[&str] = &[
+    "direct",
+    "block",
+    "dns",
+    "socks",
+    "http",
+    "shadowsocks",
+    "vmess",
+    "trojan",
+    "wireguard",
+    "hysteria",
+    "vless",
+    "shadowtls",
+    "tuic",
+    "hysteria2",
+    "selector",
+    "urltest",
+];
+
+/// 【APP63 任务1.2】出站类型白名单净化器。
+///
+/// 1. 剔除 `type` 不在 `VALID_SINGBOX_OUTBOUND_TYPES` 中的非法出站；
+/// 2. 同步把被剔除出站的 tag 从 `node_tags` 移除（防止 Proxy /
+///    GO-AIM-PROBE 组继续引用悬空节点）；
+/// 3. 清洗所有 selector / urltest 的 `outbounds` 引用（过滤后为空则
+///    回填 `["direct"]`），并修正 selector 的 `default`。
+pub(crate) fn purge_invalid_outbound_types(
+    outbounds: &mut Vec<Value>,
+    node_tags: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let is_valid = |o: &Value| {
+        o["type"]
+            .as_str()
+            .is_some_and(|t| VALID_SINGBOX_OUTBOUND_TYPES.contains(&t))
+    };
+
+    let removed_tags: HashSet<String> = outbounds
+        .iter()
+        .filter(|o| !is_valid(o))
+        .filter_map(|o| o["tag"].as_str().map(String::from))
+        .collect();
+    let removed_desc: Vec<String> = outbounds
+        .iter()
+        .filter(|o| !is_valid(o))
+        .map(|o| {
+            let ty = o["type"].as_str().unwrap_or("?");
+            match o["tag"].as_str() {
+                Some(tag) if !tag.is_empty() => format!("{tag}({ty})"),
+                _ => ty.to_string(),
+            }
+        })
+        .collect();
+    if removed_desc.is_empty() {
+        return;
+    }
+
+    outbounds.retain(is_valid);
+    node_tags.retain(|t| !removed_tags.contains(t));
+
+    let valid_tags: HashSet<String> = outbounds
+        .iter()
+        .filter_map(|o| o["tag"].as_str().map(String::from))
+        .collect();
+    for ob in outbounds.iter_mut() {
+        let ty = ob["type"].as_str().unwrap_or("").to_string();
+        if ty != "selector" && ty != "urltest" {
+            continue;
+        }
+        if let Some(list) = ob.get_mut("outbounds").and_then(Value::as_array_mut) {
+            list.retain(|v| v.as_str().is_some_and(|t| valid_tags.contains(t)));
+            if list.is_empty() {
+                list.push(json!("direct"));
+            }
+        }
+        if ty == "selector" {
+            let members: Vec<String> = ob
+                .get("outbounds")
+                .and_then(Value::as_array)
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cur = ob.get("default").and_then(Value::as_str).unwrap_or("");
+            if cur.is_empty() || !members.iter().any(|m| m == cur) {
+                ob["default"] = json!(members.first().map(String::as_str).unwrap_or("direct"));
+            }
+        }
+    }
+
+    warnings.push(format!(
+        "已剔除 {} 个内核不支持的出站类型：{}",
+        removed_desc.len(),
+        removed_desc.join("、")
+    ));
+}
+
 /// 【APP33 任务2】出站依赖完整性闭环校验器。
 ///
 /// 两遍清洗：
@@ -2104,7 +2213,13 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
             (o, note)
         }
 
-        // 【APP42 任务1.2】AnyTLS（sing-box 1.10+ 原生支持）：密码 + 强制 TLS
+        // 【APP63 任务1.2】AnyTLS 兼容桥接：sing-box 1.11.x 出站注册表中
+        // **没有** "anytls" 类型（1.12+ 才原生支持，且 1.12 废除旧
+        // dns-out/block 结构），直接输出会触发
+        // `decode config: outbounds[n]: unknown outbound type: anytls`
+        // 整个内核启动崩溃。AnyTLS 与 Trojan 同为「TLS 承载 + 密码鉴权」，
+        // 此处映射为 trojan 出站并保留 SNI / ALPN / uTLS 指纹，
+        // 确保含 anytls 节点的订阅 100% 可启动。
         "anytls" => {
             let password = node.password.clone().unwrap_or_default();
             if password.is_empty() {
@@ -2114,7 +2229,7 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
                 ));
             }
             let mut o = json!({
-                "type": "anytls",
+                "type": "trojan",
                 "password": password,
             });
             merge(&mut o, &base);
@@ -3920,7 +4035,8 @@ rules:
         );
     }
 
-    /// 【APP42 任务1.2】AnyTLS 节点构建：password + 强制 TLS + SNI
+    /// 【APP63 任务1.2】AnyTLS 节点必须转换为 trojan 出站（1.11.x 无 anytls
+    /// 注册表），且整份配置的 outbound type 100% 落在白名单内。
     #[test]
     fn anytls_node_built() {
         let clash = r#"
@@ -3950,10 +4066,66 @@ rules:
             .iter()
             .find(|o| o["tag"] == "AT-01")
             .expect("anytls outbound missing");
-        assert_eq!(node["type"], "anytls");
+        assert_eq!(node["type"], "trojan");
         assert_eq!(node["password"], "pw");
         assert_eq!(node["tls"]["enabled"], true);
         assert_eq!(node["tls"]["server_name"], "at.example.com");
+
+        // 整份配置绝不出现白名单之外的出站类型
+        for ob in built.config["outbounds"].as_array().unwrap() {
+            let ty = ob["type"].as_str().unwrap_or("");
+            assert!(
+                VALID_SINGBOX_OUTBOUND_TYPES.contains(&ty),
+                "非法出站类型泄漏到配置：{ty}"
+            );
+        }
+        // 所有 selector / urltest 引用必须真实存在
+        let tags: HashSet<&str> = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        for ob in built.config["outbounds"].as_array().unwrap() {
+            if let Some(list) = ob["outbounds"].as_array() {
+                for item in list {
+                    let t = item.as_str().unwrap_or("");
+                    assert!(tags.contains(t), "策略组引用了不存在的出站：{t}");
+                }
+            }
+        }
+    }
+
+    /// 【APP63 任务1.2】白名单净化器：未知类型被剔除、selector 引用同步清理。
+    #[test]
+    fn purge_invalid_outbound_types_drops_unknown() {
+        let mut outbounds = vec![
+            json!({"type": "direct", "tag": "direct"}),
+            json!({"type": "snell", "tag": "AT-BAD"}),
+            json!({"type": "trojan", "tag": "OK"}),
+            json!({"type": "selector", "tag": "Proxy", "outbounds": ["AT-BAD", "OK"], "default": "AT-BAD"}),
+            json!({"type": "selector", "tag": "Empty", "outbounds": ["AT-BAD"], "default": "AT-BAD"}),
+        ];
+        let mut node_tags = vec!["AT-BAD".to_string(), "OK".to_string()];
+        let mut warnings = Vec::new();
+
+        purge_invalid_outbound_types(&mut outbounds, &mut node_tags, &mut warnings);
+
+        assert_eq!(node_tags, vec!["OK".to_string()]);
+        assert!(outbounds.iter().all(|o| o["tag"] != "AT-BAD"));
+        let proxy = outbounds
+            .iter()
+            .find(|o| o["tag"] == "Proxy")
+            .expect("Proxy missing");
+        assert_eq!(proxy["outbounds"], json!(["OK"]));
+        assert_eq!(proxy["default"], json!("OK"));
+        let empty = outbounds
+            .iter()
+            .find(|o| o["tag"] == "Empty")
+            .expect("Empty missing");
+        assert_eq!(empty["outbounds"], json!(["direct"]));
+        assert_eq!(empty["default"], json!("direct"));
+        assert!(warnings.iter().any(|w| w.contains("AT-BAD(snell)")));
     }
 
     /// 【APP42 任务1.3】DNS 规则首位必须是 outbound:any → dns-direct，

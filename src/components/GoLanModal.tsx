@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ClipboardPaste, Home, Plus, RotateCcw, Trash2, X } from "lucide-react";
 import { toast } from "@/components/ui/Toast";
 import Switch from "@/components/ui/Switch";
@@ -57,6 +57,25 @@ interface GoLanForm {
 // 【APP14 任务1】MTU 默认值改为 WireGuard 标准值 1420，严禁再写死 1280。
 const WG_DEFAULTS = { localIp: "10.0.0.2/24", mtu: 1420 };
 const MANAGED_SERVER_DEFAULT = "https://prism.sarl";
+
+/** 【APP63 任务3.2】所有 Go Lan IPC 统一 2500ms 超时。
+ *
+ * iOS 长时间后台后 WebView 的 Promise 永不 resolve/reject，导致
+ * busy / probing / syncing 永久卡住 → 弹窗假死。统一 race 一层超时，
+ * 让 UI 状态必定在 2.5s 内释放。
+ */
+const IPC_TIMEOUT_MS = 2500;
+function invokeWithTimeout<T>(task: () => Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    task(),
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`${label} timeout (${IPC_TIMEOUT_MS}ms)`)),
+        IPC_TIMEOUT_MS,
+      ),
+    ),
+  ]);
+}
 
 /** 【APP6 任务2.3】从 WireGuard local_address（如 10.1.8.2/24）推导
  *  对端家庭网关（同网段 .1），作为「内网连通性检测」默认目标。
@@ -407,6 +426,9 @@ export default function GoLanModal({ open, onClose }: Props) {
   const [showPrivKey, setShowPrivKey] = useState(false);
   /** 【APP52 任务3】非标准 WG 配置的内联红色提示（尝试启用/保存时点亮） */
   const [wgHint, setWgHint] = useState(false);
+  /** 【APP63 任务3.3】弹窗打开瞬间只初始化一次，打开期间忽略外部
+   *  goLanSettings store 轮询回写造成的表单漂移 / 假死。 */
+  const prevIsOpenRef = useRef(false);
 
   /** 把当前表单回写进 profiles（切换标签/保存前调用） */
   const mergeActiveForm = (list: GoLanProfile[]): GoLanProfile[] =>
@@ -449,11 +471,15 @@ export default function GoLanModal({ open, onClose }: Props) {
       deviceCode: cleanInput(f.deviceCode),
     };
     try {
-      await saveGoLanSettings(payload);
-      const fresh = await getGoLanSettings();
+      await invokeWithTimeout(() => saveGoLanSettings(payload), "saveGoLanSettings");
+      const fresh = await invokeWithTimeout(() => getGoLanSettings(), "getGoLanSettings");
       setLoaded(fresh);
       setGoLanSettings(fresh);
-      setStatus(await getGoLanStatus().catch(() => null));
+      setStatus(
+        await invokeWithTimeout(() => getGoLanStatus(), "getGoLanStatus").catch(
+          () => null,
+        ),
+      );
       if (!opts?.silent) toast.success(opts?.successMsg ?? t("goLan.saved"));
     } catch (e) {
       if (!opts?.silent) toast.error(String(e));
@@ -578,10 +604,19 @@ export default function GoLanModal({ open, onClose }: Props) {
   };
 
   // 每次打开都从后端拉取最新配置（防止 Settings 页与 Dashboard 双入口数据漂移）
+  // 【APP63 任务3.3】用 prevIsOpenRef 保证「打开瞬间只初始化一次」，
+  // 弹窗打开期间外部 goLanSettings store 轮询回写不再覆盖正在编辑的表单。
   useEffect(() => {
-    if (!open) return;
-    getGoLanSettings()
+    if (!open) {
+      prevIsOpenRef.current = false;
+      return;
+    }
+    if (prevIsOpenRef.current) return;
+    prevIsOpenRef.current = true;
+    let cancelled = false;
+    invokeWithTimeout(() => getGoLanSettings(), "getGoLanSettings")
       .then((s) => {
+        if (cancelled) return;
         setLoaded(s);
         let list = s.profiles;
         if (list.length === 0) {
@@ -616,27 +651,41 @@ export default function GoLanModal({ open, onClose }: Props) {
             : (list.find((p) => p.id === s.activeProfileId) ?? list[0]).id,
         );
         setGoLanSettings(s);
-        getGoLanStatus()
-          .then(setStatus)
-          .catch(() => setStatus(null));
+        invokeWithTimeout(() => getGoLanStatus(), "getGoLanStatus")
+          .then((v) => {
+            if (!cancelled) setStatus(v);
+          })
+          .catch(() => {
+            if (!cancelled) setStatus(null);
+          });
       })
       .catch((e) => console.error("load go lan failed:", e));
+    return () => {
+      cancelled = true;
+    };
   }, [open, setGoLanSettings]);
 
   // 【IPA9 任务2】锁屏唤醒 / 切后台回来时复位视口并重置 saving 状态，
   // 修复 iOS 锁屏解锁后键盘收起导致 WKWebView 视口触摸坐标偏移、
   // 以及 IPC 挂起导致 saving 卡死的问题。
+  // 【APP63 任务3.4】唤醒自愈：后台挂起后所有 IPC 的 Promise 可能永不
+  // 返回，必须无条件复位 busy / probing / syncing，并强制回滚视口，
+  // 同时监听 pageshow（bfcache 恢复）杜绝切回后整个弹窗触摸假死。
   useEffect(() => {
     const handleWake = () => {
       window.scrollTo(0, 0);
       document.body.scrollTop = 0;
       setBusy(false);
+      setProbing(false);
+      setSyncing(false);
     };
     document.addEventListener("visibilitychange", handleWake);
     window.addEventListener("focus", handleWake);
+    window.addEventListener("pageshow", handleWake);
     return () => {
       document.removeEventListener("visibilitychange", handleWake);
       window.removeEventListener("focus", handleWake);
+      window.removeEventListener("pageshow", handleWake);
     };
   }, []);
 
@@ -646,6 +695,15 @@ export default function GoLanModal({ open, onClose }: Props) {
   const closeModal = () => {
     (document.activeElement as HTMLElement | null)?.blur();
     onClose();
+  };
+
+  /** 【APP63 任务3.1】× / 取消 / 遮罩点击：无条件同步关闭。
+   *  绝不等待任何 IPC，先强制释放所有锁死状态再立即 onClose。 */
+  const handleForceClose = () => {
+    setBusy(false);
+    setProbing(false);
+    setSyncing(false);
+    closeModal();
   };
 
   /** 后端检测结果 message 为中文时，英文界面用结构化字段拼英文展示 */
@@ -709,7 +767,7 @@ export default function GoLanModal({ open, onClose }: Props) {
   const handleSyncManaged = async () => {
     setSyncing(true);
     try {
-      const s = await syncGoLanManaged();
+      const s = await invokeWithTimeout(() => syncGoLanManaged(), "syncGoLanManaged");
       setLoaded(s);
       setForm(applyGoLanLoaded(s));
       setGoLanSettings(s);
@@ -732,7 +790,7 @@ export default function GoLanModal({ open, onClose }: Props) {
     setProbeOk(null);
     setProbeMsg(t("logs.probeRunning"));
     try {
-      const r = await testGoLanIp(target);
+      const r = await invokeWithTimeout(() => testGoLanIp(target), "testGoLanIp");
       setProbeOk(r.reachable);
       const text = probeText(r);
       setProbeMsg(text);
@@ -798,24 +856,27 @@ export default function GoLanModal({ open, onClose }: Props) {
         managedServer: cleanInput(form.managedServer) || MANAGED_SERVER_DEFAULT,
         deviceCode: cleanInput(form.deviceCode),
       };
-      // 【IPA9 任务2】Promise.race 2500ms 超时保底：saveGoLanSettings 后端
-      // 已改为后台异步重启，这里再兜底一层，确保 saving 状态最多 2.5s
-      // 就释放，绝不让弹窗卡死。
-      const warnings = await Promise.race([
-        saveGoLanSettings(payload),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(t("goLan.saveTimeout"))), 2500),
-        ),
-      ]);
+      // 【APP63 任务3.2】统一 2500ms IPC 超时，saving 状态最多 2.5s 释放
+      const warnings = await invokeWithTimeout(
+        () => saveGoLanSettings(payload),
+        "saveGoLanSettings",
+      );
       try {
         if (form.probeTarget) localStorage.setItem("prism.golan.probe_ip", form.probeTarget);
       } catch {
         /* localStorage 不可用时静默忽略 */
       }
       // 回读最新设置到全局 store（含 enabled 状态）
-      const fresh = await getGoLanSettings();
+      const fresh = await invokeWithTimeout(
+        () => getGoLanSettings(),
+        "getGoLanSettings",
+      );
       setGoLanSettings(fresh);
-      setStatus(await getGoLanStatus().catch(() => null));
+      setStatus(
+        await invokeWithTimeout(() => getGoLanStatus(), "getGoLanStatus").catch(
+          () => null,
+        ),
+      );
       if (warnings && warnings.length > 0) {
         toast.error(warnings[0]);
       } else {
@@ -833,8 +894,8 @@ export default function GoLanModal({ open, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 pb-[calc(env(safe-area-inset-bottom,16px)+16px)]"
-      onClick={closeModal}
+      className="pointer-events-auto fixed inset-0 z-[999] flex touch-manipulation items-center justify-center bg-black/60 p-4 pb-[calc(env(safe-area-inset-bottom,16px)+16px)]"
+      onClick={handleForceClose}
     >
       {/* 【APP-4 任务4.2】三段式布局：固定头部 / 可滚动中部 / 固定底部，
           底部保存按钮永远完整显示不被屏幕截断 */}
@@ -848,9 +909,9 @@ export default function GoLanModal({ open, onClose }: Props) {
             <Home size={16} className="text-accent" />
             <h3 className="text-sm font-semibold">{t("goLan.modalTitle")}</h3>
           </div>
-          {/* 【IPA9 任务2】× 关闭按钮永不禁用：任何时候点击都立即关闭弹窗 */}
+          {/* 【APP63 任务3.1】× 关闭按钮：无条件同步关闭，绝不等待 IPC */}
           <button
-            onClick={closeModal}
+            onClick={handleForceClose}
             className="rounded p-1 text-gray-400 hover:bg-surface-hover hover:text-gray-200"
             aria-label={t("common.close")}
           >
@@ -858,8 +919,8 @@ export default function GoLanModal({ open, onClose }: Props) {
           </button>
         </div>
 
-        {/* 可滚动表单区 */}
-        <div className="flex-1 space-y-2.5 overflow-y-auto px-4 py-3">
+        {/* 可滚动表单区（iOS 惯性滚动 + 独立触摸层，避免遮罩吞掉手势） */}
+        <div className="flex-1 space-y-2.5 overflow-y-auto px-4 py-3 [-webkit-overflow-scrolling:touch]">
 
         {/* 【APP40 任务2】内网档案 Tabs（家里 / 公司 / 工作室……） */}
         <div className="rounded-xl border border-border bg-surface-hover/40 p-2">
@@ -1243,10 +1304,9 @@ export default function GoLanModal({ open, onClose }: Props) {
 
         {/* 底部操作栏（固定，永不被屏幕底部截断） */}
         <div className="flex shrink-0 gap-2 border-t border-border bg-surface px-4 py-3">
-          {/* 【IPA9 任务2】取消按钮永不禁用：任何时候点击都立即关闭弹窗，
-              防止 saving 状态卡死时用户无法退出 */}
+          {/* 【APP63 任务3.1】取消按钮：无条件同步关闭，即使 saving 卡死也能退出 */}
           <button
-            onClick={closeModal}
+            onClick={handleForceClose}
             className="pressable flex-1 rounded-md border border-border bg-surface px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-surface-hover"
           >
             {t("common.cancel")}

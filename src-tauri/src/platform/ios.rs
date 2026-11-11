@@ -38,6 +38,13 @@ mod sys {
         /// 返回 true = 已派发；WKWebView 的 window.open 会被系统丢弃，
         /// 必须走原生打开才能在 iOS 上真正跳转
         pub fn prism_ios_open_url(url: *const std::os::raw::c_char) -> bool;
+        /// 【APP63 任务2.2】导出文本文件：写入剪贴板 + tmp 文件并在主线程
+        /// 安全唤起系统分享面板（sourceView 已配置，绝不闪退）。
+        /// 返回 true = 已派发，false = 参数非法 / 空内容
+        pub fn prism_ios_share_text_file(
+            filename: *const std::os::raw::c_char,
+            content: *const std::os::raw::c_char,
+        ) -> bool;
     }
 }
 
@@ -72,6 +79,12 @@ mod sys {
         std::ptr::null()
     }
     pub unsafe fn prism_ios_open_url(_url: *const c_char) -> bool {
+        false
+    }
+    pub unsafe fn prism_ios_share_text_file(
+        _filename: *const c_char,
+        _content: *const c_char,
+    ) -> bool {
         false
     }
 }
@@ -166,6 +179,18 @@ pub fn open_url(url: &str) -> bool {
         return false;
     };
     unsafe { sys::prism_ios_open_url(cc.as_ptr()) }
+}
+
+/// 【APP63 任务2.2】iOS 原生文本文件导出 / 分享：Swift 侧先写剪贴板兜底，
+/// 再写 tmp 文件并在主线程安全唤起系统分享面板。返回 true = 已派发。
+pub fn share_text_file(filename: &str, content: &str) -> bool {
+    let Ok(name) = CString::new(filename) else {
+        return false;
+    };
+    let Ok(body) = CString::new(content) else {
+        return false;
+    };
+    unsafe { sys::prism_ios_share_text_file(name.as_ptr(), body.as_ptr()) }
 }
 
 

@@ -279,6 +279,67 @@ func prismIosOpenUrl(_ urlCStr: UnsafePointer<CChar>?) -> Bool {
     return true
 }
 
+/// 【APP63 任务2.2】零闪退文本文件导出 / 分享：
+/// 1. 先无条件写入系统剪贴板（100% 可靠保底）；
+/// 2. 再写入 tmp 目录并**在主线程**安全唤起 UIActivityViewController，
+///    且必须设置 popoverPresentationController.sourceView / sourceRect，
+///    否则 iPad / 折叠屏会抛 NSGenericException 导致 APP 闪退。
+/// 全程仅做字符串写入与主线程派发，绝不触碰 WebView 视图树。
+@_cdecl("prism_ios_share_text_file")
+func prismIosShareTextFile(
+    _ filenameCStr: UnsafePointer<CChar>?,
+    _ contentCStr: UnsafePointer<CChar>?
+) -> Bool {
+    guard let filenameCStr = filenameCStr, let contentCStr = contentCStr else { return false }
+    let filename = String(cString: filenameCStr)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let content = String(cString: contentCStr)
+    if filename.isEmpty || content.isEmpty { return false }
+
+    DispatchQueue.main.async {
+        // 1. 剪贴板兜底
+        UIPasteboard.general.string = content
+
+        // 2. 写临时文件
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileURL = tempDir.appendingPathComponent(filename)
+        do {
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+        } catch {
+            NSLog("[PrismVPN] 写导出日志失败: \(error.localizedDescription)")
+            return
+        }
+
+        // 3. 定位最顶层控制器
+        guard let scene = UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+            ?? UIApplication.shared.connectedScenes.first as? UIWindowScene,
+            let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+                ?? scene.windows.first?.rootViewController else {
+            return
+        }
+        var topVC = rootVC
+        while let presented = topVC.presentedViewController {
+            topVC = presented
+        }
+        // 已有分享面板时绝不重复弹出
+        if topVC is UIActivityViewController { return }
+
+        let activityVC = UIActivityViewController(
+            activityItems: [fileURL], applicationActivities: nil)
+        if let popover = activityVC.popoverPresentationController {
+            popover.sourceView = topVC.view
+            popover.sourceRect = CGRect(
+                x: topVC.view.bounds.midX,
+                y: topVC.view.bounds.maxY - 60,
+                width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        topVC.present(activityVC, animated: true, completion: nil)
+    }
+    return true
+}
+
 final class PrismTunnelController {
     static let shared = PrismTunnelController()
 

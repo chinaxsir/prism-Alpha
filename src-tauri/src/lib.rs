@@ -351,6 +351,7 @@ pub fn run() {
             ipc::commands::get_app_logs,
             ipc::commands::clear_app_logs,
             ipc::commands::export_app_logs,
+            ipc::commands::export_diagnostic_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

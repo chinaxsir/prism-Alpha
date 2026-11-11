@@ -1704,11 +1704,58 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var goLanLocalAddrs: [String: String] = [:]
         var goLanTags: [String] = []
 
+        // 【APP63 任务1.2】出站类型白名单：sing-box 1.11.x 出站注册表中
+        // 没有 "anytls"（1.12+ 才支持），直接下发会让扩展在 decode config
+        // 阶段 FATAL：unknown outbound type: anytls。Rust 侧已做转换，
+        // 这里对历史缓存 / 旧版配置再做一次兜底清洗。
+        let allowedTypes: Set<String> = [
+            "direct", "block", "dns", "socks", "http", "shadowsocks",
+            "vmess", "trojan", "wireguard", "hysteria", "vless",
+            "shadowtls", "tuic", "hysteria2", "selector", "urltest",
+        ]
         let proxyOutboundTypes: Set<String> = [
             "vless", "vmess", "trojan", "shadowsocks",
-            "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh", "anytls"
+            "hysteria", "hysteria2", "tuic", "wireguard", "http", "socks", "ssh",
         ]
         var outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
+        // anytls → trojan 兼容桥接（同为 TLS 承载 + 密码鉴权），并剥离
+        // anytls 专有的非标准字段；其他未知类型整体剔除，并同步从
+        // selector / urltest 的 outbounds 引用中移除，杜绝悬空依赖。
+        var droppedOutboundTags = Set<String>()
+        var sanitizedOutbounds: [[String: Any]] = []
+        sanitizedOutbounds.reserveCapacity(outbounds.count)
+        for var ob in outbounds {
+            var outType = (ob["type"] as? String) ?? ""
+            let obTag = (ob["tag"] as? String) ?? ""
+            if outType == "anytls" {
+                ob["type"] = "trojan"
+                for key in ["idle_session_check_interval", "idle_session_timeout",
+                            "min_idle_session", "client_metadata"] {
+                    ob.removeValue(forKey: key)
+                }
+                outType = "trojan"
+            }
+            if allowedTypes.contains(outType) {
+                sanitizedOutbounds.append(ob)
+            } else {
+                if !obTag.isEmpty {
+                    droppedOutboundTags.insert(obTag)
+                }
+                NSLog("[PrismVPN] 剔除内核不支持的出站类型 \(outType) tag=\(obTag)")
+            }
+        }
+        outbounds = sanitizedOutbounds
+        if !droppedOutboundTags.isEmpty {
+            for i in outbounds.indices {
+                guard let refs = outbounds[i]["outbounds"] as? [String] else { continue }
+                let kept = refs.filter { !droppedOutboundTags.contains($0) }
+                outbounds[i]["outbounds"] = kept.isEmpty ? ["direct"] : kept
+                if let def = outbounds[i]["default"] as? String,
+                   droppedOutboundTags.contains(def) {
+                    outbounds[i]["default"] = kept.first ?? "direct"
+                }
+            }
+        }
         // 【APP31 任务1】物理网卡纯直链：go-lan-home 的外层 UDP 51821 与
         // direct 显式绑定 getifaddrs 扫描到的活跃物理网卡（en0 / pdp_ip0），
         // 让 14.105.65.122:51821 的 UDP 包直接从手机天线飞往家里，

@@ -921,6 +921,82 @@ try {
 }
 
 // ============================================================
+// 检查 16：【APP63 任务1】出站类型白名单门禁
+// 根因：sing-box 1.11.x 没有 anytls 出站注册表，订阅里的 anytls 节点
+// 直接下发会 FATAL：outbounds[n]: unknown outbound type: anytls。
+// 这里硬性校验：
+//  1. go.mod 已升级到 v1.11.15；
+//  2. config_builder.rs 存在 VALID_SINGBOX_OUTBOUND_TYPES 白名单与净化调用；
+//  3. config_builder.rs 不再输出 `"type": "anytls"`；
+//  4. Swift 扩展侧保留 allowedTypes 白名单与 anytls→trojan 转换。
+// ============================================================
+console.log('\n--- 检查 16：sing-box 出站类型白名单 ---');
+try {
+  const goModSrc = readFileSync(resolve(ROOT, 'src-tauri/ios-kernel/go.mod'), 'utf8');
+  if (/github\.com\/sagernet\/sing-box\s+v1\.11\.15/.test(goModSrc)) {
+    pass('go.mod 已锁定 sing-box v1.11.15 ✓');
+  } else {
+    fail('go.mod 未升级到 sing-box v1.11.15（1.11.3 含已知出站解码崩溃问题）');
+  }
+
+  const cbSrc = readFileSync(resolve(ROOT, 'src-tauri/src/core/config_builder.rs'), 'utf8');
+  const cbMust = [
+    ['VALID_SINGBOX_OUTBOUND_TYPES', '出站类型白名单常量'],
+    ['purge_invalid_outbound_types', '出站类型净化调用'],
+  ];
+  for (const [token, desc] of cbMust) {
+    if (cbSrc.includes(token)) pass(`config_builder.rs 含${desc} \`${token}\` ✓`);
+    else fail(`config_builder.rs 缺少${desc} \`${token}\``);
+  }
+  if (cbSrc.includes('"type": "anytls"')) {
+    fail('config_builder.rs 仍在输出 `"type": "anytls"`——sing-box 1.11.x 无此类型，内核必崩');
+  } else {
+    pass('config_builder.rs 未输出 anytls 出站类型 ✓');
+  }
+
+  const pttSrc = readFileSync(
+    resolve(ROOT, 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift'),
+    'utf8'
+  );
+  const swiftMust = [
+    ['allowedTypes', '扩展侧出站类型白名单'],
+    ['"anytls"', 'anytls 兼容桥接判定'],
+    ['ob["type"] = "trojan"', 'anytls→trojan 转换'],
+  ];
+  for (const [token, desc] of swiftMust) {
+    if (pttSrc.includes(token)) pass(`PacketTunnelProvider 含${desc} ✓`);
+    else fail(`PacketTunnelProvider 缺少${desc}（${token}）`);
+  }
+} catch (e) {
+  fail(`出站类型白名单检查失败：${e.message}`);
+}
+
+// ============================================================
+// 检查 17：【APP63 任务2】日志导出零闪退门禁
+// iOS WKWebView 的 Blob / <a download> / navigator.share 会导致闪退，
+// 必须走后端 export_diagnostic_logs + Swift 原生分享。
+// ============================================================
+console.log('\n--- 检查 17：日志导出零闪退 ---');
+try {
+  const modalSrc = readFileSync(resolve(ROOT, 'src/components/LogViewerModal.tsx'), 'utf8');
+  if (modalSrc.includes('export_diagnostic_logs')) pass('LogViewerModal 已调用原生导出命令 ✓');
+  else fail('LogViewerModal 未调用 export_diagnostic_logs，导出仍会走 WebView 崩溃路径');
+  const banned = ['URL.createObjectURL', 'navigator.share', 'a.download'];
+  for (const token of banned) {
+    if (modalSrc.includes(token)) fail(`LogViewerModal 仍含 \`${token}\`——iOS 导出必闪退`);
+    else pass(`LogViewerModal 已移除 \`${token}\` ✓`);
+  }
+  const cmdSrc3 = readFileSync(resolve(ROOT, 'src-tauri/src/ipc/commands.rs'), 'utf8');
+  if (cmdSrc3.includes('pub async fn export_diagnostic_logs')) pass('后端 export_diagnostic_logs 命令已实现 ✓');
+  else fail('后端缺少 export_diagnostic_logs 命令');
+  const logSrc2 = readFileSync(resolve(ROOT, 'src-tauri/src/core/logger.rs'), 'utf8');
+  if (logSrc2.includes('pub fn export_diagnostic_text')) pass('logger.rs 提供 export_diagnostic_text ✓');
+  else fail('logger.rs 缺少 export_diagnostic_text 导出文本生成函数');
+} catch (e) {
+  fail(`日志导出检查失败：${e.message}`);
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
@@ -928,5 +1004,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 11 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 17 项检查绿灯通过，iOS / Android 构建就绪！');
 }

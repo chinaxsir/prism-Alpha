@@ -40,7 +40,7 @@ pub fn sanitize_kernel_error(msg: &str) -> String {
 
 /// iOS/Android 内嵌内核版本（与 ios-kernel/go.mod 的 sing-box 依赖保持一致）
 #[cfg(any(target_os = "ios", target_os = "android"))]
-pub const EMBEDDED_VERSION: &str = "1.11.3";
+pub const EMBEDDED_VERSION: &str = "1.11.15";
 
 /// iOS/Android 内嵌内核 FFI（sing-box c-archive，见 src-tauri/ios-kernel/）。
 ///

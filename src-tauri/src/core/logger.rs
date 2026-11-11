@@ -1009,6 +1009,47 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
     out
 }
 
+/// 【APP63 任务2.2】全 7 分类诊断日志导出全文（iOS 原生分享 / 桌面 Downloads）。
+///
+/// 全程使用字符级安全截断 `safe_truncate_str`，**绝不做字节切片**
+/// （`&s[..n]`），中文 / emoji 日志永不 panic。
+pub fn export_diagnostic_text(data_dir: &std::path::Path) -> String {
+    let payload = get_logs_categorized(data_dir);
+    let mut out = String::new();
+    out.push_str("================ Prism 诊断日志 ================\n");
+    out.push_str(&format!(
+        "App 版本: {} ({})\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    ));
+    out.push_str(&format!("导出时间: {}\n", beijing_now_string()));
+    out.push_str(&format!("日志条数: {}\n", payload.logs.len()));
+    out.push_str("说明: WireGuard 密钥与 License Key 已自动脱敏\n");
+    out.push_str("===============================================\n\n");
+    const SECTIONS: &[(&str, &str)] = &[
+        (MOD_KERNEL, "=== [内核 Kernel] ==="),
+        (MOD_NODE, "=== [节点 Node] ==="),
+        (MOD_RULE, "=== [规则 Rule] ==="),
+        (MOD_GO_AIM, "=== [Go AIM] ==="),
+        (MOD_GO_LAN, "=== [Go Lan] ==="),
+        (MOD_GO_CUS, "=== [Go Cus] ==="),
+        (MOD_SUB, "=== [订阅 Sub] ==="),
+    ];
+    for (module, title) in SECTIONS {
+        out.push_str(title);
+        out.push('\n');
+        for e in payload.logs.iter().filter(|e| e.module == *module) {
+            let msg = safe_truncate_str(&sanitize_sensitive(&e.message), 4000);
+            out.push_str(&format!(
+                "[{}][{}][{}] {}\n",
+                e.timestamp, e.level, e.module, msg
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1264,6 +1305,45 @@ mod tests {
                 .any(|e| e.message.contains("prism.sarl")),
             "Sub 桶未收到 prism.sarl 日志"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【APP63 任务2.2】全分类导出文本：中文 / emoji / 超长行均不得 panic，
+    /// 且 7 个分类章节齐全。
+    #[test]
+    fn test_export_diagnostic_text_handles_cjk() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-log-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        super::init(&dir);
+
+        let long_line = format!("中文诊断日志😀{}", "内核状态正常".repeat(900));
+        super::info(MOD_NODE, &long_line);
+        super::info(MOD_KERNEL, "中文内核日志：连接成功");
+
+        let text = super::export_diagnostic_text(&dir);
+        for title in [
+            "=== [内核 Kernel] ===",
+            "=== [节点 Node] ===",
+            "=== [规则 Rule] ===",
+            "=== [Go AIM] ===",
+            "=== [Go Lan] ===",
+            "=== [Go Cus] ===",
+            "=== [订阅 Sub] ===",
+        ] {
+            assert!(text.contains(title), "缺少章节 {title}");
+        }
+        assert!(text.contains("中文内核日志"));
+        assert!(text.contains("中文诊断日志😀"));
+        // 字符级安全截断：中文 / emoji 不得被截成半个字符（无替换符 U+FFFD）
+        assert!(!text.contains('\u{FFFD}'));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

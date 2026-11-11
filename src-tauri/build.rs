@@ -46,6 +46,7 @@ fn main() {
                 "_prism_ios_get_device_id",
                 "_prism_ios_app_group_dir",
                 "_prism_ios_open_url",
+                "_prism_ios_share_text_file",
             ] {
                 println!("cargo:rustc-link-arg=-Wl,-U,{sym}");
             }
