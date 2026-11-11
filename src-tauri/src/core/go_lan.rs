@@ -376,6 +376,67 @@ pub fn enabled_profiles(settings: &GoLanSettings) -> Vec<(String, GoLanProfile)>
     out
 }
 
+/// 【APP62 任务1 机制2】由内网地址 / CIDR 推导家庭网关（末段置 1）
+fn derive_gateway_from_cidr(cidr: &str) -> Option<String> {
+    let ip = cidr.split('/').next()?.trim();
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 || parts.iter().any(|p| p.parse::<u8>().is_err()) {
+        return None;
+    }
+    Some(format!("{}.{}.{}.1", parts[0], parts[1], parts[2]))
+}
+
+/// 【APP62 任务1 机制2】主 APP 回到前台时，主动触发全部 `go-lan-*` 隧道
+/// 各发一个轻量探测包（穿过隧道即触发 WireGuard Handshake）。
+/// 返回实际发起的探测数量；结果（延迟）不重要，发包即可。
+pub async fn trigger_all_handshakes(
+    settings: &GoLanSettings,
+    api_addr: &str,
+    api_secret: &str,
+) -> usize {
+    if api_addr.is_empty() {
+        return 0;
+    }
+    let profiles = enabled_profiles(settings);
+    if profiles.is_empty() {
+        return 0;
+    }
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for (tag, profile) in profiles {
+        let gateway = profile
+            .wg_config
+            .as_ref()
+            .and_then(|wg| derive_gateway_from_cidr(&wg.local_ip))
+            .or_else(|| {
+                profile
+                    .lan_cidrs
+                    .iter()
+                    .find_map(|c| derive_gateway_from_cidr(c))
+            });
+        let Some(gw) = gateway else { continue };
+        jobs.push((tag, gw));
+    }
+    let count = jobs.len();
+    if count > 0 {
+        // 并发发包，避免多档案串行等待各自的探测超时。
+        // 每个 future 独占自己的 tag/gateway，避免借用局部变量跨 await。
+        let api_addr = api_addr.to_string();
+        let api_secret = api_secret.to_string();
+        let tasks = jobs.into_iter().map(move |(tag, gw)| {
+            let api_addr = api_addr.clone();
+            let api_secret = api_secret.clone();
+            async move {
+                probe_clash_delay_for_tag(
+                    &tag, &gw, 80, "http", "/", &api_addr, &api_secret, 1500,
+                )
+                .await
+            }
+        });
+        let _ = futures_util::future::join_all(tasks).await;
+    }
+    count
+}
+
 /// 【APP40 任务2】自动无损迁移旧版单配置 + 校正档案字段。
 /// 当 profiles 为空且顶层存在旧版 wg_config / node_uri / lan_cidrs 时，
 /// 自动生成默认档案「家里」（id = home）。

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD}, Engine as _};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -1522,12 +1521,40 @@ fn count_nodes_in_text(text: &str) -> usize {
 /// 2. v2rayN —— 仅放行 v2ray 客户端 UA 的面板（首拉 0 节点时重试）；
 /// 3. Shadowrocket —— 屏蔽 Clash UA 的面板；
 /// 4. 通用浏览器 —— 只放行浏览器 UA 的兜底。
-const SUBSCRIPTION_UAS: [&str; 4] = [
+/// 【APP62 任务3】追加 Surge / Loon / Karing 三家专用 UA：部分机场按
+/// 客户端只下发自家格式（Surge INI / Loon INI / Karing JSON），统一由
+/// subscription::parse_subscription_content 六格式解析器消化。
+const SUBSCRIPTION_UAS: [&str; 7] = [
     "Clash.Meta/v1.18.3 mihomo/1.18.3 Prism/0.3.69 sing-box/1.11.3",
     "v2rayN/6.45",
+    "Surge/5.8.0",
+    "Loon/800",
+    "Karing/1.0",
     "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ];
+
+/// 【APP62 任务3】订阅链接 `?flag=xxx` 客户端格式提示 → 对应专用 UA。
+/// 机场常用该参数强制返回某客户端格式（surge / loon / stash / karing /
+/// clash / meta / shadowsocks），命中后只发该 UA，避免格式来回转换。
+fn ua_for_subscription_flag(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    for flag in ["flag=surge", "flag=loon", "flag=stash", "flag=clash", "flag=meta",
+                 "flag=karing", "flag=shadowsocks"] {
+        if !lower.contains(flag) {
+            continue;
+        }
+        return Some(match flag {
+            "flag=surge" => "Surge/5.8.0",
+            "flag=loon" => "Loon/800",
+            "flag=karing" => "Karing/1.0",
+            "flag=shadowsocks" => "Shadowsocks/1.0",
+            // stash / clash / meta 统一走 Clash.Meta 组合 UA
+            _ => SUBSCRIPTION_UAS[0],
+        });
+    }
+    None
+}
 
 /// 首拉解析出 0 个节点时用于二次重试的 UA
 const SUBSCRIPTION_RETRY_UA: &str = "v2rayN/6.45";
@@ -1559,37 +1586,44 @@ fn sanitize_subscription_url(raw: &str) -> String {
 /// 【APP42 任务1.1】订阅内容归一化：
 /// base64 解包 + URI 列表（ss/vmess/vless/trojan/hysteria2/tuic/anytls…）
 /// → 统一 Clash YAML，供后续校验与落盘复用。
-fn prepare_subscription_payload(mut text: String) -> Result<String, String> {
-    // base64 包裹：明文不含 YAML/JSON 结构时尝试解码
-    if !text.contains("proxies") && !text.trim_start().starts_with('{')
-        && let Ok(decoded) = try_decode_base64(&text)
-    {
-        text = decoded;
+fn prepare_subscription_payload(text: String) -> Result<String, String> {
+    // 【APP62 任务3】多层自适应 Base64 剥壳（机场常见 1~3 层包裹）
+    let text = crate::core::subscription::auto_decrypt_base64_payload(&text);
+
+    // 原生 Clash / Meta 订阅：proxy-groups、rules 等完整结构必须原样保留，
+    // 不能拆成节点后重建（否则分组、规则、策略全丢）
+    if text.contains("proxies:") {
+        return Ok(text);
     }
 
-    // URI 列表订阅：解析为节点并合成 Clash YAML，复用统一 pipeline
-    if crate::core::uri_parser::is_uri_list(&text) {
-        let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
-        // 机场提示（流量超限/到期等）优先展示，引导用户去机场面板处理
-        if let Some(notice_text) = notice {
-            return Err(format!(
-                "机场提示：{notice_text}\n\n请至机场面板重置接入记录或续费后重试"
-            ));
-        }
-        if nodes.is_empty() {
-            return Err(format!(
-                "URI 列表订阅解析失败：{}",
-                errors.first().cloned().unwrap_or_else(|| "内容为空".into())
-            ));
-        }
+    // 【APP62 任务3】六格式统一解析：Clash/Meta YAML、Surge/Loon、
+    // SIP008、sing-box JSON、Quantumult X、URI 列表
+    let (mut nodes, errors) = crate::core::subscription::parse_subscription_content(&text);
+
+    // 机场提示（流量超限 / 到期 / 需要重置接入）优先展示
+    if let Some(notice) = errors
+        .iter()
+        .find_map(|e| e.strip_prefix("AIRPORT_NOTICE:"))
+    {
+        return Err(format!(
+            "机场提示：{}\n\n请至机场面板重置接入记录或续费后重试",
+            notice.trim()
+        ));
+    }
+
+    if !nodes.is_empty() {
         if !errors.is_empty() {
             tracing::warn!("subscription partial parse: {}", errors.join("；"));
         }
-        tracing::info!("URI subscription parsed: {} nodes ({} errors)", nodes.len(), errors.len());
+        tracing::info!(
+            "subscription parsed: {} nodes ({} errors)",
+            nodes.len(),
+            errors.len()
+        );
         // 节点名称去重（同名节点会互相覆盖）
         let mut seen = std::collections::HashSet::new();
         let mut proxies = Vec::new();
-        for mut node in nodes {
+        for mut node in nodes.drain(..) {
             // 【APP-4 任务1】还原被 Latin-1 展开的 UTF-8 乱码节点名
             let base = crate::core::uri_parser::fix_utf8_mojibake(
                 node["name"].as_str().unwrap_or_default(),
@@ -1623,13 +1657,22 @@ fn prepare_subscription_payload(mut text: String) -> Result<String, String> {
             ],
             "rules": ["MATCH,节点选择"],
         });
-        text = serde_yaml::to_string(&profile).map_err(|e| format!("订阅转换失败: {e}"))?;
+        return serde_yaml::to_string(&profile)
+            .map_err(|e| format!("订阅转换失败: {e}"));
     }
 
-    if !text.contains("proxies") && !text.contains("{") {
-        return Err("订阅内容无法识别：既不是 Clash YAML，也不是内核 JSON".into());
+    // 兼容旧行为：原样就是内核 JSON 时直接下发
+    if text.trim_start().starts_with('{') {
+        return Ok(text);
     }
-    Ok(text)
+
+    Err(format!(
+        "订阅内容无法识别：{}",
+        errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "既不是 Clash YAML，也不是内核 JSON".into())
+    ))
 }
 
 /// 统计 Clash YAML 中的真实节点数（排除机场提示用的 127.x / localhost 占位节点）
@@ -1679,6 +1722,9 @@ async fn fetch_remote_text(
     let mut last_err = String::new();
 
     // ---- 直连双栈竞速（自动探测 + 强制 IPv4 同时发起）× 多 UA ----
+    // 【APP62 任务3】订阅链接带 `?flag=surge/loon/stash/karing/...` 时，
+    // 机场会按该参数下发对应客户端格式，这里直接锁定对应 UA。
+    let force_ua = force_ua.or_else(|| ua_for_subscription_flag(&url));
     // 原串行实现：第一次请求若撞上 IPv6 黑洞，必须等满 10s 连接超时才
     // 发起第二次，导入体感「非常慢」。竞速后任一栈先成功立即返回，
     // 整体只受实际网络 RTT 约束，不再为黑洞等待。
@@ -2039,20 +2085,6 @@ async fn refresh_providers(state: &AppState, sub_url: &str, profile_text: &str) 
         "{count} proxy-providers refreshed concurrently in {}ms",
         started.elapsed().as_millis()
     );
-}
-
-/// 尝试 base64 解码（容错换行/空白；依次尝试标准 / URL-safe 两种字符集），
-/// 成功且结果为可读 UTF-8 时返回
-fn try_decode_base64(input: &str) -> Result<String, String> {
-    let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    for eng in [&STANDARD, &URL_SAFE, &URL_SAFE_NO_PAD] {
-        if let Ok(bytes) = eng.decode(&compact)
-            && let Ok(text) = String::from_utf8(bytes)
-        {
-            return Ok(text);
-        }
-    }
-    Err("not base64".into())
 }
 
 /// 订阅记录（前端展示用）：在存储记录上附加节点数统计
@@ -3591,16 +3623,20 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                 });
                 if let Some(c) = first {
                     let node_name = selected.clone().unwrap_or_else(|| "自动".into());
-                    if logged_node.as_deref() != Some(node_name.as_str()) {
-                        let meta = c.get("metadata").cloned().unwrap_or_default();
-                        let host = meta
-                            .get("host")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let dest_ip = meta
-                            .get("destinationIP")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                    let meta = c.get("metadata").cloned().unwrap_or_default();
+                    let host = meta
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let dest_ip = meta
+                        .get("destinationIP")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    // 【APP62 任务4】隐身保护的域名 / IP 绝不出现在
+                    // [流量开始转发] 日志中（prism.sarl 及关联 IP 100% 跳过）
+                    let stealth = crate::core::license::is_stealth_protected_host_or_ip(host)
+                        || crate::core::license::is_stealth_protected_host_or_ip(dest_ip);
+                    if !stealth && logged_node.as_deref() != Some(node_name.as_str()) {
                         crate::core::logger::info(
                             crate::core::logger::MOD_NODE,
                             &format!(
@@ -4477,6 +4513,27 @@ pub async fn test_go_lan_ip(
     Ok(result)
 }
 
+/// 【APP62 任务1 机制2】主 APP 回到前台时，主动触发全部 `go-lan-*`
+/// 隧道握手：iOS 上内核跑在独立扩展进程，主 APP 不在前台时扩展已能
+/// 自愈；前台再补一次可保证用户看到 VPN 图标瞬间即在线。
+#[tauri::command]
+pub async fn trigger_go_lan_handshakes(
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    if !is_vpn_actually_running(&state) {
+        return Ok(0);
+    }
+    let (api_addr, api_secret, lan) = {
+        let go_lan_cfg = state.go_lan.read();
+        (
+            state.api_addr.read().clone(),
+            state.api_secret.read().clone(),
+            go_lan_cfg.clone(),
+        )
+    };
+    Ok(crate::core::go_lan::trigger_all_handshakes(&lan, &api_addr, &api_secret).await)
+}
+
 /// 【APP6 任务2】VPN 是否真实在运行：
 /// 桌面端看内核子进程状态；iOS 上内核运行在独立 PrismVPN 扩展进程，
 /// `state.is_running()` 恒为 false，必须叠加 `vpn_is_connected()`
@@ -4649,10 +4706,14 @@ pub async fn generate_or_get_ca_url(
 pub async fn get_app_logs(
     module_filter: Option<String>,
     state: State<'_, AppState>,
-) -> Result<crate::core::logger::LogsPayload, String> {
-    Ok(crate::core::logger::get_logs(
+) -> Result<crate::core::logger::CategorizedLogsPayload, String> {
+    // 【APP62 任务4】一次性返回全部 7 个分类 + 桶区间 + 增量游标。
+    // 前端切换分类只在本地 logs.slice(start, end)，不再重复请求后端，
+    // 即便某次网络抖动也不会出现某个分类列表清空 / 卡在加载中。
+    // module_filter 保留参数位以兼容旧前端调用，实际返回全量分类。
+    let _ = module_filter;
+    Ok(crate::core::logger::get_logs_categorized(
         &state.data_dir,
-        module_filter.as_deref(),
     ))
 }
 

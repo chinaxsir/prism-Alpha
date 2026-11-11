@@ -22,6 +22,7 @@ pub mod obf;
 pub mod security;
 pub mod state;
 pub mod store;
+pub mod subscription;
 pub mod sync_links;
 pub mod tun;
 pub mod uri_parser;

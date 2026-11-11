@@ -74,6 +74,40 @@ pub struct LogsPayload {
     pub total_bytes: usize,
 }
 
+/// 【APP62 任务4】单个分类桶在 `CategorizedLogsPayload.logs` 中的区间。
+/// 前端按分类切片时只做 `logs.slice(start, end)`，**零网络请求**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogBucket {
+    /// 分类名（Kernel / Node / Rule / GoAIM / GoLan / GoCus / Sub）
+    pub module: String,
+    /// 该分类在 logs 数组中的起始下标（含）
+    pub start: usize,
+    /// 该分类在 logs 数组中的结束下标（不含）
+    pub end: usize,
+    /// 该分类日志条数（= end - start）
+    pub count: usize,
+}
+
+/// 【APP62 任务4】一次性返回全部分类日志 + 桶区间 + 增量游标：
+/// 前端切换分类不再发请求，彻底消除「切标签 -> 网络抖动 -> 列表清空/卡死」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategorizedLogsPayload {
+    /// 按固定桶顺序（Kernel → Node → Rule → GoAIM → GoLan → GoCus → Sub）
+    /// 拼接的全量日志，桶内按时间升序
+    pub logs: Vec<LogEntry>,
+    pub buckets: Vec<LogBucket>,
+    pub total_bytes: usize,
+    /// 本次返回的最大日志 id（增量拉取的游标）
+    pub last_offset: u64,
+}
+
+/// 分类桶的固定顺序（与前端 CATEGORY_TABS 完全一致）
+pub const BUCKET_ORDER: [&str; 7] = [
+    MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
+];
+
 struct LogState {
     seq: AtomicU64,
     /// 【APP59 任务2.2】7 个物理隔离的分类环形队列：键恒为 7 个合法分类之一，
@@ -563,44 +597,95 @@ fn file_modified_after_clear(path: &std::path::Path) -> bool {
     mtime_ms >= cleared
 }
 
-/// 收集 sing-box 内核日志 + iOS 扩展诊断日志（合并进内存条目列表）
-fn collect_kernel_and_extension_logs(
-    data_dir: &std::path::Path,
-    entries: &mut Vec<LogEntry>,
-    seq: &AtomicU64,
-) {
-    // 1. 桌面端（含 Android）：sing-box 子进程日志 kernel.log
+/// 【APP62 任务4】外部日志（kernel.log / 扩展诊断日志）增量读取状态：
+/// - `EXT_READ_OFFSETS`：每个文件已消费到的字节偏移；
+/// - `EXT_ENTRY_CACHE`：已解析外部条目缓存（多次轮询结果稳定、不丢日志）。
+/// get_app_logs 每 2 秒轮询时只读取文件新增字节，绝不每次从头全量重读。
+static EXT_READ_OFFSETS: OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> = OnceLock::new();
+static EXT_ENTRY_CACHE: OnceLock<Mutex<Vec<LogEntry>>> = OnceLock::new();
+static EXT_SEQ: AtomicU64 = AtomicU64::new(u64::MAX / 2);
+/// 外部条目缓存上限（条），只保留近期现场
+const EXT_CACHE_MAX: usize = 600;
+/// 首次读取大文件时只取末尾 256 KB，避免历史日志一次性灌入
+const EXT_FIRST_READ_MAX: u64 = 256 * 1024;
+
+/// 读取文件「自上次消费位置以来」的新增字节（增量读取）。
+/// - 文件被截断（长度 < 偏移）→ 偏移归零重新读；
+/// - 首次读取超大文件 → 只取末尾 `EXT_FIRST_READ_MAX`；
+/// - 只消费到最后一个换行，半行留到下次，避免把一行拆成两条日志。
+fn read_new_segment(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return String::new();
+    };
+    let len = meta.len();
+    let offsets = EXT_READ_OFFSETS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut map) = offsets.lock() else {
+        return String::new();
+    };
+    let prev = *map.get(path).unwrap_or(&0);
+    let mut start = if len < prev { 0 } else { prev };
+    if prev == 0 && len > EXT_FIRST_READ_MAX {
+        start = len - EXT_FIRST_READ_MAX;
+    }
+    if start >= len {
+        map.insert(path.to_path_buf(), len);
+        return String::new();
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let consumed = match buf.iter().rposition(|b| *b == b'\n') {
+        Some(i) => i + 1,
+        // 没有换行：首次读取视为单行文件全部消费；增量读取则等待下一行写完
+        None if prev == 0 => buf.len(),
+        None => return String::new(),
+    };
+    buf.truncate(consumed);
+    map.insert(path.to_path_buf(), start + consumed as u64);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 【APP62 任务4】增量同步内核 / 扩展外部日志到解析缓存。
+fn sync_kernel_and_extension_logs(data_dir: &std::path::Path) {
+    let mut fresh: Vec<LogEntry> = Vec::new();
     {
-        let kernel_log = data_dir.join("kernel").join("kernel.log");
-        if file_modified_after_clear(&kernel_log) {
-            if let Ok(text) = std::fs::read_to_string(&kernel_log) {
-                // 只取末尾 200 行（前面是历史，环形日志只关心近期现场）
-                let tail: Vec<&str> = text.lines().collect();
-                let start = tail.len().saturating_sub(200);
-                let joined = tail[start..].join("\n");
-                merge_external_text(&joined, entries, seq, 200);
+        let mut feed = |path: &std::path::Path, max: usize| {
+            if !file_modified_after_clear(path) {
+                return;
             }
+            let chunk = read_new_segment(path);
+            if chunk.is_empty() {
+                return;
+            }
+            merge_external_text(&chunk, &mut fresh, &EXT_SEQ, max);
+        };
+        // 1. 桌面端（含 Android）：sing-box 子进程日志 kernel.log
+        feed(&data_dir.join("kernel").join("kernel.log"), 200);
+        // 2. iOS：App Group 共享目录下的扩展诊断日志
+        #[cfg(target_os = "ios")]
+        if let Some(group) = ios_app_group_dir() {
+            feed(&group.join("prism_error.txt"), 100);
+            feed(&group.join("vpn_trace.log"), 100);
+            feed(&group.join("prism_work").join("box.log"), 200);
         }
     }
-    // 2. iOS：App Group 共享目录下的扩展诊断日志
-    #[cfg(target_os = "ios")]
-    if let Some(group) = ios_app_group_dir() {
-        for name in ["prism_error.txt", "vpn_trace.log"] {
-            let p = group.join(name);
-            if file_modified_after_clear(&p) {
-                if let Ok(text) = std::fs::read_to_string(&p) {
-                    merge_external_text(&text, entries, seq, 100);
-                }
-            }
-        }
-        let box_log = group.join("prism_work").join("box.log");
-        if file_modified_after_clear(&box_log) {
-            if let Ok(text) = std::fs::read_to_string(&box_log) {
-                let tail: Vec<&str> = text.lines().collect();
-                let start = tail.len().saturating_sub(200);
-                let joined = tail[start..].join("\n");
-                merge_external_text(&joined, entries, seq, 200);
-            }
+    if fresh.is_empty() {
+        return;
+    }
+    let cache = EXT_ENTRY_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut c) = cache.lock() {
+        c.extend(fresh);
+        let overflow = c.len().saturating_sub(EXT_CACHE_MAX);
+        if overflow > 0 {
+            c.drain(0..overflow);
         }
     }
 }
@@ -614,7 +699,6 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
         module_filter.map(|f| enforce_strict_log_category(f, ""));
     let mut mem_entries: Vec<LogEntry> = Vec::new();
     let mut file_bytes = 0usize;
-    let seq = AtomicU64::new(u64::MAX / 2); // 外部日志 id 从高位段分配，避免与内存条目冲突
     if let Some(mutex) = state()
         && let Ok(st) = mutex.lock()
     {
@@ -650,9 +734,13 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
             file_bytes = std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
         }
         drop(st);
-        let mut ext = Vec::new();
-        collect_kernel_and_extension_logs(data_dir, &mut ext, &seq);
-        for mut e in ext {
+        // 【APP62 任务4】增量读取外部日志（只读新增字节），再从缓存取出
+        sync_kernel_and_extension_logs(data_dir);
+        let cached: Vec<LogEntry> = EXT_ENTRY_CACHE
+            .get()
+            .and_then(|m| m.lock().ok().map(|c| c.clone()))
+            .unwrap_or_default();
+        for mut e in cached {
             // 【APP56 任务4】外部日志同样按唯一分类下发
             e.module = enforce_strict_log_category(&e.module, &e.message).to_string();
             let matched = filter.map(|f| e.module == f).unwrap_or(true);
@@ -672,10 +760,53 @@ pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> Logs
     }
 }
 
+/// 【APP62 任务4】分类聚合读取：一次性返回全部 7 个分类的日志 + 每个分类
+/// 在数组中的区间下标 + 增量游标。前端切换分类只做本地切片，零请求。
+///
+/// 逻辑：
+/// 1. 复用 `get_logs(None)` 拿到全量（含内核 / 扩展外部日志）；
+/// 2. 按固定桶顺序分组，桶内按「时间戳 → id」升序（时间戳格式等长，
+///    字典序即时间序），保证某分类内部严格按时间排列；
+/// 3. 逐桶记录 start/end，供前端 `logs.slice(start, end)`。
+pub fn get_logs_categorized(data_dir: &std::path::Path) -> CategorizedLogsPayload {
+    let payload = get_logs(data_dir, None);
+    let mut logs: Vec<LogEntry> = Vec::with_capacity(payload.entries.len());
+    let mut buckets: Vec<LogBucket> = Vec::with_capacity(BUCKET_ORDER.len());
+    for module in BUCKET_ORDER {
+        let mut rows: Vec<LogEntry> = payload
+            .entries
+            .iter()
+            .filter(|e| e.module == module)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let start = logs.len();
+        let count = rows.len();
+        logs.extend(rows);
+        buckets.push(LogBucket {
+            module: module.to_string(),
+            start,
+            end: logs.len(),
+            count,
+        });
+    }
+    let last_offset = logs.iter().map(|e| e.id).max().unwrap_or(0);
+    CategorizedLogsPayload {
+        logs,
+        buckets,
+        total_bytes: payload.total_bytes,
+        last_offset,
+    }
+}
+
 /// 清空全部日志：内存环形缓冲 + 删除本地 prism_app.log +
 /// 清空内核 kernel.log + iOS 共享容器中的旧日志缓存
 ///
-/// 【IPA9 任务1.2】同步设置 LAST_CLEARED_UNIX_MS，collect_kernel_and_extension_logs
+/// 【IPA9 任务1.2】同步设置 LAST_CLEARED_UNIX_MS，sync_kernel_and_extension_logs
 /// 会据此过滤外部文件中清空时刻之前的旧内容，防止内核/扩展进程持有的旧 fd
 /// 继续写入导致历史日志回弹。
 pub fn clear_logs(data_dir: &std::path::Path) {
@@ -686,6 +817,19 @@ pub fn clear_logs(data_dir: &std::path::Path) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     LAST_CLEARED_UNIX_MS.store(now_ms, Ordering::Relaxed);
+
+    // 【APP62 任务4】清空外部日志增量偏移与解析缓存，
+    // 防止清空后仍从旧偏移继续拼接、或缓存旧内容回弹
+    if let Some(m) = EXT_ENTRY_CACHE.get()
+        && let Ok(mut c) = m.lock()
+    {
+        c.clear();
+    }
+    if let Some(m) = EXT_READ_OFFSETS.get()
+        && let Ok(mut o) = m.lock()
+    {
+        o.clear();
+    }
 
     if let Some(mutex) = state()
         && let Ok(mut st) = mutex.lock()
@@ -1056,5 +1200,71 @@ mod tests {
             "INFO hello"
         );
         assert_eq!(strip_leading_datetime("plain message"), "plain message");
+    }
+
+    /// 【APP62 任务4】7 个日志分类桶必须严格隔离：
+    /// 1. 桶区间从 0 连续覆盖整个 logs 数组，顺序固定；
+    /// 2. 桶内 `count == end - start`；
+    /// 3. `prism.sarl` 只允许出现在 Sub 桶，绝不出现在 Node / Rule 桶。
+    #[test]
+    fn test_categorized_buckets_partition_and_isolate() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-log-cat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        super::init(&dir);
+
+        let tag = format!("APP62-CAT-{}", std::process::id());
+        super::info(MOD_NODE, format!("{tag}-node"));
+        super::info(MOD_RULE, format!("{tag}-rule"));
+        super::info(MOD_SUB, format!("{tag}-sub prism.sarl"));
+
+        let payload = super::get_logs_categorized(&dir);
+        assert_eq!(payload.buckets.len(), super::BUCKET_ORDER.len());
+
+        let mut cursor = 0usize;
+        for (i, b) in payload.buckets.iter().enumerate() {
+            assert_eq!(b.module, super::BUCKET_ORDER[i], "桶顺序不符合固定规范");
+            assert_eq!(b.start, cursor, "桶 {} 区间不连续", b.module);
+            assert_eq!(b.end - b.start, b.count, "桶 {} 条数不一致", b.module);
+            cursor = b.end;
+        }
+        assert_eq!(cursor, payload.logs.len(), "桶区间未覆盖全部日志");
+        assert_eq!(
+            payload.last_offset,
+            payload.logs.iter().map(|e| e.id).max().unwrap_or(0)
+        );
+
+        for b in &payload.buckets {
+            if b.module == MOD_SUB {
+                continue;
+            }
+            for e in &payload.logs[b.start..b.end] {
+                assert!(
+                    !e.message.contains("prism.sarl"),
+                    "prism.sarl 泄漏到 {} 分类",
+                    b.module
+                );
+            }
+        }
+
+        let sub = payload
+            .buckets
+            .iter()
+            .find(|b| b.module == MOD_SUB)
+            .expect("缺少 Sub 桶");
+        assert!(
+            payload.logs[sub.start..sub.end]
+                .iter()
+                .any(|e| e.message.contains("prism.sarl")),
+            "Sub 桶未收到 prism.sarl 日志"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

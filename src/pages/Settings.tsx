@@ -76,7 +76,7 @@ const HELP_LINKS = [
   {
     labelKey: "settings.helpTickets",
     descKey: "settings.helpTicketsDesc",
-    url: "https://prism.sarl/tickets",
+    url: "https://prism.sarl/ticket",
     Icon: Ticket,
   },
   {
@@ -673,7 +673,16 @@ export default function Settings() {
             key={labelKey}
             type="button"
             onClick={() => openHelpLink(url)}
-            className="flex w-full items-center justify-between gap-3 px-3 py-3 border-b border-border last:border-0 text-left hover:bg-glass/40 transition-colors"
+            /* 【APP62 任务2】关于帮助 5 个外链行：按下/点击/聚焦必须 100% 保持
+               卡片原本底色，严禁 hover/active/focus 变色、阴影或缩放，
+               否则 iOS 深色模式下会出现一团黑色阴影块 */
+            style={{
+              WebkitTapHighlightColor: "transparent",
+              backgroundColor: "transparent",
+              boxShadow: "none",
+              outline: "none",
+            }}
+            className="flex w-full select-none items-center justify-between gap-3 border-b border-border px-3 py-3 text-left last:border-0 hover:bg-transparent active:bg-transparent focus:bg-transparent active:shadow-none focus:outline-none"
           >
             <div className="flex items-center gap-3 flex-1 min-w-0">
               <RowIcon>

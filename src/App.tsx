@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { ShieldBan } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "@/components/Sidebar";
 import TitleBar from "@/components/TitleBar";
 import BottomNav from "@/components/BottomNav";
@@ -376,7 +377,12 @@ export default function App() {
     void refreshRuntime();
     const id = window.setInterval(() => void refreshRuntime(), 1500);
     const onWake = () => {
-      if (document.visibilityState === "visible") void refreshRuntime();
+      if (document.visibilityState === "visible") {
+        void refreshRuntime();
+        // 【APP62 任务1 机制2】后台期间 WireGuard 空闲 >150s 可能已休眠，
+        // 回到前台立即主动触发一次 go-lan-* 握手，防止首访卡顿
+        void invoke("trigger_go_lan_handshakes").catch(() => undefined);
+      }
     };
     window.addEventListener("focus", onWake);
     document.addEventListener("visibilitychange", onWake);

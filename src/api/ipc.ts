@@ -425,8 +425,24 @@ export interface AppLogsPayload {
   entries: AppLogEntry[];
   totalBytes: number;
 }
+/** 【APP62 任务4】单个分类桶在 logs 数组中的区间 */
+export interface LogBucket {
+  module: string;
+  start: number;
+  end: number;
+  count: number;
+}
+/** 【APP62 任务4】分类聚合日志：一次请求拿全部分类，切标签零请求 */
+export interface CategorizedLogsPayload {
+  logs: AppLogEntry[];
+  buckets: LogBucket[];
+  totalBytes: number;
+  lastOffset: number;
+}
 export const getAppLogs = (moduleFilter?: string) =>
-  invoke<AppLogsPayload>("get_app_logs", { moduleFilter: moduleFilter ?? null });
+  invoke<CategorizedLogsPayload>("get_app_logs", {
+    moduleFilter: moduleFilter ?? null,
+  });
 export const clearAppLogs = () => invoke<void>("clear_app_logs");
 export const exportAppLogs = (moduleFilter?: string) =>
   invoke<string>("export_app_logs", { moduleFilter: moduleFilter ?? null });

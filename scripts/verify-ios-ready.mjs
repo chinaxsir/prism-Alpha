@@ -824,6 +824,103 @@ for (const { rel, desc } of SB_CHECK_FILES) {
 }
 
 // ============================================================
+// 检查 13：【APP62 任务3】订阅解析引擎门禁
+// 机场可能下发 Surge/Loon、SIP008、sing-box JSON、Quantumult X、Clash YAML
+// 与 URI 列表六种格式；必须统一走 subscription::parse_subscription_content，
+// 且 prepare_subscription_payload 不得回退成「只解一层 base64」。
+// ============================================================
+console.log('\n--- 检查 13：订阅多格式解析引擎 ---');
+try {
+  const subSrc = readFileSync(resolve(ROOT, 'src-tauri/src/core/subscription.rs'), 'utf8');
+  const requiredFns = ['auto_decrypt_base64_payload', 'parse_subscription_content'];
+  for (const fn of requiredFns) {
+    if (subSrc.includes(`pub fn ${fn}`)) pass(`subscription.rs 暴露 ${fn} ✓`);
+    else fail(`subscription.rs 缺少公开函数 ${fn}（订阅解析能力不完整）`);
+  }
+  const modSrc = readFileSync(resolve(ROOT, 'src-tauri/src/core/mod.rs'), 'utf8');
+  if (/pub\s+mod\s+subscription\s*;/.test(modSrc)) pass('core/mod.rs 已注册 subscription 模块 ✓');
+  else fail('core/mod.rs 未注册 `pub mod subscription;`，订阅解析模块不会参与编译');
+
+  const cmdSrc = readFileSync(resolve(ROOT, 'src-tauri/src/ipc/commands.rs'), 'utf8');
+  if (cmdSrc.includes('subscription::parse_subscription_content')) pass('commands.rs 已接入 subscription 解析器 ✓');
+  else fail('commands.rs 未调用 subscription::parse_subscription_content，机场订阅仍会解析失败');
+  if (cmdSrc.includes('fn prepare_subscription_payload')) pass('prepare_subscription_payload 仍存在 ✓');
+  else fail('prepare_subscription_payload 被删除（订阅导入链路断裂）');
+} catch (e) {
+  fail(`订阅解析引擎检查失败：${e.message}`);
+}
+
+// ============================================================
+// 检查 14：【APP62 任务4】日志分类聚合门禁
+// 必须一次性返回全部分类 + 桶区间，前端切标签零请求。
+// ============================================================
+console.log('\n--- 检查 14：日志分类聚合（切标签零请求）---');
+try {
+  const logSrc = readFileSync(resolve(ROOT, 'src-tauri/src/core/logger.rs'), 'utf8');
+  const logMust = [
+    ['CategorizedLogsPayload', '分类聚合返回结构'],
+    ['pub struct LogBucket', '分类桶区间结构'],
+    ['pub fn get_logs_categorized', '分类聚合读取函数'],
+    ['last_offset', '增量游标'],
+  ];
+  for (const [token, desc] of logMust) {
+    if (logSrc.includes(token)) pass(`logger.rs 含${desc} \`${token}\` ✓`);
+    else fail(`logger.rs 缺少${desc} \`${token}\``);
+  }
+  const modalSrc = readFileSync(resolve(ROOT, 'src/components/LogViewerModal.tsx'), 'utf8');
+  if (modalSrc.includes('logs.slice(bucket.start, bucket.end)')) pass('LogViewerModal 切换分类走本地切片 ✓');
+  else fail('LogViewerModal 未按桶区间本地切片，切换分类仍会发请求');
+  if (modalSrc.includes('key={activeModule}')) pass('日志列表已按分类强制重建 ✓');
+  else fail('日志列表缺少 key={activeModule}，切换分类可能残留旧节点/滚动位置');
+  if (/"logs"|logs:/.test(modalSrc)) pass('前端已使用 logs 字段 ✓');
+} catch (e) {
+  fail(`日志分类聚合检查失败：${e.message}`);
+}
+
+// ============================================================
+// 检查 15：【APP62 任务1】iOS 全场景自愈作用域校验
+// 防止只声明变量不接线：四个成员必须真实出现在使用点。
+// ============================================================
+console.log('\n--- 检查 15：iOS 全场景自愈接线 ---');
+try {
+  const pttRel = 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift';
+  const ptt = readFileSync(resolve(ROOT, pttRel), 'utf8');
+  const wireMust = [
+    ['activeGoLanProbes', 3, 'go-lan 握手清单（声明 + 赋值 + 发包）'],
+    ['triggerExtensionGoLanHandshakes', 3, '扩展自主重握手（声明 + 切网/唤醒调用）'],
+    ['activeBoundIPv4', 3, '物理 IPv4 跟踪（声明 + 赋值 + 比对）'],
+    ['override func wake()', 1, '休眠唤醒自愈入口'],
+    ['goLanKeepaliveTimer', 3, '25 秒保活定时器'],
+  ];
+  for (const [token, min, desc] of wireMust) {
+    const n = ptt.split(token).length - 1;
+    if (n >= min) pass(`${desc}：${token} 出现 ${n} 次 ✓`);
+    else fail(`${desc}：${token} 仅出现 ${n} 次（至少 ${min} 次），可能只声明未接线`);
+  }
+  const scopeBans = [
+    [/(?<![\w.])as!/, '`as!` 强制转换'],
+    [/->\s*\(/, '`-> (` 元组返回值'],
+  ];
+  for (const [re, msg] of scopeBans) {
+    const m = ptt.match(re);
+    if (m) {
+      const line = ptt.slice(0, m.index).split('\n').length;
+      fail(`${pttRel} 第 ${line} 行：出现${msg}（APP16 禁令）`);
+    } else {
+      pass(`PacketTunnelProvider 无${msg} ✓`);
+    }
+  }
+  const appSrc = readFileSync(resolve(ROOT, 'src/App.tsx'), 'utf8');
+  if (appSrc.includes('trigger_go_lan_handshakes')) pass('App.tsx 回前台已触发 go-lan 握手 ✓');
+  else fail('App.tsx 未在回前台时调用 trigger_go_lan_handshakes');
+  const cmdSrc2 = readFileSync(resolve(ROOT, 'src-tauri/src/ipc/commands.rs'), 'utf8');
+  if (cmdSrc2.includes('trigger_all_handshakes')) pass('commands.rs 已接入 trigger_all_handshakes ✓');
+  else fail('commands.rs 未接入 go_lan::trigger_all_handshakes');
+} catch (e) {
+  fail(`iOS 自愈接线检查失败：${e.message}`);
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();

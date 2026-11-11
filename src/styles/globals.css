@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 【APP62 任务2】移动端 WebView 点击高亮总闸：
+   iOS WKWebView / Android WebView 默认会给被点击元素叠加一层
+   黑色/深灰的半透明遮罩（-webkit-tap-highlight-color），在「关于帮助」
+   等整行按钮上表现为一团黑影。此处全局置为透明，任何按钮 / 链接 /
+   行容器按下时都保持原本底色，不出现任何黑灰阴影。 */
+*,
+*::before,
+*::after,
+button,
+a,
+div {
+  -webkit-tap-highlight-color: transparent !important;
+}
+
 /* ============================ 语义化主题变量 ============================
    浅色为默认（:root / [data-theme="light"]），深色覆盖
    （[data-theme="dark"] 或 .dark）。App.tsx 依据「跟随系统 / 深色 / 浅色」

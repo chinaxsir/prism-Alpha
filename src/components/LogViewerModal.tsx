@@ -13,6 +13,7 @@ import {
   clearAppLogs,
   getAppLogs,
   type AppLogEntry,
+  type LogBucket,
 } from "@/api/ipc";
 
 /** 【IPA9 任务1】「设置 -> 运行日志」全局诊断中心弹窗
@@ -154,60 +155,70 @@ export default function LogViewerModal({
   const { t } = useTranslation();
   // 【APP56 任务4】默认选中「内核」，不存在「全部」混合视图
   const [activeModule, setActiveModule] = useState<string>(initialModule ?? "Kernel");
-  const [entries, setEntries] = useState<AppLogEntry[]>([]);
+  // 【APP62 任务4】一次性拿到全部分类日志 + 桶区间，切标签只在本地切片
+  const [logs, setLogs] = useState<AppLogEntry[]>([]);
+  const [buckets, setBuckets] = useState<LogBucket[]>([]);
+  const [, setLastOffset] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const load = useCallback(
-    async (_module: string | null) => {
-      setLoading(true);
+  /** 【APP62 任务4】拉取分类聚合日志：失败自动重试 3 次（指数退避），
+   *  避免一次性网络抖动导致某个分类列表被清空 / 卡在加载态。 */
+  const load = useCallback(async () => {
+    setLoading(true);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        // 【APP55 任务5】始终拉全量，分类筛选在前端严格按 module 精确匹配，
-        // 避免后端模糊过滤把 Go Lan 混进 Kernel
         const payload = await getAppLogs();
-        setEntries(payload.entries ?? []);
+        setLogs(payload.logs ?? []);
+        setBuckets(payload.buckets ?? []);
         setTotalBytes(payload.totalBytes ?? 0);
-      } catch (e) {
-        console.warn("[LogViewer] 读取日志失败:", e);
-      } finally {
+        setLastOffset(payload.lastOffset ?? 0);
         setLoading(false);
+        return;
+      } catch (e) {
+        if (attempt === 2) {
+          console.warn("[LogViewer] 读取日志失败:", e);
+        } else {
+          await new Promise((r) => window.setTimeout(r, 300 * (attempt + 1)));
+        }
       }
-    },
-    [],
-  );
+    }
+    setLoading(false);
+  }, []);
 
-  /** 【APP56 任务4 / APP58 任务5】列表 100% 仅渲染投影后分类等于 activeModule
-   *  的日志：7 个分类互不混杂，绝不做模糊包含或兜底展示 */
-  const visibleEntries = useMemo(
-    () => entries.filter((e) => projectCategory(e.module) === activeModule),
-    [entries, activeModule],
-  );
+  /** 【APP62 任务4】切换分类只做本地切片：bucket.start ~ bucket.end，
+   *  全程零网络请求，也就不会出现「黑色挡住内容」的加载遮罩。 */
+  const visibleEntries = useMemo(() => {
+    const bucket = buckets.find((b) => b.module === activeModule);
+    if (!bucket) return [];
+    return logs.slice(bucket.start, bucket.end);
+  }, [logs, buckets, activeModule]);
 
-  /** 每个分类标签的实时条数（与列表使用完全相同的投影分类） */
+  /** 每个分类标签的实时条数（直接取自后端桶区间，与切片同源） */
   const categoryCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const tab of CATEGORY_TABS) counts[tab.value] = 0;
-    for (const e of entries) {
-      counts[projectCategory(e.module)] += 1;
+    for (const b of buckets) {
+      if (b.module in counts) counts[b.module] = b.count;
     }
     return counts;
-  }, [entries]);
+  }, [buckets]);
 
-  // 打开期间每 2 秒轮询（activeModule/refreshSignal 变化时立即重拉）
+  // 打开期间每 2 秒轮询全量分类（切换分类不再触发请求）
   useEffect(() => {
     if (!open) return;
-    void load(activeModule);
-    const timer = window.setInterval(() => void load(activeModule), 2000);
+    void load();
+    const timer = window.setInterval(() => void load(), 2000);
     return () => window.clearInterval(timer);
-  }, [open, activeModule, load, refreshSignal]);
+  }, [open, load, refreshSignal]);
 
   // 新日志到达时自动滚动到底部
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [entries.length]);
+  }, [visibleEntries.length]);
 
   if (!open) return null;
 
@@ -223,7 +234,7 @@ export default function LogViewerModal({
    *  await 异步之后调用剪贴板会被 iOS 系统拦截。改为在点击瞬间同步
    *  基于已加载 entries 构造导出文本，直接写入剪贴板并调起原生分享。 */
   const handleExport = async () => {
-    if (entries.length === 0) {
+    if (logs.length === 0) {
       toast.error(t("logs.exportEmpty"));
       return;
     }
@@ -233,14 +244,14 @@ export default function LogViewerModal({
     const lines: string[] = [];
     lines.push(t("logs.exportHeader"));
     lines.push(t("logs.exportTime", { time: ts }));
-    lines.push(t("logs.exportCount", { count: entries.length }));
+    lines.push(t("logs.exportCount", { count: logs.length }));
     lines.push("===============================================");
     lines.push("");
     // 【APP56 任务4 / APP58 任务5】导出严格按 7 个分类分章节，
     // 分类使用与列表/徽章完全一致的 projectCategory 投影
     for (const section of EXPORT_SECTIONS) {
       lines.push(section.title);
-      for (const e of entries) {
+      for (const e of logs) {
         const cat = projectCategory(e.module);
         if (cat !== section.value) continue;
         lines.push(`[${e.timestamp}][${e.level}][${cat}] ${e.message}`);
@@ -306,8 +317,10 @@ export default function LogViewerModal({
   const handleClear = async () => {
     try {
       await clearAppLogs();
-      setEntries([]);
+      setLogs([]);
+      setBuckets([]);
       setTotalBytes(0);
+      setLastOffset(0);
       toast.success(t("logs.cleared"));
     } catch (e) {
       toast.error(String(e));
@@ -381,8 +394,11 @@ export default function LogViewerModal({
           })()}
         </div>
 
-        {/* 日志列表：每条为上下两行全宽卡片 */}
+        {/* 日志列表：每条为上下两行全宽卡片。
+            【APP62 任务4】key={activeModule} 强制切换分类时重建列表，
+            彻底清除上一分类的滚动位置 / 残留节点 */}
         <div
+          key={activeModule}
           ref={listRef}
           className="flex-1 space-y-1.5 overflow-y-auto bg-black/40 px-3 py-2"
         >
@@ -449,7 +465,7 @@ export default function LogViewerModal({
         {!compact && (
           <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border px-4 py-3">
             <button
-              onClick={() => void load(activeModule)}
+              onClick={() => void load()}
               className="flex items-center gap-1.5 rounded-lg bg-surface-hover px-3 py-1.5 text-xs text-gray-300 hover:text-white"
             >
               <RefreshCw size={13} />

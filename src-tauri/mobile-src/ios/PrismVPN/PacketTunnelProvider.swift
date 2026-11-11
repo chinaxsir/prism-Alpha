@@ -406,6 +406,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeBoundInterface: String = ""
     private var isReloadingForNetworkChange: Bool = false
 
+    // MARK: - 【APP62 任务1】Go Lan 全场景自愈状态
+    /// 扩展侧自主握手清单：每项保存 ["tag": "go-lan-home", "gateway": "10.196.0.1"]。
+    /// 由 scheduleGoLanWarmup 从已 sanitize 的内核配置中提取，供扩展在
+    /// 软重启 / 切网 / 休眠唤醒 / 25 秒保活时独立触发 WireGuard 握手。
+    private var activeGoLanProbes: [[String: String]] = []
+    /// 当前绑定的物理网卡 IPv4（5G 基站切换时网卡名可能不变，但 IP 会变）
+    private var activeBoundIPv4: String = ""
+    /// 25 秒轻量保活定时器（仅当存在 go-lan-* 隧道时运行）
+    private var goLanKeepaliveTimer: Timer?
+    /// 同网卡 IP 变化（基站切换）后的延迟软重启任务（可被下一轮切网取消）
+    private var pendingCellHandoverRestart: DispatchWorkItem?
+    /// 当前内核 Clash API 地址与密钥（清空死连接 / 触发握手用）
+    private var activeClashBase: String = ""
+    private var activeClashSecret: String = ""
+
     // MARK: - 生命周期
 
     /// 【build 169 方案】init() 级最早心跳：系统 pkd 实例化扩展进程的
@@ -624,6 +639,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
                 let currentPhy = findActivePhysicalInterface()
                 self.activeBoundInterface = currentPhy.name
+                self.activeBoundIPv4 = currentPhy.ipv4
                 let sanitizedConfig = self.sanitizeConfigForExtension(
                     configText,
                     workDir: workDir,
@@ -697,30 +713,85 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 飞行模式/电梯等短暂完全无网时 findActivePhysicalInterface 走
         // 盲猜兜底（hasRoutableIP=false），此时保持现有隧道待机，等
         // 信号恢复（真实网卡出现）后再平滑切网，绝不报错停止
-        guard !latestPhy.name.isEmpty,
-              latestPhy.hasRoutableIP,
-              latestPhy.name != activeBoundInterface
-        else {
+        guard !latestPhy.name.isEmpty, latestPhy.hasRoutableIP else { return }
+
+        // 【APP62 任务1 机制3】同时比对网卡名称与物理 IPv4：
+        // - 名称变化：Wi-Fi ↔ 蜂窝 物理通道切换；
+        // - 名称不变但 IP 变化：5G 基站切换 / Wi-Fi 漫游，旧 UDP 四元组已失效。
+        let ifNameChanged = latestPhy.name != activeBoundInterface
+        let ipChanged = !latestPhy.ipv4.isEmpty
+            && !activeBoundIPv4.isEmpty
+            && latestPhy.ipv4 != activeBoundIPv4
+        guard ifNameChanged || ipChanged else { return }
+
+        // 新一轮网络变化：取消上一轮基站切换的延迟软重启
+        pendingCellHandoverRestart?.cancel()
+        pendingCellHandoverRestart = nil
+
+        if ifNameChanged {
+            let oldIf = activeBoundInterface
+            let newIf = latestPhy.name
+            // 【APP50 任务1】切网软重启：bind_interface / default_interface 已
+            // 恢复为显式物理网卡绑定（根治 no available network interface），
+            // 而 sing-box v1.11.3 的 Clash API PUT /configs 为空实现、无法热更
+            // 出站网卡绑定，因此物理网卡实质切换（en0 ↔ pdp_ip0）时必须软重启
+            // Go 内核：重新 sanitize 磁盘配置并以新网卡重启。NEPacketTunnel
+            // 会话与 utun 保持不变，主 APP UI 不闪断。
+            writeExtLog("INFO", "🌐 物理网络切换 \(oldIf) -> \(newIf) (\(latestPhy.ipv4))，软重启内核重新绑定物理网卡")
+            isReloadingForNetworkChange = true
+            writeHeartbeat("netSwitch:\(oldIf)->\(newIf)")
+
+            vpnQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.restartKernelOnCurrentQueue(newPhy: latestPhy)
+                self.activeBoundIPv4 = latestPhy.ipv4
+                self.refreshOnDemandBypassIfNeeded(phyName: newIf, phyIPv4: latestPhy.ipv4)
+                self.isReloadingForNetworkChange = false
+                // 【APP62 任务1 机制2】软重启完成后立即由扩展自主重握手，
+                // 不依赖主 APP 是否在前台
+                self.triggerExtensionGoLanHandshakes(reason: "net-switch")
+            }
             return
         }
 
-        let oldIf = activeBoundInterface
-        let newIf = latestPhy.name
-        // 【APP50 任务1】切网软重启：bind_interface / default_interface 已
-        // 恢复为显式物理网卡绑定（根治 no available network interface），
-        // 而 sing-box v1.11.3 的 Clash API PUT /configs 为空实现、无法热更
-        // 出站网卡绑定，因此物理网卡实质切换（en0 ↔ pdp_ip0）时必须软重启
-        // Go 内核：重新 sanitize 磁盘配置并以新网卡重启。NEPacketTunnel
-        // 会话与 utun 保持不变，主 APP UI 不闪断。
-        writeExtLog("INFO", "🌐 物理网络切换 \(oldIf) -> \(newIf) (\(latestPhy.ipv4))，软重启内核重新绑定物理网卡")
-        isReloadingForNetworkChange = true
-        writeHeartbeat("netSwitch:\(oldIf)->\(newIf)")
+        // 【APP62 任务1 机制3】同网卡 IP 变化（5G 基站切换 / Wi-Fi 漫游）：
+        // 旧 UDP 四元组已随运营商 NAT 端口变化而失效。先清空内核中的死连接
+        // 并立即重握手；若 4 秒后仍未见效，则软重启内核重新绑定新 IP。
+        writeExtLog("INFO", "📶 同网卡 IP 变化 \(activeBoundIPv4) -> \(latestPhy.ipv4)，清空死连接并重握手")
+        writeHeartbeat("cellHandover:\(latestPhy.ipv4)")
+        activeBoundIPv4 = latestPhy.ipv4
 
         vpnQueue.async { [weak self] in
             guard let self = self else { return }
-            self.restartKernelOnCurrentQueue(newPhy: latestPhy)
-            self.refreshOnDemandBypassIfNeeded(phyName: newIf, phyIPv4: latestPhy.ipv4)
-            self.isReloadingForNetworkChange = false
+            self.clearClashConnections()
+            self.triggerExtensionGoLanHandshakes(reason: "cell-handover")
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                guard !self.isReloadingForNetworkChange,
+                      self.activeBoundInterface == latestPhy.name,
+                      self.activeBoundIPv4 == latestPhy.ipv4
+                else { return }
+                self.isReloadingForNetworkChange = true
+                self.writeExtLog("WARN", "📶 基站切换后 WG 仍无响应，软重启内核重新绑定 \(latestPhy.name) (\(latestPhy.ipv4))")
+                self.restartKernelOnCurrentQueue(newPhy: latestPhy)
+                self.refreshOnDemandBypassIfNeeded(phyName: latestPhy.name, phyIPv4: latestPhy.ipv4)
+                self.isReloadingForNetworkChange = false
+                self.triggerExtensionGoLanHandshakes(reason: "cell-handover-restart")
+            }
+            self.pendingCellHandoverRestart = work
+            self.vpnQueue.asyncAfter(deadline: .now() + 4.0, execute: work)
+        }
+    }
+
+    /// 【APP62 任务1 机制4】系统休眠唤醒自愈：唤醒瞬间运营商 / 路由器
+    /// 的 UDP NAT 映射通常已被回收，这里重新比对物理网卡与 IP，必要时
+    /// 软重启内核，并无条件触发一次 go-lan-* 重握手。
+    override func wake() {
+        super.wake()
+        vpnQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.checkAndReloadIfNetworkChanged()
+            self.triggerExtensionGoLanHandshakes(reason: "device-wake")
         }
     }
 
@@ -759,6 +830,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         activeBoundInterface = newPhy.name
+        activeBoundIPv4 = newPhy.ipv4
         writeHeartbeat("running(\(newPhy.name))")
         writeExtLog("INFO", "🌐 内核已切换至 \(newPhy.name) (\(newPhy.ipv4))，全部出站已重新绑定")
         scheduleGoLanWarmup(sanitizedConfig: sanitized)
@@ -890,6 +962,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.main.async {
             self.heartbeatTimer?.invalidate()
             self.heartbeatTimer = nil
+            // 【APP62 任务1】停止 25 秒保活巡检与待执行的基站切换软重启
+            self.goLanKeepaliveTimer?.invalidate()
+            self.goLanKeepaliveTimer = nil
+            self.pendingCellHandoverRestart?.cancel()
+            self.pendingCellHandoverRestart = nil
         }
         pathMonitor?.cancel()
         pathMonitor = nil
@@ -1343,21 +1420,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Handshake——配合 peers[0].persistent_keepalive_interval=15 的启动即
     /// 握手，wg-easy 面板立即显示在线与实时流量（与桌面端
     /// spawn_go_lan_warmup 对齐；结果不重要，发包即可）。
+    ///
+    /// 【APP62 任务1】同时把 tag + 网关写入 `activeGoLanProbes`，并启动
+    /// 25 秒轻量保活定时器：此后扩展在软重启 / 切网 / 休眠唤醒时都能
+    /// 自主重握手，完全不依赖主 APP 是否在前台。
     private func scheduleGoLanWarmup(sanitizedConfig: String) {
         guard let data = sanitizedConfig.data(using: .utf8),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return }
 
+        // Clash API 地址与密钥（与桌面端 KernelApi.test_delay 一致）
+        if let clashAPI = (root["experimental"] as? [String: Any])?["clash_api"] as? [String: Any],
+           let controller = clashAPI["external_controller"] as? String,
+           !controller.isEmpty {
+            activeClashBase = controller.hasPrefix("http") ? controller : "http://\(controller)"
+            activeClashSecret = (clashAPI["secret"] as? String) ?? ""
+        }
+
         // 【APP40 任务2】多路内网档案：逐路收集 go-lan-* WireGuard 出站的网关
         let outbounds = (root["outbounds"] as? [[String: Any]]) ?? []
-        var gatewaysByTag: [String: [String]] = [:]
+        var probes: [[String: String]] = []
+        var seenKeys: Set<String> = []
         func pushGateway(_ ip: String, tag: String) {
             let parts = ip.split(separator: ".")
             guard parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }) else { return }
             let gw = "\(parts[0]).\(parts[1]).\(parts[2]).1"
-            var list = gatewaysByTag[tag] ?? []
-            if !list.contains(gw) { list.append(gw) }
-            gatewaysByTag[tag] = list
+            let key = "\(tag)|\(gw)"
+            guard !seenKeys.contains(key) else { return }
+            seenKeys.insert(key)
+            probes.append(["tag": tag, "gateway": gw])
         }
         for wg in outbounds {
             guard let tag = wg["tag"] as? String, tag.hasPrefix("go-lan"),
@@ -1377,34 +1468,92 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 pushGateway(cidr.split(separator: "/").first.map(String.init) ?? "", tag: tag)
             }
         }
-        guard !gatewaysByTag.isEmpty else { return }
-
-        // Clash API 地址与密钥（与桌面端 KernelApi.test_delay 一致）
-        guard let clashAPI = (root["experimental"] as? [String: Any])?["clash_api"] as? [String: Any],
-              let controller = clashAPI["external_controller"] as? String,
-              !controller.isEmpty else { return }
-        let secret = clashAPI["secret"] as? String
-        let base = controller.hasPrefix("http") ? controller : "http://\(controller)"
-
-        vpnQueue.asyncAfter(deadline: .now() + 1.0) {
-            for (tag, gateways) in gatewaysByTag {
-                for gw in gateways {
-                    var comps = URLComponents(string: "\(base)/proxies/\(tag)/delay")
-                    comps?.queryItems = [
-                        URLQueryItem(name: "url", value: "http://\(gw)"),
-                        URLQueryItem(name: "timeout", value: "1500"),
-                    ]
-                    guard let url = comps?.url else { continue }
-                    var req = URLRequest(url: url, timeoutInterval: 3.5)
-                    if let secret = secret, !secret.isEmpty {
-                        req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-                    }
-                    // 探测结果不重要（家庭网关多半不开 HTTP），只要发包即可触发握手
-                    URLSession.shared.dataTask(with: req).resume()
-                }
-            }
-            NSLog("[PrismVPN] [go-lan] 主动握手探测已触发 \(gatewaysByTag)")
+        activeGoLanProbes = probes
+        guard !probes.isEmpty else {
+            stopGoLanKeepaliveTimer()
+            return
         }
+        startGoLanKeepaliveTimer()
+        vpnQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.fireGoLanHandshakeProbes(reason: "kernel-start")
+        }
+    }
+
+    // MARK: - 【APP62 任务1】扩展侧自主握手与保活
+
+    /// 主动向全部 go-lan-* 隧道网关发一次轻量探测包，触发 WireGuard 握手。
+    /// 结果不重要（家庭网关多半不开 HTTP），只要 UDP 包穿过隧道即可。
+    private func fireGoLanHandshakeProbes(reason: String) {
+        let probes = activeGoLanProbes
+        guard !probes.isEmpty, !activeClashBase.isEmpty else { return }
+        for item in probes {
+            guard let tag = item["tag"], !tag.isEmpty,
+                  let gw = item["gateway"], !gw.isEmpty
+            else { continue }
+            guard let encodedTag = tag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                  var comps = URLComponents(string: "\(activeClashBase)/proxies/\(encodedTag)/delay")
+            else { continue }
+            comps.queryItems = [
+                URLQueryItem(name: "url", value: "http://\(gw):80"),
+                URLQueryItem(name: "timeout", value: "2500"),
+            ]
+            guard let url = comps.url else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 3.0)
+            if !activeClashSecret.isEmpty {
+                req.setValue("Bearer \(activeClashSecret)", forHTTPHeaderField: "Authorization")
+            }
+            URLSession.shared.dataTask(with: req).resume()
+        }
+        writeExtLog("INFO", "[GoLan-Ext] 自主握手已触发 reason=\(reason) probes=\(probes.count)")
+    }
+
+    /// 【APP62 任务1 机制2】扩展内主动握手：软重启 / 切网 / 休眠唤醒后
+    /// 0.6 秒自动唤醒全部 go-lan-* 隧道，主 APP 无需在前台参与。
+    private func triggerExtensionGoLanHandshakes(reason: String) {
+        let probes = activeGoLanProbes
+        if probes.isEmpty { return }
+        vpnQueue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.fireGoLanHandshakeProbes(reason: reason)
+        }
+    }
+
+    /// 【APP62 任务1 机制4】25 秒轻量保活巡检：保持运营商 5G NAT 与
+    /// 家用路由器 UDP 映射不断开（仅当存在 go-lan-* 隧道时运行）。
+    private func startGoLanKeepaliveTimer() {
+        guard !activeGoLanProbes.isEmpty else {
+            stopGoLanKeepaliveTimer()
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.goLanKeepaliveTimer?.invalidate()
+            let t = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
+                guard let self = self, !self.activeGoLanProbes.isEmpty else { return }
+                self.fireGoLanHandshakeProbes(reason: "keepalive")
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.goLanKeepaliveTimer = t
+        }
+    }
+
+    private func stopGoLanKeepaliveTimer() {
+        DispatchQueue.main.async { [weak self] in
+            self?.goLanKeepaliveTimer?.invalidate()
+            self?.goLanKeepaliveTimer = nil
+        }
+    }
+
+    /// 清空内核中已失效的旧四元组连接（DELETE /connections）
+    private func clearClashConnections() {
+        guard !activeClashBase.isEmpty,
+              let url = URL(string: "\(activeClashBase)/connections")
+        else { return }
+        var req = URLRequest(url: url, timeoutInterval: 2.0)
+        req.httpMethod = "DELETE"
+        if !activeClashSecret.isEmpty {
+            req.setValue("Bearer \(activeClashSecret)", forHTTPHeaderField: "Authorization")
+        }
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     // MARK: - go-lan-home 剥离兜底（APP-8 任务4）
