@@ -483,25 +483,34 @@ fn parse_conf_line(line: &str) -> Option<Value> {
     });
 
     // 通用 TLS 字段
+    // 【APP64 任务1】trojan 默认走 TLS；任何协议显式写 tls/over-tls/over_tls/https 也开启
     let tls_flag = ["tls", "over-tls", "over_tls"]
         .iter()
         .any(|k| kv.get(*k).is_some_and(|v| truthy(v)));
-    if tls_flag || raw_proto == "https" {
+    if tls_flag || raw_proto == "https" || kind == "trojan" {
         node["tls"] = json!(true);
     }
-    if let Some(sni) = kv
-        .get("sni")
-        .or_else(|| kv.get("tls-name"))
-        .or_else(|| kv.get("tls-host"))
-        .or_else(|| kv.get("peer"))
-        .filter(|s| !s.is_empty())
+    // 【APP64 任务1】完整 SNI 优先级链：sni → servername → peer → tls-name → tls-host
+    if let Some(sni) = ["sni", "servername", "peer", "tls-name", "tls-host"]
+        .iter()
+        .find_map(|k| kv.get(*k).filter(|s| !s.is_empty()))
     {
         node["servername"] = json!(sni);
     }
-    if kv
-        .get("skip-cert-verify")
-        .is_some_and(|v| truthy(v))
-    {
+    // 【APP64 任务1】Clash / Clash.Meta YAML 里的四种写法统一归一：
+    //   skip-cert-verify: true / 1
+    //   insecure: true / yes / 1
+    //   allow-insecure: true / 1
+    //   verify: false / no / 0
+    let cert_insecure = {
+        let truthy = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        let falsy = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+        ["skip-cert-verify", "insecure", "allow-insecure", "allow_insecure"]
+            .iter()
+            .any(|k| kv.get(*k).is_some_and(|v| truthy(v)))
+            || kv.get("verify").is_some_and(|v| falsy(v))
+    };
+    if cert_insecure {
         node["skip-cert-verify"] = json!(true);
     }
 

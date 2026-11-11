@@ -1357,8 +1357,15 @@ pub fn build(
         // 最具体的规则放最前，优先于 geosite/后缀规则
         dns_rules.push(json!({ "outbound": domain_server_tags, "server": "dns-local" }));
     }
-    dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-local" }));
-    dns_rules.push(json!({ "domain_suffix": [".cn"], "server": "dns-local" }));
+    // 【APP60 / APP64 任务2.2】clash_mode 规则：严格对标 Karing 第 3/4 条
+    //  - clash_mode: direct（用户切到「直连」）→ 所有域名经 dns-direct 解析
+    //  - clash_mode: global（用户切到「全局」）→ 所有域名经 dns-remote 解析
+    // 必须排在具体 geosite/cn 规则之前，让 clash_mode 在 Rule/Global 模式下
+    // 抢先命中（first-match 语义）
+    dns_rules.push(json!({ "clash_mode": "direct", "server": "dns-direct" }));
+    dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
+    dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-direct" }));
+    dns_rules.push(json!({ "domain_suffix": [".cn"], "server": "dns-direct" }));
 
     // Go Cus [Host] 非阻断映射：走本地直连 DNS（防远程 DoH 解析私网域名失败）
     if !cus_dns_local_domains.is_empty() {
@@ -1413,22 +1420,25 @@ pub fn build(
     // direct 出站 ipv4_only，彻底告别 403 与 EPERM。
     let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
-        // 【APP-11B 任务3】dns-remote 锁定 tcp://8.8.8.8 经主选择器出境：
-        // 原先 https://dns.alidns.com/dns-query detour direct 走国内直连，
-        // 在被墙/污染环境下会被 RST；tcp://8.8.8.8 经主代理出境更稳，
-        // 且 ipv4_only 避免 iOS NECP 沙盒拒绝 AF_INET6 UDP Socket。
-        // 无代理组时回落 direct（桌面端无订阅场景兜底）。
+        // 【APP64 任务2.2】对标 Karing：dns-remote 改用 Cloudflare DoH，
+        //  https://1.1.1.1/dns-query
+        //  - URL 中直接是 IPv4 字面量 1.1.1.1，**完全不需要 DNS 解析域名**，
+        //    100% 规避 iOS NECP 沙盒拒绝 AF_INET6 UDP Socket 导致的
+        //    `[2606:4700...]:443 no route to host`；
+        //  - 走 HTTPS 443 端口经 Proxy 节点出境，100% 绕过机场对 UDP 53
+        //    的审计封锁（当前 tcp://8.8.8.8 在「一元机场」这类机场常被 RST）；
+        //  - 仅在无代理组（桌面端无订阅场景）时回落 direct。
         if let Some(main_tag) = &main_group_tag {
             json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://1.1.1.1/dns-query",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             })
         } else {
             json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://1.1.1.1/dns-query",
                 "detour": "direct",
                 "strategy": "ipv4_only",
             })
@@ -1439,34 +1449,38 @@ pub fn build(
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 【APP44 任务5】节点域名专用直连 DNS：明文 UDP 53 的 223.5.5.5，
-        // 经 direct 出站 + 扩展侧 default_interface 绑定物理网卡解析，
-        // 不依赖 dns-remote 出境，避免「先解析节点域名才能连节点」的死循环
+        // 【APP44 任务5 / APP64 任务2.2】节点域名专用直连 DNS：
+        // 明文 UDP 53 的 223.5.5.5，经 direct 出站 + 扩展侧 default_interface
+        // 绑定物理网卡解析，不依赖 dns-remote 出境，避免
+        // 「先解析节点域名才能连节点」的死锁
         json!({
             "tag": "dns-direct",
             "address": "223.5.5.5",
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 【APP50 任务2】备用直连 DNS：TCP 53 的腾讯 119.29.29.29，
-        // UDP 53 被运营商劫持/静默丢弃时经 TCP 兜底解析节点域名
+        // 备用直连 DNS：TCP 53 的腾讯 119.29.29.29，UDP 53 被运营商
+        // 劫持/静默丢弃时经 TCP 兜底解析节点域名
         json!({
             "tag": "dns-direct-tcp",
             "address": "tcp://119.29.29.29",
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
+        // 【APP64 任务2.2】iOS SVCB/HTTPS 查询拦截
+        json!({
+            "tag": "dns-block",
+            "address": "rcode://success",
+        }),
     ];
 
-    // Android DNS 清洗（APP-2 断层二修复 + APP-11B 任务3 统一）：
-    // 上方 dns-remote 已统一为 tcp://8.8.8.8 经主组出境，本分支仅作
-    // 双保险——保留原有覆盖逻辑，防止未来回归。
+    // Android DNS 清洗：同桌面 / iOS，统一 DoH 1.1.1.1
     #[cfg(target_os = "android")]
     {
         if let Some(main_tag) = &main_group_tag {
             dns_servers[0] = json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://1.1.1.1/dns-query",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             });
@@ -1738,7 +1752,7 @@ fn emit_node(
     node: &ClashNode,
     apply: &dyn Fn(&str) -> String,
     total_nodes: &mut usize,
-    ip_map: &std::collections::HashMap<String, String>,
+    _ip_map: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     // 【APP32 任务1.2】同名节点自动去重：两个相同 tag 的 outbound 会让
     // sing-box 直接启动失败，自动追加 " (2)"/" (3)" 序号后缀确保 tag 唯一。
@@ -1767,18 +1781,14 @@ fn emit_node(
                 return None;
             }
             outbound["tag"] = json!(tag);
-            // 【APP50 任务2】server 域名 → 预解析公网 IPv4（tls.server_name /
-            // ws Host 在 node_to_outbound 内已从 sni/servername/host 独立字段
-            // 写入，此处仅替换连接地址，不影响 SNI/Host 校验）
-            let server = outbound
-                .get("server")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(server) = server {
-                if let Some(ip) = ip_map.get(&server.to_ascii_lowercase()) {
-                    outbound["server"] = json!(ip);
-                }
-            }
+            // 【APP64 任务2.1】对标 Karing：**严禁**把代理节点的 server 域名预
+            // 解析替换成 IP（会破坏中转伪装 SNI / 动态域名 / 防止 sing-box
+            // 通过 dns-direct 原生解析）。统一给每个节点出站注入
+            // "domain_strategy": "prefer_ipv4"，让 sing-box 优先 IPv4
+            // Socket 直连，绕过机场服务器的双栈 IPv6 `[addr]:port` no route to host。
+            // 注：Go Lan WireGuard 出站（go-lan-home / go-lan-*）由独立代码
+            // 路径构建，不受此段影响，继续保留域名预解析（需求明确）。
+            outbound["domain_strategy"] = json!("prefer_ipv4");
             if let Some(note) = note {
                 warnings.push(format!("节点 '{}': {}", node.name, note));
             }
@@ -2207,8 +2217,14 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
                 "password": node.password.clone().unwrap_or_default(),
             });
             merge(&mut o, &base);
-            // Trojan 始终 TLS
-            o["tls"] = tls_block(node);
+            // 【APP64 任务2.1】Trojan 默认 TLS；但如果上游（URI / YAML）显式
+            // 写了 tls=false（trojan://...&security=none 或 Clash tls: false），
+            // 则严禁注入 TLS 块——否则会让 sing-box 按 TLS 握手纯 TCP 节点，
+            // 表现为「测速正常但下载为 0」
+            let tls_enabled = !matches!(node.tls, Some(false));
+            if tls_enabled {
+                o["tls"] = tls_block(node);
+            }
             let note = attach_transport(&mut o, node);
             (o, note)
         }
@@ -2450,23 +2466,44 @@ fn node_sni(node: &ClashNode) -> String {
 
 /// 完整 TLS 块：SNI / insecure / alpn / uTLS 指纹（trojan/hy2 等强制 TLS 的节点也用）
 fn tls_block(node: &ClashNode) -> Value {
-    let mut tls = json!({
-        "enabled": true,
-        "server_name": node_sni(node),
-        "insecure": node.skip_cert_verify.unwrap_or(false),
-    });
-    if let Some(alpn) = &node.alpn
-        && !alpn.is_empty()
-    {
-        tls["alpn"] = json!(alpn);
-    }
-    // 【APP42 任务1.2】uTLS 指纹：显式 client-fingerprint 优先；Reality 节点
-    // 必须带 uTLS（sing-box 侧缺省指纹会导致 Reality 握手失败），缺省补 chrome
+    let server_name = node_sni(node);
     let reality_pk = node
         .reality_opts
         .as_ref()
         .and_then(|r| r.public_key.as_deref())
         .filter(|pk| !pk.is_empty());
+    // 【APP64 任务2.1】智能 insecure 防断流保护：
+    // 当订阅没写 allowInsecure=1 / skip-cert-verify=true，但
+    //   - 节点 SNI 非空（伪装域名）
+    //   - server 是域名（不是 IPv4 字面量）
+    //   - sni 与 server 的根域名不同（典型中转伪装 SNI）
+    //   - 且不是 Reality 节点（Reality 严格证书校验，严禁开 insecure）
+    // 时，自动补 insecure=true，防止服务端自签证书与伪装 SNI 域名不匹配
+    // 导致 TLS 握手失败（表现为测速正常但下载为 0）。
+    let insecure = if node.skip_cert_verify.unwrap_or(false) {
+        true
+    } else if reality_pk.is_some() {
+        false // Reality 严格校验
+    } else {
+        sni_is_proxy_mask(&server_name, &node.server)
+    };
+    let mut tls = json!({
+        "enabled": true,
+        "server_name": server_name,
+        "insecure": insecure,
+    });
+    // 仅当 node.alpn 显式非空时才写入；**严禁**给空 alpn 默认补
+    // ["h2", "http/1.1"]——会让中转服务器因协商 h2 而拒绝 TCP 帧（下载为 0）
+    if let Some(alpn) = &node.alpn
+        && !alpn.is_empty()
+    {
+        tls["alpn"] = json!(alpn);
+    }
+    // 【APP42 / APP64 任务2.1】uTLS 指纹：
+    //   - 显式 client-fingerprint → 直接写入
+    //   - Reality 缺指纹 → 补 chrome（Reality 必须带 uTLS，否则握手失败）
+    //   - 非 Reality 且无 fp → **严禁**注入多余的 uTLS（画蛇添足会让中转服务
+    //     器因匹配不上指纹规则而拒绝连接）
     let mut fingerprint = node.client_fingerprint.clone().filter(|f| !f.is_empty());
     if fingerprint.is_none() && reality_pk.is_some() {
         fingerprint = Some("chrome".into());
@@ -2488,6 +2525,35 @@ fn tls_block(node: &ClashNode) -> Value {
         tls["reality"] = r;
     }
     tls
+}
+
+/// 【APP64 任务2.1】判断 sni 是否为中转伪装域名（与 server 根域名不同）。
+/// server=hk1.the-best-airport.com, sni=baidu.com → true（自动补 insecure）；
+/// server=hk1.example.com, sni=hk1.example.com → false（同根，正常证书）；
+/// server=1.2.3.4（IPv4 字面量）→ false（无根域名可比对）。
+fn sni_is_proxy_mask(sni: &str, server: &str) -> bool {
+    if sni.is_empty() || server.is_empty() {
+        return false;
+    }
+    // server 是 IPv4 字面量 → 无域名根可比对
+    if server.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    // 同 server 完全相同 → 非伪装
+    if sni.eq_ignore_ascii_case(server) {
+        return false;
+    }
+    // 取各自最后两段作为"根域名"：hk1.the-best-airport.com → the-best-airport.com
+    let root = |d: &str| -> String {
+        let mut parts: Vec<&str> = d.rsplit('.').collect();
+        parts.reverse();
+        if parts.len() >= 2 {
+            format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+        } else {
+            d.to_string()
+        }
+    };
+    root(sni).to_ascii_lowercase() != root(server).to_ascii_lowercase()
 }
 
 /// 传输层转换；返回 (传输块, 可选警告)。
@@ -3094,8 +3160,8 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("tcp://8.8.8.8"),
-            "dns-remote 锁定 tcp://8.8.8.8 经主选择器出境（APP-11B 任务3）"
+            Some("https://1.1.1.1/dns-query"),
+            "dns-remote 锁定 Cloudflare DoH 经主选择器出境（APP64 任务2.2）"
         );
 
         let outbound_rule = dns["rules"]
@@ -4197,16 +4263,9 @@ rules:
         let text = lines.join("\n");
         // 真实链路：URI 列表 → uri_parser → 节点 JSON → 合成 Clash YAML → build
         let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
-        assert!(errors.is_empty(), "19 行必须全部解析成功: {errors:?}");
-        assert!(notice.is_none(), "0.0.0.0 假节点不得被误作机场提示");
-        assert_eq!(nodes.len(), 19, "1 假 + 14 vless + 4 trojan = 19 行");
-        // 假节点：sni=0.0.0.0 必须被清空（APP45 任务2.1）
-        assert_eq!(nodes[0]["server"], "0.0.0.0");
-        assert!(
-            nodes[0].get("sni").is_none(),
-            "sni=0.0.0.0 占位值必须丢弃: {}",
-            nodes[0]
-        );
+        assert!(errors.is_empty(), "真实 18 行必须全部解析成功: {errors:?}");
+        assert!(notice.is_some(), "server=0.0.0.0 的假节点必须被识别为机场提示");
+        assert_eq!(nodes.len(), 18, "假节点被过滤后：14 vless + 4 trojan = 18 行");
         let doc = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
             .expect("合成 Clash YAML");
         let built = build(
@@ -4279,9 +4338,10 @@ rules:
             ));
         }
         let text = lines.join("\n");
-        let (nodes, errors, _notice) = crate::core::uri_parser::parse_lines(&text);
-        assert!(errors.is_empty(), "19 行必须全部解析成功: {errors:?}");
-        assert_eq!(nodes.len(), 19, "1 假 + 14 vless + 4 trojan = 19 行");
+        let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
+        assert!(errors.is_empty(), "真实 18 行必须全部解析成功: {errors:?}");
+        assert!(notice.is_some(), "server=0.0.0.0 假节点必须被识别为机场提示");
+        assert_eq!(nodes.len(), 18, "假节点被过滤后：14 vless + 4 trojan = 18 行");
         let doc_a = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
             .expect("合成 Clash YAML");
 
@@ -4404,6 +4464,164 @@ rules:
         assert!(
             !rewritten.is_empty(),
             "第三方组规则出口必须被归一化为 Proxy: {rules:?}"
+        );
+    }
+
+    /// 【APP64 任务4】节点_3.txt 对标 Karing 全链路验证：
+    /// - Trojan 默认 TLS；VLESS 默认 TLS；Trojan+security=none 显式关 TLS
+    /// - Trojan/Reality 缺指纹自动补 chrome；无 fp 非 Reality 严禁 utls
+    /// - 伪装 SNI（peer/sni 根域名 ≠ server 根域名）自动补 insecure=true
+    /// - VLESS outbound 必须带 flow + packet_encoding=xudp
+    /// - 每个代理节点统一 domain_strategy=prefer_ipv4
+    /// - DNS 对标 Karing：dns-remote=https://1.1.1.1/dns-query + Proxy；
+    ///   DNS 规则首条 outbound:any → dns-direct；含 clash_mode:direct/global
+    /// - **严禁** 给未知 network（tcp/空）的节点写多余 transport 字段
+    #[test]
+    fn test_node_3_txt_vless_vision_and_trojan_full_pipeline() {
+        // 14 vless（tcp + sni=baidu.com + flow=xtls-rprx-vision + allowInsecure=1 + 无 fp）
+        let mut lines: Vec<String> = (1..=14u32)
+            .map(|i| {
+                format!(
+                    "vless://6588f867-42b2-44d2-afd4-65227ca09d30@hk{i}.the-best-airport.com:443?allowInsecure=1&encryption=none&flow=xtls-rprx-vision&security=tls&sni=baidu.com&type=tcp#HK{i}"
+                )
+            })
+            .collect();
+        // 4 trojan（peer=update.microsoft.com 伪装 SNI + allowInsecure=1 + 无 fp）
+        for i in 1..=4u32 {
+            lines.push(format!(
+                "trojan://6588f867-42b2-44d2-afd4-65227ca09d30@us{i}.the-best-airport.com:443?allowInsecure=1&peer=update.microsoft.com&sni=update.microsoft.com&type=tcp#US{i}"
+            ));
+        }
+        // 额外：trojan://...&security=none 显式关 TLS —— 验证 Trojan 默认 TLS 但显式 none 会关
+        lines.push(
+            "trojan://pw@plain.example.com:8080?type=tcp&security=none&allowInsecure=1#PLAIN-TROJAN"
+                .to_string(),
+        );
+        // 额外：trojan://...&security=tls 默认开 TLS —— 验证默认 tls=true
+        lines.push(
+            "trojan://pw@default.example.com:443?type=tcp#DEFAULT-TROJAN".to_string(),
+        );
+        let text = lines.join("\n");
+        let (nodes, errors, _) = crate::core::uri_parser::parse_lines(&text);
+        assert!(errors.is_empty());
+        assert_eq!(nodes.len(), 20, "14 vless + 4 trojan + 1 plain + 1 default = 20");
+        let doc = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
+            .expect("合成 Clash YAML");
+        let base = std::env::temp_dir().join("prism-cb-test-app64");
+        let built = build(
+            &[("https://sub.example".into(), "机场".into(), doc)],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &base,
+            &base.join("kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build 成功");
+
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+
+        // —— Trojan 默认 TLS + 显式 security=none 关 TLS ——
+        let plain_trojan = outbounds
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("PLAIN-TROJAN"))
+            .expect("PLAIN-TROJAN 缺失");
+        assert_eq!(plain_trojan["type"], "trojan");
+        assert!(
+            plain_trojan.get("tls").is_none(),
+            "trojan security=none 必须完全移除 TLS 块: {plain_trojan}"
+        );
+
+        let default_trojan = outbounds
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("DEFAULT-TROJAN"))
+            .expect("DEFAULT-TROJAN 缺失");
+        assert!(
+            default_trojan.get("tls").is_some()
+                && default_trojan["tls"]["enabled"].as_bool() == Some(true),
+            "trojan 默认必须开启 TLS: {default_trojan}"
+        );
+
+        // —— 伪装 SNI 智能 insecure（trojan peer/sni = update.microsoft.com，
+        //    server = us1.the-best-airport.com → 根域名不同）——
+        let trojan_mask = outbounds
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("US1"))
+            .expect("US1 trojan 缺失");
+        assert_eq!(
+            trojan_mask["tls"]["server_name"], "update.microsoft.com",
+            "伪装 SNI server_name 必须正确"
+        );
+        assert!(
+            trojan_mask["tls"]["insecure"].as_bool() == Some(true),
+            "伪装 SNI 的 trojan 必须自动补 insecure=true: {trojan_mask}"
+        );
+
+        // —— VLESS：flow + packet_encoding + utls 严禁 ——
+        let hk1_vless = outbounds
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("HK1"))
+            .expect("HK1 vless 缺失");
+        assert_eq!(hk1_vless["flow"], "xtls-rprx-vision");
+        assert_eq!(hk1_vless["packet_encoding"], "xudp");
+        assert!(
+            hk1_vless.get("utls").is_none() && hk1_vless["tls"].get("utls").is_none(),
+            "无 fp 的 vless 严禁注入 utls: {hk1_vless}"
+        );
+
+        // —— 每个代理节点统一 domain_strategy=prefer_ipv4 ——
+        for o in outbounds.iter().filter(|o| {
+            let t = o["type"].as_str().unwrap_or("");
+            matches!(
+                t,
+                "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria" | "hysteria2" | "tuic"
+            )
+        }) {
+            assert_eq!(
+                o["domain_strategy"].as_str(),
+                Some("prefer_ipv4"),
+                "{} 必须注入 domain_strategy=prefer_ipv4",
+                o["tag"]
+            );
+        }
+
+        // —— 严禁给 tcp 节点写多余 transport 字段 ——
+        for o in outbounds.iter().filter(|o| o["type"].as_str() == Some("vless")) {
+            assert!(
+                o.get("transport").is_none() && o.get("ws-opts").is_none()
+                    && o.get("grpc-opts").is_none(),
+                "tcp 类型节点严禁写 transport / ws-opts / grpc-opts: {o}"
+            );
+        }
+
+        // —— DNS 对标 Karing ——
+        let dns = &built.config["dns"];
+        let remote = dns["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"].as_str() == Some("dns-remote"))
+            .unwrap();
+        assert_eq!(remote["address"], "https://1.1.1.1/dns-query");
+        assert_eq!(remote["detour"], "Proxy");
+        let rules = dns["rules"].as_array().unwrap();
+        assert!(
+            rules.iter().any(|r| r["outbound"].as_str() == Some("any")
+                && r["server"].as_str() == Some("dns-direct")),
+            "必须存在 outbound:any → dns-direct"
+        );
+        assert!(
+            rules.iter().any(|r| r["clash_mode"].as_str() == Some("direct")
+                && r["server"].as_str() == Some("dns-direct")),
+            "必须存在 clash_mode: direct → dns-direct"
+        );
+        assert!(
+            rules.iter().any(|r| r["clash_mode"].as_str() == Some("global")
+                && r["server"].as_str() == Some("dns-remote")),
+            "必须存在 clash_mode: global → dns-remote"
         );
     }
 

@@ -203,39 +203,47 @@ fn urlencoding_decode(s: &str) -> Option<String> {
 }
 
 /// 解析 query string 为键值对（保留顺序）
+///
+/// 【APP64 任务1】三项关键修复：
+/// 1. 先 trim `?` 前缀（整 URL 直传场景也安全）；
+/// 2. 键名统一 to_ascii_lowercase（allowInsecure / Allowinsecure / ALLOWINSECURE 全部命中）；
+/// 3. 值已做 percent_decode + trim，消除行尾残留 \r。
 fn parse_query(q: &str) -> Vec<(String, String)> {
-    q.split('&')
+    let clean_q = q.trim().trim_start_matches('?');
+    clean_q
+        .split('&')
         .filter(|p| !p.is_empty())
         .filter_map(|p| {
             let mut it = p.splitn(2, '=');
-            let k = it.next()?.trim();
+            let k = it.next()?.trim().to_ascii_lowercase();
             let v = it.next().unwrap_or_default().trim();
-            Some((
-                urlencoding_decode(k).unwrap_or_else(|| k.to_string()).trim().to_string(),
-                urlencoding_decode(v).unwrap_or_else(|| v.to_string()).trim().to_string(),
-            ))
+            let decoded_k = urlencoding_decode(&k).unwrap_or_else(|| k.clone());
+            let decoded_v = urlencoding_decode(v)
+                .unwrap_or_else(|| v.to_string())
+                .trim()
+                .to_string();
+            Some((decoded_k, decoded_v))
         })
         .collect()
 }
 
-/// 【APP44 任务5】自签证书 / 跳过证书校验参数识别。
-/// 各机场/客户端写法五花八门：insecure / allowInsecure / allow_insecure /
-/// skip-cert-verify，取值 1 / true / yes。此前 vless / trojan 完全忽略这些
-/// 参数，自签或 CDN 证书不匹配的节点会 TLS 握手失败而“连不上”。
+/// 【APP44 任务5 / APP64 任务1】自签证书 / 跳过证书校验参数识别。
+///
+/// 触发 skip-cert-verify=true 的两种等价方式：
+///  1) allowinsecure / allow_insecure / insecure / skip-cert-verify / skip_cert_verify
+///     值为 "1"/"true"/"yes"/"on"；
+///  2) verify / cert-verify 值为 "0"/"false"/"no"/"off"。
+/// parse_query 已统一键为小写，这里直接匹配即可。
 fn insecure_flag(params: &std::collections::HashMap<String, String>) -> bool {
-    let truthy = |v: &str| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    };
-    // 参数名大小写在不同机场并不统一（allowInsecure / allowinsecure），
-    // 统一转小写后匹配
+    let truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    let falsy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
     params.iter().any(|(k, v)| {
+        let kl = k.as_str();
         matches!(
-            k.trim().to_ascii_lowercase().as_str(),
-            "insecure" | "allowinsecure" | "allow_insecure" | "skip-cert-verify" | "skipcertverify"
+            kl,
+            "insecure" | "allowinsecure" | "allow_insecure" | "skip-cert-verify" | "skipcertverify" | "skip_cert_verify"
         ) && truthy(v)
+        || matches!(kl, "verify" | "cert-verify" | "certverify") && falsy(v)
     })
 }
 
@@ -427,7 +435,9 @@ fn parse_vless(rest: &str) -> Result<Value> {
     let name = decode_name(name);
 
     // 机场返回的提示节点（流量超限/到期/重置引导等）
-    if server.starts_with("127.") || server.starts_with("localhost")
+    // 【APP64 任务1】补全 0.0.0.0 / server=0 / port=0 的伪节点过滤
+    if server == "0.0.0.0" || server == "127.0.0.1" || server.starts_with("127.")
+        || server == "localhost" || port == 0
         || name.contains("剩余流量") || name.contains("下次重置")
         || name.contains("超限") || name.contains("重置接入")
         || name.contains("到期") || name.contains("请至面板") {
@@ -445,8 +455,11 @@ fn parse_vless(rest: &str) -> Result<Value> {
         .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
-    // 【APP45 任务2.1】sni/servername/peer 提取非空值，且拒绝 "0.0.0.0" 占位值
-    let sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned()).unwrap_or_default();
+    // 【APP64 任务1】完整 SNI 优先级链：sni → servername → peer → tls-name → tls-host
+    let sni = ["sni", "servername", "peer", "tls-name", "tls-host"]
+        .iter()
+        .find_map(|k| params.get(*k).cloned())
+        .unwrap_or_default();
     let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
     let fp = params.get("fp").cloned().unwrap_or_default();
     let flow = params.get("flow").cloned().unwrap_or_default();
@@ -455,7 +468,7 @@ fn parse_vless(rest: &str) -> Result<Value> {
     let alpn = params.get("alpn").cloned().unwrap_or_default();
     let path = params.get("path").cloned().unwrap_or_default();
     let host = params.get("host").cloned().unwrap_or_default();
-    let service_name = params.get("serviceName").cloned().unwrap_or_default();
+    let service_name = params.get("servicename").cloned().unwrap_or_default();
 
     let mut node = json!({
         "name": name,
@@ -520,7 +533,9 @@ fn parse_trojan(rest: &str) -> Result<Value> {
     let name = decode_name(name);
 
     // 机场返回的提示节点
-    if server.starts_with("127.") || server.starts_with("localhost")
+    // 【APP64 任务1】补全 0.0.0.0 / server=0 / port=0 的伪节点过滤
+    if server == "0.0.0.0" || server == "127.0.0.1" || server.starts_with("127.")
+        || server == "localhost" || port == 0
         || name.contains("剩余流量") || name.contains("下次重置")
         || name.contains("超限") || name.contains("重置接入")
         || name.contains("到期") || name.contains("请至面板") {
@@ -528,13 +543,23 @@ fn parse_trojan(rest: &str) -> Result<Value> {
     }
 
     let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
-    // 【APP45 任务2.1】peer 映射 sni（update.microsoft.com 等伪装域名），拒绝 0.0.0.0
-    let sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned()).unwrap_or_default();
+    // 【APP64 任务1】完整 SNI 优先级链：sni → servername → peer → tls-name → tls-host
+    let sni = ["sni", "servername", "peer", "tls-name", "tls-host"]
+        .iter()
+        .find_map(|k| params.get(*k).cloned())
+        .unwrap_or_default();
     let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
     let alpn = params.get("alpn").cloned().unwrap_or_default();
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let path = params.get("path").cloned().unwrap_or_default();
     let host = params.get("host").cloned().unwrap_or_default();
+    // 【APP64 任务1】trojan 安全参数：显式 security=none 才关掉 TLS；缺省一律默认开启。
+    // 显式写 json!(false) 让下游 config_builder 能区分「上游明确要关」与「默认」，
+    // 不会因 None 而误加 TLS 块。
+    let security = params
+        .get("security")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
 
     let mut node = json!({
         "name": name,
@@ -544,6 +569,9 @@ fn parse_trojan(rest: &str) -> Result<Value> {
         "password": password,
     });
 
+    // 【APP64 任务1】trojan 默认走 TLS；security=none 显式关 TLS
+    let tls_enabled = security != "none";
+    node["tls"] = json!(tls_enabled);
     if !sni.is_empty() {
         node["sni"] = json!(sni);
     }
@@ -564,8 +592,8 @@ fn parse_trojan(rest: &str) -> Result<Value> {
         node["network"] = json!("grpc");
         node["grpc-opts"] = json!({ "grpc-service-name": host });
     }
-    // 【APP44 任务5】trojan 默认走 TLS；allowInsecure / insecure 必须落到
-    // skip-cert-verify，否则自签证书节点握手失败（表现为全部节点不可用）
+    // 【APP44 / APP64 任务1】allowInsecure / insecure / verify=0 落到
+    // skip-cert-verify，否则自签证书节点握手失败
     if insecure_flag(&params) {
         node["skip-cert-verify"] = json!(true);
     }

@@ -1666,23 +1666,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 【APP18 任务2】iOS 路由完全由 NEPacketTunnelNetworkSettings
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
-                    // 【APP39 任务2.1】tun-in 改为纯用户态 gvisor 栈并把 MTU
-                    // 锁定 1280：mixed 栈的 TCP 会走 system 栈、由扩展进程创建
-                    // 172.19.0.2（utun 虚拟地址）的内部 BSD Socket，被 iOS
-                    // NECP 防回环策略拒绝，刷屏 "report handshake success:
-                    // connection refused"。gvisor 全程用户态内存转发，
-                    // Safari TCP 与远程桌面 UDP 走完全相同的纯内存通道，
-                    // 直达 go-lan-home，彻底消除该内核错误。
+                    // 【APP39 / APP64 任务3.1】tun-in 统一虚拟网卡地址与 gvisor 协议栈：
+                    // - stack="gvisor"：用户态协议栈直接从 utun fd 读写 IP 包，不依赖 iOS 内核
+                    //   Loopback 注入，彻底根除 `endpoint not connected` 导致下载为 0 的问题；
+                    // - address=["172.19.0.1/30"]：与 NEPacketTunnelNetworkSettings 的
+                    //   NEIPv4Settings 100% 对齐（系统路由、DNS 默认路由、tun 本地三者同一网段）；
+                    // - 移除旧字段 inet4_address 冲突（它是旧 sing-box 旧 API，新 sing-box 仅用 address）。
+                    inbounds[i].removeValue(forKey: "inet4_address")
+                    inbounds[i]["address"] = ["172.19.0.1/30"]
                     inbounds[i]["mtu"] = 1280
                     inbounds[i]["stack"] = "gvisor"
-                    // 【APP39 任务3】开启非改写式被动嗅探：提取 TLS SNI 与
-                    // HTTP Host 到 metadata.host，分析页「域名/IP」切换才有
-                    // 真实数据；sniff_override_destination 保持 false，
-                    // 绝不改写目标地址（否则会破坏 ip_cidr → go-lan-home 匹配）。
+                    // 【APP39 任务3 / APP64 任务3.1】开启非改写式被动嗅探：提取 TLS SNI 与
+                    // HTTP Host 到 metadata.host；**严禁** sniff_override_destination=true
+                    // （会破坏 ip_cidr → go-lan-home 匹配 / 伪装 SNI 节点连接目标错乱）
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = false
-                    // 【APP60 任务3.3】50ms 嗅探超时：非 HTTP 协议快速放行，
-                    // 避免拖慢首包
                     inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
