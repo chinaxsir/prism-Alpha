@@ -1479,24 +1479,74 @@ pub(crate) async fn refresh_subscription(
     // 【APP51 任务1】订阅刷新后第一时间清理失效节点缓存并中止旧探测任务
     purge_disabled_or_deleted_subscription_nodes(state);
 
-    // 内核运行中：重建配置重启，新订阅即刻生效。
-    // APP34：移动端 VPN 运行期间严禁「停隧道 + 重启隧道」——iOS 扩展在
-    // 50MB Jetsam 红线内重启必然崩溃（表现为启动 10~15 秒后自动停止）。
-    // 此时只落盘订阅缓存并广播事件，新节点在下次正常启动时生效。
-    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+    // 内核运行中：重建配置立即生效。
+    // 【APP65 任务3.1】移动端不再「等下次启动」：重建 config 后写入磁盘与
+    // iOS App Group 共享目录 prism_config.json，扩展侧 3s 配置监视器检测到
+    // mtime 变化即软重启 Go 内核（NEPacketTunnel 会话与 utun 不变），
+    // 新订阅节点 3 秒内出现在内核中，用户无需手动关闭再开启 VPN。
     if *state.status.read() == CoreStatus::Running {
-        if mobile {
-            tracing::info!("subscription updated, mobile running: skip tunnel restart");
-            crate::core::logger::info(
-                crate::core::logger::MOD_SUB,
-                "移动端 VPN 运行中，订阅缓存已更新，隧道保持不重启（下次启动生效）",
-            );
-        } else {
+        #[cfg(target_os = "ios")]
+        {
+            match hot_reload_mobile_config(app, state).await {
+                Ok(()) => crate::core::logger::info(
+                    crate::core::logger::MOD_SUB,
+                    "VPN 运行中：订阅已更新，正在热重载内核配置（新节点即刻生效）",
+                ),
+                Err(e) => {
+                    tracing::warn!("mobile hot reload failed: {e}");
+                    crate::core::logger::info(
+                        crate::core::logger::MOD_SUB,
+                        &format!("VPN 运行中：订阅已更新，热重载失败（下次启动生效）：{e}"),
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
             tracing::info!("subscription updated, restarting core");
             restart_core(app, state).await?;
         }
     }
 
+    Ok(())
+}
+
+/// 【APP65 任务3.1】移动端 VPN 运行中订阅 / 节点热生效：
+/// 1. 复用 prepare_start 完整重建 sing-box 配置（多订阅合并 + 规则 + DNS）；
+/// 2. Clash API 地址与密钥沿用当前运行值，扩展软重启后主 App 无需重新同步；
+/// 3. 落盘 work_dir/config.json（诊断留档）与 App Group 共享目录
+///    prism_config.json（iOS 扩展下一次软重启直接读取）。
+#[cfg(target_os = "ios")]
+async fn hot_reload_mobile_config(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let mut prepared = prepare_start(app, state).await?;
+    if let Some(api) = prepared
+        .built
+        .config
+        .pointer_mut("/experimental/clash_api")
+        .and_then(|v| v.as_object_mut())
+    {
+        api.insert(
+            "external_controller".to_string(),
+            serde_json::json!(state.api_addr.read().clone()),
+        );
+        let secret = state.api_secret.read().clone();
+        if secret.is_empty() {
+            api.remove("secret");
+        } else {
+            api.insert("secret".to_string(), serde_json::json!(secret));
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&prepared.built.config)
+        .map_err(|e| format!("序列化热重载配置失败: {e}"))?;
+    let path = prepared.work_dir.join("config.json");
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入热重载配置失败: {e}"))?;
+    #[cfg(target_os = "ios")]
+    if let Some(group) = crate::platform::ios::app_group_dir() {
+        let shared = std::path::Path::new(&group).join("prism_config.json");
+        std::fs::write(&shared, &bytes)
+            .map_err(|e| format!("写入 App Group 热重载配置失败: {e}"))?;
+        tracing::info!("hot reload config written to {}", shared.display());
+    }
     Ok(())
 }
 
@@ -2386,14 +2436,33 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
     }
 }
 
-/// 【APP44 任务1.3】内核未运行时的真实测速：DoH / 系统 DNS 解析节点服务器
+/// 【APP65 任务3.2】节点域名解析缓存条目：解析时刻 + IPv4 列表（5 分钟 TTL）。
+/// 带 TTL 后既避免每次测速重复打系统 DNS，也保证机场换 IP 后能及时刷新。
+type NodeDnsEntry = (std::time::Instant, Vec<std::net::Ipv4Addr>);
+
+/// 缓存有效期：5 分钟（与 config_builder 的 DoH 预解析缓存同口径）
+const NODE_DNS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 【APP54 任务2】全局节点域名预解析缓存（系统 DNS + 阿里/腾讯 DoH）。
 /// 一次全量测速只解析去重后的服务器域名（20 路并发），失败不缓存。
-static NODE_DNS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>>> =
+static NODE_DNS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, NodeDnsEntry>>,
+> = std::sync::OnceLock::new();
+
+fn node_dns_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, NodeDnsEntry>,
+> {
+    NODE_DNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 【APP65 任务3.2】系统 DNS 并发闸门：最多 8 个 lookup_host 同时进行。
+/// iOS 的 getaddrinfo 由 mDNSResponder 单一线程池服务，并发过高会把
+/// 查询互相阻塞成递归等待（崩溃报告 Thread 14~17 全部卡在 getaddrinfo）。
+static DNS_LOOKUP_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
     std::sync::OnceLock::new();
 
-fn node_dns_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>> {
-    NODE_DNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn dns_lookup_semaphore() -> &'static tokio::sync::Semaphore {
+    DNS_LOOKUP_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(8))
 }
 
 /// 解析节点服务器真实 IPv4（系统 DNS 优先，再回退阿里 DoH 223.5.5.5、
@@ -2408,21 +2477,27 @@ async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
         };
     }
     if let Ok(cache) = node_dns_cache().lock()
-        && let Some(hit) = cache.get(&key).filter(|v| !v.is_empty())
+        && let Some((ts, hit)) = cache.get(&key)
+        && ts.elapsed() < NODE_DNS_TTL
+        && !hit.is_empty()
     {
         return hit.clone();
     }
     let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
-    // 1) 系统 DNS
-    if let Ok(addrs) = tokio::net::lookup_host((server, 443)).await {
-        for addr in addrs {
-            if let std::net::IpAddr::V4(ip) = addr.ip()
-                && !is_virtual_speedtest_ip(addr.ip())
-                && !out.contains(&ip)
-            {
-                out.push(ip);
+    // 1) 系统 DNS（并发闸门 8：防止堵死 iOS mDNSResponder 线程池）
+    {
+        let permit = dns_lookup_semaphore().acquire().await.ok();
+        if let Ok(addrs) = tokio::net::lookup_host((server, 443)).await {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(ip) = addr.ip()
+                    && !is_virtual_speedtest_ip(addr.ip())
+                    && !out.contains(&ip)
+                {
+                    out.push(ip);
+                }
             }
         }
+        drop(permit);
     }
     // 2) DoH 兜底（阿里 / 腾讯），JSON 接口返回 Answer 数组
     if out.is_empty() {
@@ -2462,7 +2537,9 @@ async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
     if !out.is_empty()
         && let Ok(mut cache) = node_dns_cache().lock()
     {
-        cache.insert(key, out.clone());
+        // 顺带清理过期条目，保证缓存不会无限增长
+        cache.retain(|_, (ts, _)| ts.elapsed() < NODE_DNS_TTL);
+        cache.insert(key, (std::time::Instant::now(), out.clone()));
     }
     out
 }
@@ -2778,17 +2855,20 @@ async fn resolve_real_ipv4s(
             }
         }
     }
-    if out.is_empty()
-        && let Ok(addrs) = tokio::net::lookup_host((server, port)).await
-    {
-        for addr in addrs {
-            if let std::net::IpAddr::V4(ip) = addr.ip()
-                && !is_virtual_speedtest_ip(addr.ip())
-                && !out.contains(&ip)
-            {
-                out.push(ip);
+    if out.is_empty() {
+        // 【APP65 任务3.2】系统 DNS 兜底同样受 8 路并发闸门约束
+        let permit = dns_lookup_semaphore().acquire().await.ok();
+        if let Ok(addrs) = tokio::net::lookup_host((server, port)).await {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(ip) = addr.ip()
+                    && !is_virtual_speedtest_ip(addr.ip())
+                    && !out.contains(&ip)
+                {
+                    out.push(ip);
+                }
             }
         }
+        drop(permit);
     }
     out
 }

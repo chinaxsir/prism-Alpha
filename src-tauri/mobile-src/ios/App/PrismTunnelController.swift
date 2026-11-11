@@ -279,11 +279,21 @@ func prismIosOpenUrl(_ urlCStr: UnsafePointer<CChar>?) -> Bool {
     return true
 }
 
-/// 【APP63 任务2.2】零闪退文本文件导出 / 分享：
-/// 1. 先无条件写入系统剪贴板（100% 可靠保底）；
-/// 2. 再写入 tmp 目录并**在主线程**安全唤起 UIActivityViewController，
-///    且必须设置 popoverPresentationController.sourceView / sourceRect，
-///    否则 iPad / 折叠屏会抛 NSGenericException 导致 APP 闪退。
+/// 【APP65 任务1】根治 iOS 导出运行日志 SIGSEGV 闪退。
+///
+/// 崩溃铁证（`Prism-2026-11-11-173006.ips` Thread 4
+/// `com.apple.SharingUI.SFUIImageProvider.fetchQueue`）：
+/// `UIActivityViewController` → `-[UIAirDropActivity _activityImage]`
+/// → `LICreateIconForImage` → `CI::GLContext::GLContext` 在 iOS 16.5
+/// 系统分享面板渲染 AirDrop 图标时 `EXC_BAD_ACCESS (pc=0x0)`。
+/// 因此这里**彻底移除 `UIActivityViewController`**，改用
+/// `UIDocumentPickerViewController(forExporting:asCopy:)` 直接导出到
+/// iOS「文件」App，完全不经过 SharingUI / AirDrop / CoreImage。
+///
+/// 三通道保底：
+/// 1. 立即写入系统剪贴板（100% 零崩溃，随时可直接粘贴）；
+/// 2. 同时写入 tmp 目录与 Documents 目录（用户可在「文件」App 中找到）；
+/// 3. 主线程弹出「存储到文件」原生选择器。
 /// 全程仅做字符串写入与主线程派发，绝不触碰 WebView 视图树。
 @_cdecl("prism_ios_share_text_file")
 func prismIosShareTextFile(
@@ -291,16 +301,17 @@ func prismIosShareTextFile(
     _ contentCStr: UnsafePointer<CChar>?
 ) -> Bool {
     guard let filenameCStr = filenameCStr, let contentCStr = contentCStr else { return false }
-    let filename = String(cString: filenameCStr)
+    let rawName = String(cString: filenameCStr)
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    let filename = rawName.isEmpty ? "prism-diagnostic-log.txt" : rawName
     let content = String(cString: contentCStr)
-    if filename.isEmpty || content.isEmpty { return false }
+    if content.isEmpty { return false }
 
     DispatchQueue.main.async {
-        // 1. 剪贴板兜底
+        // 1. 立即写入系统剪贴板（100% 零崩溃、随时可直接粘贴）
         UIPasteboard.general.string = content
 
-        // 2. 写临时文件
+        // 2. 写入临时目录与 Documents 目录
         let tempDir = FileManager.default.temporaryDirectory
         let fileURL = tempDir.appendingPathComponent(filename)
         do {
@@ -309,11 +320,17 @@ func prismIosShareTextFile(
             NSLog("[PrismVPN] 写导出日志失败: \(error.localizedDescription)")
             return
         }
+        if let docDir = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask).first {
+            let docURL = docDir.appendingPathComponent(filename)
+            try? content.write(to: docURL, atomically: true, encoding: .utf8)
+        }
 
         // 3. 定位最顶层控制器
-        guard let scene = UIApplication.shared.connectedScenes
+        let activeScene = UIApplication.shared.connectedScenes
             .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
-            ?? UIApplication.shared.connectedScenes.first as? UIWindowScene,
+        let fallbackScene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+        guard let scene = activeScene ?? fallbackScene,
             let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController
                 ?? scene.windows.first?.rootViewController else {
             return
@@ -322,20 +339,13 @@ func prismIosShareTextFile(
         while let presented = topVC.presentedViewController {
             topVC = presented
         }
-        // 已有分享面板时绝不重复弹出
-        if topVC is UIActivityViewController { return }
+        // 已有导出面板时绝不重复弹出
+        if topVC is UIDocumentPickerViewController { return }
 
-        let activityVC = UIActivityViewController(
-            activityItems: [fileURL], applicationActivities: nil)
-        if let popover = activityVC.popoverPresentationController {
-            popover.sourceView = topVC.view
-            popover.sourceRect = CGRect(
-                x: topVC.view.bounds.midX,
-                y: topVC.view.bounds.maxY - 60,
-                width: 1, height: 1)
-            popover.permittedArrowDirections = []
-        }
-        topVC.present(activityVC, animated: true, completion: nil)
+        // 4. 系统「文件」导出面板：零 SharingUI / 零 AirDrop / 零 CoreImage
+        let picker = UIDocumentPickerViewController(forExporting: [fileURL], asCopy: true)
+        picker.modalPresentationStyle = .formSheet
+        topVC.present(picker, animated: true, completion: nil)
     }
     return true
 }

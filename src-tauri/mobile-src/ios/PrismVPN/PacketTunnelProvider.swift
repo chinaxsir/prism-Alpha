@@ -421,6 +421,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeClashBase: String = ""
     private var activeClashSecret: String = ""
 
+    /// 【APP65 任务3.1】订阅热更新配置监视器：3s 轮询共享
+    /// prism_config.json 的 mtime，主 App 更新订阅后写入新配置即触发
+    /// 内核软重启，NEPacketTunnel 会话与 utun 保持不变。
+    private var configWatchTimer: Timer?
+    private var lastConfigMTime: Date?
+
     // MARK: - 生命周期
 
     /// 【build 169 方案】init() 级最早心跳：系统 pkd 实例化扩展进程的
@@ -692,6 +698,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.scheduleGoLanWarmup(sanitizedConfig: sanitizedConfig)
                 DispatchQueue.main.async {
                     self.startHeartbeatTimer()
+                    self.startConfigWatchTimer()
                     completionHandler(nil)
                 }
             } catch {
@@ -951,6 +958,78 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         heartbeatTimer = t
     }
 
+    /// 【APP65 任务3.1】订阅热更新监视：主 App 更新/导入订阅成功后会把新的
+    /// sing-box 配置写入共享 prism_config.json（Rust 侧 hot_reload_mobile_config），
+    /// 这里每 3s 比对一次 mtime，变化即在 vpnQueue 内软重启 Go 内核加载新节点。
+    /// 隧道会话与 utun 不销毁，UI 计时器不重置，用户无感。
+    private func startConfigWatchTimer() {
+        configWatchTimer?.invalidate()
+        lastConfigMTime = configFileModificationDate()
+        let t = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard let latest = self.configFileModificationDate() else { return }
+            guard let last = self.lastConfigMTime else {
+                self.lastConfigMTime = latest
+                return
+            }
+            guard latest > last else { return }
+            self.lastConfigMTime = latest
+            self.stateLock.lock()
+            let running = (self.currentState == .running)
+            self.stateLock.unlock()
+            guard running, !self.isReloadingForNetworkChange else { return }
+            self.vpnQueue.async { [weak self] in
+                guard let self = self else { return }
+                guard !self.isReloadingForNetworkChange, self.activeWorkDir != nil else { return }
+                let phy = self.boundPhysicalInterface()
+                self.isReloadingForNetworkChange = true
+                self.writeExtLog("INFO", "📥 检测到订阅配置更新，软重启内核加载新节点（\(phy.name) \(phy.ipv4)）")
+                self.writeHeartbeat("config-reload")
+                self.restartKernelOnCurrentQueue(newPhy: phy)
+                self.refreshOnDemandBypassIfNeeded(phyName: phy.name, phyIPv4: phy.ipv4)
+                self.isReloadingForNetworkChange = false
+                self.triggerExtensionGoLanHandshakes(reason: "config-reload")
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        configWatchTimer = t
+    }
+
+    /// 共享配置文件 URL（providerConfiguration.config_path 优先，回落 App Group）
+    private func sharedConfigFileURL() -> URL? {
+        if let configPath = (protocolConfiguration as? NETunnelProviderProtocol)?
+            .providerConfiguration?["config_path"] as? String,
+           !configPath.isEmpty
+        {
+            return URL(fileURLWithPath: configPath)
+        }
+        let base = resolvedSharedDirURL
+            ?? FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: prismAppGroupID)
+        return base?.appendingPathComponent("prism_config.json")
+    }
+
+    private func configFileModificationDate() -> Date? {
+        guard let url = sharedConfigFileURL(),
+              let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        else { return nil }
+        return values.contentModificationDate
+    }
+
+    /// 当前绑定的物理网卡（配置热重载时沿用已生效的绑定，不做重新探测）
+    private func boundPhysicalInterface() -> PhysicalInterface {
+        let name = activeBoundInterface.isEmpty ? cachedPhysicalIfName : activeBoundInterface
+        let ip = activeBoundIPv4.isEmpty
+            ? (localInterfaceIPv4(name) ?? "")
+            : activeBoundIPv4
+        return PhysicalInterface(
+            name: name,
+            index: cachedPhysicalIfIndex,
+            hasRoutableIP: !ip.isEmpty,
+            ipv4: ip
+        )
+    }
+
     override func stopTunnel(
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
@@ -962,6 +1041,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.main.async {
             self.heartbeatTimer?.invalidate()
             self.heartbeatTimer = nil
+            // 【APP65 任务3.1】停止订阅热更新配置监视器
+            self.configWatchTimer?.invalidate()
+            self.configWatchTimer = nil
+            self.lastConfigMTime = nil
             // 【APP62 任务1】停止 25 秒保活巡检与待执行的基站切换软重启
             self.goLanKeepaliveTimer?.invalidate()
             self.goLanKeepaliveTimer = nil
@@ -1080,11 +1163,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
 
-        let dnsServer = (json["dns_server"] as? String)
-            ?? ((json["dns_servers"] as? [String])?.first)
-            ?? "1.1.1.1"
-        let cleanDNS = dnsServer.isEmpty ? "1.1.1.1" : dnsServer
-        let dnsSettings = NEDNSSettings(servers: [cleanDNS, "8.8.8.8"])
+        // 【APP65 任务2.3】虚拟 DNS 地址固定为隧道内的 172.19.0.2：
+        // iPhone 的系统 DNS 请求发往 172.19.0.2 后进入 tun-in，由 sing-box
+        // 的 dns.rules / dns.final 统一裁决。**严禁**把 223.5.5.5 /
+        // 119.29.29.29 / 8.8.8.8 放进 NEDNSSettings(servers:)——iOS 会把这些
+        // 地址强制路由回 utun，导致 dns-direct 访问 223.5.5.5 时自我回环，
+        // 最终刷屏 `dns: exchange failed ... IN A: EOF`、下载恒为 0。
+        // 真实上游 DNS 全部改由下方 excludedRoutes 直出物理网卡（见 APP50 逻辑）。
+        let cleanDNS = "172.19.0.2"
+        let dnsSettings = NEDNSSettings(servers: [cleanDNS])
         dnsSettings.matchDomains = [""]
         settings.dnsSettings = dnsSettings
 
@@ -1180,9 +1267,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 NEIPv4Route(destinationAddress: epIP, subnetMask: "255.255.255.255")
             )
         }
-        excluded.append(
-            NEIPv4Route(destinationAddress: "223.5.5.5", subnetMask: "255.255.255.255")
-        )
+        // 【APP65 任务2.3】直连 DNS 上游（223.5.5.5 主 / 119.29.29.29 备）以
+        // /32 写入 excludedRoutes：iOS 内核强制这两条 UDP 53 报文绕开 utun，
+        // 从当前活跃物理网卡（en0/pdp_ip0）直接发出，**永远不可能回环**，
+        // 与 NEDNSSettings 中的虚拟地址 172.19.0.2 彻底解耦。
+        for upstreamDNS in ["223.5.5.5", "119.29.29.29"] {
+            excluded.append(
+                NEIPv4Route(destinationAddress: upstreamDNS, subnetMask: "255.255.255.255")
+            )
+        }
         ipv4.excludedRoutes = excluded
         if !excluded.isEmpty {
             writeExtLog("INFO", "[GoLan-Ext] ⚡ On-Demand 直连网段已写入 excludedRoutes: \(bypassCidrs)")
@@ -1676,11 +1769,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i]["address"] = ["172.19.0.1/30"]
                     inbounds[i]["mtu"] = 1280
                     inbounds[i]["stack"] = "gvisor"
-                    // 【APP39 任务3 / APP64 任务3.1】开启非改写式被动嗅探：提取 TLS SNI 与
-                    // HTTP Host 到 metadata.host；**严禁** sniff_override_destination=true
-                    // （会破坏 ip_cidr → go-lan-home 匹配 / 伪装 SNI 节点连接目标错乱）
+                    // 【APP65 任务2.3】嗅探 + 目标改写：tun-in 从 TLS ClientHello /
+                    // HTTP Host 中拿到真实域名后，直接把连接目标改写为域名，
+                    // 由路由规则按域名分流到 Proxy，域名交给节点服务器在海外
+                    // 本地解析——彻底摆脱「本地 DNS 必须解析成功才能上网」的死锁。
+                    // 纯 IP 的内网流量（192.168.x.x）没有 SNI，目标地址保持原样，
+                    // 顶部 ip_cidr → go-lan-* 规则依然 100% 精准命中。
                     inbounds[i]["sniff"] = true
-                    inbounds[i]["sniff_override_destination"] = false
+                    inbounds[i]["sniff_override_destination"] = true
                     inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
@@ -2217,19 +2313,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         var dnsServers: [[String: Any]] = [
+            // 【APP65 任务2.3】dns-remote 改回明文 UDP 8.8.8.8 经主代理出境：
+            // 机场中转节点会重置 1.1.1.1 的 DoH 连接（读取响应直接 EOF），
+            // 而 UDP 53 由 sing-box 自己封装在代理隧道内，不依赖本机 UDP 通路。
             [
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "udp://8.8.8.8",
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP-11B 任务3】dns-direct 锁定纯 UDP/TCP 53：
-            // APP-11 的 DoT（tls://223.5.5.5:853）在部分运营商网络仍会被
-            // SNI 嗅探拦截；且 erro-2.txt 显示 https://223.5.5.5/dns-query
-            // 仍被阿里云 WAF 拦返回 403。dns-direct 直接用最经典的
-            // `223.5.5.5`（UDP/TCP 53 + ipv4_only），彻底告别 403 与 EPERM。
-            // direct 出站已强制 ipv4_only（见 sanitize 循环），UDP Socket
-            // 走纯 AF_INET，不存在双栈被 NECP 拒绝的问题。
+            // 【APP65 任务2.3】dns-direct 主用阿里 UDP 223.5.5.5，
+            // dns-direct-backup 备用腾讯 UDP 119.29.29.29；两者都以 /32
+            // 写入 ipv4Settings.excludedRoutes，从物理网卡直出，绝不回环。
             [
                 "tag": "dns-direct",
                 "address": "223.5.5.5",
@@ -2237,8 +2332,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "strategy": "ipv4_only"
             ],
             [
-                "tag": "dns-direct-bak",
-                "address": "223.5.5.5",
+                "tag": "dns-direct-backup",
+                "address": "119.29.29.29",
                 "detour": "direct",
                 "strategy": "ipv4_only"
             ]
@@ -2291,7 +2386,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         root["dns"] = [
             "servers": dnsServers,
             "rules": dnsRules,
-            "final": "dns-remote",
+            // 【APP65 任务2.3】final 固定 dns-direct（UDP 223.5.5.5 直出）：
+            // 本地 DNS 10ms 内必答，绝不因远端节点封禁 DNS/DoH 超时而
+            // 出现 `dns: exchange failed ... IN A: EOF`；真实域名由
+            // tun-in 的 sniff_override_destination 还原后交给节点服务器解析。
+            "final": "dns-direct",
             "strategy": "ipv4_only",
             // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
             // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路

@@ -992,6 +992,34 @@ try {
   const logSrc2 = readFileSync(resolve(ROOT, 'src-tauri/src/core/logger.rs'), 'utf8');
   if (logSrc2.includes('pub fn export_diagnostic_text')) pass('logger.rs 提供 export_diagnostic_text ✓');
   else fail('logger.rs 缺少 export_diagnostic_text 导出文本生成函数');
+  // 【APP65 任务1】导出必须绕开 UIActivityViewController（iOS 16.5 的
+  // AirDrop 图标渲染会在 CI::GLContext 空指针崩溃），改用 UIDocumentPicker。
+  const tunnelCtrl = readFileSync(
+    resolve(ROOT, 'src-tauri/mobile-src/ios/App/PrismTunnelController.swift'), 'utf8');
+  if (tunnelCtrl.includes('UIDocumentPickerViewController(forExporting:')) {
+    pass('iOS 日志导出使用 UIDocumentPickerViewController ✓');
+  } else {
+    fail('iOS 日志导出未使用 UIDocumentPickerViewController(forExporting:)');
+  }
+  if (tunnelCtrl.includes('UIActivityViewController')) {
+    // 只检查真实代码：剔除 // 与 /// 注释行（注释里会记录崩溃根因）
+    const tunnelCtrlCode = tunnelCtrl
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .join('\n');
+    if (tunnelCtrlCode.includes('UIActivityViewController')) {
+      fail('PrismTunnelController 仍含 UIActivityViewController——iOS 16.5 必 SIGSEGV');
+    } else {
+      pass('PrismTunnelController 已彻底移除 UIActivityViewController ✓');
+    }
+  } else {
+    pass('PrismTunnelController 已彻底移除 UIActivityViewController ✓');
+  }
+  if (tunnelCtrl.includes('UIPasteboard.general.string')) {
+    pass('iOS 日志导出保留剪贴板通道 ✓');
+  } else {
+    fail('iOS 日志导出缺少剪贴板兜底通道');
+  }
 } catch (e) {
   fail(`日志导出检查失败：${e.message}`);
 }
