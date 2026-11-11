@@ -12,7 +12,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
-const KERNEL_VERSION = "1.11.3";
+const KERNEL_VERSION = "1.11.15";
 const ROOT = path.join(__dirname, "..");
 const OUT_DIR = path.join(ROOT, "src-tauri", "binaries");
 

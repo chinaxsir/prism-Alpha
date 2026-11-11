@@ -278,7 +278,7 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey};
 
     /// 固定向量：用户指定的生产公钥 base64url / hex / raw bytes 三者必须一一对应
     const PUBKEY_B64URL: &str = "UzKKqVLOFJuozWM2UGbkKDezvzMpn7crq019eMs0F_k";

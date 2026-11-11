@@ -35,6 +35,7 @@ import {
   isGoLanConfigured,
   clearAppLogs,
   openExternalUrl,
+  getKernelInfo,
   type GoLanSettings,
 } from "@/api/ipc";
 import type { RunMode, UserSettings } from "@/stores/core";
@@ -135,10 +136,20 @@ export default function Settings() {
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   // 【APP58 任务2.2】软件版本：运行时从 Tauri 读取当前真实版本，杜绝写死漂移
   const [appVersion, setAppVersion] = useState("0.3.91");
+  const [kernelVersion, setKernelVersion] = useState("1.11.15");
   useEffect(() => {
     import("@tauri-apps/api/app")
       .then((m) => m.getVersion())
       .then((v) => setAppVersion(v))
+      .catch(() => undefined);
+  }, []);
+  // 【APP63 内核勾稽】内核版本：运行时从后端 EMBEDDED_VERSION / 探测结果读取，
+  // 杜绝写死漂移（与 src-tauri/src/core/kernel.rs:EMBEDDED_VERSION 保持一致）
+  useEffect(() => {
+    getKernelInfo()
+      .then((info) => {
+        if (info.version) setKernelVersion(info.version);
+      })
       .catch(() => undefined);
   }, []);
   const proUnlocked = useProStore((s) => s.unlocked);
@@ -663,7 +674,7 @@ export default function Settings() {
         <Row
           icon={<Cpu size={14} className="text-accent" />}
           title={t("settings.kernelVersion")}
-          value="v1.11.3"
+          value={`v${kernelVersion}`}
           valueClass="font-mono text-gray-300"
         />
 
