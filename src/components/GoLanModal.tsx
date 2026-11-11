@@ -781,25 +781,37 @@ export default function GoLanModal({ open, onClose }: Props) {
 
   // 【APP50 任务3】内网目标探测：支持纯 IP（默认测 http:80 / https:443）、
   // IP:端口、域名:端口与 http(s):// 完整 URL，后端逐个尝试常用 Web 端口。
+  // 【APP66 任务2.1】请求计数 ID：只有最新一次检测的结果才允许回写 UI，
+  // 连续点击不会互相覆盖；probing 仅影响「检测内网」按钮，绝不禁用其它控件。
+  const probeSeqRef = useRef(0);
   const handleProbe = async () => {
     const target = form.probeTarget.trim();
     if (!target) return;
     // 【APP50 任务3】支持纯 IP（后端默认探测该 IP 的 http:80 / https:443）
     // 与 IP:端口 / 域名:端口；不再前端强制要求端口号
+    const seq = ++probeSeqRef.current;
     setProbing(true);
     setProbeOk(null);
     setProbeMsg(t("logs.probeRunning"));
     try {
-      const r = await invokeWithTimeout(() => testGoLanIp(target), "testGoLanIp");
+      // 【APP66 任务2.2】带上当前档案 id 与输入框中尚未保存的网段：
+      // 目标不在任何已保存网段时后端自动推导 /24 并入档案并热更新路由。
+      const r = await invokeWithTimeout(
+        () =>
+          testGoLanIp(target, form.id, splitCidrsText(form.lanCidrs)),
+        "testGoLanIp",
+      );
+      if (seq !== probeSeqRef.current) return;
       setProbeOk(r.reachable);
       const text = probeText(r);
       setProbeMsg(text);
       if (r.reachable) toast.success(text);
     } catch (e) {
+      if (seq !== probeSeqRef.current) return;
       setProbeOk(false);
       setProbeMsg(String(e));
     } finally {
-      setProbing(false);
+      if (seq === probeSeqRef.current) setProbing(false);
     }
   };
 

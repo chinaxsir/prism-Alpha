@@ -403,15 +403,26 @@ export const syncGoLanManaged = async (): Promise<GoLanSettings> =>
   normalizeGoLanSettings(await invoke<GoLanSettings>("sync_go_lan_managed"));
 
 /** 【APP-5 任务2 / APP6 任务2】穿过 go-lan-home 隧道检测指定内网 IP 可达性。
- *  targetIp 可省略：后端自动从 WireGuard local_address 推导对端网关 */
+ *  targetIp 可省略：后端自动从 WireGuard local_address 推导对端网关
+ *  【APP66 任务2.2】profileId / currentCidrs：目标不在已保存网段时后端
+ *  自动推导 /24 并入该档案并热更新路由，不再报「不在允许的网段」。 */
 export interface GoLanProbeResult {
   reachable: boolean;
   targetIp: string;
   latencyMs: number | null;
   message: string;
+  autoCidr?: string | null;
 }
-export const testGoLanIp = (targetIp?: string) =>
-  invoke<GoLanProbeResult>("test_go_lan_ip", { targetIp: targetIp ?? null });
+export const testGoLanIp = (
+  targetIp?: string,
+  profileId?: string,
+  currentCidrs?: string[],
+) =>
+  invoke<GoLanProbeResult>("test_go_lan_ip", {
+    targetIp: targetIp ?? null,
+    profileId: profileId ?? null,
+    currentCidrs: currentCidrs ?? null,
+  });
 
 /** 【APP6 任务1】全模块环形日志系统 */
 export interface AppLogEntry {

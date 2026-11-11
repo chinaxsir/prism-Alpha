@@ -366,7 +366,7 @@ export default function App() {
   //   跳过所有 fetchStatus / getRuntimeSnapshot，WebView 与 Rust 主进程
   //   在后台保持 0% CPU；
   // - 回到前台 → visibilitychange / focus 立即补拉一次（网速与流量基于
-  //   内核累计字节差值计算，切回瞬间即可无缝显示），随后以 1500ms 温和间隔更新。
+  //   内核累计字节差值计算，切回瞬间即可无缝显示），随后以 1000ms 稳定间隔更新。
   const appVisible = useAppVisible();
   useEffect(() => {
     // 上报后端：遥测协程据此在后台跳过 /connections 网络请求
@@ -374,8 +374,10 @@ export default function App() {
     if (!appVisible) return;
     // 【APP43】即使显示未连接也要轮询：后台隧道可能仍在运行，
     // refreshRuntime 会先查状态并触发后端自动接管。
+    // 【APP66 任务3/4】1000ms 稳定采样：仪表盘插值有稳定目标值，
+    // 分析页分流占比与 Top 主机每秒实时刷新。
     void refreshRuntime();
-    const id = window.setInterval(() => void refreshRuntime(), 1500);
+    const id = window.setInterval(() => void refreshRuntime(), 1000);
     const onWake = () => {
       if (document.visibilityState === "visible") {
         void refreshRuntime();

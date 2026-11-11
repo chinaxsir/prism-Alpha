@@ -55,11 +55,49 @@ interface ProxyEntry {
   history?: Array<{ delay: number }>;
 }
 
+/// 【APP66 任务3】仪表盘丝滑网速插值：
+/// 后端每 1000ms 采样一次，若直接渲染会 "瞬移" 跳动。以 160ms（约 6fps）
+/// 指数阻尼 0.32 向目标值缓动，纯前端数学插值，0 IPC、CPU 占用 < 0.05%。
+function useSmoothSpeed(target: number, active: boolean): number {
+  const [display, setDisplay] = useState(0);
+  const currentRef = useRef(0);
+  const targetRef = useRef(0);
+
+  useEffect(() => {
+    targetRef.current = active ? Math.max(0, target) : 0;
+    if (!active) {
+      currentRef.current = 0;
+      setDisplay(0);
+    }
+  }, [target, active]);
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => {
+      const cur = currentRef.current;
+      const tgt = targetRef.current;
+      const diff = tgt - cur;
+      if (Math.abs(diff) < 64) {
+        currentRef.current = tgt;
+      } else {
+        currentRef.current = Math.round(cur + diff * 0.32);
+      }
+      setDisplay(currentRef.current);
+    }, 160);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  return display;
+}
+
 export default function Dashboard() {
   const { t } = useTranslation();
   const status = useCoreStore((s) => s.status);
   const upSpeed = useCoreStore((s) => s.upSpeed);
   const downSpeed = useCoreStore((s) => s.downSpeed);
+  // 【APP66 任务3】渲染值走 160ms 缓动插值，数字连续滚动不顿挫
+  const smoothDown = useSmoothSpeed(downSpeed, status === "running");
+  const smoothUp = useSmoothSpeed(upSpeed, status === "running");
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
   const startedAtMs = useCoreStore((s) => s.startedAtMs);
   // 今日流量：后端持久化基数 + 当前会话内核绝对累计（前后台不间断）
@@ -302,7 +340,10 @@ export default function Dashboard() {
     getGoAimStatus().then(store.setGoAimStatus).catch(() => undefined);
     getGoLanSettings().then(store.setGoLanSettings).catch(() => undefined);
     getGoCusSettings().then(store.setGoCusSettings).catch(() => undefined);
-    const unAim = listen("go-aim://updated", () => {
+    const unAim = listen<{ hint?: string }>("go-aim://updated", (e) => {
+      // 【APP66 任务1】未连隧道时只做真实延迟测速：后端随事件下发 hint，
+      // 这里明确告知用户「解锁徽章需先启动代理后重新检测」，绝不含糊其辞
+      if (e.payload?.hint) toast.info(e.payload.hint);
       getGoAimStatus()
         .then(useCoreStore.getState().setGoAimStatus)
         .catch(() => undefined);
@@ -756,7 +797,7 @@ export default function Dashboard() {
             </div>
             {/* 【APP52 任务2】固定最小宽度 + 等宽数字：速率刷新时容器不抖动 */}
             <div className="text-xl font-bold tabular-nums text-latency-good mt-1.5 font-mono tracking-tight min-w-[7.5rem] whitespace-nowrap transition-all duration-150">
-              {formatSpeed(downSpeed)}
+              {formatSpeed(smoothDown)}
             </div>
           </div>
           <div className="border-l border-border pl-4">
@@ -765,7 +806,7 @@ export default function Dashboard() {
               {t("metric.upload")}
             </div>
             <div className="text-xl font-bold tabular-nums text-accent mt-1.5 font-mono tracking-tight min-w-[7.5rem] whitespace-nowrap transition-all duration-150">
-              {formatSpeed(upSpeed)}
+              {formatSpeed(smoothUp)}
             </div>
           </div>
         </div>

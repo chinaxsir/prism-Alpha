@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Globe2,
   ListFilter,
@@ -9,6 +9,7 @@ import {
 import {
   getCustomRules,
   getRules,
+  getRuntimeSnapshot,
   saveCustomRules,
 } from "@/api/ipc";
 import { toast } from "@/components/ui/Toast";
@@ -46,6 +47,35 @@ export default function Analytics() {
   // 【APP49 任务4】Top 主机搜索（大小写不敏感）与「+规则」弹层
   const [hostQuery, setHostQuery] = useState("");
   const [ruleHost, setRuleHost] = useState<string | null>(null);
+
+  // 【APP66 任务4.2】分析页前台 1000ms 实时刷新：后端在 get_runtime_snapshot
+  // 中每 450ms 主动合并一次 /connections 增量（分流占比 + Top 主机流量），
+  // 本页停留期间每秒都能看到数字变化；后台/锁屏时定时器完全不工作。
+  const analyticsBusyRef = useRef(false);
+  useEffect(() => {
+    if (!running) return;
+    let timer: number | undefined;
+    const tick = () => {
+      if (document.visibilityState !== "visible" || analyticsBusyRef.current) return;
+      analyticsBusyRef.current = true;
+      getRuntimeSnapshot()
+        .then((snap) => useCoreStore.getState().applyRuntimeSnapshot(snap))
+        .catch(() => undefined)
+        .finally(() => {
+          analyticsBusyRef.current = false;
+        });
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    tick();
+    timer = window.setInterval(tick, 1000);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (timer) window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [running]);
 
   // 内核聚合按 key 归类，部分 key 为后端占位（未知/其他）——按语言归一显示
   const mapKey = (k: string) =>
@@ -207,7 +237,7 @@ export default function Analytics() {
                 s.pct > 0 ? (
                   <div
                     key={s.key}
-                    className="flex items-center justify-center overflow-hidden whitespace-nowrap text-[11px] font-medium text-white transition-[width] duration-500 ease-out"
+                    className="flex items-center justify-center overflow-hidden whitespace-nowrap text-[11px] font-medium text-white transition-all duration-300 ease-out"
                     style={{ width: `${s.pct}%`, backgroundColor: s.color }}
                     title={`${t(s.key)} ${s.pct.toFixed(1)}%`}
                   >

@@ -543,19 +543,21 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         }
     }
 
-    // 【APP53 任务2.3 / APP54 任务2.2】预览模式（内核未运行）无法走真实隧道，
-    // 但依然要给出完整的 AI / 流媒体评级：按节点名称的地区特征 + 离线延迟基线
-    // 生成标签（香港/中国大陆等受限地区不出 AI 标签），前端徽章与排序不缺失。
+    // 【APP66 任务1.1】预览模式（内核未运行）：只做真实公网延迟测速，
+    // **严禁**再按节点名称/地区猜测 AI / 流媒体解锁标识。此前
+    // `preview_tags` 会按「香港」「日本」等关键词直接打上 GPT/NF 徽章，
+    // 属于零网络验证的虚假解锁，用户切到受限节点后必然穿帮。
+    // 现在预览模式所有节点 unlocked_tags 为空、ai/media=false、probed=true，
+    // 并通过事件 hint 明确提示「需先启动代理才能做隧道真实解锁验证」。
     if preview_mode {
-        let mut best: Option<AimNodeResult> = None;
+        let mut leader: Option<AimNodeResult> = None;
         for (name, d) in alive.iter() {
-            let (tags, ai_unlocked, media_unlocked) = preview_tags(name, *d);
             let result = AimNodeResult {
                 node_name: name.clone(),
-                score: tags.len() as u32,
-                unlocked_tags: tags,
-                ai_unlocked,
-                media_unlocked,
+                unlocked_tags: Vec::new(),
+                ai_unlocked: false,
+                media_unlocked: false,
+                score: 0,
                 delay_ms: *d,
                 updated_at: now_secs(),
                 probed: true,
@@ -565,29 +567,15 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 AIM_EVENT,
                 serde_json::json!({ "name": name.clone(), "result": result.clone() }),
             );
-            if ai_unlocked
-                && best
-                    .as_ref()
-                    .map_or(true, |b| result.delay_ms < b.delay_ms)
+            if leader
+                .as_ref()
+                .map_or(true, |b| result.delay_ms < b.delay_ms)
             {
-                best = Some(result.clone());
+                leader = Some(result);
             }
         }
-        // 锁定基线最快节点为默认选择（与内核运行时行为一致）
-        let leader = best.unwrap_or_else(|| {
-            let (name, d) = alive[0].clone();
-            let (tags, ai_unlocked, media_unlocked) = preview_tags(&name, d);
-            AimNodeResult {
-                node_name: name,
-                score: tags.len() as u32,
-                unlocked_tags: tags,
-                ai_unlocked,
-                media_unlocked,
-                delay_ms: d,
-                updated_at: now_secs(),
-                probed: true,
-            }
-        });
+        let leader = leader.expect("alive 非空");
+        // 锁定延迟最低节点作为默认选择（仅基于真实延迟，不含任何猜测）
         let _ = lock_node(app, state, &leader, false).await;
         // 预览结果立即持久化（切页/重启不丢失）
         {
@@ -600,12 +588,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             p.done = p.total;
             p.percent = 100;
             p.running = false;
-            p.unlocked_count = state
-                .aim_results
-                .read()
-                .values()
-                .filter(|r| r.ai_unlocked)
-                .count();
+            p.unlocked_count = 0;
             let snapshot = p.clone();
             drop(p);
             let _ = app.emit("aim://progress", &snapshot);
@@ -613,7 +596,11 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         state.aim_probing.store(false, Ordering::Release);
         let _ = app.emit(
             AIM_EVENT,
-            serde_json::json!({ "phase": "preview_done", "best": leader.node_name }),
+            serde_json::json!({
+                "phase": "preview_done",
+                "best": leader.node_name,
+                "hint": "当前未连接 VPN，仅完成真实延迟测速；AI / 流媒体解锁需经隧道验证，请先启动代理后重新检测"
+            }),
         );
         return Ok(alive.len());
     }
@@ -925,33 +912,9 @@ async fn probe_node(
     }
 }
 
-/// 【APP54 任务2.2】预览模式（内核未运行）地区特征评级：
-/// 依据节点名称中的国家/地区关键词推断 AI 与流媒体可用性，
-/// 受限地区（香港/中国大陆/俄罗斯等）不出 AI 标签，香港/大陆/印度不出 TK。
-fn preview_tags(name: &str, delay_ms: u64) -> (Vec<String>, bool, bool) {
-    let n = name.to_ascii_lowercase();
-    let hit = |keys: &[&str]| keys.iter().any(|k| n.contains(k));
-    let ai_blocked = hit(&[
-        "香港", "hong kong", "hk", "澳门", "macau", "中国", "china", "cn-", "cn节点", "北京",
-        "上海", "广州", "深圳", "俄罗斯", "russia", "ru-", "伊朗", "iran", "朝鲜", "dprk",
-        "印度", "india", "in-", "土耳其", "turkey", "tr-", "埃及", "egypt", "eg-", "巴基斯坦",
-        "pakistan", "pk-", "越南", "vietnam", "vn-", "乌克兰", "ukraine", "ua-",
-    ]);
-    let media_blocked = hit(&[
-        "香港", "hong kong", "hk", "澳门", "macau", "中国", "china", "cn-", "北京", "上海",
-        "广州", "深圳", "印度", "india", "in-",
-    ]);
-    let mut tags: Vec<String> = Vec::new();
-    if !ai_blocked && delay_ms > 0 {
-        tags.extend(["GPT", "Claude", "Gemini"].iter().map(|s| s.to_string()));
-    }
-    if !media_blocked && delay_ms > 0 {
-        tags.extend(["NF", "YT", "Disney+", "TK"].iter().map(|s| s.to_string()));
-    }
-    let ai_unlocked = tags.iter().any(|t| t == "GPT");
-    let media_unlocked = tags.iter().any(|t| t == "NF");
-    (tags, ai_unlocked, media_unlocked)
-}
+// 【APP66 任务1.1】已删除 `preview_tags`：任何「按节点名称/地区关键词推断
+// AI / 流媒体解锁」的启发式都必须彻底移除。解锁结论唯一来源是真实隧道内
+// 的 HTTP 探测（check_once），预览模式一律返回空标签。
 
 fn dead_result(name: &str) -> AimNodeResult {
     AimNodeResult {
@@ -1036,25 +999,113 @@ async fn check_once(
     let loc_allowed = |list: &[&str]| loc.as_deref().is_some_and(|l| !region_blocked(Some(l), list));
 
     let verdict = match probe.tag {
-        // 【APP49 任务3】GPT：chatgpt.com/cdn-cgi/trace（1600ms）——
-        // 解析 loc= 且国家码不得属于 AI 受限名单（CN/HK/MO/RU/BY/IR/KP/CU/SY）
-        "GPT" => Some(status == 200 && loc_allowed(AI_BLOCKLIST)),
-        // 【APP49 任务3】Claude：claude.ai/cdn-cgi/trace 同样排除受限区
-        "Claude" => Some(status == 200 && loc_allowed(AI_BLOCKLIST)),
+        // 【APP66 任务1.3】GPT 双保险：trace 200 + 出口地区不限 +
+        // ios.chat.openai.com 服务端状态二次校验（403/429 或正文含
+        // unsupported_country / 403 forbidden → 未解锁）。
+        "GPT" => {
+            if status == 200 && loc_allowed(AI_BLOCKLIST) {
+                Some(check_gpt_server_status(client).await)
+            } else {
+                Some(false)
+            }
+        }
+        // 【APP66 任务1.3】Claude：trace 200 + 出口地区不限 + /login 正文/重定向二次校验
+        "Claude" => {
+            if status == 200 && loc_allowed(AI_BLOCKLIST) {
+                Some(check_claude_login(nr_client).await)
+            } else {
+                Some(false)
+            }
+        }
         // Gemini：已在 check_once 入口提前分支（首跳 Location 判定），此处不可达
         "Gemini" => Some(false),
-        // 【APP49 任务3】NF：区域锁片源 81280792——200/301/302 判完整解锁，
-        // 403/404 及其余状态码判未解锁
-        "NF" => Some(netflix_unlocked(status)),
-        // Disney+：200 且未跳到不可用提示页
-        "Disney+" => Some(status == 200 && !final_url.contains("unavailable")),
-        // 【APP49 任务3】YT：Premium 页 200 且正文不含 "not available"
-        "YT" => Some(status == 200 && !body_lc.contains("not available")),
-        // 【APP49 任务3】TikTok：trace loc 不得为 CN/HK/IN
-        "TK" => Some(status == 200 && loc_allowed(TIKTOK_BLOCKLIST)),
+        // 【APP49 任务3 / APP66 任务1.3】NF：区域锁片源 + 正文排除不可用文案
+        "NF" => Some(
+            netflix_unlocked(status)
+                && !body_lc.contains("oh no!")
+                && !body_lc.contains("not available in your country")
+                && !body_lc.contains("this title is not available"),
+        ),
+        // Disney+：200 且未跳到不可用提示页 / 正文无地区不可用文案
+        "Disney+" => Some(
+            status == 200
+                && !final_url.contains("unavailable")
+                && !body_lc.contains("not available in your region"),
+        ),
+        // 【APP66 任务1.3】YT：200 + 正文含 youtube 品牌词 + 不含不可用文案
+        "YT" => Some(
+            status == 200 && body_lc.contains("youtube") && !body_lc.contains("not available"),
+        ),
+        // 【APP66 任务1.3】TikTok：trace 200 + 出口地区不限 + /explore 200 二次校验
+        "TK" => {
+            if status == 200 && loc_allowed(TIKTOK_BLOCKLIST) {
+                Some(check_tiktok_explore(client).await)
+            } else {
+                Some(false)
+            }
+        }
         _ => Some(false),
     };
     verdict
+}
+
+/// 【APP66 任务1.3】GPT 服务端状态二次校验：
+/// - 传输失败 / 非 200 / 403 / 429 → 未解锁（不放过可疑出口）；
+/// - 200 但正文出现 unsupported_country / 403 forbidden → 未解锁。
+async fn check_gpt_server_status(client: &reqwest::Client) -> bool {
+    let Ok(resp) = client
+        .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let status = resp.status().as_u16();
+    // 403 / 429 / 任何非 200 → OpenAI 已对该出口触发风控，严格判未解锁
+    if status != 200 {
+        return false;
+    }
+    let body = resp.text().await.unwrap_or_default().to_lowercase();
+    !(body.contains("unsupported_country")
+        || body.contains("not available in your country")
+        || body.contains("403 forbidden"))
+}
+
+/// 【APP66 任务1.3】Claude 登录页二次校验：200/3xx 且正文无地区不可用文案
+async fn check_claude_login(client: &reqwest::Client) -> bool {
+    let Ok(resp) = client
+        .get("https://claude.ai/login")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let status = resp.status().as_u16();
+    if status != 200 && !(300..400).contains(&status) {
+        return false;
+    }
+    let body = resp.text().await.unwrap_or_default().to_lowercase();
+    !(body.contains("not available in your country")
+        || body.contains("not available in your region")
+        || body.contains("unavailable in your region"))
+}
+
+/// 【APP66 任务1.3】TikTok 探索页二次校验：必须真实 200
+async fn check_tiktok_explore(client: &reqwest::Client) -> bool {
+    let Ok(resp) = client
+        .get("https://www.tiktok.com/explore")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    resp.status().as_u16() == 200
 }
 
 /// 【APP-10 任务3】Gemini 首跳判定（无重定向客户端）：
@@ -1081,7 +1132,13 @@ async fn check_gemini_first_hop(
     };
     let status = resp.status().as_u16();
     if status == 200 {
-        return Some(true);
+        // 【APP66 任务1.3】Gemini：200 也必须有正文二次校验，
+        // 出现 not available in your country / unsupported region
+        // / currently not available 一律判未解锁。
+        let body = resp.text().await.unwrap_or_default().to_lowercase();
+        return Some(!(body.contains("not available in your country")
+            || body.contains("unsupported region")
+            || body.contains("currently not available")));
     }
     if (300..400).contains(&status) {
         let location = resp
@@ -1490,5 +1547,30 @@ mod tests {
     fn test_probe_score_matches_tag_count() {
         let r = node("n", 100, &["GPT", "Claude"]);
         assert_eq!(r.unlocked_tags.len(), 2);
+    }
+
+    /// 【APP66 任务1】防复发：Go AIM 解锁判定必须 100% 真实网络验证，
+    /// 严禁任何基于节点名称 / 地区关键词（香港、日本、美国…）的启发式猜测。
+    #[test]
+    fn test_no_heuristic_preview_guess() {
+        let src = include_str!("go_aim.rs");
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let code = code.join("\n");
+        // 动态拼接，避免测试源码自身命中 include_str 的内容
+        let forbidden: [String; 4] = [
+            concat!("preview", "_tags").to_string(),
+            "\u{9999}\u{6e2f}".to_string(),
+            "\u{65e5}\u{672c}".to_string(),
+            "\u{7f8e}\u{56fd}".to_string(),
+        ];
+        for needle in forbidden {
+            assert!(
+                !code.contains(&needle),
+                "APP66 任务1：禁止按节点名/地区关键词猜测解锁标签: {needle}"
+            );
+        }
     }
 }

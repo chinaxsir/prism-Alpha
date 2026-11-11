@@ -216,7 +216,13 @@ fn log_rule_hit_dedupe(rule: &str, payload: &str) {
     );
 }
 
-fn apply_connections_update(state: &AppState, value: &serde_json::Value, foreground: bool) {
+/// 【APP66 任务4.1】`get_runtime_snapshot` 每 450ms 主动同步一次当前
+/// `/connections` 快照，实时刷新分析页的分流占比与 Top 主机流量排行。
+pub(crate) fn apply_connections_update(
+    state: &AppState,
+    value: &serde_json::Value,
+    foreground: bool,
+) {
     let download_total = value
         .get("downloadTotal")
         .and_then(|v| v.as_u64())

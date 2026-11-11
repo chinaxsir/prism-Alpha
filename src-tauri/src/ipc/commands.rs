@@ -2436,14 +2436,14 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
     }
 }
 
-/// 【APP65 任务3.2】节点域名解析缓存条目：解析时刻 + IPv4 列表（5 分钟 TTL）。
-/// 带 TTL 后既避免每次测速重复打系统 DNS，也保证机场换 IP 后能及时刷新。
+/// 【APP65 任务3.2 / APP66 任务5】节点域名解析缓存条目：解析时刻 + IPv4 列表。
+/// 带 TTL 后既避免每次测速重复打 DNS，也保证机场换 IP 后能及时刷新。
 type NodeDnsEntry = (std::time::Instant, Vec<std::net::Ipv4Addr>);
 
-/// 缓存有效期：5 分钟（与 config_builder 的 DoH 预解析缓存同口径）
-const NODE_DNS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// 缓存有效期：10 分钟（APP66 由 5 分钟放宽，配合纯异步 UDP DNS 降低查询量）
+const NODE_DNS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// 【APP54 任务2】全局节点域名预解析缓存（系统 DNS + 阿里/腾讯 DoH）。
+/// 【APP54 任务2】全局节点域名预解析缓存（异步 UDP DNS + 阿里/腾讯 DoH）。
 /// 一次全量测速只解析去重后的服务器域名（20 路并发），失败不缓存。
 static NODE_DNS_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, NodeDnsEntry>>,
@@ -2455,17 +2455,7 @@ fn node_dns_cache() -> &'static std::sync::Mutex<
     NODE_DNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 【APP65 任务3.2】系统 DNS 并发闸门：最多 8 个 lookup_host 同时进行。
-/// iOS 的 getaddrinfo 由 mDNSResponder 单一线程池服务，并发过高会把
-/// 查询互相阻塞成递归等待（崩溃报告 Thread 14~17 全部卡在 getaddrinfo）。
-static DNS_LOOKUP_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
-    std::sync::OnceLock::new();
-
-fn dns_lookup_semaphore() -> &'static tokio::sync::Semaphore {
-    DNS_LOOKUP_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(8))
-}
-
-/// 解析节点服务器真实 IPv4（系统 DNS 优先，再回退阿里 DoH 223.5.5.5、
+/// 解析节点服务器真实 IPv4（异步 UDP DNS 优先，再回退阿里 DoH 223.5.5.5、
 /// 腾讯 DoH 1.12.12.12），结果写入 NODE_DNS_CACHE 供后续测速直接命中。
 async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
     let key = server.trim().to_ascii_lowercase();
@@ -2483,22 +2473,9 @@ async fn resolve_server_ipv4s(server: &str) -> Vec<std::net::Ipv4Addr> {
     {
         return hit.clone();
     }
-    let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
-    // 1) 系统 DNS（并发闸门 8：防止堵死 iOS mDNSResponder 线程池）
-    {
-        let permit = dns_lookup_semaphore().acquire().await.ok();
-        if let Ok(addrs) = tokio::net::lookup_host((server, 443)).await {
-            for addr in addrs {
-                if let std::net::IpAddr::V4(ip) = addr.ip()
-                    && !is_virtual_speedtest_ip(addr.ip())
-                    && !out.contains(&ip)
-                {
-                    out.push(ip);
-                }
-            }
-        }
-        drop(permit);
-    }
+    // 1) 【APP66 任务5.1】纯异步 UDP DNS（223.5.5.5 / 119.29.29.29）：
+    // 绝不调用阻塞的 getaddrinfo，避免 iOS mDNSResponder 线程池被堵死
+    let mut out: Vec<std::net::Ipv4Addr> = resolve_ipv4_via_udp_dns(server).await;
     // 2) DoH 兜底（阿里 / 腾讯），JSON 接口返回 Answer 数组
     if out.is_empty() {
         let client = SPEEDTEST_DOH_CLIENT.get_or_init(|| {
@@ -2812,12 +2789,161 @@ fn is_virtual_speedtest_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- UDP DNS（APP66 任务5.1）
+//
+// iOS 的 getaddrinfo 由 mDNSResponder 单线程池服务，Tokio 工作线程批量
+// `lookup_host` 会把它堵死成上百层递归等待（Prism-2026-11-11-173006.ips
+// Thread 10~15 全部卡在 _mdns_search_ex），触发 dns: exchange failed 风暴。
+// 这里改用纯异步 tokio::net::UdpSocket 直接向公共 DNS 发 30 字节标准 A 查询，
+// 全程不经过系统解析器；所有解析函数均为**有界迭代**，无任何递归调用。
+
+/// 构造标准 DNS A 记录查询报文（RD=1，QDCOUNT=1），返回 (报文, 事务 ID)。
+fn build_dns_a_query(domain: &str) -> Option<(Vec<u8>, u16)> {
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty() || domain.len() > 253 {
+        return None;
+    }
+    // 事务 ID：基于域名哈希 + 时间低位，足以避免同 socket 内的错配
+    let mut hash: u32 = 2166136261;
+    for b in domain.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let id = ((hash ^ t) & 0xFFFF) as u16;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    buf.extend_from_slice(&id.to_be_bytes());
+    buf.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        buf.push(label.len() as u8);
+        buf.extend_from_slice(label.as_bytes());
+    }
+    buf.push(0);
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+    Some((buf, id))
+}
+
+/// 跳过（可能被压缩的）DNS 名称，返回下一个字段的起始偏移。
+/// 纯循环实现，步进至少 1 字节并以缓冲区长度封顶，绝无递归/死循环。
+fn skip_dns_name(buf: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    while pos < buf.len() {
+        let len = buf[pos];
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Some(pos + 2);
+        }
+        pos += 1 + len as usize;
+    }
+    None
+}
+
+/// 解析 DNS 响应中的 A 记录（校验事务 ID / QR / RCODE，忽略 CNAME 等非 A 记录）。
+fn parse_dns_a_response(buf: &[u8], query_id: u16) -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    if buf.len() < 12 {
+        return out;
+    }
+    if u16::from_be_bytes([buf[0], buf[1]]) != query_id {
+        return out;
+    }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 || flags & 0x000F != 0 {
+        return out; // 不是响应，或 RCODE != NOERROR
+    }
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = match skip_dns_name(buf, pos) {
+            Some(p) => p,
+            None => return out,
+        };
+        pos += 4; // QTYPE + QCLASS
+        if pos > buf.len() {
+            return out;
+        }
+    }
+    for _ in 0..an {
+        pos = match skip_dns_name(buf, pos) {
+            Some(p) => p,
+            None => return out,
+        };
+        if pos + 10 > buf.len() {
+            return out;
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > buf.len() {
+            return out;
+        }
+        if rtype == 1 && rdlen == 4 {
+            let ip = std::net::Ipv4Addr::new(buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
+            if !is_virtual_speedtest_ip(std::net::IpAddr::V4(ip)) && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        pos += rdlen;
+    }
+    out
+}
+
+/// 【APP66 任务5.1】异步 UDP DNS A 查询：223.5.5.5 → 119.29.29.29 依次兜底，
+/// 单服务器超时 800ms；完全不触碰系统 getaddrinfo / mDNSResponder。
+async fn resolve_ipv4_via_udp_dns(domain: &str) -> Vec<std::net::Ipv4Addr> {
+    let Some((query, id)) = build_dns_a_query(domain) else {
+        return Vec::new();
+    };
+    for server in ["223.5.5.5:53", "119.29.29.29:53"] {
+        let Ok(socket) = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await else {
+            continue;
+        };
+        if socket.connect(server).await.is_err() {
+            continue;
+        }
+        if socket.send(&query).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 1500];
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            socket.recv(&mut buf),
+        )
+        .await;
+        let Ok(Ok(n)) = recv else {
+            continue;
+        };
+        let ips = parse_dns_a_response(&buf[..n], id);
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    Vec::new()
+}
+
+
+
 static SPEEDTEST_DOH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
-/// 解析节点服务器的真实 IPv4：DoH（223.5.5.5）优先，失败回退系统 DNS
+/// 解析节点服务器的真实 IPv4：DoH（223.5.5.5）优先，失败回退异步 UDP DNS
+/// 【APP66 任务5.1】不再调用系统 getaddrinfo / lookup_host
 async fn resolve_real_ipv4s(
     server: &str,
-    port: u16,
+    _port: u16,
     _timeout_ms: u32,
 ) -> Vec<std::net::Ipv4Addr> {
     if let Ok(ip) = server.trim().parse::<std::net::Ipv4Addr>() {
@@ -2856,19 +2982,8 @@ async fn resolve_real_ipv4s(
         }
     }
     if out.is_empty() {
-        // 【APP65 任务3.2】系统 DNS 兜底同样受 8 路并发闸门约束
-        let permit = dns_lookup_semaphore().acquire().await.ok();
-        if let Ok(addrs) = tokio::net::lookup_host((server, port)).await {
-            for addr in addrs {
-                if let std::net::IpAddr::V4(ip) = addr.ip()
-                    && !is_virtual_speedtest_ip(addr.ip())
-                    && !out.contains(&ip)
-                {
-                    out.push(ip);
-                }
-            }
-        }
-        drop(permit);
+        // 【APP66 任务5.1】系统 DNS 兜底 → 纯异步 UDP DNS（不经过 mDNSResponder）
+        out = resolve_ipv4_via_udp_dns(server).await;
     }
     out
 }
@@ -3570,7 +3685,8 @@ pub async fn get_traffic_stats(
     }))
 }
 
-/// 【APP52 任务2 / APP58 任务1.2】常驻后台遥测协程：1500ms 一轮低功耗采样；
+/// 【APP52 任务2 / APP58 任务1.2 / APP66 任务3】常驻后台遥测协程：
+/// 1000ms 一轮低功耗采样（APP66 由 1500ms 收紧到稳定 1s，仪表盘丝滑插值）；
 /// APP 处于后台（锁屏 / 切到其他 App）时**完全跳过 `/connections` 网络请求**，
 /// 只复用上次缓存速率广播，让 Rust 主进程在后台保持近乎 0% CPU；
 /// 回到前台后下一轮立即恢复真实采样。速率经 EMA(0.65/0.35) 平滑，
@@ -3581,7 +3697,7 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut logged_node: Option<String> = None;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             let state = app.state::<AppState>();
             let today = crate::core::store::today_total_bytes(&state.data_dir)
                 .max(*state.today_bytes_cache.read());
@@ -3757,17 +3873,24 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
 pub async fn get_runtime_snapshot(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // 【APP57 任务3.3 / APP58 任务1.2】遥测请求节流：1.5 秒内最多拉取一次
+    // 【APP57 任务3.3 / APP58 任务1.2】遥测请求节流：1 秒内最多拉取一次
     // `/connections`，期间直接复用上次结果；原子开关防止并发重复请求造成
     // 后台流量风暴与手机发热。
+    // 【APP66 任务3】采样间隔 1500ms → 1000ms（稳定 1s，仪表盘丝滑插值）
+    // 【APP66 任务4.1】分析页独立 450ms 采样：不受 1s 速度节流阻挡，
+    // 每次拉取都把活跃连接增量合并进 analytics（proxy/direct/lan + host 排行）。
     static FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static LAST_FETCH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_ANALYTICS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let due = now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed))
-        >= 1500
+    let due_speed = now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed))
+        >= 1000;
+    let due_analytics =
+        now_ms.saturating_sub(LAST_ANALYTICS_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 450;
+    let due = (due_speed || due_analytics)
         && FETCHING
             .compare_exchange(
                 false,
@@ -3778,26 +3901,35 @@ pub async fn get_runtime_snapshot(
             .is_ok();
 
     // 1. 到期才探测：内核 API 可访问即视为运行中（修复「内核未运行」误报）
-    let telemetry = if due {
-        LAST_FETCH_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-        let fetched = async {
-            let conn_json = state.kernel_api().get_connections().await.ok()?;
-            let total_down = conn_json
-                .get("downloadTotal")
-                .and_then(|v| v.as_u64())
-                .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
-            let total_up = conn_json
-                .get("uploadTotal")
-                .and_then(|v| v.as_u64())
-                .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
-            Some((total_down, total_up))
+    let mut conn_json: Option<serde_json::Value> = None;
+    if due {
+        if due_speed {
+            LAST_FETCH_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
         }
-        .await;
+        if due_analytics {
+            LAST_ANALYTICS_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        conn_json = state.kernel_api().get_connections().await.ok();
         FETCHING.store(false, std::sync::atomic::Ordering::Release);
-        fetched
-    } else {
-        None
-    };
+    }
+    let telemetry = conn_json.as_ref().and_then(|conn_json| {
+        let total_down = conn_json
+            .get("downloadTotal")
+            .and_then(|v| v.as_u64())
+            .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+        let total_up = conn_json
+            .get("uploadTotal")
+            .and_then(|v| v.as_u64())
+            .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+        Some((total_down, total_up))
+    });
+
+    // 【APP66 任务4.1】把本次 /connections 快照实时合并进分析聚合
+    if due_analytics
+        && let Some(json) = conn_json.as_ref()
+    {
+        crate::core::events::apply_connections_update(state.inner(), json, true);
+    }
 
     // 仅当处于 Stopped/Error 且内核 API 正常应答时自愈，避免干扰启动/停止中间态
     if telemetry.is_some() {
@@ -3809,7 +3941,7 @@ pub async fn get_runtime_snapshot(
     }
 
     let mut display: Option<(u64, u64)> = None;
-    if !due {
+    if !due_speed {
         // 1 秒内的重复调用：直接复用缓存速率，绝不重复请求、也不做衰减
         display = state
             .last_traffic_sample
@@ -3865,7 +3997,7 @@ pub async fn get_runtime_snapshot(
     }
 
     // 2. 追加一条 60s 环形队列样本（每秒最多一条，与节流同频）
-    if due && let Some((down, up)) = display {
+    if due_speed && let Some((down, up)) = display {
         // 不引入 chrono：以 Unix 秒换算 HH:MM:SS（events.rs 同款）
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4561,9 +4693,16 @@ pub async fn sync_go_lan_managed(
 
 /// 【APP-5 任务2】穿过 go-lan-home 隧道检测是否能到达指定内网 IP，
 /// 返回真实延迟毫秒数并瞬间触发 wg-easy 连接状态。
+///
+/// 【APP66 任务2.2】新增 `profile_id` / `current_cidrs`：检测目标不属任何
+/// 已保存网段时不再拒绝，而是自动推导 /24 并入当前档案（`auto_cidr`），
+/// 持久化后热更新路由，彻底解决多网卡 WG 宿主机内网无法访问的问题。
 #[tauri::command]
 pub async fn test_go_lan_ip(
+    app: AppHandle,
     target_ip: Option<String>,
+    profile_id: Option<String>,
+    current_cidrs: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<crate::core::go_lan::GoLanProbeResult, String> {
     // 提前 .clone() 取走锁内值，避免 parking_lot::RwLockReadGuard（非 Send）
@@ -4581,6 +4720,7 @@ pub async fn test_go_lan_ip(
     // 子进程句柄恒为空，必须结合 NEPacketTunnelFlow 的连接状态判断，
     // 否则 iOS 上启动 VPN 后「检测内网」被误判为未运行
     let is_running = is_vpn_actually_running(&state);
+    let empty_cidrs: Vec<String> = Vec::new();
     let result = crate::core::go_lan::probe_intranet_ip(
         target_ip.as_deref(),
         &api_addr,
@@ -4588,9 +4728,72 @@ pub async fn test_go_lan_ip(
         is_running,
         go_lan_enabled,
         &lan,
+        profile_id.as_deref(),
+        current_cidrs.as_deref().unwrap_or(&empty_cidrs),
     )
     .await;
+
+    // 【APP66 任务2.2】自动补网段：探测确认目标不受任何已保存网段覆盖时，
+    // 把推导出的 /24 并入当前档案并热更新内核路由（无需用户手动改保存）。
+    if let Some(cidr) = result.auto_cidr.clone()
+        && persist_probe_auto_cidr(&app, &state, profile_id.as_deref(), &cidr).await
+    {
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_LAN,
+            &format!("已自动把网段 {cidr} 并入内网档案并触发路由热更新"),
+        );
+    }
     Ok(result)
+}
+
+/// 【APP66 任务2.2】把检测自动推导的 /24 持久化进目标档案并热更新路由。
+/// 返回值表示配置是否真的发生变化（未变化时不重启内核、不断网）。
+async fn persist_probe_auto_cidr(
+    app: &AppHandle,
+    state: &AppState,
+    profile_id: Option<&str>,
+    cidr: &str,
+) -> bool {
+    let mut lan = state.go_lan.read().clone();
+    let wanted = profile_id.map(str::trim).filter(|s| !s.is_empty());
+    let idx = if lan.profiles.is_empty() {
+        None
+    } else {
+        wanted
+            .and_then(|id| {
+                lan.profiles
+                    .iter()
+                    .position(|p| p.id == id || p.name == id)
+            })
+            .or_else(|| lan.profiles.iter().position(|p| p.enabled))
+            .or(Some(0))
+    };
+    let slot = match idx {
+        Some(i) => &mut lan.profiles[i].lan_cidrs,
+        None => &mut lan.lan_cidrs,
+    };
+    if slot.iter().any(|c| c == cidr) {
+        return false;
+    }
+    slot.push(cidr.to_string());
+    crate::core::go_lan::normalize_go_lan_settings(&mut lan);
+    if let Err(e) = crate::core::go_lan::save(&state.data_dir, &lan) {
+        tracing::warn!("[go-lan] 自动网段持久化失败: {e}");
+        return false;
+    }
+    *state.go_lan.write() = lan.clone();
+    crate::core::go_lan::invalidate_lan_direct_cache();
+    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
+    if *state.status.read() == CoreStatus::Running {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state_static = app_clone.state::<AppState>();
+            if let Err(e) = restart_core(&app_clone, &state_static).await {
+                tracing::warn!("[go-lan] 自动补网段后热更新内核失败: {e}");
+            }
+        });
+    }
+    true
 }
 
 /// 【APP62 任务1 机制2】主 APP 回到前台时，主动触发全部 `go-lan-*`
@@ -4913,6 +5116,89 @@ mod app56_tests {
         assert!(
             hello.windows(11).any(|w| w == b"example.com"),
             "ClientHello 必须携带 SNI 主机名"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app66_dns_tests {
+    use super::{build_dns_a_query, parse_dns_a_response, skip_dns_name};
+
+    /// 【APP66 任务5.1】UDP DNS 请求报文：标准 12 字节头 + QNAME 标签 + QTYPE/QCLASS
+    #[test]
+    fn test_build_dns_a_query_layout() {
+        let (q, _id) = build_dns_a_query("example.com").expect("合法域名必须能构造查询");
+        assert_eq!(q[2], 0x01, "RD 位必须为 1");
+        assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1, "QDCOUNT=1");
+        let qname = &q[12..12 + 13];
+        assert_eq!(
+            qname,
+            b"\x07example\x03com\x00",
+            "QNAME 必须是长度前缀标签格式"
+        );
+        let tail = &q[25..];
+        assert_eq!(u16::from_be_bytes([tail[0], tail[1]]), 1, "QTYPE=A");
+        assert_eq!(u16::from_be_bytes([tail[2], tail[3]]), 1, "QCLASS=IN");
+        // 非法输入必须拒绝，绝不发出畸形查询
+        assert!(build_dns_a_query("").is_none());
+        assert!(build_dns_a_query("a..b").is_none());
+    }
+
+    /// 【APP66 任务5.1】响应解析：压缩指针名称 + A 记录 + 事务 ID / RCODE 校验
+    #[test]
+    fn test_parse_dns_a_response() {
+        let (query, id) = build_dns_a_query("example.com").unwrap();
+        let mut resp: Vec<u8> = Vec::new();
+        resp.extend_from_slice(&id.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1, RCODE=0
+        resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        resp.extend_from_slice(&2u16.to_be_bytes()); // ANCOUNT：CNAME + A
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&query[12..]); // 原样问题段
+        // CNAME 记录（类型 5，压缩名称指针 0xC00C）——必须被忽略
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&5u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        resp.extend_from_slice(&2u16.to_be_bytes());
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        // A 记录：93.184.216.34
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        let ips = parse_dns_a_response(&resp, id);
+        assert_eq!(
+            ips,
+            vec![std::net::Ipv4Addr::new(93, 184, 216, 34)],
+            "必须解析出真实 A 记录"
+        );
+        // 事务 ID 不匹配 → 丢弃（防止错配其他查询的应答）
+        assert!(parse_dns_a_response(&resp, id.wrapping_add(1)).is_empty());
+        // RCODE != 0（NXDOMAIN=3）→ 丢弃
+        let mut bad = resp.clone();
+        bad[3] = 0x83;
+        assert!(parse_dns_a_response(&bad, id).is_empty());
+        // 名称压缩指针步进正确（仅占 2 字节）
+        assert_eq!(skip_dns_name(&[0xC0, 0x0C], 0), Some(2));
+        assert_eq!(skip_dns_name(b"\x03www\x00", 0), Some(5));
+    }
+
+    /// 【APP66 任务5.1】防复发：异步路径严禁调用阻塞的系统解析器
+    #[test]
+    fn test_no_blocking_getaddrinfo_left() {
+        let src = include_str!("commands.rs");
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let code = code.join("\n");
+        assert!(
+            !code.contains(concat!("lookup", "_host")),
+            "APP66 任务5.1：禁止在异步线程调用阻塞的系统解析器"
         );
     }
 }

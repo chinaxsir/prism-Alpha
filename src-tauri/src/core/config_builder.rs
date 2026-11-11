@@ -1302,13 +1302,14 @@ pub fn build(
             // mixed 栈的 TCP 短连接走 system 栈（iOS utun 直连，不再被 NECP
             // 拒绝），WireGuard 内网长连接仍由 gVisor 处理，兼顾吞吐与防回环。
             "stack": "mixed",
-            // 【APP65 任务2.3】嗅探 + 目标改写：从 TLS ClientHello / HTTP Host
-            // 拿到真实域名后把连接目标改写为域名，路由按域名分流到 Proxy，
-            // 由节点服务器在海外本地解析目标域名——本地 DNS 只需解析节点
-            // 自己的域名（且已被预解析为公网 IPv4），彻底消灭 IN A: EOF。
-            // 纯 IP 的内网流量无 SNI，目标不变，顶部 ip_cidr 规则照常命中。
+            // 【APP66 任务2.2C】sniff_override_destination 必须为 false：
+            // sing-box 在 sniff=true + sniff_override_destination=false 时
+            // 同样能用嗅探出的域名命中域名分流规则，但数据包目标地址永远
+            // 保持为原始 IP —— 访问多网卡内网 `https://192.168.10.253:8001`
+            // 或自定义 Host 时 100% 命中排在最前的 ip_cidr → go-lan-* 规则，
+            // 绝不会被改写后漏进公网代理或 DNS 解析失败。
             "sniff": true,
-            "sniff_override_destination": true,
+            "sniff_override_destination": false,
             // 【APP60 任务3.3】嗅探超时 100ms → 50ms：非 HTTP 协议快速放行，
             // 进一步压缩首包等待（网页/小文件请求不再为等 SNI 多付延迟）。
             "sniff_timeout": "50ms",
@@ -1427,20 +1428,20 @@ pub fn build(
     // direct 出站 ipv4_only，彻底告别 403 与 EPERM。
     let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
-        // 【APP65 任务2.3】dns-remote 改回明文 UDP 8.8.8.8 经主代理出境：
-        // 「一元机场」等中转节点会重置到 1.1.1.1 的 DoH（读取响应直接 EOF），
-        // 而 UDP 53 由 sing-box 自己封装进代理隧道，不依赖本机 UDP 通路。
+        // 【APP66 任务5.2】dns-remote 改为 tcp://8.8.8.8 经主代理出境：
+        // 明文 TCP 53 由 sing-box 自己封装进代理隧道，规避 UDP 53 在部分
+        // 运营商/节点被针对性丢包（表现为 `IN A: EOF` / 解析超时）。
         if let Some(main_tag) = &main_group_tag {
             json!({
                 "tag": "dns-remote",
-                "address": "udp://8.8.8.8",
+                "address": "tcp://8.8.8.8",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             })
         } else {
             json!({
                 "tag": "dns-remote",
-                "address": "udp://8.8.8.8",
+                "address": "tcp://8.8.8.8",
                 "detour": "direct",
                 "strategy": "ipv4_only",
             })
@@ -1451,21 +1452,20 @@ pub fn build(
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 【APP65 任务2.3】dns-direct 主用阿里 UDP 223.5.5.5：节点域名与
-        // 系统域名都由它 10ms 内直答，绝不依赖 dns-remote 出境，彻底消灭
-        // 「先解析节点域名才能连节点」的死锁 + `IN A: EOF`。
+        // 【APP66 任务5.2】dns-direct 主用阿里 UDP 223.5.5.5，且**禁止设置
+        // `detour: "direct"`**：显式 direct detour 会让 DNS 查询绕回 TUN 栈，
+        // 形成「解析 DNS 需要先出 TUN、出 TUN 又需要先解析 DNS」的自回环。
+        // 不写 detour 时 sing-box 直接走默认出站的底层 UDP 通路，10ms 内直答。
         json!({
             "tag": "dns-direct",
-            "address": "223.5.5.5",
-            "detour": "direct",
+            "address": "udp://223.5.5.5",
             "strategy": "ipv4_only",
         }),
         // 备用直连 DNS：腾讯 119.29.29.29（UDP 53），阿里 DNS 被运营商
         // 劫持/静默丢弃时兜底。两者在 iOS 侧均写入 excludedRoutes 直出。
         json!({
             "tag": "dns-direct-backup",
-            "address": "119.29.29.29",
-            "detour": "direct",
+            "address": "udp://119.29.29.29",
             "strategy": "ipv4_only",
         }),
         // 【APP64 任务2.2】iOS SVCB/HTTPS 查询拦截
@@ -1475,13 +1475,13 @@ pub fn build(
         }),
     ];
 
-    // Android DNS 清洗：同桌面 / iOS，统一 UDP 8.8.8.8 经主代理出境
+    // Android DNS 清洗：同桌面 / iOS，统一 tcp://8.8.8.8 经主代理出境
     #[cfg(target_os = "android")]
     {
         if let Some(main_tag) = &main_group_tag {
             dns_servers[0] = json!({
                 "tag": "dns-remote",
-                "address": "udp://8.8.8.8",
+                "address": "tcp://8.8.8.8",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             });
@@ -1495,8 +1495,8 @@ pub fn build(
         "rules": dns_rules,
         // 【APP65 任务2.3】final 固定 dns-direct（UDP 223.5.5.5 直出）：
         // 本地 DNS 10ms 内必答，绝不因远端节点封禁 DNS/DoH 超时而报
-        // `dns: exchange failed ... IN A: EOF`；真实域名由 tun-in 的
-        // sniff_override_destination 还原后交给节点服务器在海外解析。
+        // `dns: exchange failed ... IN A: EOF`；真实域名靠嗅探识别（不改写目标），
+        // 目标域名交给节点服务器在海外解析。
         "final": "dns-direct",
         // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
         // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路
@@ -3225,8 +3225,8 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("udp://8.8.8.8"),
-            "dns-remote 锁定 UDP 8.8.8.8 经主选择器出境（APP65 任务2.3）"
+            Some("tcp://8.8.8.8"),
+            "dns-remote 锁定 TCP 8.8.8.8 经主选择器出境（APP66 任务5.2）"
         );
 
         let outbound_rule = dns["rules"]
@@ -3904,8 +3904,8 @@ rules:
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启被动嗅探");
         assert_eq!(
             tun["sniff_override_destination"].as_bool(),
-            Some(true),
-            "【APP65 任务2.3】tun-in 必须开启嗅探目标改写（域名交给节点海外解析）"
+            Some(false),
+            "【APP66 任务2.2C】tun-in 只嗅探不改写目标（内网 ip_cidr 规则必须 100% 命中）"
         );
         assert_eq!(tun["strict_route"].as_bool(), Some(false));
 
@@ -4297,10 +4297,13 @@ rules:
             .iter()
             .find(|s| s["tag"] == "dns-direct")
             .expect("dns-direct server missing");
-        // 【APP44 任务5】节点域名直连 DNS 固定 223.5.5.5（明文 UDP 53），
-        // 不再使用 address=local 系统解析器
-        assert_eq!(direct["address"], "223.5.5.5");
-        assert_eq!(direct["detour"], "direct");
+        // 【APP66 任务5.2】节点域名直连 DNS 固定 UDP 223.5.5.5，且**不得**
+        // 带 detour: "direct"（显式 direct 会让 DNS 查询绕回 TUN 自回环）
+        assert_eq!(direct["address"], "udp://223.5.5.5");
+        assert!(
+            direct.get("detour").is_none(),
+            "dns-direct 禁止设置 detour（APP66 任务5.2）"
+        );
     }
 
     /// 【APP45 任务2】节点_2.txt 全链路：19 行 URI 订阅（1 行 0.0.0.0 假节点
@@ -4621,14 +4624,14 @@ rules:
             assert_eq!(o["tls"]["insecure"], true, "伪装 SNI 自动 insecure");
         }
 
-        // tun-in：嗅探 + 目标改写（APP65 任务2.3）
+        // tun-in：嗅探但不改写目标地址（APP66 任务2.2C）
         let inbounds = built.config["inbounds"].as_array().unwrap();
         let tun_in = inbounds
             .iter()
             .find(|o| o["tag"] == "tun-in")
             .expect("tun-in 入站缺失");
         assert_eq!(tun_in["sniff"], true);
-        assert_eq!(tun_in["sniff_override_destination"], true);
+        assert_eq!(tun_in["sniff_override_destination"], false);
 
         // DNS：final=dns-direct（UDP 223.5.5.5 直出）
         assert_eq!(built.config["dns"]["final"], "dns-direct");
@@ -4637,13 +4640,16 @@ rules:
             .iter()
             .find(|s| s["tag"] == "dns-direct")
             .expect("dns-direct 缺失");
-        assert_eq!(direct["address"], "223.5.5.5");
-        assert_eq!(direct["detour"], "direct");
+        assert_eq!(direct["address"], "udp://223.5.5.5");
+        assert!(
+            direct.get("detour").is_none(),
+            "dns-direct 禁止 detour（APP66 任务5.2）"
+        );
         assert!(
             servers
                 .iter()
                 .any(|s| s["tag"] == "dns-direct-backup"
-                    && s["address"] == "119.29.29.29"),
+                    && s["address"] == "udp://119.29.29.29"),
             "119.29.29.29 备用 DNS 缺失: {servers:?}"
         );
     }
@@ -4786,7 +4792,7 @@ rules:
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-remote"))
             .unwrap();
-        assert_eq!(remote["address"], "udp://8.8.8.8");
+        assert_eq!(remote["address"], "tcp://8.8.8.8");
         assert_eq!(remote["detour"], "Proxy");
         assert_eq!(dns["final"], "dns-direct", "dns.final 必须固定 dns-direct");
         let rules = dns["rules"].as_array().unwrap();
@@ -4880,14 +4886,23 @@ rules:
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-direct"))
             .expect("dns-direct 服务器缺失");
-        assert_eq!(direct["address"].as_str(), Some("223.5.5.5"));
-        assert_eq!(direct["detour"].as_str(), Some("direct"));
+        assert_eq!(direct["address"].as_str(), Some("udp://223.5.5.5"));
+        assert!(
+            direct.get("detour").is_none(),
+            "dns-direct 禁止 detour（APP66 任务5.2）"
+        );
         let direct_backup = servers
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-direct-backup"))
             .expect("dns-direct-backup 备用服务器缺失");
-        assert_eq!(direct_backup["address"].as_str(), Some("119.29.29.29"));
-        assert_eq!(direct_backup["detour"].as_str(), Some("direct"));
+        assert_eq!(
+            direct_backup["address"].as_str(),
+            Some("udp://119.29.29.29")
+        );
+        assert!(
+            direct_backup.get("detour").is_none(),
+            "dns-direct-backup 禁止 detour（APP66 任务5.2）"
+        );
         assert_eq!(
             built.config["dns"]["final"].as_str(),
             Some("dns-direct"),

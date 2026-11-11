@@ -1769,14 +1769,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i]["address"] = ["172.19.0.1/30"]
                     inbounds[i]["mtu"] = 1280
                     inbounds[i]["stack"] = "gvisor"
-                    // 【APP65 任务2.3】嗅探 + 目标改写：tun-in 从 TLS ClientHello /
-                    // HTTP Host 中拿到真实域名后，直接把连接目标改写为域名，
-                    // 由路由规则按域名分流到 Proxy，域名交给节点服务器在海外
-                    // 本地解析——彻底摆脱「本地 DNS 必须解析成功才能上网」的死锁。
-                    // 纯 IP 的内网流量（192.168.x.x）没有 SNI，目标地址保持原样，
-                    // 顶部 ip_cidr → go-lan-* 规则依然 100% 精准命中。
+                    // 【APP66 任务2.2C】sniff_override_destination 必须为 false：
+                    // sniff=true 仍能从 TLS ClientHello / HTTP Host 识别真实域名并
+                    // 命中域名分流规则，但数据包目标地址永远保持原始 IP —— 访问
+                    // 多网卡内网 `https://192.168.10.253:8001` 或自定义 Host 时
+                    // 100% 命中顶部 ip_cidr → go-lan-* 规则，绝不被改写漏进代理。
                     inbounds[i]["sniff"] = true
-                    inbounds[i]["sniff_override_destination"] = true
+                    inbounds[i]["sniff_override_destination"] = false
                     inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
@@ -2313,28 +2312,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         var dnsServers: [[String: Any]] = [
-            // 【APP65 任务2.3】dns-remote 改回明文 UDP 8.8.8.8 经主代理出境：
-            // 机场中转节点会重置 1.1.1.1 的 DoH 连接（读取响应直接 EOF），
-            // 而 UDP 53 由 sing-box 自己封装在代理隧道内，不依赖本机 UDP 通路。
+            // 【APP66 任务5.2】dns-remote 改为 tcp://8.8.8.8 经主代理出境：
+            // 明文 TCP 53 由 sing-box 自己封装进隧道，规避 UDP 53 被运营商或
+            // 节点针对性丢包（表现为 `IN A: EOF` / 解析超时）。
             [
                 "tag": "dns-remote",
-                "address": "udp://8.8.8.8",
+                "address": "tcp://8.8.8.8",
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP65 任务2.3】dns-direct 主用阿里 UDP 223.5.5.5，
+            // 【APP66 任务5.2】dns-direct 主用阿里 UDP 223.5.5.5、
             // dns-direct-backup 备用腾讯 UDP 119.29.29.29；两者都以 /32
             // 写入 ipv4Settings.excludedRoutes，从物理网卡直出，绝不回环。
+            // **禁止 detour: "direct"**：显式 direct 会让查询绕回 TUN 栈，
+            // 形成「出 TUN 需要 DNS、DNS 又需要出 TUN」的自回环。
             [
                 "tag": "dns-direct",
-                "address": "223.5.5.5",
-                "detour": "direct",
+                "address": "udp://223.5.5.5",
                 "strategy": "ipv4_only"
             ],
             [
                 "tag": "dns-direct-backup",
-                "address": "119.29.29.29",
-                "detour": "direct",
+                "address": "udp://119.29.29.29",
                 "strategy": "ipv4_only"
             ]
         ]

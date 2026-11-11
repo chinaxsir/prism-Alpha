@@ -539,7 +539,13 @@ fn profile_virtual_cidrs(profile: &GoLanProfile) -> Vec<String> {
     cidrs
 }
 
-/// 【APP40 任务2】On-Demand 分网段：返回 (走隧道的网段, 命中本地局域网直连的网段)。
+/// 【APP40 任务2 / APP66 任务2.2】On-Demand 分网段：
+/// 返回 (走隧道的网段, 命中本地局域网可直连的网段)。
+///
+/// 【APP66 任务2.2 缺陷修复 A】第一个返回值**必须 100% 保留档案全部网段**
+/// （业务网段 + WG 虚拟网段）：直连只是临时插入在其上方的例外规则，
+/// 绝不能把业务网段从 go-lan-* 规则里删掉——否则手机曾在局域网触发一次
+/// On-Demand 直连后，切回蜂窝/异地 Wi-Fi 时多网卡宿主机内网全部失联。
 pub fn split_profile_cidrs_for_on_demand(
     profile: &GoLanProfile,
     physical_ips: &[std::net::Ipv4Addr],
@@ -549,22 +555,18 @@ pub fn split_profile_cidrs_for_on_demand(
         return (cidrs, Vec::new());
     }
     let virtual_cidrs = profile_virtual_cidrs(profile);
-    let mut tunnel: Vec<String> = Vec::new();
     let mut direct: Vec<String> = Vec::new();
-    for cidr in cidrs {
-        if virtual_cidrs.contains(&cidr) {
-            tunnel.push(cidr);
+    for cidr in &cidrs {
+        if virtual_cidrs.contains(cidr) {
             continue;
         }
         // 【APP60 任务2.1】逐网段独立判定：同子网位运算 OR 跨子网 TCP 短探测
         // （65ms，绑定物理源 IP，结果签名缓存，非轮询）
-        if is_cidr_direct(profile, &cidr, physical_ips) {
-            direct.push(cidr);
-        } else {
-            tunnel.push(cidr);
+        if is_cidr_direct(profile, cidr, physical_ips) {
+            direct.push(cidr.clone());
         }
     }
-    (tunnel, direct)
+    (cidrs, direct)
 }
 
 /// 【APP58 任务1.1】物理网卡枚举结果 5 秒内存缓存：
@@ -1849,6 +1851,80 @@ pub struct GoLanProbeResult {
     pub target_ip: String,
     pub latency_ms: Option<u64>,
     pub message: String,
+    /// 【APP66 任务2.1】目标不在任何档案网段时自动推导出的 /24，
+    /// 由 IPC 层持久化进档案 lan_cidrs，实现「检测即可自动补网段」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_cidr: Option<String>,
+}
+
+/// 【APP66 任务2.1】按目标 IPv4 推导所在 /24 网段字符串。
+fn derive_slash24(ip: std::net::Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+}
+
+/// 【APP66 任务2.2】内网检测的档案归属结果。
+struct ProbeOwner {
+    tag: String,
+    profile: GoLanProfile,
+    tunnel: Vec<String>,
+    direct: Vec<String>,
+    bypassed: bool,
+    /// 目标不在档案网段时自动推导的 /24（由 IPC 层持久化并热更新）
+    auto_cidr: Option<String>,
+}
+
+/// 【APP66 任务2.2】解决「多网卡 WG 宿主机」检测目标不属于任何已保存网段
+/// 时被硬拦截的问题：
+/// - 显式 `profile_id`（弹窗当前编辑档案）优先；
+/// - 其次按目标网段匹配已启用档案（含前端正在编辑、尚未保存的网段）；
+/// - 最后归属第一个启用档案，并自动推导目标所在 /24 作为待补充网段。
+fn resolve_probe_owner(
+    profiles: &[(String, GoLanProfile)],
+    target: std::net::Ipv4Addr,
+    profile_id: Option<&str>,
+    current_cidrs: &[String],
+    physical_ips: &[std::net::Ipv4Addr],
+) -> Option<ProbeOwner> {
+    let editing_cidrs: Vec<String> = current_cidrs
+        .iter()
+        .filter_map(|c| sanitize_ip_prefix(c, 24))
+        .collect();
+    let explicit = profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            profiles
+                .iter()
+                .find(|(tag, p)| p.id == id || tag == id || p.name == id)
+                .cloned()
+        });
+    let (tag, profile) = explicit
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|(_, p)| {
+                    ipv4_in_any_cidr(target, &profile_route_cidrs(p))
+                        || ipv4_in_any_cidr(target, &editing_cidrs)
+                })
+                .cloned()
+        })
+        .or_else(|| profiles.first().cloned())?;
+    let covered = ipv4_in_any_cidr(target, &profile_route_cidrs(&profile))
+        || ipv4_in_any_cidr(target, &editing_cidrs);
+    let auto_cidr = (!covered).then(|| derive_slash24(target));
+    let (tunnel, direct) = split_profile_cidrs_for_on_demand(&profile, physical_ips);
+    let bypassed = direct
+        .iter()
+        .any(|c| ipv4_in_any_cidr(target, std::slice::from_ref(c)));
+    Some(ProbeOwner {
+        tag,
+        profile,
+        tunnel,
+        direct,
+        bypassed,
+        auto_cidr,
+    })
 }
 
 /// 【APP6 任务2】从 WireGuard local_address（如 "10.1.8.2/24"）推导对端
@@ -1899,8 +1975,11 @@ struct PortProbeHit {
     latency_ms: u64,
 }
 
-/// 单端口 HTTP/HTTPS 探测窗口（Clash API 与直连均 2500ms）
-const PROBE_PORT_WINDOW_MS: u64 = 2500;
+/// 单端口 HTTP/HTTPS 探测窗口（Clash API 与直连均 1000ms）。
+/// 【APP66 任务2.1】探测整体硬超时 2200ms：Clash API（1000ms）+ 应用层直连
+/// （1000ms）必须都能在超时前跑完；可达内网目标的真实延迟通常 <300ms，
+/// 1000ms 窗口不会造成误判，却能保证 2.2 秒内必定返回结果。
+const PROBE_PORT_WINDOW_MS: u64 = 1000;
 
 /// 【APP40 任务1】经 Clash API 对指定 `go-lan-*` 出站做单协议延迟测试。
 /// 请求由 sing-box 内核 ctx 承载，`timeout` 到期立即由内核 Close() 销毁
@@ -2236,15 +2315,19 @@ fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
     false
 }
 
-/// 【APP40 任务1/3】精准 `IP:端口` 智能检测：
+/// 【APP40 任务1/3 / APP66 任务2】精准 `IP:端口` 智能检测：
 ///
 /// - 强制 `IP:端口`（或 `http(s)://IP[:端口]`）：纯 IP 不发起任何扫描，
 ///   直接返回友好提示；
-/// - 网段归属硬校验：目标必须落在当前已启用档案的 lan_cidrs 内；
+/// - 【APP66 任务2.2】**彻底删除**「目标不在已配置内网网段 → 拒绝检测」的
+///   硬拦截：显式 profileId 优先，其次按网段匹配，最后归属第一个启用档案；
+///   目标不在档案网段时自动推导 /24（`auto_cidr`）交由 IPC 层并入档案；
 /// - 拒绝检测本机自身的 WireGuard 虚拟 IP；
 /// - 仅对用户指定的**唯一端口**并发 HTTPS（忽略自签名证书）/ HTTP 探测，
 ///   必要时再做一次单端口 TCP 握手兜底，绝不触碰任何其他端口；
-/// - On-Demand 命中本地同网段时，直接走物理网络并返回 ⚡ 提示。
+/// - On-Demand 命中本地同网段时，直接走物理网络并返回 ⚡ 提示；
+/// - 【APP66 任务2.1】原子单飞 + 2200ms 硬超时：连续点击绝不堆积并发，
+///   任何网络异常都必定在 2.2 秒内返回，100% 不挂起 IPC 通道。
 pub async fn probe_intranet_ip(
     target_ip_raw: Option<&str>,
     api_addr: &str,
@@ -2252,6 +2335,71 @@ pub async fn probe_intranet_ip(
     is_running: bool,
     go_lan_enabled: bool,
     lan: &GoLanSettings,
+    profile_id: Option<&str>,
+    current_cidrs: &[String],
+) -> GoLanProbeResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // 【APP66 任务2.1】原子单飞：上一次检测未结束时立即快速返回，
+    // 防止连续点击把并发探测堆满 Tokio 工作线程（.ips 卡死根因之一）。
+    static PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    struct InFlightGuard;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            PROBE_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+    if PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return GoLanProbeResult {
+            reachable: false,
+            target_ip: target_ip_raw.unwrap_or("").to_string(),
+            latency_ms: None,
+            message: "上一次内网检测尚未结束（最长 2.2 秒），请稍候再试".into(),
+            auto_cidr: None,
+        };
+    }
+    let _guard = InFlightGuard;
+    // 【APP66 任务2.1】硬超时上限 2200ms：无论网络如何异常都必须返回
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(2200),
+        probe_intranet_ip_inner(
+            target_ip_raw,
+            api_addr,
+            api_secret,
+            is_running,
+            go_lan_enabled,
+            lan,
+            profile_id,
+            current_cidrs,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let msg =
+                "⚠️ 检测超时（2.2 秒）：目标无响应，请确认内网端口已开放或稍后重试".to_string();
+            crate::core::logger::warn(crate::core::logger::MOD_GO_LAN, &msg);
+            GoLanProbeResult {
+                reachable: false,
+                target_ip: target_ip_raw.unwrap_or("").to_string(),
+                latency_ms: None,
+                message: msg,
+                auto_cidr: None,
+            }
+        }
+    }
+}
+
+/// 内网检测的实际逻辑（由 `probe_intranet_ip` 以单飞 + 2.2s 超时包裹）。
+async fn probe_intranet_ip_inner(
+    target_ip_raw: Option<&str>,
+    api_addr: &str,
+    api_secret: &str,
+    is_running: bool,
+    go_lan_enabled: bool,
+    lan: &GoLanSettings,
+    profile_id: Option<&str>,
+    current_cidrs: &[String],
 ) -> GoLanProbeResult {
     let log = crate::core::logger::MOD_GO_LAN;
     // 1. 严格解析输入（未带端口 → 直接提示，绝不扫描）
@@ -2264,6 +2412,7 @@ pub async fn probe_intranet_ip(
                 target_ip: target_ip_raw.unwrap_or("").to_string(),
                 latency_ms: None,
                 message: msg,
+                auto_cidr: None,
             };
         }
         None => {
@@ -2272,6 +2421,7 @@ pub async fn probe_intranet_ip(
                 target_ip: String::new(),
                 latency_ms: None,
                 message: PROBE_MISSING_PORT_MSG.into(),
+                auto_cidr: None,
             };
         }
     };
@@ -2286,6 +2436,7 @@ pub async fn probe_intranet_ip(
                 target_ip,
                 latency_ms: None,
                 message,
+                auto_cidr: None,
             };
         }
     };
@@ -2298,6 +2449,7 @@ pub async fn probe_intranet_ip(
             target_ip: target_ip.clone(),
             latency_ms: None,
             message: "VPN 尚未启动，请先在仪表盘启动代理后再检测".into(),
+            auto_cidr: None,
         };
     }
     if !go_lan_enabled {
@@ -2307,6 +2459,7 @@ pub async fn probe_intranet_ip(
             target_ip: target_ip.clone(),
             latency_ms: None,
             message: "Go Lan 尚未开启，请先打开 Go Lan 开关".into(),
+            auto_cidr: None,
         };
     }
     let mut profiles = enabled_profiles(lan);
@@ -2339,6 +2492,7 @@ pub async fn probe_intranet_ip(
             target_ip: target_ip.clone(),
             latency_ms: None,
             message: "没有已启用的内网档案，请先在 Go Lan 中启用一路内网".into(),
+            auto_cidr: None,
         };
     }
 
@@ -2369,39 +2523,46 @@ pub async fn probe_intranet_ip(
             target_ip,
             latency_ms: None,
             message: msg,
+            auto_cidr: None,
         };
     }
 
-    // 4. 找到目标所属的档案 + 是否触发 On-Demand 同局域网直连
+    // 4. 归属档案 + 是否触发 On-Demand 同局域网直连
+    // 【APP66 任务2.2】彻底删除「目标不在已配置网段 → 拒绝检测」的硬拦截：
+    // 用户在多网卡 WG 宿主机上检测另一张网卡的 IP 时，绝不能报
+    // 「检测 IP 不在允许的网段」。归属顺序：显式 profileId > 网段匹配 >
+    // 第一个启用档案；未覆盖时自动推导 /24 交 IPC 层并入档案并热更新。
     let physical_ips = detect_physical_lan_ipv4s();
-    let owner = profiles.iter().find_map(|(tag, profile)| {
-        let cidrs = profile_route_cidrs(profile);
-        if !ipv4_in_any_cidr(target_v4, &cidrs) {
-            return None;
-        }
-        let (tunnel, direct) = split_profile_cidrs_for_on_demand(profile, &physical_ips);
-        let bypassed = direct
-            .iter()
-            .any(|c| ipv4_in_any_cidr(target_v4, std::slice::from_ref(c)));
-        Some((tag.clone(), profile.clone(), tunnel, direct, bypassed))
-    });
-    let Some((tag, profile, tunnel, direct, bypassed)) = owner else {
-        let all_cidrs: Vec<String> = profiles
-            .iter()
-            .flat_map(|(_, p)| profile_route_cidrs(p))
-            .collect();
-        let msg = format!(
-            "❌ 目标 IP {target_ip} 不在已启用的内网网段 [{}] 内，不会经过 Go Lan 隧道",
-            all_cidrs.join(", ")
-        );
+    let Some(owner) =
+        resolve_probe_owner(&profiles, target_v4, profile_id, current_cidrs, &physical_ips)
+    else {
+        let msg = "没有已启用的内网档案，请先在 Go Lan 中启用一路内网".to_string();
         crate::core::logger::warn(log, &msg);
         return GoLanProbeResult {
             reachable: false,
             target_ip,
             latency_ms: None,
             message: msg,
+            auto_cidr: None,
         };
     };
+    let ProbeOwner {
+        tag,
+        profile,
+        tunnel,
+        direct,
+        bypassed,
+        auto_cidr,
+    } = owner;
+    if let Some(cidr) = auto_cidr.as_deref() {
+        crate::core::logger::info(
+            log,
+            &format!(
+                "目标 IP {target_ip} 不在档案「{}」已配置网段内，自动识别为 {cidr} 并加入路由",
+                profile.name
+            ),
+        );
+    }
     if bypassed {
         crate::core::logger::info(
             log,
@@ -2430,6 +2591,8 @@ pub async fn probe_intranet_ip(
     // 5. 探测：On-Demand 直连 → 仅直连；否则 Clash API → 直连 → 单端口 TCP
     // 【APP50 任务3】纯 IP（端口哨兵 0）：仅依次探测 http:80 → https:443
     // （最多 2 次 Clash API 延迟测试，绝不盲目扫描其他端口），首次成功即返回
+    // 【APP66 任务2.1】单端口探测与 Web 探测**并发**：2.2 秒硬超时内仍能
+    // 完成非 Web 端口（3389/22/445…）的 TCP 握手判定，绝不因串行等待超时。
     let mut result: Result<PortProbeHit, String> = if input.port == 0 {
         let mut r = Err("未发起探测".to_string());
         for (scheme, port) in [("http", 80u16), ("https", 443u16)] {
@@ -2455,16 +2618,25 @@ pub async fn probe_intranet_ip(
     } else if bypassed {
         probe_web_protocols_direct_only(&target_ip, input.port, scheme_hint, &input.path).await
     } else {
-        probe_web_protocols(
-            &target_ip,
-            input.port,
-            scheme_hint,
-            &input.path,
-            api_addr,
-            api_secret,
-            &tag,
-        )
-        .await
+        let (web, tcp) = tokio::join!(
+            probe_web_protocols(
+                &target_ip,
+                input.port,
+                scheme_hint,
+                &input.path,
+                api_addr,
+                api_secret,
+                &tag,
+            ),
+            probe_single_port_tcp(&target_ip, input.port)
+        );
+        // 非 Web 端口（3389 / 22 / 445…）握手成功同样视为可达，绝不扫描其他端口
+        web.or_else(|_| {
+            tcp.map(|ms| PortProbeHit {
+                scheme: "TCP".into(),
+                latency_ms: ms,
+            })
+        })
     };
     if result.is_err() && !bypassed && input.port != 0 {
         // 非 Web 端口（3389 / 22 / 445…）单端口握手兜底，绝不扫描其他端口
@@ -2495,8 +2667,12 @@ pub async fn probe_intranet_ip(
             } else {
                 ""
             };
+            let auto_note = auto_cidr
+                .as_deref()
+                .map(|c| format!("（已自动识别网段 {c} 并持久化）"))
+                .unwrap_or_default();
             let msg = format!(
-                "✅ 已通过「{}」隧道连通 {}://{target_ip}:{shown_port}{od_note} · 延迟 {} ms",
+                "✅ 已通过「{}」隧道连通 {}://{target_ip}:{shown_port}{od_note} · 延迟 {} ms{auto_note}",
                 profile.name, hit.scheme, hit.latency_ms
             );
             crate::core::logger::info(log, &msg);
@@ -2505,6 +2681,7 @@ pub async fn probe_intranet_ip(
                 target_ip,
                 latency_ms: Some(hit.latency_ms),
                 message: msg,
+                auto_cidr,
             }
         }
         Err(_) => {
@@ -2524,6 +2701,7 @@ pub async fn probe_intranet_ip(
                 target_ip,
                 latency_ms: None,
                 message: msg,
+                auto_cidr,
             }
         }
     }
@@ -3319,31 +3497,80 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
-    /// 【APP11 任务2 铁律1 / 任务5.3】不在回家网段内的 IP 必须 100% 拒绝
-    #[tokio::test]
-    async fn test_probe_rejects_ip_outside_lan_cidrs() {
-        let lan = GoLanSettings {
+    /// 【APP66 任务2.2】网段外 IP 不再被硬拦截：自动归属第一个启用档案并
+    /// 推导所属 /24（多网卡 WG 宿主机修复），绝不再提示「不在允许的网段」。
+    #[test]
+    fn test_probe_owner_auto_cidr_for_outside_ip() {
+        let profile = sample_profile(
+            "home",
+            "家里",
+            &["10.1.8.0/24", "192.168.10.0/24"],
+            "10.1.8.2/24",
+            68,
+        );
+        let profiles = vec![(GO_LAN_TAG.to_string(), profile)];
+        let owner = resolve_probe_owner(
+            &profiles,
+            "192.168.0.1".parse().unwrap(),
+            None,
+            &[],
+            &[],
+        )
+        .expect("必须归属第一个启用档案，而不是拒绝检测");
+        assert_eq!(owner.auto_cidr.as_deref(), Some("192.168.0.0/24"));
+        // 已覆盖的网段不再重复补网段
+        let covered = resolve_probe_owner(
+            &profiles,
+            "192.168.10.253".parse().unwrap(),
+            None,
+            &[],
+            &[],
+        )
+        .expect("网段内目标");
+        assert!(covered.auto_cidr.is_none());
+        // 前端正在编辑、尚未保存的网段同样视为已覆盖
+        let editing = resolve_probe_owner(
+            &profiles,
+            "192.168.0.1".parse().unwrap(),
+            None,
+            &["192.168.0.0/24".to_string()],
+            &[],
+        )
+        .expect("编辑中网段");
+        assert!(editing.auto_cidr.is_none());
+    }
+
+    /// 【APP66 任务2.2】多网卡宿主机网段必须 100% 完整保留在隧道路由中
+    /// （直连只是上方例外规则，绝不从 config.json 的 go-lan-* 规则剔除）
+    #[test]
+    fn test_multi_nic_cidrs_fully_retained_in_route_rules() {
+        let mut lan = GoLanSettings {
             enabled: true,
-            lan_cidrs: vec!["10.1.8.0/24".into(), "192.168.10.0/24".into()],
-            wg_config: Some(WgManualConfig {
-                server: "home.example.com".into(),
-                server_port: 51820,
-                private_key: test_key(1),
-                peer_public_key: test_key(2),
-                pre_shared_key: None,
-                local_ip: "10.1.8.2/24".into(),
-                mtu: 1420,
-            }),
             ..Default::default()
         };
-        // 192.168.0.1 不在 [10.1.8.0/24, 192.168.10.0/24] 内 → 直接拒绝，不发起探测
-        let r = probe_intranet_ip(Some("192.168.0.1:8001"), "", "", true, true, &lan).await;
-        assert!(!r.reachable, "网段外 IP 必须拒绝: {r:?}");
-        assert!(
-            r.message.contains("不在已启用的内网网段"),
-            "错误消息应说明网段不匹配: {}",
-            r.message
+        let mut home = sample_profile(
+            "home",
+            "家里",
+            &["10.37.0.0/24", "10.10.10.0/24", "192.168.10.0/24"],
+            "10.37.0.2/32",
+            69,
         );
+        home.bypass_on_local_lan = true;
+        lan.profiles = vec![home];
+        let (rules, _) = go_lan_route_rules(&lan);
+        let all: Vec<String> = rules
+            .iter()
+            .filter(|r| r.get("outbound").and_then(|o| o.as_str()) == Some(GO_LAN_TAG))
+            .filter_map(|r| r.get("ip_cidr")?.as_array().cloned())
+            .flatten()
+            .filter_map(|c| c.as_str().map(str::to_string))
+            .collect();
+        for cidr in ["10.37.0.0/24", "10.10.10.0/24", "192.168.10.0/24"] {
+            assert!(
+                all.contains(&cidr.to_string()),
+                "隧道规则必须保留 {cidr}: {all:?}"
+            );
+        }
     }
 
     /// 【APP11 任务2 铁律1】本机自身 WireGuard 虚拟 IP 必须拒绝
@@ -3363,7 +3590,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = probe_intranet_ip(Some("10.1.8.2:8001"), "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("10.1.8.2:8001"), "", "", true, true, &lan, None, &[]).await;
         assert!(!r.reachable, "本机虚拟 IP 必须拒绝: {r:?}");
         assert!(
             r.message.contains("本机自身"),
@@ -3461,7 +3688,7 @@ mod tests {
             ..Default::default()
         };
         // 未输入目标 → 友好提示
-        let r = probe_intranet_ip(None, "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(None, "", "", true, true, &lan, None, &[]).await;
         assert!(!r.reachable, "无输入必须直接提示: {r:?}");
         assert!(
             r.message.contains("IP:端口"),
@@ -3472,7 +3699,7 @@ mod tests {
         // 可达性取决于测试环境（本机恰在同网段且目标在线时会真实连通成功），
         // 因此只断言文案结构：含目标 IP、绝无「请输入端口」拦截、
         // 绝无「延迟仅 1 ms」式误报
-        let r = probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan).await;
+        let r = probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan, None, &[]).await;
         assert!(r.message.contains("192.168.10.253"), "{}", r.message);
         assert!(
             !r.message.contains("请输入"),
@@ -3485,7 +3712,7 @@ mod tests {
             r.message
         );
         // 显式 IP:端口 且内核未运行 → 提示启动
-        let r = probe_intranet_ip(Some("192.168.10.253:8001"), "", "", false, true, &lan).await;
+        let r = probe_intranet_ip(Some("192.168.10.253:8001"), "", "", false, true, &lan, None, &[]).await;
         assert!(r.message.contains("VPN 尚未启动"), "{}", r.message);
     }
 
@@ -4223,12 +4450,12 @@ mod tests {
         let physical: Vec<std::net::Ipv4Addr> =
             vec!["192.168.10.88".parse().unwrap()];
 
-        // 家里：命中同网段 → 直连，隧道内仅保留 WG 虚拟子网
+        // 家里：命中同网段 → 直连例外，隧道规则仍完整保留全部网段
         let (tunnel, direct) = split_profile_cidrs_for_on_demand(&home, &physical);
         assert!(direct.contains(&"192.168.10.0/24".to_string()), "{direct:?}");
         assert!(
-            !tunnel.contains(&"192.168.10.0/24".to_string()),
-            "命中本机局域网必须退出隧道: {tunnel:?}"
+            tunnel.contains(&"192.168.10.0/24".to_string()),
+            "【APP66】隧道规则必须完整保留业务网段: {tunnel:?}"
         );
         assert!(tunnel.contains(&"10.196.0.0/24".to_string()), "{tunnel:?}");
         assert!(
@@ -4275,6 +4502,11 @@ mod tests {
             tunnel.contains(&"10.8.0.0/24".to_string()),
             "未命中网段必须仍走隧道: {tunnel:?}"
         );
+        // 【APP66】命中直连的网段也不得从隧道规则中消失（多网卡宿主机修复）
+        assert!(
+            tunnel.contains(&"192.168.10.0/24".to_string()),
+            "隧道规则必须完整保留全部业务网段: {tunnel:?}"
+        );
     }
 
     /// 【APP60 任务2.1】跨子网网段进入 65ms TCP 探测路径，且结果按
@@ -4314,7 +4546,8 @@ mod tests {
             d_office.contains(&"10.8.0.0/24".to_string()),
             "direct={d_office:?} tunnel={t_office:?}"
         );
-        assert!(!t_office.contains(&"10.8.0.0/24".to_string()));
+        // 【APP66】直连只是上方例外，隧道规则仍保留 10.8.0.0/24
+        assert!(t_office.contains(&"10.8.0.0/24".to_string()));
         let any_direct = !d_home.is_empty() || !d_office.is_empty();
         assert!(any_direct, "任一启用隧道命中即 any_on_demand_direct=true");
     }
