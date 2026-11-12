@@ -1031,6 +1031,79 @@ try {
 }
 
 // ============================================================
+// 检查 18：【APP70】大陆网络卡顿修复门禁（三种出站模式全平台）
+//  1. Swift 扩展不得再无条件注入 QUIC / UDP443 阻断；
+//  2. Swift 不得再无条件拒绝 SVCB/HTTPS；
+//  3. Rust 的 QUIC 阻断只能由 settings.block_quic 驱动，且在大陆直连之后；
+//  4. 两侧都必须内置大陆域名后缀与大陆 ip_cidr 直连兜底清单。
+// ============================================================
+console.log('\n--- 检查 18：大陆网络卡顿修复（APP70）---');
+try {
+  const pttRel = 'src-tauri/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift';
+  const ptt = readFileSync(resolve(ROOT, pttRel), 'utf8');
+  const codeOnly = (src) =>
+    src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim();
+        return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*');
+      })
+      .join('\n');
+  const pttCode = codeOnly(ptt);
+  const bannedSwift = [
+    ['["protocol": ["quic"], "outbound": finalBlockTag]', '扩展层无条件 QUIC 阻断'],
+    ['["network": ["udp"], "port": [443], "outbound": finalBlockTag]', '扩展层无条件 UDP/443 阻断'],
+    ['dnsRules.insert(["query_type": ["SVCB", "HTTPS"], "action": "reject"], at: 0)', '扩展层无条件 SVCB/HTTPS 拒绝'],
+  ];
+  for (const [token, desc] of bannedSwift) {
+    if (pttCode.includes(token)) fail(`${pttRel} 仍含${desc}：${token}`);
+    else pass(`扩展层已移除${desc} ✓`);
+  }
+  if (ptt.includes('incomingQuicBlocked')) pass('扩展层 SVCB 拒绝由 QUIC 阻断状态驱动 ✓');
+  else fail('扩展层缺少 incomingQuicBlocked 条件判定');
+  if (ptt.includes('cnDirectDomainSuffixes') && ptt.includes('cnDirectCIDRs')) {
+    pass('扩展层内置大陆域名后缀 + 大陆 ip_cidr 直连兜底 ✓');
+  } else {
+    fail('扩展层缺少内置大陆直连兜底清单');
+  }
+
+  const cbSrc = readFileSync(resolve(ROOT, 'src-tauri/src/core/config_builder.rs'), 'utf8');
+  if (cbSrc.includes('has_go_lan_rules')) {
+    fail('config_builder 仍以 has_go_lan_rules 触发 QUIC 阻断（关闭开关也会阻断）');
+  } else {
+    pass('QUIC 阻断不再受 Go Lan 开关牵连 ✓');
+  }
+  if (!cbSrc.includes('if settings.block_quic {')) {
+    fail('config_builder 缺少 settings.block_quic 条件门禁');
+  } else {
+    pass('QUIC 阻断仅由 settings.block_quic 驱动 ✓');
+  }
+  const svcbIdx = cbSrc.indexOf('"query_type": ["SVCB", "HTTPS"], "action": "reject"');
+  const quicGuardIdx = cbSrc.indexOf('if settings.block_quic {');
+  if (svcbIdx < 0) {
+    fail('config_builder 缺少受控 SVCB/HTTPS 拦截规则');
+  } else if (quicGuardIdx < 0 || svcbIdx - quicGuardIdx > 200) {
+    fail('config_builder 的 SVCB/HTTPS 拦截未置于 block_quic 条件内');
+  } else {
+    pass('SVCB/HTTPS 拦截仅在 block_quic 开启时生成 ✓');
+  }
+  if (cbSrc.includes('CN_DIRECT_DOMAIN_SUFFIXES') && cbSrc.includes('CN_DIRECT_CIDRS')) {
+    pass('config_builder 内置大陆域名后缀 + 大陆 ip_cidr 直连清单 ✓');
+  } else {
+    fail('config_builder 缺少内置大陆直连清单常量');
+  }
+  const cnRule = cbSrc.indexOf('"domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES');
+  const quicGuard2 = cbSrc.lastIndexOf('if settings.block_quic {');
+  if (cnRule >= 0 && quicGuard2 > cnRule) {
+    pass('QUIC 阻断严格排在大陆直连规则之后 ✓');
+  } else {
+    fail('QUIC 阻断未排在大陆直连规则之后');
+  }
+} catch (e) {
+  fail(`大陆网络卡顿修复检查失败：${e.message}`);
+}
+
+// ============================================================
 // 收尾
 // ============================================================
 console.log();
@@ -1038,5 +1111,5 @@ if (failed) {
   console.error('❌ verify-ios-ready 有硬性检查不通过，请修正后再推送！');
   process.exit(1);
 } else {
-  console.log('✅ verify-ios-ready: 全部 17 项检查绿灯通过，iOS / Android 构建就绪！');
+  console.log('✅ verify-ios-ready: 全部 18 项检查绿灯通过，iOS / Android 构建就绪！');
 }

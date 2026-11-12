@@ -11,6 +11,54 @@ private var prismProviderRef: PacketTunnelProvider?
 /// 的 HTTP/HTTPS 请求才会 100% 进入内核并从 go-lan-home 直达内网 Web 服务。
 private let prismMixedPort = 2080
 
+/// 【APP70 任务2.2】内置中国大陆核心域名后缀（与 config_builder.rs 的
+/// CN_DIRECT_DOMAIN_SUFFIXES 保持 100% 同步）。iOS 扩展剥离 geosite: cn
+/// 与订阅内联规则后，国内域名仍能在 dns.rules / route.rules 命中
+/// dns-direct / direct，杜绝 `gw.alicdn.com -> dial tcp 172.64.229.88:443
+/// network is unreachable` 与国内站点数秒卡顿。
+private let cnDirectDomainSuffixes: [String] = [
+    "cn", "xn--fiqs8s", "xn--55qx5d", "xn--io0a7i",
+    "baidu.com", "bdstatic.com", "baidupcs.com",
+    "qq.com", "weixin.qq.com", "weixinbridge.com", "wechat.com", "tenpay.com",
+    "gtimg.cn", "gtimg.com", "qpic.cn", "qlogo.cn", "myqcloud.com", "tencent.com",
+    "tencent-cloud.net",
+    "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
+    "alipay.com", "alipayobjects.com", "alibaba.com", "alibaba-inc.com",
+    "dingtalk.com", "goofish.com", "tbcache.com", "mmstat.com", "youku.com",
+    "ucweb.com", "amap.com",
+    "jd.com", "360buyimg.com", "jdcloud.com",
+    "bilibili.com", "hdslb.com", "biliapi.net", "biliapi.com", "bilivideo.com",
+    "douyin.com", "douyincdn.com", "byteimg.com", "bytedance.com", "toutiao.com",
+    "snssdk.com", "pstatp.com", "volces.com", "feishu.cn",
+    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "yximgs.com",
+    "163.com", "126.com", "126.net", "127.net", "netease.com",
+    "sina.com.cn", "weibo.com", "weibocdn.com", "sinaimg.cn",
+    "meituan.com", "meituan.net", "dianping.com", "dpfile.com",
+    "pinduoduo.com", "yangkeduo.com", "pddugc.com",
+    "xiaomi.com", "mi.com", "miui.com", "huawei.com", "vmall.com", "hicloud.com",
+    "dbankcdn.com",
+    "zhihu.com", "zhimg.com", "csdn.net", "juejin.cn", "gitee.com", "oschina.net",
+    "ctrip.com", "12306.cn", "didiglobal.com", "didichuxing.com",
+    "apple.com", "icloud.com", "icloud.com.cn", "icloud-content.com", "mzstatic.com",
+    "cdn-apple.com", "aaplimg.com"
+]
+
+/// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段
+/// （与 config_builder.rs 的 CN_DIRECT_CIDRS 保持 100% 同步）。
+private let cnDirectCIDRs: [String] = [
+    "8.129.0.0/16", "47.92.0.0/14", "47.96.0.0/11", "47.100.0.0/14",
+    "59.110.0.0/16", "101.37.0.0/16", "106.11.0.0/16", "112.124.0.0/14",
+    "116.62.0.0/16", "118.31.0.0/16", "120.24.0.0/13", "121.40.0.0/14",
+    "123.56.0.0/15", "139.129.0.0/16", "182.92.0.0/16", "203.107.0.0/16",
+    "49.51.0.0/16", "106.52.0.0/14", "119.29.0.0/16", "129.28.0.0/16",
+    "132.232.0.0/16", "134.175.0.0/16", "162.62.0.0/16", "175.24.0.0/14",
+    "193.112.0.0/16",
+    "61.135.0.0/16", "180.76.0.0/16", "182.61.0.0/16", "220.181.0.0/16",
+    "114.115.0.0/16", "121.36.0.0/16", "122.112.0.0/16", "139.9.0.0/16",
+    "111.13.0.0/16", "119.3.0.0/16", "180.101.0.0/16", "210.22.0.0/16",
+    "58.216.0.0/16", "221.204.0.0/16"
+]
+
 /// 缓存当前活跃的物理网卡索引与名称（en0 / pdp_ip0）
 private var cachedPhysicalIfIndex: UInt32 = 0
 private var cachedPhysicalIfName: String = "en0"
@@ -1762,6 +1810,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 全部以此为准（不再使用全局 route.default_interface）。
         let physIfName = findPhysicalInterfaceName()
 
+        // 【APP70 任务2.1】QUIC 阻断已统一由 Rust config_builder 依据
+        // settings.block_quic 生成；扩展层只读取、绝不重复生成。此处仅
+        // 判断配置里是否已存在 QUIC/UDP443 阻断规则，用于决定是否拦截
+        // SVCB/HTTPS 查询（关闭「阻止 QUIC」时完全放行，消除服务发现延迟）。
+        let incomingRules = ((root["route"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        let incomingQuicBlocked = incomingRules.contains { rule in
+            let out = (rule["outbound"] as? String) ?? ""
+            guard out == "block" || out == "reject" else { return false }
+            if (rule["protocol"] as? String) == "quic" { return true }
+            if let protos = rule["protocol"] as? [String], protos.contains("quic") { return true }
+            let udp = (rule["network"] as? String) == "udp"
+                || ((rule["network"] as? [String])?.contains("udp") ?? false)
+            if udp, let ports = rule["port"] as? [Int], ports.contains(443) { return true }
+            return false
+        }
+
         // 1. 修正 inbounds 中的 tun 配置
         if var inbounds = root["inbounds"] as? [[String: Any]] {
             for i in inbounds.indices {
@@ -2354,13 +2418,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         dnsServers.append(contentsOf: preservedDnsServers)
         // dns-home 规则必须排在最前（位于 outbound:any 兜底规则之前）
         var dnsRules: [[String: Any]] = preservedDnsRules
-        // 【APP60 任务3.1】Swift 扩展侧默认只接管 IPv4（tun address 仅含
-        // 172.19.0.1/30），Safari 通过 SVCB/HTTPS(Type 64/65) 的 ipv6hint
-        // 绕过 ipv4_only 策略直连 IPv6 会触发 no route to host 风暴；
-        // _dns.resolver.arpa 是系统加密 DNS 发现查询，VPN 场景下无意义。
-        // 两种规则都在最顶部快速拦截，避免进入 dns-remote 空转。
-        dnsRules.insert(["query_type": ["SVCB", "HTTPS"], "action": "reject"], at: 0)
+        // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，
+        // VPN 场景下无意义，固定在最顶部快速拦截。
+        // 【APP70 任务2.1】已删除无条件 SVCB/HTTPS(Type 64/65) 拒绝规则：
+        // 它干扰 iOS Network.framework 的服务端点发现与连接复用状态机，
+        // 造成首包额外等待；仅在用户开启「阻止 QUIC」（Rust 已下发 QUIC
+        // 阻断规则）时才拦截，且必须排在 cn 直连规则之后。
         dnsRules.insert(["domain": ["_dns.resolver.arpa"], "action": "reject"], at: 0)
+        // 【APP70 任务2.2】dns.rules 严格顺序（与 config_builder.rs 一致）：
+        // 1. outbound:any → dns-direct（节点自身域名解析直连）
+        // 2. clash_mode:direct → dns-direct（直连模式 100% 走国内 DNS）
+        // 3. 内置大陆域名后缀 → dns-direct（剥离 geosite 后仍生效）
+        // 4. 局域网 / 反向解析后缀 → dns-direct
+        // 5. clash_mode:global → dns-remote（全局模式走海外 DNS）
         dnsRules.append(contentsOf: [
             [
                 // 【APP14 任务4】节点域名解析（内核出站侧发起）直接走 dns-direct
@@ -2369,6 +2439,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // 就会出现文本(1) 里 `->8.8.8.8:53 read: connection reset by peer`
                 // 的刷屏；改走国内直连 DNS 后与「解析节点域名」这一用途完全匹配。
                 "outbound": "any",
+                "server": "dns-direct"
+            ],
+            [
+                "clash_mode": "direct",
+                "server": "dns-direct"
+            ],
+            [
+                // 【APP70 任务2.2】内置大陆核心域名后缀：iOS 扩展剥离
+                // geosite: cn 后，国内域名（淘宝/微信/B站/百度…）仍由本地
+                // dns-direct 毫秒级解析，绝不再掉进 dns-remote 报
+                // `gw.alicdn.com -> dial tcp 172.64.229.88:443 network is unreachable`
+                "domain_suffix": cnDirectDomainSuffixes,
                 "server": "dns-direct"
             ],
             [
@@ -2384,17 +2466,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "server": "dns-direct"
             ],
             [
-                "clash_mode": "direct",
-                "server": "dns-direct"
-            ],
-            [
-                "clash_mode": "global",
-                "server": "dns-remote"
-            ],
-            [
                 "geosite": ["cn", "private"],
                 "server": "dns-direct"
             ]
+        ])
+        // 【APP70 任务2.1】仅在「阻止 QUIC」开启（Rust 已下发 quic → block）
+        // 时拦截 SVCB/HTTPS，避免浏览器取到 alpn="h3" 去撞已阻断的 QUIC。
+        if incomingQuicBlocked {
+            dnsRules.append(["query_type": ["SVCB", "HTTPS"], "action": "reject"])
+        }
+        dnsRules.append([
+            "clash_mode": "global",
+            "server": "dns-remote"
         ])
         root["dns"] = [
             "servers": dnsServers,
@@ -2631,9 +2714,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
                 "port": [443, 853],
                 "outbound": finalBlockTag
-            ],
-            ["protocol": ["quic"], "outbound": finalBlockTag],
-            ["network": ["udp"], "port": [443], "outbound": finalBlockTag]
+            ]
+            // 【APP70 任务2.1】已彻底删除扩展层无条件注入的
+            // ["protocol": ["quic"], "outbound": block] 与
+            // ["network": ["udp"], "port": [443], "outbound": block]：
+            // QUIC 阻断统一由 Rust 依据 settings.block_quic 生成，并排在
+            // go-lan / clash_mode: direct / 大陆直连之后，避免国内 App 的
+            // HTTP/3 首包被黑洞 1.5~3 秒后才回退 TCP。
         ]
 
         // GO-AIM 探针路由（APP-4 任务3.1 + APP37 任务2.1）：
@@ -2701,6 +2788,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "ip_is_private": true, "outbound": "direct"
         ])
         rules.insert(contentsOf: finalHead, at: 0)
+        // 【APP70 任务2.2】兜底：历史缓存配置若未携带内置大陆直连规则
+        // （Rust 升级前生成的旧 config.json），在 clash_mode: global 之后
+        // 补齐，与 Rust 生成顺序（全局 → 大陆直连 → 可选 QUIC）保持一致。
+        let hasCnDirectRule = rules.contains { rule in
+            (rule["outbound"] as? String) == "direct"
+                && ((rule["domain_suffix"] as? [String])?.contains("taobao.com") ?? false)
+        }
+        if !hasCnDirectRule {
+            var insertAt = rules.count
+            if let idx = rules.firstIndex(where: {
+                ($0["clash_mode"] as? String) == "global"
+            }) {
+                insertAt = idx + 1
+            }
+            rules.insert(contentsOf: [
+                ["domain_suffix": cnDirectDomainSuffixes, "outbound": "direct"],
+                ["ip_cidr": cnDirectCIDRs, "outbound": "direct"]
+            ], at: insertAt)
+        }
         route["rules"] = rules
         // 【APP40 任务2】最终路由表锁定日志：确认每路档案网段已真正进入
         // 最终 rules 且置顶在 ip_is_private / clash_mode 之前。

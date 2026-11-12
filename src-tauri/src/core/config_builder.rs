@@ -116,6 +116,62 @@ pub(crate) fn auto_detect_interface_enabled() -> bool {
     !cfg!(any(target_os = "android", target_os = "ios"))
 }
 
+/// 【APP70 任务2.2】内置中国大陆核心域名后缀（不依赖 geosite.db）。
+///
+/// iOS 网络扩展为控制内存剥离了订阅内联规则与部分 geosite 规则后，
+/// 国内域名必须仍能在 `dns.rules` / `route.rules` 命中 dns-direct / direct，
+/// 否则会掉进 dns-remote（tcp://8.8.8.8 经海外节点）导致
+/// `gw.alicdn.com -> dial tcp 172.64.229.88:443: network is unreachable`。
+/// 该清单在 Rust 与 PacketTunnelProvider.swift 中必须保持 100% 同步。
+pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
+    "cn", "xn--fiqs8s", "xn--55qx5d", "xn--io0a7i",
+    "baidu.com", "bdstatic.com", "baidupcs.com",
+    "qq.com", "weixin.qq.com", "weixinbridge.com", "wechat.com", "tenpay.com",
+    "gtimg.cn", "gtimg.com", "qpic.cn", "qlogo.cn", "myqcloud.com", "tencent.com",
+    "tencent-cloud.net",
+    "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
+    "alipay.com", "alipayobjects.com", "alibaba.com", "alibaba-inc.com",
+    "dingtalk.com", "goofish.com", "tbcache.com", "mmstat.com", "youku.com",
+    "ucweb.com", "amap.com",
+    "jd.com", "360buyimg.com", "jdcloud.com",
+    "bilibili.com", "hdslb.com", "biliapi.net", "biliapi.com", "bilivideo.com",
+    "douyin.com", "douyincdn.com", "byteimg.com", "bytedance.com", "toutiao.com",
+    "snssdk.com", "pstatp.com", "volces.com", "feishu.cn",
+    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "yximgs.com",
+    "163.com", "126.com", "126.net", "127.net", "netease.com",
+    "sina.com.cn", "weibo.com", "weibocdn.com", "sinaimg.cn",
+    "meituan.com", "meituan.net", "dianping.com", "dpfile.com",
+    "pinduoduo.com", "yangkeduo.com", "pddugc.com",
+    "xiaomi.com", "mi.com", "miui.com", "huawei.com", "vmall.com", "hicloud.com",
+    "dbankcdn.com",
+    "zhihu.com", "zhimg.com", "csdn.net", "juejin.cn", "gitee.com", "oschina.net",
+    "ctrip.com", "12306.cn", "didiglobal.com", "didichuxing.com",
+    "apple.com", "icloud.com", "icloud.com.cn", "icloud-content.com", "mzstatic.com",
+    "cdn-apple.com", "aaplimg.com",
+];
+
+/// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段。
+///
+/// 用于 `geoip: cn` 不可用（iOS 扩展剥离 .db 规则）时仍能按 IP 判定
+/// 大陆目标 → direct。仅包含大陆云厂商与运营商公网段，不含私网段。
+pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
+    // 阿里云 / 阿里系 CDN
+    "8.129.0.0/16", "47.92.0.0/14", "47.96.0.0/11", "47.100.0.0/14",
+    "59.110.0.0/16", "101.37.0.0/16", "106.11.0.0/16", "112.124.0.0/14",
+    "116.62.0.0/16", "118.31.0.0/16", "120.24.0.0/13", "121.40.0.0/14",
+    "123.56.0.0/15", "139.129.0.0/16", "182.92.0.0/16", "203.107.0.0/16",
+    // 腾讯云 / 腾讯系
+    "49.51.0.0/16", "106.52.0.0/14", "119.29.0.0/16", "129.28.0.0/16",
+    "132.232.0.0/16", "134.175.0.0/16", "162.62.0.0/16", "175.24.0.0/14",
+    "193.112.0.0/16",
+    // 百度 / 百度智能云
+    "61.135.0.0/16", "180.76.0.0/16", "182.61.0.0/16", "220.181.0.0/16",
+    // 华为云 / 移动 / 联通 / 电信高频段
+    "114.115.0.0/16", "121.36.0.0/16", "122.112.0.0/16", "139.9.0.0/16",
+    "111.13.0.0/16", "119.3.0.0/16", "180.101.0.0/16", "210.22.0.0/16",
+    "58.216.0.0/16", "221.204.0.0/16",
+];
+
 pub struct BuiltConfig {
     pub config: Value,
     /// 转换过程中的降级/跳过提示（不致命）
@@ -757,9 +813,8 @@ pub fn build(
     // 的 DNS 污染会返回中国/私有 IP（如 gstatic → 113.108.239.226），
     // 若 geoip 规则在订阅 MATCH 之前，会强制解析并命中 geoip cn/private，
     // 把应走节点的流量改道直连，导致「选了节点却上不了网」。
-    route_rules.push(json!({ "geosite": "category-ads-all", "outbound": "block" }));
-    route_rules.push(json!({ "geosite": "private", "outbound": "direct" }));
-    route_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
+    // 广告拦截 / 局域网主机名 / 国内域名直连统一改由下方「route.rules 黄金
+    // 顺序装配」第 8 条落位（clash_mode: global 之后、geoip 之前）。
     warnings.push(
         "已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into(),
     );
@@ -920,38 +975,11 @@ pub fn build(
     let rule_final = final_tag
         .or(first_group_tag)
         .unwrap_or_else(|| "direct".into());
-    if rule_final != "direct" {
-        route_rules.push(json!({
-            "geosite": "geolocation-!cn",
-            "outbound": rule_final,
-        }));
-    }
-
-    // ---- 内置常见分流规则·IP 类（全平台，位于订阅规则之后）----
-    // 订阅 MATCH 命中的流量（被墙域名，无论 DNS 污染成什么 IP）已在上方
-    // 走节点，永远不会到达这两条——杜绝污染 IP 触发 geoip 改道直连；
-    // 未被订阅覆盖的流量按真实 IP 兜底：局域网/私有网段与国内网段直连
-    // （IP 字面量目标无需解析即匹配；域名目标才会触发解析）
-    route_rules.push(json!({ "geoip": "private", "outbound": "direct" }));
-    // ip_is_private：不依赖 geoip 数据库的内置私网判定（IPA-3 方案 6.3，
-    // iOS 端 sanitize 流程同样引用该规则，Go Lan 回家规则已排在其前）
-    route_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
-    route_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
-
-    // 【APP-5 任务1.2】海外公共 DNS IP（Google DoT/DoH 853/443）强制走代理，
-    // 防止 iOS 系统或应用发起的 8.8.8.8:853 / 8.8.4.4:443 / 1.1.1.1 等请求
-    // 漏到 direct 出站在国内网络下直连超时卡顿。
-    // 规则模式下指向首个策略组，全局模式下指向 GLOBAL，直连模式下跳过（本来就直连）
-    if settings.outbound_mode != OutboundMode::Direct {
-        let main_tag = match settings.outbound_mode {
-            OutboundMode::Global if !node_tags.is_empty() => "GLOBAL".to_string(),
-            _ => rule_final.clone(),
-        };
-        route_rules.push(json!({
-            "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
-            "outbound": main_tag,
-        }));
-    }
+    // 【APP70 任务2.2】内置 IP / 兜底域名规则不再在此处直接入列，统一由
+    // 下方「route.rules 黄金顺序装配」按第 7~8 条落位（geolocation-!cn 在
+    // 大陆直连之后、geoip 之前，避免污染 IP 把应走节点的流量改道直连）。
+    // 海外公共 DNS IP（Google DoT/DoH 853/443）强制走代理的规则同样在
+    // 装配区生成——必须在第三方策略组归一化（→ Proxy）之后落笔。
 
     // 未显式 MATCH：优先全部订阅中的首个策略组，否则 direct（上方已算）
 
@@ -978,48 +1006,22 @@ pub fn build(
         warnings.push("全局模式需要至少一个节点，当前订阅无节点，回退为规则模式".into());
     }
     let final_tag = match settings.outbound_mode {
-        OutboundMode::Rule => rule_final,
+        OutboundMode::Rule => rule_final.clone(),
         OutboundMode::Direct => "direct".to_string(),
         OutboundMode::Global => {
             if node_tags.is_empty() {
                 // 无节点时 GLOBAL 组未生成，final 不能指向不存在的组
-                rule_final
+                rule_final.clone()
             } else {
                 "GLOBAL".to_string()
             }
         }
     };
 
-    // clash_mode 热切换规则置顶（build 157 用户方案）：sing-box 的
-    // PATCH /configs {"mode": ...} 只改 clashServer.Mode() 字符串，路由
-    // 行为变化完全由 clash_mode 规则驱动（route/rule/rule_item_clash_mode.go:
-    // strings.EqualFold(clashServer.Mode(), r.mode)）。规则/直连模式回落
-    // 到原 final 链，无需重建配置即可热切换
-    //
-    // 【APP-9 任务2.1a 黄金优先级】Go Lan 回家规则必须严格排在 clash_mode
-    // 与 ip_is_private 之前——家庭内网网段本身属于私有 IP，若 clash_mode:
-    // global 在前，全局模式下回家流量会被 GLOBAL 组吞掉走海外节点；
-    // 若 ip_is_private 在前，回家流量被误判为普通私网直连而丢包。
-    // 最终顺序：prism.sarl → block_quic → Go Lan → clash_mode → 自定义/订阅。
-    if !node_tags.is_empty() {
-        route_rules.insert(0, json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
-        route_rules.insert(1, json!({ "clash_mode": "direct", "outbound": "direct" }));
-    }
-
-    // 【APP36 任务1.1】QUIC 拦截统一在下方「头部规则」中构建并置于
-    // go-lan-home 之前（此处不再单独插入，避免顺序不可控）。
-
-    // 【APP-9 任务2.1a / APP17 任务5.1】Go Lan 回家规则的最终落位在
-    // 下方头部规则构建区统一执行（强制置顶），此处仅先声明。
-
-    // 官网域名强制直连（最高优先级）：官方站点用于授权激活/续费与客户端下载，
-    // 经节点在部分机场会被 CDN 或上游策略拦截，表现为「开代理后官网打不开」。
-    // 置于 clash_mode（全局/直连）与内置 geosite 规则之前，确保任何出站模式下
-    // 官网始终可访问；域名后缀匹配零解析开销，不影响其它流量分流。
-    route_rules.insert(
-        0,
-        json!({ "domain_suffix": [crate::obf!("prism.sarl")], "outbound": "direct" }),
-    );
+    // 【APP70 任务2.2】clash_mode 全局/直连热切换规则、官网直连与
+    // QUIC 阻断统一在下方「route.rules 黄金顺序装配」按第 5/6/9 条落位，
+    // 此处不再直接 insert(0)（旧顺序会把 clash_mode: direct 排在
+    // ip_is_private / 大陆直连之前，导致直连模式下 DNS 与分流被覆盖）。
 
     // 校验策略组引用，剔除悬空目标
     // 注意：必须用 get_mut 探测，直接 outbound["outbounds"] 可变索引会给
@@ -1365,60 +1367,51 @@ pub fn build(
         // 最具体的规则放最前，优先于 geosite/后缀规则
         dns_rules.push(json!({ "outbound": domain_server_tags, "server": "dns-local" }));
     }
-    // 【APP60 / APP64 任务2.2】clash_mode 规则：严格对标 Karing 第 3/4 条
-    //  - clash_mode: direct（用户切到「直连」）→ 所有域名经 dns-direct 解析
-    //  - clash_mode: global（用户切到「全局」）→ 所有域名经 dns-remote 解析
-    // 必须排在具体 geosite/cn 规则之前，让 clash_mode 在 Rule/Global 模式下
-    // 抢先命中（first-match 语义）
-    dns_rules.push(json!({ "clash_mode": "direct", "server": "dns-direct" }));
-    dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
-    dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-direct" }));
-    dns_rules.push(json!({ "domain_suffix": [".cn"], "server": "dns-direct" }));
-
     // Go Cus [Host] 非阻断映射：走本地直连 DNS（防远程 DoH 解析私网域名失败）
     if !cus_dns_local_domains.is_empty() {
         dns_rules.push(json!({ "domain_suffix": cus_dns_local_domains, "server": "dns-local" }));
     }
+    // Go Lan 家庭 DNS：lan_domains 域名经隧道内家庭 DNS 解析（最高优先级之一）
+    if let Some(rule) = lan_dns_rule {
+        dns_rules.push(rule);
+    }
+    // 【APP70 任务2.2】dns.rules 严格顺序（1→4）：
+    // 1. outbound: any → dns-direct（节点自身域名解析直连）
+    // 2. clash_mode: direct → dns-direct（直连模式下 100% 走国内 DNS）
+    // 3. 内置大陆域名后缀 → dns-direct（不依赖 geosite.db，iOS 剥离后仍生效）
+    // 4. clash_mode: global → dns-remote（全局模式走海外 DNS）
+    dns_rules.push(json!({ "outbound": "any", "server": "dns-direct" }));
+    dns_rules.push(json!({ "clash_mode": "direct", "server": "dns-direct" }));
+    dns_rules.push(json!({
+        "domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES,
+        "server": "dns-direct"
+    }));
     // 【APP19 任务3】内网反向 DNS 与局域网后缀快速解析：iOS「文件」App
     // 挂载 SMB、AirPrint 打印机发现、WebDAV 等系统组件会频繁查询
     // *.in-addr.arpa / *.ip6.arpa / .local / .lan，若被送到海外
     // dns-remote（tcp://8.8.8.8）会等待数秒超时，表现为共享文件夹打开
     // 极慢或报错。统一走本地直连 DNS（dns-local，detour=direct）。
-    dns_rules.insert(
-        0,
-        json!({
-            "domain_suffix": [
-                ".in-addr.arpa", ".ip6.arpa", ".lan", ".local",
-                ".home", ".internal", ".localdomain"
-            ],
-            "server": "dns-local"
-        }),
-    );
-    // Go Lan 家庭 DNS：lan_domains 域名经隧道内家庭 DNS 解析（置顶最高优先级）
-    if let Some(rule) = lan_dns_rule {
-        dns_rules.insert(0, rule);
+    dns_rules.push(json!({
+        "domain_suffix": [
+            ".in-addr.arpa", ".ip6.arpa", ".lan", ".local",
+            ".home", ".internal", ".localdomain"
+        ],
+        "server": "dns-local"
+    }));
+    dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-direct" }));
+    // 【APP70 任务2.1】SVCB/HTTPS 仅在用户开启「阻止 QUIC」时拦截（防止
+    // 浏览器从 HTTPS 记录取到 alpn="h3" 去撞已阻断的 QUIC），且必须排在
+    // 大陆直连规则之后、clash_mode: global 之前——不再无条件拒绝。
+    if settings.block_quic {
+        dns_rules.push(json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }));
     }
-    // 【APP42 任务1.3】所有出站域名解析（含节点 server 域名、DoH 域名）
-    // 优先走系统 DNS（dns-direct，detour=direct），避免依赖 dns-remote
-    // 自身出境解析形成「先有鸡还是先有蛋」的循环，导致启动首包超时
-    dns_rules.insert(
-        0,
-        json!({ "outbound": "any", "server": "dns-direct" }),
-    );
-    // 【APP60 任务3.1】SVCB/HTTPS 与 _dns.resolver.arpa 拦截必须排在所有规则
-    // **最顶部**（first-match 语义下精确匹配 query_type / domain），否则
-    // 会被 outbound:any 抢先吞掉。通过"反向 insert(0)"让 reject 规则最终
-    // 排在 index 0 和 1，outbound:any 挤到 index 2。
+    dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
+    // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，VPN
+    // 场景下无意义，固定在 index 0 快速拦截。
     dns_rules.insert(
         0,
         json!({ "domain": ["_dns.resolver.arpa"], "action": "reject" }),
     );
-    if !settings.ipv6 {
-        dns_rules.insert(
-            0,
-            json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }),
-        );
-    }
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
     // 【APP-11B 任务3】默认锁定纯 UDP/TCP 53 的 223.5.5.5：
@@ -1560,29 +1553,36 @@ pub fn build(
             lan_other.push(r);
         }
     }
-    let has_go_lan_rules = !lan_ip_tunnel.is_empty() || !lan_ip_direct.is_empty();
-    let mut head_rules: Vec<Value> = Vec::new();
-    // ① On-Demand 局域网直连
-    head_rules.append(&mut lan_ip_direct);
-    // ② WG 服务端公网 IP 直连豁免（防环路，必须先于隧道网段）
+    // ===== 【APP70 任务2.2】route.rules 黄金顺序装配（严格 1 → 10，禁止再调整）=====
+    // 1. 直连公共 DNS Bypass（必须先于 port 53 劫持，杜绝 DNS query loopback）
+    // 2. Go Lan 回家内网：On-Demand 局域网直连 → WG 服务端豁免 → go-lan 隧道网段
+    // 3. 标准 DNS 接管：protocol dns / port 53 → dns-out，853 与公共 DoH/DoT 拦截
+    // 4. 私有局域网 IP 直连（ip_is_private）
+    // 5. 直连（Direct）模式全局置顶 → direct（先于一切 Global / 自定义 / QUIC 规则）
+    // 6. 用户自定义规则 / Go Cus / 订阅规则（含官网直连与 go-lan 域名规则）
+    // 7. 全局（Global）模式规则 → GLOBAL
+    // 8. 规则（Rule）模式的大陆高速直连：内置域名后缀 → direct、
+    //    大陆高频 ip_cidr → direct、桌面端保留 geosite/geoip cn → direct，
+    //    最后 geolocation-!cn → 策略组（域名级判定，避免污染 IP 改道直连）
+    // 9. 可选 QUIC 阻断（仅 settings.block_quic == true，且必在大陆直连之后）
+    // 10. route.final 兜底（Proxy / GLOBAL / direct）
+    let mut final_rules: Vec<Value> = Vec::new();
+    // —— 1. 直连 DNS 免拦截 ——
+    final_rules.push(json!({
+        "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32", "119.29.29.29/32"],
+        "outbound": "direct"
+    }));
+    // —— 2. Go Lan 回家内网 ——
+    final_rules.append(&mut lan_ip_direct);
     for ip in &wg_server_ips {
-        head_rules.push(json!({
+        final_rules.push(json!({
             "ip_cidr": [format!("{ip}/32")],
             "outbound": "direct"
         }));
     }
-    // ③ go-lan-* 隧道网段
-    head_rules.append(&mut lan_ip_tunnel);
-    // 【APP69 任务1】直连公共 DNS 免拦截：必须排在 `port: 53 → dns-out` 之前。
-    // 否则 dns-direct 发往 223.5.5.5:53 / 119.29.29.29:53 的查询进入路由表后
-    // 又被送回 dns-out，触发 `DNS query loopback in transport[dns-direct]`
-    // 无限自环风暴，节点域名与系统域名会全部解析失败。
-    head_rules.push(json!({
-        "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32", "119.29.29.29/32"],
-        "outbound": "direct"
-    }));
-    // ④ 协议规则
-    head_rules.extend([
+    final_rules.append(&mut lan_ip_tunnel);
+    // —— 3. 标准 DNS 53 接管 / 853 / 公共 DoH-DoT 拦截 ——
+    final_rules.extend([
         json!({ "protocol": "dns", "outbound": "dns-out" }),
         json!({ "port": 53, "outbound": "dns-out" }),
         json!({ "port": 853, "outbound": "block" }),
@@ -1592,20 +1592,69 @@ pub fn build(
             "outbound": "block"
         }),
     ]);
-    // QUIC：tun-in 已关闭 sniff，仅靠 protocol 匹配无法识别，故同时用
-    // UDP/443 兜底；必须排在 go-lan 之后（内网 UDP/443 不能被误杀）。
-    if settings.block_quic || has_go_lan_rules {
-        head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
-        head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
+    // go-lan 域名后缀规则（DNS 劫持之后，保证域名先解析再按域名分流）
+    final_rules.append(&mut lan_other);
+    // —— 4. 私有局域网 IP 直连 ——
+    final_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+    // —— 5. 直连（Direct）模式置顶 ——
+    if !node_tags.is_empty() {
+        final_rules.push(json!({ "clash_mode": "direct", "outbound": "direct" }));
     }
-    // ⑥ go-lan 域名后缀规则
-    head_rules.append(&mut lan_other);
-    for (i, rule) in head_rules.into_iter().enumerate() {
-        route_rules.insert(i, rule);
+    // —— 6. 官网直连 + 用户自定义 / Go Cus / 订阅规则 ——
+    final_rules.push(json!({
+        "domain_suffix": [crate::obf!("prism.sarl")],
+        "outbound": "direct"
+    }));
+    final_rules.append(&mut route_rules);
+    // —— 7. 全局（Global）模式 ——
+    if !node_tags.is_empty() {
+        final_rules.push(json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
     }
+    // —— 8. 大陆高速直连（Rule 模式，不依赖 geosite.db） ——
+    // 广告域名拦截 → 局域网主机名 → 国内域名（geosite cn）→ 内置大陆域名
+    // 后缀 → 大陆高频 ip_cidr，全部域名级规则零解析开销
+    final_rules.push(json!({ "geosite": "category-ads-all", "outbound": "block" }));
+    final_rules.push(json!({ "geosite": "private", "outbound": "direct" }));
+    final_rules.push(json!({ "domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES, "outbound": "direct" }));
+    final_rules.push(json!({ "ip_cidr": CN_DIRECT_CIDRS, "outbound": "direct" }));
+    // 桌面/Android 保留 geosite: cn / geoip: cn（iOS 由上方内置名单兜底）
+    final_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
+    // 【APP70 任务2.2】主代理出口：第三方策略组已被归一化为 Prism 标准
+    // 主选择器 Proxy，此处必须同步沿用，严禁再写回第三方组 tag
+    let main_proxy_target = prism_proxy_tag.clone().unwrap_or_else(|| rule_final.clone());
+    // 非大陆域名 → 策略组：域名级判定，零解析开销，必须先于 geoip，
+    // 否则被墙域名的污染 IP 会命中 geoip cn 被改道直连
+    if main_proxy_target != "direct" {
+        final_rules.push(json!({
+            "geosite": "geolocation-!cn",
+            "outbound": main_proxy_target.clone(),
+        }));
+    }
+    final_rules.push(json!({ "geoip": "private", "outbound": "direct" }));
+    final_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
+    // 【APP-5 任务1.2】海外公共 DNS IP（Google DoT/DoH 853/443）强制走代理，
+    // 防止 iOS 系统或应用发起的 8.8.8.8:853 / 8.8.4.4:443 / 1.1.1.1 等请求
+    // 漏到 direct 出站在国内网络下直连超时卡顿
+    if settings.outbound_mode != OutboundMode::Direct {
+        let main_tag = match settings.outbound_mode {
+            OutboundMode::Global if !node_tags.is_empty() => "GLOBAL".to_string(),
+            _ => main_proxy_target.clone(),
+        };
+        final_rules.push(json!({
+            "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
+            "outbound": main_tag,
+        }));
+    }
+    // —— 9. 可选 QUIC 阻断（block_quic=false 时全链路绝不生成） ——
+    // 必须排在大陆直连、clash_mode: direct、go-lan 之后，只作用于后续
+    // 走代理的海外流量；关闭 sniff 时 protocol 无法识别，叠加 UDP/443 兜底。
+    if settings.block_quic {
+        final_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
+        final_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
+    }
+    // —— 10. route.final 兜底（见上方 final_tag） ——
+    let route_rules = final_rules;
 
-    // 【APP36 任务1.1】DNS 劫持规则已在头部规则区统一置顶（全平台一致），
-    // Android 不再单独清洗，直接使用 route_rules。
     let final_route_rules: Vec<serde_json::Value> = route_rules;
 
     // 【APP-11B 任务3】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
@@ -2999,8 +3048,8 @@ rules:
 
         let rules = built.config["route"]["rules"].as_array().unwrap();
         let sig = |r: &Value| -> Option<String> {
-            if r.get("clash_mode").is_some() {
-                return Some("clash_mode".into());
+            if let Some(mode) = r.get("clash_mode").and_then(|v| v.as_str()) {
+                return Some(format!("clash_mode-{mode}"));
             }
             if let Some(a) = r.get("domain_suffix").and_then(|v| v.as_array()) {
                 if a.iter().any(|x| x.as_str() == Some("example.org")) {
@@ -3036,16 +3085,23 @@ rules:
             find("builtin-geoip-private"),
             find("builtin-geoip-cn"),
         );
-        // 域名类内置规则：自定义 < 内置（域名类）< 订阅规则
-        assert!(custom < ads && ads < gpriv && gpriv < cn, "域名类内置规则顺序: {sigs:?}");
-        assert!(cn < subrule, "域名类内置规则必须先于订阅规则: {sigs:?}");
-        // IP 类内置规则：订阅规则之后（污染改道回归）
+        // 【APP70 任务2.2】黄金顺序：DNS 旁路 / go-lan / DNS 劫持 / 私网直连
+        // → clash_mode: direct → 自定义规则 → 域名类内置（广告/私网/cn）
+        // → 订阅规则 → clash_mode: global → 大陆直连 → geoip 兜底
+        let direct_mode = find("clash_mode-direct");
+        let global_mode = find("clash_mode-global");
+        assert!(direct_mode < custom, "clash_mode: direct 必须早于自定义规则: {sigs:?}");
+        assert!(custom < subrule, "自定义规则必须先于订阅规则: {sigs:?}");
+        assert!(subrule < global_mode, "clash_mode: global 必须在订阅规则之后: {sigs:?}");
         assert!(
-            subrule < ippriv && ippriv < ipcn,
-            "geoip 规则必须在订阅规则之后: {sigs:?}"
+            global_mode < ads && ads < gpriv && gpriv < cn,
+            "域名类内置规则必须在全局规则之后: {sigs:?}"
         );
-        // clash_mode 热切换规则置顶（出现在最前两条）
-        assert_eq!(&sigs[..2], &["clash_mode", "clash_mode"], "{sigs:?}");
+        // IP 类内置规则：全局与大陆直连之后（污染改道回归）
+        assert!(
+            cn < ippriv && ippriv < ipcn,
+            "geoip 规则必须在全局与订阅规则之后: {sigs:?}"
+        );
         // 【APP47 任务3.3】规则模式下 route.final 恒为 Prism 标准主选择器 Proxy
         // （即使订阅 MATCH 指向第三方组「节点选择」，也已被归一化为 Proxy）
         assert_eq!(built.config["route"]["final"].as_str(), Some("Proxy"));
@@ -3725,13 +3781,13 @@ rules:
             .iter()
             .position(|r| r.get("protocol").and_then(Value::as_str) == Some("dns"))
             .expect("必须存在 protocol dns 劫持规则");
-        // 【APP60 任务3.2 / APP69 任务1】黄金顺序 aim-probe(0-3) →
-        // On-Demand direct → WG 服务端豁免 → go-lan 隧道 → 直连 DNS 旁路 →
-        // protocol dns。GoLanSettings::default() 下 On-Demand 空，
-        // wg_server 1 条，go-lan tunnel 1 条，DNS 旁路 1 条，故 dns_pos=7
+        // 【APP70 任务2.2】黄金顺序 aim-probe(0-3) → 直连 DNS 旁路 →
+        // WG 服务端豁免 → go-lan 隧道 → protocol dns。GoLanSettings::default()
+        // 下 On-Demand 空，DNS 旁路 1 条，wg_server 1 条，go-lan tunnel 1 条，
+        // 故 dns_pos=7（aim-probe 4 条 + 1 + 1 + 1）
         assert_eq!(
             dns_pos, 7,
-            "aim-probe + WG豁免 + go-lan隧道 + 直连DNS旁路 之后才是 protocol dns"
+            "aim-probe + 直连DNS旁路 + WG豁免 + go-lan隧道 之后才是 protocol dns"
         );
         assert_eq!(rules[dns_pos + 1]["port"].as_u64(), Some(53), "缺 port 53 劫持");
         assert_eq!(rules[dns_pos + 2]["port"].as_u64(), Some(853), "缺 853 拦截");
@@ -3756,16 +3812,18 @@ rules:
             wg_pos < go_lan_first,
             "WG 服务端豁免必须早于 go-lan 回家规则"
         );
-        // 【APP48 任务1.3】QUIC / UDP 443 拦截必须晚于 go-lan-home，
-        // 否则内网 NAS 的 UDP/443（SMB over QUIC、WebDAV）会被误杀。
-        let quic_pos = rules
-            .iter()
-            .position(|r| r.get("network").and_then(Value::as_str) == Some("udp")
-                && r.get("port").and_then(Value::as_u64) == Some(443));
-        assert!(quic_pos.is_some(), "Go Lan 开启时必须注入 QUIC 拦截");
+        // 【APP70 任务2.1】block_quic=false（UserSettings::default）时，
+        // 即便 Go Lan 开启也绝不生成任何 QUIC / UDP443 阻断规则，
+        // 普通互联网 UDP/443 与 HTTP/3 必须 100% 正常通过。
+        let has_quic_block = rules.iter().any(|r| {
+            r.get("outbound").and_then(Value::as_str) == Some("block")
+                && (r.get("protocol").and_then(Value::as_str) == Some("quic")
+                    || (r.get("network").and_then(Value::as_str) == Some("udp")
+                        && r.get("port").and_then(Value::as_u64) == Some(443)))
+        });
         assert!(
-            go_lan_first < quic_pos.unwrap(),
-            "go-lan 回家规则必须早于 QUIC 拦截"
+            !has_quic_block,
+            "block_quic=false 时严禁生成 QUIC / UDP443 阻断规则"
         );
         let cidrs: Vec<String> = rules
             .iter()
@@ -4998,5 +5056,380 @@ rules:
             .find(|r| r["outbound"].as_str() == Some("any"))
             .expect("必须存在 outbound:any → dns-direct");
         assert_eq!(outbound_any["server"].as_str(), Some("dns-direct"));
+    }
+
+    // ================= 【APP70】三阶段回归测试矩阵 =================
+
+    /// 单档案 Go Lan（关闭 On-Demand 直连，保证测试机本地 IP 不影响断言）
+    fn app70_golan_settings() -> crate::core::go_lan::GoLanSettings {
+        crate::core::go_lan::GoLanSettings {
+            enabled: true,
+            bypass_on_local_lan: false,
+            profiles: Vec::new(),
+            active_profile_id: String::new(),
+            mode: "manual".into(),
+            node_uri: String::new(),
+            wg_config: Some(crate::core::go_lan::WgManualConfig {
+                server: "10.0.0.1".into(),
+                server_port: 51820,
+                private_key: "QEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                peer_public_key: "QEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                pre_shared_key: None,
+                local_ip: "10.8.0.2/24".into(),
+                mtu: 1420,
+            }),
+            lan_cidrs: vec!["192.168.1.0/24".into()],
+            lan_dns: None,
+            lan_domains: Vec::new(),
+            managed_server: String::new(),
+            device_code: String::new(),
+            cached_managed_outbound: None,
+            home_name: None,
+        }
+    }
+
+    fn app70_sub() -> Vec<(String, String, String)> {
+        vec![(
+            "https://sub.example".into(),
+            "订阅1".into(),
+            "proxies:\n  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}\nproxy-groups:\n  - {name: 节点选择, type: select, proxies: [HK1]}\nrules:\n  - MATCH,节点选择\n".to_string(),
+        )]
+    }
+
+    /// APP70 测试1：`blockQuic = false`（默认态）时，无论 Go Lan 开关如何，
+    /// route.rules 绝不包含任何 quic / UDP443 阻断规则。
+    #[test]
+    fn app70_test1_block_quic_off_never_blocks_quic() {
+        let settings = UserSettings::default();
+        assert!(!settings.block_quic);
+        for lan in [
+            crate::core::go_lan::GoLanSettings::default(),
+            app70_golan_settings(),
+        ] {
+            let built = build(
+                &app70_sub(),
+                &[],
+                RunMode::Tun,
+                &settings,
+                &std::env::temp_dir().join("prism-cb-test-app70-t1"),
+                &std::env::temp_dir().join("prism-cb-test-app70-t1/kernel"),
+                "127.0.0.1:9090",
+                "secret",
+                &lan,
+                &crate::core::go_cus::GoCusSettings::default(),
+            )
+            .expect("build must succeed");
+            let rules = built.config["route"]["rules"].as_array().unwrap();
+            let blocked = rules.iter().filter(|r| {
+                r.get("outbound").and_then(Value::as_str) == Some("block")
+                    && (r.get("protocol").and_then(Value::as_str) == Some("quic")
+                        || (r.get("network").and_then(Value::as_str) == Some("udp")
+                            && r.get("port").and_then(Value::as_u64) == Some(443)))
+            });
+            assert_eq!(
+                blocked.count(),
+                0,
+                "block_quic=false 时严禁生成 QUIC / UDP443 阻断规则"
+            );
+        }
+    }
+
+    /// APP70 测试2：`blockQuic = true` 时 QUIC 阻断必须存在，且严格排在
+    /// go-lan 隧道、clash_mode: direct、大陆直连规则之后（仅作用于代理流量）。
+    #[test]
+    fn app70_test2_block_quic_after_cn_direct_and_golan() {
+        let settings = UserSettings {
+            block_quic: true,
+            ..UserSettings::default()
+        };
+        let built = build(
+            &app70_sub(),
+            &[],
+            RunMode::Tun,
+            &settings,
+            &std::env::temp_dir().join("prism-cb-test-app70-t2"),
+            &std::env::temp_dir().join("prism-cb-test-app70-t2/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &app70_golan_settings(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        let pos = |pred: &dyn Fn(&Value) -> bool| rules.iter().position(|r| pred(r));
+        let quic = pos(&|r| {
+            r.get("outbound").and_then(Value::as_str) == Some("block")
+                && r.get("protocol").and_then(Value::as_str) == Some("quic")
+        })
+        .expect("block_quic=true 必须生成 protocol quic → block");
+        let udp443 = pos(&|r| {
+            r.get("outbound").and_then(Value::as_str) == Some("block")
+                && r.get("network").and_then(Value::as_str) == Some("udp")
+                && r.get("port").and_then(Value::as_u64) == Some(443)
+        })
+        .expect("block_quic=true 必须生成 udp/443 → block");
+        let direct_mode = pos(&|r| r.get("clash_mode").and_then(Value::as_str) == Some("direct"))
+            .expect("缺少 clash_mode: direct");
+        let cn_suffix = pos(&|r| {
+            r.get("domain_suffix")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("taobao.com")))
+        })
+        .expect("缺少内置大陆域名直连规则");
+        let golan = pos(&|r| {
+            r.get("outbound")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with("go-lan-"))
+        })
+        .expect("缺少 go-lan 隧道规则");
+        assert!(golan < quic, "go-lan 隧道规则必须早于 QUIC 阻断");
+        assert!(direct_mode < quic, "clash_mode: direct 必须早于 QUIC 阻断");
+        assert!(cn_suffix < quic, "大陆直连规则必须早于 QUIC 阻断");
+        assert!(quic < udp443, "protocol quic 与 udp/443 必须成对相邻");
+    }
+
+    /// APP70 测试3：无条件 SVCB/HTTPS reject 已删除；仅在 block_quic=true
+    /// 时拦截，且排在 cn 直连规则之后；dns.strategy 恒为 ipv4_only。
+    #[test]
+    fn app70_test3_svcb_only_when_block_quic() {
+        let build_with = |quic: bool| {
+            build(
+                &app70_sub(),
+                &[],
+                RunMode::Tun,
+                &UserSettings {
+                    block_quic: quic,
+                    ..UserSettings::default()
+                },
+                &std::env::temp_dir().join(format!("prism-cb-test-app70-t3-{quic}")),
+                &std::env::temp_dir().join(format!("prism-cb-test-app70-t3-{quic}/kernel")),
+                "127.0.0.1:9090",
+                "secret",
+                &crate::core::go_lan::GoLanSettings::default(),
+                &crate::core::go_cus::GoCusSettings::default(),
+            )
+            .expect("build must succeed")
+        };
+        let off = build_with(false);
+        let off_rules = off.config["dns"]["rules"].as_array().unwrap();
+        assert!(
+            off_rules.iter().all(|r| r.get("query_type").is_none()),
+            "block_quic=false 时不得拒绝 SVCB/HTTPS 查询"
+        );
+        assert_eq!(
+            off.config["dns"]["strategy"].as_str(),
+            Some("ipv4_only"),
+            "ipv4_only 策略严禁删除"
+        );
+
+        let on = build_with(true);
+        let on_rules = on.config["dns"]["rules"].as_array().unwrap();
+        let svcb = on_rules
+            .iter()
+            .position(|r| r.get("query_type").is_some())
+            .expect("block_quic=true 必须拦截 SVCB/HTTPS");
+        let cn = on_rules
+            .iter()
+            .position(|r| {
+                r.get("domain_suffix")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("weixin.qq.com")))
+            })
+            .expect("dns.rules 缺少内置大陆域名后缀");
+        let global = on_rules
+            .iter()
+            .position(|r| r.get("clash_mode").and_then(Value::as_str) == Some("global"))
+            .expect("dns.rules 缺少 clash_mode: global");
+        assert!(cn < svcb && svcb < global, "SVCB 拦截必须位于 cn 直连之后、global 之前");
+    }
+
+    /// APP70 测试4：Rule / Global / Direct × Go Lan 开/关 组合矩阵。
+    #[test]
+    fn app70_test4_three_modes_with_golan_matrix() {
+        for mode in [
+            OutboundMode::Rule,
+            OutboundMode::Global,
+            OutboundMode::Direct,
+        ] {
+            for lan_on in [false, true] {
+                let settings = UserSettings {
+                    outbound_mode: mode.clone(),
+                    ..UserSettings::default()
+                };
+                let lan = if lan_on {
+                    app70_golan_settings()
+                } else {
+                    crate::core::go_lan::GoLanSettings::default()
+                };
+                let built = build(
+                    &app70_sub(),
+                    &[],
+                    RunMode::Tun,
+                    &settings,
+                    &std::env::temp_dir().join("prism-cb-test-app70-t4"),
+                    &std::env::temp_dir().join("prism-cb-test-app70-t4/kernel"),
+                    "127.0.0.1:9090",
+                    "secret",
+                    &lan,
+                    &crate::core::go_cus::GoCusSettings::default(),
+                )
+                .expect("build must succeed");
+                let rules = built.config["route"]["rules"].as_array().unwrap();
+                let bypass = rules
+                    .iter()
+                    .position(|r| {
+                        r.get("ip_cidr")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| a.iter().any(|c| c == "223.5.5.5/32"))
+                    })
+                    .expect("直连 DNS 旁路缺失");
+                let hijack = rules
+                    .iter()
+                    .position(|r| r.get("port").and_then(Value::as_u64) == Some(53))
+                    .expect("port 53 劫持缺失");
+                assert!(bypass < hijack, "直连 DNS 旁路必须早于 53 劫持");
+
+                // dns.rules：clash_mode: direct → dns-direct 必须存在且早于 global
+                let dns_rules = built.config["dns"]["rules"].as_array().unwrap();
+                let dirc = dns_rules
+                    .iter()
+                    .position(|r| r.get("clash_mode").and_then(Value::as_str) == Some("direct"))
+                    .expect("dns.rules 缺少 clash_mode: direct");
+                let glob = dns_rules
+                    .iter()
+                    .position(|r| r.get("clash_mode").and_then(Value::as_str) == Some("global"))
+                    .expect("dns.rules 缺少 clash_mode: global");
+                let cn_dns = dns_rules
+                    .iter()
+                    .position(|r| {
+                        r.get("domain_suffix")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| {
+                                ["taobao.com", "alicdn.com", "weixin.qq.com", "bilibili.com", "icloud.com.cn"]
+                                    .iter()
+                                    .all(|d| a.iter().any(|x| x.as_str() == Some(d)))
+                            })
+                    })
+                    .expect("dns.rules 缺少内置大陆域名后缀");
+                assert!(dirc < cn_dns && cn_dns < glob, "dns.rules 顺序错误");
+
+                // route.rules：大陆域名在 Rule/Direct 模式下命中 direct
+                let cn_route = rules
+                    .iter()
+                    .position(|r| {
+                        r.get("outbound").and_then(Value::as_str) == Some("direct")
+                            && r.get("domain_suffix")
+                                .and_then(Value::as_array)
+                                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("taobao.com")))
+                    })
+                    .expect("route.rules 缺少大陆域名直连规则");
+                if mode != OutboundMode::Global {
+                    assert!(cn_route > 0, "大陆直连规则必须存在");
+                }
+
+                let has_golan = rules.iter().any(|r| {
+                    r.get("outbound")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.starts_with("go-lan-"))
+                });
+                assert_eq!(has_golan, lan_on, "Go Lan 开/关与规则注入不一致");
+                if lan_on {
+                    let wg = rules
+                        .iter()
+                        .position(|r| {
+                            r.get("ip_cidr").and_then(Value::as_array).is_some_and(|c| {
+                                c.len() == 1 && c[0].as_str() == Some("10.0.0.1/32")
+                            })
+                        })
+                        .expect("WG 服务端豁免缺失");
+                    let tun = rules
+                        .iter()
+                        .position(|r| {
+                            r.get("outbound")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| t.starts_with("go-lan-"))
+                                && r.get("ip_cidr").is_some()
+                        })
+                        .expect("go-lan 隧道网段缺失");
+                    assert!(wg < tun, "WG 服务端豁免必须先于 go-lan 隧道网段");
+                }
+            }
+        }
+    }
+
+    /// APP70 测试5：6 项禁改红线（MTU / stack / DNS 上游 / 节点协议 /
+    /// Go Lan 网段 / AIM 探针）自动校验。
+    #[test]
+    fn app70_test5_six_red_lines_untouched() {
+        let built = build(
+            &app70_sub(),
+            &[],
+            RunMode::Tun,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-app70-t5"),
+            &std::env::temp_dir().join("prism-cb-test-app70-t5/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        // 1) TUN MTU 锁定 1400（APP48 定稿值，严禁回退）；2) mixed 协议栈
+        let tun = built.config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == TUN_TAG)
+            .expect("tun-in 缺失");
+        assert_eq!(tun["mtu"].as_u64(), Some(1400), "TUN MTU 红线被改动");
+        assert_eq!(tun["stack"].as_str(), Some("mixed"), "TUN 协议栈红线被改动");
+        // 3) DNS 上游地址
+        let servers = built.config["dns"]["servers"].as_array().unwrap();
+        let addr = |tag: &str| {
+            servers
+                .iter()
+                .find(|s| s["tag"].as_str() == Some(tag))
+                .map(|s| s["address"].as_str().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(addr("dns-remote"), "tcp://8.8.8.8");
+        assert_eq!(addr("dns-direct"), "udp://223.5.5.5");
+        assert_eq!(addr("dns-direct-backup"), "udp://119.29.29.29");
+        assert_eq!(addr("dns-local"), "223.5.5.5");
+        // 4) 代理节点协议保持 ss 原样
+        let node = built.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("HK1"))
+            .expect("节点出站缺失");
+        assert_eq!(node["type"].as_str(), Some("shadowsocks"));
+        assert_eq!(node["server"].as_str(), Some("1.2.3.4"));
+        assert_eq!(node["server_port"].as_u64(), Some(8388));
+        // 5) 内置大陆网段清单不含私网段（不得侵占 Go Lan 网段）
+        for cidr in CN_DIRECT_CIDRS {
+            assert!(
+                !cidr.starts_with("10.") && !cidr.starts_with("192.168.")
+                    && !(cidr.starts_with("172.16.") || cidr.starts_with("172.17.")
+                        || cidr.starts_with("172.18.") || cidr.starts_with("172.19.")
+                        || cidr.starts_with("172.2")),
+                "内置大陆网段严禁包含私网段: {cidr}"
+            );
+        }
+        assert!(CN_DIRECT_DOMAIN_SUFFIXES.contains(&"taobao.com"));
+        assert!(CN_DIRECT_DOMAIN_SUFFIXES.contains(&"cn"));
+        // 6) AIM 探针规则仍固定 4 条且居首（并发/探测逻辑未改动）
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        for slot in 0..4 {
+            assert_eq!(
+                rules[slot]["inbound"][0].as_str(),
+                Some(format!("aim-probe-in-{slot}").as_str()),
+                "AIM 探针规则必须固定在 route.rules 前 4 条"
+            );
+            assert_eq!(
+                rules[slot]["outbound"].as_str(),
+                Some(format!("GO-AIM-PROBE-{slot}").as_str())
+            );
+        }
     }
 }
