@@ -4295,28 +4295,24 @@ pub async fn set_go_aim_enabled(
     Ok(())
 }
 
-/// 手动触发一轮全量探测（需内核运行中 + 授权激活）
+/// 手动触发 FAST / FULL / SELECTED 或默认自动分级探测（需授权激活）。
 #[tauri::command]
-pub async fn run_go_aim_probe(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
-    // APP34：Go AIM 关闭时严禁执行全量探测——148 节点并发真实 HTTP
-    // 探测会瞬间撑爆 iOS 扩展进程 50MB Jetsam 上限（「启动一会儿自动停止」）。
+pub async fn run_go_aim_probe(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: Option<crate::core::go_aim::AimProbeMode>,
+) -> Result<bool, String> {
     if !state.settings.read().go_aim_enabled {
         return Ok(false);
     }
     if !state.is_pro_active() {
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
-    // 【APP53 任务2.3】预览模式（内核未运行）同样允许 Go AIM 执行：
-    // 先全量测速（离线 TCP/TLS 握手）对可达节点做基线，再基于节点地区/出口 IP
-    // 归属地智能识别 AI/流媒体解锁能力，内核启动后会二次用真实隧道刷新。
-    // 内核运行时走原有的真实隧道探测路径（2800ms 超时 + 4 探针槽位）。
+    // 内核未运行时只做真实离线延迟快筛，不猜测任何解锁能力；
+    // 运行时经独立探针验证出口与七个平台，手动指定状态始终保留。
     let already = state.aim_probing.load(std::sync::atomic::Ordering::Acquire);
     if !already {
-        let mut settings = state.settings.read().clone();
-        settings.user_manually_selected_node = false;
-        *state.user_manually_selected_node.write() = false;
-        let _ = state.save_settings(settings);
-        crate::core::go_aim::start_probe(app);
+        crate::core::go_aim::start_probe_with_mode(app, mode);
     }
     Ok(already)
 }

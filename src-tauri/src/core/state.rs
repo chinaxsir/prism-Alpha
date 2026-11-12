@@ -275,6 +275,26 @@ pub struct ProbeProgress {
     /// Go AIM 已解锁节点数（测速进度恒为 0）
     #[serde(default)]
     pub unlocked_count: usize,
+    /// 【APP68】阶段一快筛进度
+    #[serde(default)]
+    pub fast_done: usize,
+    #[serde(default)]
+    pub fast_total: usize,
+    /// 【APP68】阶段二实际发起的完整检测数（不含缓存命中）
+    #[serde(default)]
+    pub full_done: usize,
+    #[serde(default)]
+    pub full_total: usize,
+    #[serde(default)]
+    pub cache_hits: usize,
+    #[serde(default)]
+    pub pending_count: usize,
+    #[serde(default)]
+    pub verified_count: usize,
+    #[serde(default)]
+    pub unknown_count: usize,
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl ProbeProgress {
@@ -285,6 +305,27 @@ impl ProbeProgress {
         } else {
             ((self.done.min(self.total) * 100) / self.total) as u8
         };
+    }
+
+    /// 【APP68】真实两阶段进度：快筛 0~20%，深测 + 缓存核验 20~100%。
+    /// 未完成全部阶段二节点时封顶 99%，绝不提前显示完成。
+    pub fn recompute_aim(&mut self) {
+        if self.full_total > 0 {
+            self.total = self.full_total;
+            self.done = (self.full_done + self.cache_hits).min(self.full_total);
+            self.pending_count = self.full_total.saturating_sub(self.done);
+            let percent = 20 + (self.done * 80) / self.full_total.max(1);
+            self.percent = if self.pending_count == 0 {
+                100
+            } else {
+                percent.min(99) as u8
+            };
+        } else {
+            self.total = self.fast_total;
+            self.done = self.fast_done.min(self.fast_total);
+            self.pending_count = self.fast_total.saturating_sub(self.fast_done);
+            self.percent = ((self.fast_done * 20) / self.fast_total.max(1)).min(20) as u8;
+        }
     }
 }
 
@@ -1025,8 +1066,8 @@ mod app52_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 【APP67 P3】旧版缓存（probe_version < 2 或 rule_version < 2）加载时必须淘汰，
-    /// 只有当前引擎版本（v2）的真实结果才保留，彻底清除遗留假解锁标签。
+    /// 旧版缓存（probe_version / rule_version 低于当前 v3）加载时必须淘汰，
+    /// 只有当前引擎版本的真实结果才保留，彻底清除遗留假解锁标签。
     #[test]
     fn test_old_aim_cache_evicted_on_load() {
         use crate::core::go_aim::{CURRENT_AIM_PROBE_VERSION, CURRENT_AIM_RULE_VERSION, AimNodeResult};
@@ -1083,11 +1124,11 @@ mod app52_tests {
         );
         assert!(
             !restored.aim_results.contains_key("old-rule"),
-            "rule_version < 2 旧缓存必须淘汰"
+            "旧 rule_version 缓存必须淘汰"
         );
         assert!(
             restored.aim_results.contains_key("new-real"),
-            "v2 真实结果必须保留"
+            "当前版本真实结果必须保留"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

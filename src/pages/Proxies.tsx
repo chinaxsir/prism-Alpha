@@ -407,8 +407,9 @@ export default function Proxies() {
   const aimDone = aimProgress.running
     ? aimProgress.done
     : aimResultCount || testedCount;
-  const aimPct =
-    totalCount > 0
+  const aimPct = aimRunning
+    ? aimProgress.percent
+    : totalCount > 0
       ? Math.min(100, Math.round((aimDone * 100) / totalCount))
       : 0;
   const progressPct = isProAimMode ? aimPct : delayPct;

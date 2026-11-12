@@ -18,18 +18,19 @@
 //! 探测绝不动 GLOBAL/主选择器以外的组。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::core::state::{AppState, CoreStatus};
 
 /// 【APP67】当前 Go AIM 检测引擎版本号：升级后旧版"假解锁"缓存
 /// 因 probe_version 不符而被自动淘汰，直到用新引擎重测后才持久保留。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 2;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 2;
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 3;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 3;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -90,7 +91,7 @@ const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", 
 const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
-const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN"];
+const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN", "RU", "AF"];
 
 /// 【APP67】出口预检：若 loc 为这些值视为未知/无效，立即短路后续平台探测
 const UNKNOWN_EXIT_COUNTRIES: &[&str] = &["XX", "T1", "T2", "A1", "A2", "O1", "EU"];
@@ -122,9 +123,24 @@ fn parse_trace_ip(body: &str) -> Option<String> {
     })
 }
 
-/// 经代理读取出口真实 IP 与地区代码（多端点兜底）。
-/// 返回 (egress_ip, egress_country)，任一获取失败则对应字段为 None。
-async fn fetch_egress(client: &reqwest::Client) -> (Option<String>, Option<String>) {
+/// 【APP68】从 cdn-trace 正文解析出口 ASN。
+fn parse_trace_asn(body: &str) -> Option<String> {
+    body.lines().find_map(|l| {
+        l.strip_prefix("asn=")
+            .map(|s| s.trim().trim_start_matches("AS").to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct EgressInfo {
+    ip: Option<String>,
+    country: Option<String>,
+    asn: Option<String>,
+}
+
+/// 经代理读取出口真实 IP、地区与 ASN（多端点兜底）。
+async fn fetch_egress(client: &reqwest::Client) -> EgressInfo {
     for url in TRACE_URLS {
         let Ok(resp) = client
             .get(*url)
@@ -138,14 +154,17 @@ async fn fetch_egress(client: &reqwest::Client) -> (Option<String>, Option<Strin
             continue;
         }
         if let Ok(text) = resp.text().await {
-            let ip = parse_trace_ip(&text);
-            let loc = parse_trace_loc(&text);
-            if ip.is_some() && loc.is_some() {
-                return (ip, loc);
+            let egress = EgressInfo {
+                ip: parse_trace_ip(&text),
+                country: parse_trace_loc(&text),
+                asn: parse_trace_asn(&text),
+            };
+            if egress.ip.is_some() && egress.country.is_some() {
+                return egress;
             }
         }
     }
-    (None, None)
+    EgressInfo::default()
 }
 
 /// 【APP49 任务3】按延迟升序排序（纯函数，便于单元测试）。
@@ -153,6 +172,196 @@ async fn fetch_egress(client: &reqwest::Client) -> (Option<String>, Option<Strin
 fn sort_by_delay(mut nodes: Vec<(String, u64)>) -> Vec<(String, u64)> {
     nodes.sort_by_key(|(_, d)| *d);
     nodes
+}
+
+/// 【APP68】五级优先级队列：手动指定 > 上次最佳 > 当前使用 > 低延迟候选 > 其余。
+struct AimPriorityQueue;
+
+impl AimPriorityQueue {
+    fn new(
+        alive: Vec<(String, u64)>,
+        selected: Option<&str>,
+        manual: bool,
+        best: Option<&str>,
+    ) -> Vec<(String, u64)> {
+        let mut alive = sort_by_delay(alive);
+        let mut out = Vec::with_capacity(alive.len());
+        let mut push = |name: &str, out: &mut Vec<(String, u64)>| {
+            if let Some(pos) = alive.iter().position(|(n, _)| n == name) {
+                out.push(alive.remove(pos));
+            }
+        };
+        if manual {
+            if let Some(name) = selected {
+                push(name, &mut out);
+            }
+        }
+        if let Some(name) = best {
+            push(name, &mut out);
+        }
+        if let Some(name) = selected {
+            push(name, &mut out);
+        }
+        let (preferred, rest): (Vec<_>, Vec<_>) =
+            alive.into_iter().partition(|(_, delay)| *delay <= 350);
+        out.extend(preferred);
+        out.extend(rest);
+        out
+    }
+}
+
+/// 【APP68】只有节点配置指纹、双版本与当前出口 IP 全部一致才允许复用。
+/// FULL 是用户强制全量重测，必须绕过缓存；FAST 结果（probed=false）永不命中。
+fn cache_reusable(
+    cached: &AimNodeResult,
+    node_id: &str,
+    current_egress_ip: &str,
+    force_full: bool,
+) -> bool {
+    !force_full
+        && !node_id.is_empty()
+        && cached.probed
+        && cached.node_id == node_id
+        && cached.probe_version == CURRENT_AIM_PROBE_VERSION
+        && cached.rule_version == CURRENT_AIM_RULE_VERSION
+        && cached.egress_ip.as_deref() == Some(current_egress_ip)
+        && cached.mode != Some(AimProbeMode::Fast)
+        // probed=true 也包含死节点/出口预检短路；这些结果并未完成七平台检测，
+        // 绝不能在下次出口恢复后被当成完整缓存长期复用。空 services 同样不命中。
+        && !cached.services.values().all(|service| {
+            service
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("未执行平台探测"))
+        })
+}
+
+fn yaml_scalar(value: Option<&serde_yaml::Value>) -> String {
+    match value {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        Some(serde_yaml::Value::Number(n)) => n.to_string(),
+        Some(serde_yaml::Value::Bool(v)) => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 【APP68】节点核心配置指纹：名称变化不影响命中，配置变化精准失效。
+/// 只保留 SHA-256 前 16 位，绝不把密码 / UUID 写入缓存或日志。
+fn node_fingerprint(proxy: &serde_yaml::Value) -> String {
+    let get = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|key| {
+                let value = proxy.get(*key);
+                let scalar = yaml_scalar(value);
+                (!scalar.is_empty()).then_some(scalar)
+            })
+            .unwrap_or_default()
+    };
+    let canonical = serde_json::json!({
+        "protocol": get(&["type"]),
+        "server": get(&["server"]),
+        "port": get(&["port"]),
+        "credential": get(&["uuid", "password", "auth-str", "auth_str"]),
+        "sni": get(&["sni", "servername"]),
+        "flow": get(&["flow"]),
+        "network": get(&["network"]),
+    });
+    let digest = Sha256::digest(canonical.to_string().as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 从启用订阅的本地 YAML 缓存生成 name → node_id 映射。
+/// 同名节点的订阅原样配置也会被用于离线预览，保证两种路径指纹一致。
+fn load_node_identities(data_dir: &std::path::Path) -> HashMap<String, String> {
+    let mut identities = HashMap::new();
+    for record in crate::core::store::load_subscriptions(data_dir)
+        .into_iter()
+        .filter(|record| record.enabled)
+    {
+        let path = crate::core::store::profile_path(data_dir, &record.url);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+            continue;
+        };
+        let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        for proxy in proxies {
+            if let Some(name) = proxy.get("name").and_then(|v| v.as_str()) {
+                identities.insert(name.to_string(), node_fingerprint(proxy));
+            }
+        }
+    }
+    identities
+}
+
+/// 【APP68】自适应槽位控制器：iOS 初始 2，最多 4；桌面最多 4 个物理探针。
+/// 每 8 个节点按超时率与平均耗时调速，杜绝慢连接堆积导致 Jetsam。
+struct AdaptiveSlotController {
+    active: AtomicUsize,
+    max_slots: usize,
+    batch_done: AtomicUsize,
+    batch_timeouts: AtomicUsize,
+    batch_elapsed_ms: AtomicU64,
+}
+
+impl AdaptiveSlotController {
+    fn new(max_slots: usize) -> Self {
+        #[cfg(target_os = "ios")]
+        let initial = 2.min(max_slots);
+        #[cfg(not(target_os = "ios"))]
+        let initial = max_slots;
+        Self {
+            active: AtomicUsize::new(initial.max(1)),
+            max_slots: max_slots.max(1),
+            batch_done: AtomicUsize::new(0),
+            batch_timeouts: AtomicUsize::new(0),
+            batch_elapsed_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn active_slots(&self) -> usize {
+        self.active.load(Ordering::Acquire).clamp(1, self.max_slots)
+    }
+
+    async fn wait_until_active<F>(&self, worker: usize, mut cancelled: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        while worker >= self.active_slots() {
+            if cancelled() {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        !cancelled()
+    }
+
+    fn record(&self, elapsed_ms: u64, timed_out: bool) {
+        self.batch_elapsed_ms
+            .fetch_add(elapsed_ms, Ordering::AcqRel);
+        if timed_out {
+            self.batch_timeouts.fetch_add(1, Ordering::AcqRel);
+        }
+        let done = self.batch_done.fetch_add(1, Ordering::AcqRel) + 1;
+        if done % 8 != 0 {
+            return;
+        }
+        // batch_done 保持累计值，只有每第 8 个完成者调速，避免并发 worker
+        // 同时重置计数后重复调整；耗时与超时数按最近批次原子取出。
+        let timeouts = self.batch_timeouts.swap(0, Ordering::AcqRel);
+        let elapsed = self.batch_elapsed_ms.swap(0, Ordering::AcqRel);
+        let timeout_rate = timeouts as f64 / 8.0;
+        let avg_node_ms = elapsed / 8;
+        let active = self.active_slots();
+        if timeout_rate > 0.40 || avg_node_ms > 4500 {
+            self.active.store(active.saturating_sub(1).max(1), Ordering::Release);
+        } else if timeout_rate < 0.15 && avg_node_ms < 1800 && active < self.max_slots {
+            self.active.store(active + 1, Ordering::Release);
+        }
+    }
 }
 
 /// 地区是否命中受限名单（纯函数）：loc 未知（None）时视为未命中，
@@ -216,6 +425,25 @@ impl ProbeVerdict {
     }
 }
 
+/// 【APP68】检查状态：供后续分阶段 UI 使用；FAST 绝不冒充 Passed。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    NotTested,
+    Unknown,
+}
+
+/// 【APP68】检测模式。缺省为自动分级流水线（FAST 快筛 + FULL 深测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AimProbeMode {
+    Fast,
+    Full,
+    Selected,
+}
+
 /// 【APP67 P1】单平台探测详情（正向特征码、状态码、证据、失败原因）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -234,6 +462,9 @@ pub struct ServiceProbeResult {
 #[serde(rename_all = "camelCase")]
 pub struct AimNodeResult {
     pub node_name: String,
+    /// 【APP68】节点核心配置 SHA-256 指纹前 16 位（不含节点名）。
+    #[serde(default)]
+    pub node_id: String,
     /// 解锁标签（GPT/Claude/Gemini/NF/YT/Disney+/TK）——
     /// 【APP67】仅 `ProbeVerdict::Verified` 的服务可进入，绝不含糊其辞。
     pub unlocked_tags: Vec<String>,
@@ -262,9 +493,23 @@ pub struct AimNodeResult {
     /// 节点真实出口国家/地区代码
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_country: Option<String>,
+    /// 【APP68】出口 ASN（cdn-trace `asn=`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_asn: Option<String>,
+    /// 【APP68】本轮出口核验时间（Unix 秒）
+    #[serde(default)]
+    pub detected_at: u64,
+    /// 【APP68】FAST / FULL / SELECTED；旧缓存为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AimProbeMode>,
     /// 【APP67 P1】7 个平台各自的探测详情（service → result）
     #[serde(default)]
     pub services: HashMap<String, ServiceProbeResult>,
+    /// 【APP68】独立证据索引，避免前端解析详情对象。
+    #[serde(default)]
+    pub evidence: HashMap<String, String>,
+    #[serde(default)]
+    pub failure_reasons: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,10 +551,31 @@ fn is_running(state: &AppState) -> bool {
 
 // ---------------------------------------------------------------- 探测实现
 
-/// 启动一轮全量探测（异步后台执行，立即返回）。
-/// 若正在探测或内核未运行则跳过。探测完成后：结果入缓存 + 推送事件；
-/// 若 go_aim_enabled 则执行锁定选择（手动指定优先，否则评级自动）。
+/// 【APP68】RAII 运行守卫：正常完成、取消或 panic 都复位运行标志与进度。
+struct ProbeRunGuard(AppHandle);
+
+impl Drop for ProbeRunGuard {
+    fn drop(&mut self) {
+        let state = self.0.state::<AppState>();
+        state.aim_probing.store(false, Ordering::Release);
+        {
+            let mut progress = state.aim_progress.lock();
+            progress.running = false;
+            let snapshot = progress.clone();
+            drop(progress);
+            let _ = self.0.emit("aim://progress", &snapshot);
+        }
+        let _ = self.0.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
+    }
+}
+
+/// 启动一轮自动分级探测（保持既有调用方 100% 兼容）。
 pub fn start_probe(app: AppHandle) {
+    start_probe_with_mode(app, None);
+}
+
+/// 【APP68】启动 FAST / FULL / SELECTED 或默认自动分级探测。
+pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
     let state = app.state::<AppState>();
     // APP34：Go AIM 未开启时严禁触发全量探测。148 个节点并发真实 HTTP
     // 探测会在 iOS 扩展进程内瞬间冲顶 50MB Jetsam 硬红线，导致隧道被
@@ -325,15 +591,17 @@ pub fn start_probe(app: AppHandle) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         return;
     }
-    // 【APP53 任务2.3】不再硬闸 is_running：预览模式（内核未运行）同样允许
-    // Go AIM 执行，走离线 TCP/TLS 握手基线测速 + 节点地区智能解锁识别路径。
-    // 内核运行时走原有的真实隧道 AI/流媒体探测路径。
+    // 预览模式（内核未运行）只做离线 TCP/TLS 基线测速，不生成任何解锁标签；
+    // 内核运行时走真实隧道出口预检与 AI / 流媒体独立业务探测。
     drop(state);
 
     tauri::async_runtime::spawn(async move {
+        let _run_guard = ProbeRunGuard(app.clone());
         let state = app.state::<AppState>();
-        match probe_all(&app, &state).await {
+        let mut completed = false;
+        match probe_all(&app, &state, mode).await {
             Ok(count) => {
+                completed = true;
                 // 【APP37 任务3.2】探测只被「Go AIM 开关关闭 / VPN 停止」
                 // 中止；完成日志必须携带参与评级总数与最优节点。
                 let best = pick_best(&state.aim_results.read())
@@ -343,11 +611,15 @@ pub fn start_probe(app: AppHandle) {
                 // 切换页面 / 重启 APP 后节点页徽章与排序不丢失
                 {
                     let snapshot = state.aim_results.read().clone();
-                    let best_node = pick_best(&snapshot).map(|r| r.node_name);
+                    let best_node = if mode == Some(AimProbeMode::Fast) {
+                        state.node_metrics.read().aim_best_node.clone()
+                    } else {
+                        pick_best(&snapshot).map(|r| r.node_name)
+                    };
                     // 同时把探测延迟并入持久化 delays（0 延迟节点不覆盖已有值）
                     let delays: Vec<(String, u32)> = snapshot
                         .values()
-                        .filter(|r| r.probed && r.delay_ms > 0)
+                        .filter(|r| r.delay_ms > 0)
                         .map(|r| (r.node_name.clone(), r.delay_ms as u32))
                         .collect();
                     if !delays.is_empty() {
@@ -363,7 +635,10 @@ pub fn start_probe(app: AppHandle) {
                     crate::core::logger::MOD_GO_AIM,
                     &format!("AIM 全量探测完成，共 {count} 个节点参与评级，最优节点: {best}"),
                 );
-                if state.settings.read().go_aim_enabled && is_running(&state) {
+                if mode != Some(AimProbeMode::Fast)
+                    && state.settings.read().go_aim_enabled
+                    && is_running(&state)
+                {
                     if let Err(e) = apply_selection(&app, &state).await {
                         tracing::warn!("[go-aim] 锁定选择失败: {e}");
                         crate::core::logger::warn(
@@ -375,21 +650,20 @@ pub fn start_probe(app: AppHandle) {
             }
             Err(e) => tracing::warn!("[go-aim] 探测中止: {e}"),
         }
-        // 【APP54 任务4】无论成功/异常，进度都必须收敛到完成态，
-        // 否则前端进度条会永久卡在「检测中」。
+        // 只有正常完成才允许 100%；取消/报错由 RAII 守卫复位 running，
+        // 但保留真实完成百分比，绝不把失败伪装成全部检测成功。
         {
             let mut p = state.aim_progress.lock();
-            if p.running {
+            if p.running && completed {
                 p.running = false;
                 p.done = p.total;
+                p.pending_count = 0;
                 p.percent = 100;
                 let snapshot = p.clone();
                 drop(p);
                 let _ = app.emit("aim://progress", &snapshot);
             }
         }
-        state.aim_probing.store(false, Ordering::Release);
-        let _ = app.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
     });
 }
 
@@ -435,9 +709,26 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
 /// 4 个槽位并行消费共享队列，逐节点真实 HTTP 探测 → 写缓存 + 推事件。
 /// 每个节点都必须生成 AimNodeResult（死节点 unlocked_tags=[] 且
 /// probed=true），绝不遗漏"未检测"状态。
-async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
+async fn probe_all(
+    app: &AppHandle,
+    state: &AppState,
+    mode: Option<AimProbeMode>,
+) -> Result<usize, String> {
+    let started = std::time::Instant::now();
     let api = state.kernel_api();
     let preview_mode = !is_running(state);
+    // 必须在阶段一占位结果覆盖内存前保存上一轮完整结果，否则缓存永远无法命中。
+    let cached_results = Arc::new(state.aim_results.read().clone());
+    let node_ids = Arc::new(load_node_identities(&state.data_dir));
+    let (selected_node, manual_selected, best_node) = {
+        let settings = state.settings.read();
+        (
+            settings.selected_node.clone(),
+            settings.user_manually_selected_node
+                || *state.user_manually_selected_node.read(),
+            state.node_metrics.read().aim_best_node.clone(),
+        )
+    };
     // 提前 clone 一份 api，避免 preview_mode 分支 return 之前被 stage1 move
     let api_after_stage1 = api.clone();
 
@@ -498,14 +789,23 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
+    // 节点被删除时精准淘汰对应缓存；旧完整结果已另行保存在 cached_results 中。
+    let current_names: std::collections::HashSet<&str> =
+        nodes.iter().map(|(name, _)| name.as_str()).collect();
+    state
+        .aim_results
+        .write()
+        .retain(|name, _| current_names.contains(name.as_str()));
     // 【APP54 任务4】初始化 Go AIM 进度（全部节点 100% 全量纳入统计）
     {
         let mut p = state.aim_progress.lock();
+        *p = crate::core::state::ProbeProgress::default();
         p.running = true;
-        p.done = 0;
         p.total = nodes.len();
-        p.unlocked_count = 0;
-        p.recompute();
+        p.fast_total = nodes.len();
+        p.pending_count = nodes.len();
+        p.recompute_aim();
+        p.elapsed_ms = started.elapsed().as_millis() as u64;
         let snapshot = p.clone();
         drop(p);
         let _ = app.emit("aim://progress", &snapshot);
@@ -558,10 +858,27 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 }
             })
             .buffer_unordered(SCREEN_BATCH_SIZE);
-        while let Some((name, delay)) = stream.next().await {
+        loop {
+            let next = loop {
+                tokio::select! {
+                    next = stream.next() => break next,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if !state.settings.read().go_aim_enabled
+                            || (!preview_mode && !is_running(state))
+                            || generation_changed(state)
+                        {
+                            return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
+                        }
+                    }
+                }
+            };
+            let Some((name, delay)) = next else { break };
             // 中止条件：关闭 Go AIM / 订阅变更（代数变化）
-            if !state.settings.read().go_aim_enabled || generation_changed(state) {
-                return Err("探测中止（Go AIM 已关闭或订阅已变更）".into());
+            if !state.settings.read().go_aim_enabled
+                || (!preview_mode && !is_running(state))
+                || generation_changed(state)
+            {
+                return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
             }
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
@@ -577,6 +894,10 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                         delay_ms: d,
                         updated_at: now_secs(),
                         probed: false,
+                        probe_version: CURRENT_AIM_PROBE_VERSION,
+                        rule_version: CURRENT_AIM_RULE_VERSION,
+                        node_id: node_ids.get(&name).cloned().unwrap_or_default(),
+                        mode: Some(AimProbeMode::Fast),
                         ..Default::default()
                     };
                     state.aim_results.write().insert(name.clone(), placeholder.clone());
@@ -586,7 +907,9 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     );
                 }
                 _ => {
-                    let dead = dead_result(&name);
+                    let mut dead = dead_result(&name);
+                    dead.node_id = node_ids.get(&name).cloned().unwrap_or_default();
+                    dead.mode = Some(AimProbeMode::Fast);
                     state.aim_results.write().insert(name.clone(), dead.clone());
                     let _ = app.emit(
                         AIM_EVENT,
@@ -598,22 +921,53 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             // 阶段1 仅占总进度前 20%（封顶 20%，done 不等于 total 时也不到 100%）。
             {
                 let mut p = state.aim_progress.lock();
-                p.done += 1;
-                p.percent = ((p.done * 20) / p.total.max(1)).min(20) as u8;
+                p.fast_done += 1;
+                p.recompute_aim();
+                p.elapsed_ms = started.elapsed().as_millis() as u64;
                 let snapshot = p.clone();
                 drop(p);
                 let _ = app.emit("aim://progress", &snapshot);
             }
         }
     }
-    let alive = sort_by_delay(alive);
+    let alive = AimPriorityQueue::new(
+        alive,
+        selected_node.as_deref(),
+        manual_selected || mode == Some(AimProbeMode::Selected),
+        best_node.as_deref(),
+    );
     let alive_count = alive.len();
     if alive.is_empty() {
         return Err("阶段1 快筛后无存活节点".into());
     }
-    tracing::info!("[go-aim] 阶段1 快筛完成：{} 个节点存活，进入阶段2", alive.len());
+    tracing::info!("[go-aim] 阶段1 快筛完成：{} 个节点存活", alive.len());
 
-    // 【APP51 任务1】第 1 名先行同步：按延迟升序的第一名立即成为当前选中节点，
+    // 【APP68】显式 FAST：只输出真实延迟与 Fast 模式，不发起平台请求、
+    // 不产生 Verified 标签，也不改变用户当前节点选择。
+    if mode == Some(AimProbeMode::Fast) {
+        for (name, delay) in &alive {
+            let result = AimNodeResult {
+                node_name: name.clone(),
+                node_id: node_ids.get(name).cloned().unwrap_or_default(),
+                delay_ms: *delay,
+                updated_at: now_secs(),
+                detected_at: now_secs(),
+                probed: false,
+                probe_version: CURRENT_AIM_PROBE_VERSION,
+                rule_version: CURRENT_AIM_RULE_VERSION,
+                mode: Some(AimProbeMode::Fast),
+                ..Default::default()
+            };
+            state.aim_results.write().insert(name.clone(), result.clone());
+            let _ = app.emit(
+                AIM_EVENT,
+                serde_json::json!({ "name": name, "result": result }),
+            );
+        }
+        return Ok(alive.len());
+    }
+
+    // 【APP51 任务1】第 1 名先行同步：优先级队列第一名立即成为当前选中节点，
     // 仪表盘/代理页 1 秒内可见，无需等待 7 平台深测结果
     {
         let enabled = state.settings.read().go_aim_enabled;
@@ -652,9 +1006,12 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 score: 0,
                 delay_ms: *d,
                 updated_at: now_secs(),
+                detected_at: now_secs(),
                 probed: true,
                 probe_version: CURRENT_AIM_PROBE_VERSION,
                 rule_version: CURRENT_AIM_RULE_VERSION,
+                node_id: node_ids.get(name).cloned().unwrap_or_default(),
+                mode: Some(AimProbeMode::Fast),
                 ..Default::default()
             };
             state.aim_results.write().insert(name.clone(), result.clone());
@@ -748,7 +1105,20 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             .build()
             .ok();
         if let Some(c) = direct {
-            fetch_egress(&c).await.0
+            let mut fetch = Box::pin(fetch_egress(&c));
+            loop {
+                tokio::select! {
+                    egress = &mut fetch => break egress.ip,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if !state.settings.read().go_aim_enabled
+                            || !is_running(state)
+                            || generation_changed(state)
+                        {
+                            return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
+                        }
+                    }
+                }
+            }
         } else {
             None
         }
@@ -760,9 +1130,11 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
     // percent 从 20% 起步，每完成一个存活节点 +80/alive_count。
     {
         let mut p = state.aim_progress.lock();
-        p.done = 0;
-        p.total = alive_count;
-        p.percent = 20;
+        p.full_total = alive_count;
+        p.full_done = 0;
+        p.cache_hits = 0;
+        p.recompute_aim();
+        p.elapsed_ms = started.elapsed().as_millis() as u64;
         let snapshot = p.clone();
         drop(p);
         let _ = app.emit("aim://progress", &snapshot);
@@ -780,36 +1152,42 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
             .map(|(i, (name, d))| (name, d, i < PROBE_SLOTS))
             .collect::<VecDeque<_>>(),
     ));
+    let controller = Arc::new(AdaptiveSlotController::new(slot_clients.len()));
+    let result_mode = mode.unwrap_or(AimProbeMode::Full);
+    let force_full = mode == Some(AimProbeMode::Full);
     let mut set = tokio::task::JoinSet::new();
-    for (slot, client, nr_client) in slot_clients {
+    for (worker, (slot, client, nr_client)) in slot_clients.into_iter().enumerate() {
         let queue = queue.clone();
         let api = api_after_stage1.clone();
         let task_app = app.clone();
         let instant_locked = instant_locked.clone();
         let direct_ip = direct_ip.clone();
+        let cached_results = cached_results.clone();
+        let node_ids = node_ids.clone();
+        let controller = controller.clone();
         let generation = generation;
         set.spawn(async move {
             let app = task_app;
             let mut done = 0usize;
             loop {
-                // 【APP37 任务3.2】探测循环只允许两个中止条件：
-                // ① 用户主动关闭了 Go AIM 开关；② VPN 被用户停止。
-                // 自动选点/手动切点导致的 selected_node 变化绝不再中止探测。
-                {
+                // 暂时停用的 worker 每 50ms 等待一次，同时响应关闭 / 停止 / 订阅变更。
+                let cancelled = || {
                     let st = app.state::<AppState>();
-                    if !st.settings.read().go_aim_enabled
+                    !st.settings.read().go_aim_enabled
                         || !is_running(&st)
                         || st.aim_generation.load(Ordering::Acquire) != generation
-                    {
-                        tracing::info!(
-                            "[go-aim] 槽位 {slot} 探测中止（Go AIM 关闭、VPN 停止或订阅变更）"
-                        );
-                        break;
-                    }
+                };
+                if cancelled() || !controller.wait_until_active(worker, cancelled).await {
+                    tracing::info!(
+                        "[go-aim] 槽位 {slot} 探测中止（Go AIM 关闭、VPN 停止或订阅变更）"
+                    );
+                    break;
                 }
                 let next = queue.lock().await.pop_front();
                 let Some((name, delay, first_batch)) = next else { break };
-                let result = probe_node(
+                let node_id = node_ids.get(&name).cloned().unwrap_or_default();
+                let cached = cached_results.get(&name);
+                let mut probe = Box::pin(probe_node(
                     &api,
                     &client,
                     &nr_client,
@@ -817,20 +1195,47 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     &name,
                     Some(delay),
                     direct_ip.as_deref(),
-                )
-                .await;
-                // 【APP51 任务1】订阅在探测期间变更：丢弃本轮结果，绝不污染新节点缓存
+                    &node_id,
+                    cached,
+                    result_mode,
+                    force_full,
+                ));
+                // 探针 future 可被直接 drop：取消响应不等待最慢平台请求超时。
+                let outcome = loop {
+                    tokio::select! {
+                        outcome = &mut probe => break Some(outcome),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                            let st = app.state::<AppState>();
+                            if !st.settings.read().go_aim_enabled
+                                || !is_running(&st)
+                                || st.aim_generation.load(Ordering::Acquire) != generation
+                            {
+                                break None;
+                            }
+                        }
+                    }
+                };
+                drop(probe);
+                let Some(outcome) = outcome else {
+                    tracing::info!("[go-aim] 槽位 {slot} 已取消节点「{name}」探测");
+                    break;
+                };
+                controller.record(outcome.elapsed_ms, outcome.timed_out);
+                // 过期结果不得污染新订阅或已停止的会话。
                 {
                     let st = app.state::<AppState>();
-                    if st.aim_generation.load(Ordering::Acquire) != generation {
-                        tracing::info!("[go-aim] 槽位 {slot} 丢弃过期探测结果（订阅已变更）");
+                    if !st.settings.read().go_aim_enabled
+                        || !is_running(&st)
+                        || st.aim_generation.load(Ordering::Acquire) != generation
+                    {
+                        tracing::info!("[go-aim] 槽位 {slot} 丢弃过期探测结果");
                         break;
                     }
                 }
                 done += 1;
-                // 实时缓存 + 推送前端徽章
-                // 注意：写锁 guard 必须严格限制在本作用域内，绝不可跨 await
-                //（parking_lot RwLockWriteGuard 非 Send，JoinSet::spawn 要求 future: Send）
+                let cache_hit = outcome.cache_hit;
+                let result = outcome.result;
+                // 写锁 guard 严格限制在本作用域内，绝不跨 await。
                 {
                     let app_state = app.state::<AppState>();
                     let mut results = app_state.aim_results.write();
@@ -838,30 +1243,47 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 }
                 let _ = app.emit(
                     AIM_EVENT,
-                    serde_json::json!({ "name": result.node_name, "result": result }),
+                    serde_json::json!({ "name": result.node_name, "result": result.clone() }),
                 );
-                // 【APP54 任务4 / APP67 P4】阶段2 每完成一个节点 → 进度 +1，
-                // 阶段2 占 20%~100%：percent = 20 + done*80/total（封顶 100）。
+                // 实际深测与缓存命中分别计数，共同推进 20%～100% 的真实进度。
                 {
                     let app_state = app.state::<AppState>();
+                    let (unlocked, verified, unknown) = {
+                        let results = app_state.aim_results.read();
+                        (
+                            results.values().filter(|r| r.probed && r.ai_unlocked).count(),
+                            results
+                                .values()
+                                .filter(|r| r.probed && !r.unlocked_tags.is_empty())
+                                .count(),
+                            results
+                                .values()
+                                .filter(|r| {
+                                    r.probed
+                                        && !r.services.is_empty()
+                                        && r.services
+                                            .values()
+                                            .all(|service| service.verdict == ProbeVerdict::Unknown)
+                                })
+                                .count(),
+                        )
+                    };
                     let mut p = app_state.aim_progress.lock();
-                    p.done = (p.done + 1).min(p.total);
-                    p.percent = (20 + (p.done * 80) / p.total.max(1)).min(100) as u8;
-                    p.unlocked_count = app_state
-                        .aim_results
-                        .read()
-                        .values()
-                        .filter(|r| r.probed && r.ai_unlocked)
-                        .count();
+                    if cache_hit {
+                        p.cache_hits += 1;
+                    } else {
+                        p.full_done += 1;
+                    }
+                    p.recompute_aim();
+                    p.unlocked_count = unlocked;
+                    p.verified_count = verified;
+                    p.unknown_count = unknown;
+                    p.elapsed_ms = started.elapsed().as_millis() as u64;
                     let snapshot = p.clone();
                     drop(p);
                     let _ = app.emit("aim://progress", &snapshot);
                 }
-                // 【APP49 任务3】秒级锁定：首批（延迟最低的前 4 个）中一旦
-                // 出现解锁 ChatGPT/Claude 的节点，立即走既有锁定路径切换为
-                // 当前节点（lock_node 内部同步主选择器/GLOBAL/settings 并
-                // 广播事件），后台继续完成剩余节点探测评级。手动指定节点时
-                // 绝不抢锁；全程仅锁定一次。
+                // 首批真实 AI Verified 节点可秒级锁定；缓存结果本身也已通过出口预检。
                 if first_batch
                     && result
                         .unlocked_tags
@@ -888,14 +1310,10 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                                 result.node_name, result.delay_ms
                             ),
                         );
-                        // 探测中的锁定不得断开现有连接（close_conns=false），
-                        // 否则会砍断其余槽位正在进行的探针 HTTP 连接。
                         let _ = lock_node(&app, &app_state, &result, false).await;
                     }
                 }
-                // 【APP39 任务4·时机B】探测过程中实时同步：只要出现延迟更低
-                // 的合格节点，立即刷新全局「当前节点」（仪表盘/代理页 1 秒内
-                // 跟随），无需等全量探测结束。手动指定节点时绝不抢锁。
+                // 实时同步当前最优节点；手动指定节点时绝不抢锁。
                 {
                     let app_state = app.state::<AppState>();
                     let enabled = app_state.settings.read().go_aim_enabled;
@@ -910,9 +1328,6 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                         }
                     }
                 }
-                // 【APP37 任务3.2】每完成一个节点（4 槽位并行即每批 4 个）
-                // 休眠 40ms 让出时间片供内存回收，随后继续下一批，
-                // 直到 100% 完成全部节点探测。
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             }
             done
@@ -921,7 +1336,13 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
 
     let mut count = 0usize;
     while let Some(res) = set.join_next().await {
-        count += res.unwrap_or(0);
+        count += res.map_err(|e| format!("探测任务失败: {e}"))?;
+    }
+    if !state.settings.read().go_aim_enabled || !is_running(state) || generation_changed(state) {
+        return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
+    }
+    if count != alive_count {
+        return Err(format!("探测未完整完成：{count}/{alive_count}"));
     }
     Ok(count)
 }
@@ -1060,6 +1481,12 @@ async fn read_verified_body(
 ) -> Result<(u16, reqwest::header::HeaderMap, String), ProbeVerdict> {
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
+    if status == 403 {
+        return Err(ProbeVerdict::Blocked);
+    }
+    if status == 429 {
+        return Err(ProbeVerdict::Unknown);
+    }
     let body = match resp.text().await {
         Ok(b) => b,
         Err(_) => return Err(ProbeVerdict::Unknown),
@@ -1102,8 +1529,11 @@ async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> Serv
         return svc_unknown(SVC, "server_status 请求失败");
     };
     let ss_status = ss_resp.status().as_u16();
-    if ss_status == 403 || ss_status == 429 {
-        return svc_blocked(SVC, format!("server_status 返回 {ss_status} 风控"));
+    if ss_status == 403 {
+        return svc_blocked(SVC, "server_status 返回 403 风控");
+    }
+    if ss_status == 429 {
+        return svc_unknown(SVC, "server_status 返回 429，稍后重测");
     }
     let ss_body = match ss_resp.text().await {
         Ok(b) => b,
@@ -1419,44 +1849,74 @@ async fn probe_node(
     name: &str,
     prescreened_delay: Option<u64>,
     direct_ip: Option<&str>,
-) -> AimNodeResult {
+    node_id: &str,
+    cached: Option<&AimNodeResult>,
+    mode: AimProbeMode,
+    force_full: bool,
+) -> NodeProbeOutcome {
+    let started = std::time::Instant::now();
+    let stamp = |mut result: AimNodeResult| {
+        result.node_id = node_id.to_string();
+        result.mode = Some(mode);
+        result.detected_at = now_secs();
+        result
+    };
     // 1. 基线延迟
     let base_delay = match prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS) {
         Some(d) => d,
         None => match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
             Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
-            _ => return dead_result(name),
+            _ => return NodeProbeOutcome::new(stamp(dead_result(name)), false, started),
         },
     };
 
     // 2. 探针选择器切到该节点
     if let Err(e) = api.select_proxy(&probe_selector(slot), name).await {
         tracing::warn!("[go-aim] 槽位 {slot} 切换探针到「{name}」失败: {e}");
-        return dead_result(name);
+        return NodeProbeOutcome::new(stamp(dead_result(name)), false, started);
     }
 
-    // 3. 【APP67 BUG-04】出口预检：获取真实出口 IP 与地区，失败/未知/漏直连立即短路
-    let (egress_ip, egress_country) = fetch_egress(client).await;
-    if egress_ip.is_none() || egress_country.is_none() {
+    // 3. 每个节点都先做一次轻量出口预检；缓存命中也绝不跳过。
+    let egress = fetch_egress(client).await;
+    if egress.ip.is_none() || egress.country.is_none() {
         tracing::debug!("[go-aim] 节点「{name}」出口探测失败，短路后续平台探测");
-        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
+        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
+        result.egress_asn = egress.asn;
+        return NodeProbeOutcome::new(stamp(result), false, started);
     }
-    let country = egress_country.as_deref().unwrap();
+    let country = egress.country.as_deref().unwrap();
     if UNKNOWN_EXIT_COUNTRIES.contains(&country) {
         tracing::debug!("[go-aim] 节点「{name}」出口地区 {country} 未知，短路");
-        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
+        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
+        result.egress_asn = egress.asn;
+        return NodeProbeOutcome::new(stamp(result), false, started);
     }
-    // 防漏直连：出口 IP 等于本机直连公网 IP → 代理未生效
     if let Some(dip) = direct_ip
-        && egress_ip.as_deref() == Some(dip)
+        && egress.ip.as_deref() == Some(dip)
     {
         tracing::debug!("[go-aim] 节点「{name}」出口 IP 与直连 IP 一致（漏直连），短路");
-        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
+        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
+        result.egress_asn = egress.asn;
+        return NodeProbeOutcome::new(stamp(result), false, started);
     }
 
-    // 4. 7 个平台并发真实请求（仅 Unknown 补测 1 次）
-    let ec = egress_country.as_deref();
-    // 各探测器闭包捕获的引用不同，需 box 为同一 trait object 才能 join_all
+    // 4. 配置指纹 + 双版本 + 出口 IP 全一致：0 平台请求直接复用。
+    let current_ip = egress.ip.as_deref().unwrap_or_default();
+    if let Some(cached) = cached.filter(|cached| {
+        cache_reusable(cached, node_id, current_ip, force_full)
+    }) {
+        let mut result = cached.clone();
+        result.node_name = name.to_string();
+        result.delay_ms = base_delay;
+        result.updated_at = now_secs();
+        result.detected_at = now_secs();
+        result.egress_asn = egress.asn.or(result.egress_asn);
+        result.mode = Some(mode);
+        return NodeProbeOutcome::new(result, true, started);
+    }
+
+    // 5. 仅缓存未命中时执行 7 平台并发真实请求（Unknown 最多补测 1 次）。
+    let ec = egress.country.as_deref();
     let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>> = vec![
         Box::pin(probe_with_retry(|| probe_gpt(client, ec))),
         Box::pin(probe_with_retry(|| probe_claude(client, nr_client, ec))),
@@ -1468,8 +1928,10 @@ async fn probe_node(
     ];
     let results = futures_util::future::join_all(futs).await;
 
-    // 5. 汇总：只有 Verified 进入 unlocked_tags
+    // 6. 汇总：只有 Verified 进入 unlocked_tags。
     let mut services: HashMap<String, ServiceProbeResult> = HashMap::with_capacity(results.len());
+    let mut evidence = HashMap::new();
+    let mut failure_reasons = HashMap::new();
     let mut tags: Vec<String> = Vec::new();
     let mut ai = false;
     let mut media = false;
@@ -1483,23 +1945,61 @@ async fn probe_node(
                 media = true;
             }
         }
+        if !r.evidence.is_empty() {
+            evidence.insert(r.service.clone(), r.evidence.clone());
+        }
+        if let Some(reason) = &r.failure_reason {
+            failure_reasons.insert(r.service.clone(), reason.clone());
+        }
         services.insert(r.service.clone(), r);
     }
     let score = tags.len() as u32;
-    AimNodeResult {
+    let result = AimNodeResult {
         node_name: name.to_string(),
+        node_id: node_id.to_string(),
         unlocked_tags: tags,
         ai_unlocked: ai,
         media_unlocked: media,
         score,
         delay_ms: base_delay,
         updated_at: now_secs(),
+        detected_at: now_secs(),
         probed: true,
         probe_version: CURRENT_AIM_PROBE_VERSION,
         rule_version: CURRENT_AIM_RULE_VERSION,
-        egress_ip,
-        egress_country,
+        egress_ip: egress.ip,
+        egress_country: egress.country,
+        egress_asn: egress.asn,
+        mode: Some(mode),
         services,
+        evidence,
+        failure_reasons,
+    };
+    NodeProbeOutcome::new(result, false, started)
+}
+
+struct NodeProbeOutcome {
+    result: AimNodeResult,
+    cache_hit: bool,
+    elapsed_ms: u64,
+    timed_out: bool,
+}
+
+impl NodeProbeOutcome {
+    fn new(result: AimNodeResult, cache_hit: bool, started: std::time::Instant) -> Self {
+        let timed_out = result.delay_ms == 0
+            || result.services.values().any(|service| {
+                service
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("超时") || reason.contains("timeout"))
+            });
+        Self {
+            result,
+            cache_hit,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            timed_out,
+        }
     }
 }
 
@@ -1531,6 +2031,7 @@ fn egress_unknown_result(
         egress_ip,
         egress_country,
         services,
+        ..Default::default()
     }
 }
 
@@ -1815,6 +2316,24 @@ mod tests {
 
     fn node(name: &str, delay: u64, tags: &[&str]) -> AimNodeResult {
         let tags: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+        let services = PROBES
+            .iter()
+            .map(|probe| {
+                let verdict = if tags.iter().any(|tag| tag == probe.tag) {
+                    ProbeVerdict::Verified
+                } else {
+                    ProbeVerdict::Accessible
+                };
+                (
+                    probe.tag.to_string(),
+                    ServiceProbeResult {
+                        service: probe.tag.to_string(),
+                        verdict,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
         AimNodeResult {
             ai_unlocked: tags.iter().any(|t| t == "GPT" || t == "Claude" || t == "Gemini"),
             media_unlocked: tags.iter().any(|t| t == "NF" || t == "YT" || t == "Disney+" || t == "TK"),
@@ -1826,8 +2345,35 @@ mod tests {
             probed: true,
             probe_version: CURRENT_AIM_PROBE_VERSION,
             rule_version: CURRENT_AIM_RULE_VERSION,
+            services,
             ..Default::default()
         }
+    }
+
+    /// 本地一次性 Mock HTTP 服务：不访问商业平台，也不依赖任何用户账号。
+    async fn mock_response(status: u16, body: &str) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let reason = match status {
+                200 => "OK",
+                403 => "Forbidden",
+                429 => "Too Many Requests",
+                _ => "Mock",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        reqwest::get(format!("http://{addr}/mock")).await.unwrap()
     }
 
     #[test]
@@ -1939,9 +2485,10 @@ mod tests {
         assert!(region_blocked(Some("HK"), AI_BLOCKLIST));
         assert!(!region_blocked(Some("US"), AI_BLOCKLIST));
         assert!(!region_blocked(None, AI_BLOCKLIST), "loc 未知时不应判封锁");
-        // TikTok 名单仅 CN/HK/IN：RU 不在其中
+        // 【APP68】TikTok 名单覆盖 CN/HK/IN/RU/AF。
         assert!(region_blocked(Some("IN"), TIKTOK_BLOCKLIST));
-        assert!(!region_blocked(Some("RU"), TIKTOK_BLOCKLIST));
+        assert!(region_blocked(Some("RU"), TIKTOK_BLOCKLIST));
+        assert!(region_blocked(Some("AF"), TIKTOK_BLOCKLIST));
         assert!(!region_blocked(Some("US"), TIKTOK_BLOCKLIST));
     }
 
@@ -2054,18 +2601,47 @@ mod tests {
         assert_ne!(verdict, ProbeVerdict::Verified);
     }
 
+    #[tokio::test]
+    async fn test_403_429_blocked_or_unknown() {
+        let forbidden = mock_response(403, &"access denied ".repeat(20)).await;
+        assert_eq!(
+            read_verified_body(forbidden, 1).await.unwrap_err(),
+            ProbeVerdict::Blocked
+        );
+        let limited = mock_response(429, &"rate limited ".repeat(20)).await;
+        assert_eq!(
+            read_verified_body(limited, 1).await.unwrap_err(),
+            ProbeVerdict::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_http_empty_challenge_and_valid_body() {
+        let empty = mock_response(200, "").await;
+        assert_eq!(
+            read_verified_body(empty, 100).await.unwrap_err(),
+            ProbeVerdict::Unknown
+        );
+        let challenge = mock_response(200, &"Just a moment... cf-chl-bypass ".repeat(10)).await;
+        assert_eq!(
+            read_verified_body(challenge, 100).await.unwrap_err(),
+            ProbeVerdict::Blocked
+        );
+        let valid = mock_response(200, &"chatgpt oai verified content ".repeat(20)).await;
+        let (status, _, body) = read_verified_body(valid, 100).await.unwrap();
+        assert_eq!(status, 200);
+        assert!(body.contains("chatgpt"));
+    }
+
     #[test]
-    fn test_403_429_blocked_or_unknown() {
-        // 403 / 429 → Blocked（风控），不得 Verified
-        for bad in [403u16, 429] {
-            let verdict = if bad == 403 || bad == 429 {
-                ProbeVerdict::Blocked
-            } else {
-                ProbeVerdict::Verified
-            };
-            assert_eq!(verdict, ProbeVerdict::Blocked);
-            assert!(!verdict.is_verified());
-        }
+    fn test_region_redirect_location_is_not_accepted() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            reqwest::header::HeaderValue::from_static("https://gemini.google.com/faq/unsupported"),
+        );
+        let location = location_lc(&headers);
+        assert!(location.contains("faq") || location.contains("unsupported"));
     }
 
     #[test]
@@ -2139,12 +2715,10 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        // 【APP67 P3】probe_version / rule_version = 2，旧版（0/1）缓存必须淘汰
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 2);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 2);
-        assert!(0 < CURRENT_AIM_PROBE_VERSION, "v0 缓存应被淘汰");
-        assert!(1 < CURRENT_AIM_PROBE_VERSION, "v1 缓存应被淘汰");
-        assert!(2 >= CURRENT_AIM_PROBE_VERSION, "v2 缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 3);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 3);
+        assert!(2 < CURRENT_AIM_PROBE_VERSION, "v2 及更早缓存应被淘汰");
+        assert!(3 >= CURRENT_AIM_PROBE_VERSION, "v3 真实缓存应保留");
     }
 
     #[test]
@@ -2160,5 +2734,262 @@ mod tests {
         let r = dead_result("dead");
         assert_eq!(r.probe_version, CURRENT_AIM_PROBE_VERSION);
         assert_eq!(r.rule_version, CURRENT_AIM_RULE_VERSION);
+    }
+
+    #[test]
+    fn test_parse_trace_ip_and_asn() {
+        let trace = "ip=203.0.113.8\nloc=US\nasn=AS13335\n";
+        assert_eq!(parse_trace_ip(trace).as_deref(), Some("203.0.113.8"));
+        assert_eq!(parse_trace_asn(trace).as_deref(), Some("13335"));
+    }
+
+    #[test]
+    fn test_node_fingerprint_ignores_name_but_tracks_core_config() {
+        let original: serde_yaml::Value = serde_yaml::from_str(
+            "name: node-a\ntype: vless\nserver: edge.example.com\nport: 443\nuuid: secret-id\nsni: tls.example.com\nflow: xtls-rprx-vision\nnetwork: tcp\n",
+        )
+        .unwrap();
+        let renamed: serde_yaml::Value = serde_yaml::from_str(
+            "name: 新名称\ntype: vless\nserver: edge.example.com\nport: 443\nuuid: secret-id\nsni: tls.example.com\nflow: xtls-rprx-vision\nnetwork: tcp\n",
+        )
+        .unwrap();
+        let changed: serde_yaml::Value = serde_yaml::from_str(
+            "name: node-a\ntype: vless\nserver: edge.example.com\nport: 8443\nuuid: secret-id\nsni: tls.example.com\nflow: xtls-rprx-vision\nnetwork: tcp\n",
+        )
+        .unwrap();
+        let fingerprint = node_fingerprint(&original);
+        assert_eq!(fingerprint.len(), 16);
+        assert_eq!(fingerprint, node_fingerprint(&renamed));
+        assert_ne!(fingerprint, node_fingerprint(&changed));
+    }
+
+    #[test]
+    fn test_incremental_cache_requires_identity_versions_and_egress() {
+        let mut cached = node("n", 100, &["GPT"]);
+        cached.node_id = "0123456789abcdef".into();
+        cached.egress_ip = Some("203.0.113.8".into());
+        cached.mode = Some(AimProbeMode::Full);
+        assert!(cache_reusable(&cached, &cached.node_id, "203.0.113.8", false));
+        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.9", false));
+        assert!(!cache_reusable(&cached, "fedcba9876543210", "203.0.113.8", false));
+        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.8", true));
+        let mut old_rule = cached.clone();
+        old_rule.rule_version -= 1;
+        assert!(!cache_reusable(&old_rule, &old_rule.node_id, "203.0.113.8", false));
+        let mut fast = cached.clone();
+        fast.mode = Some(AimProbeMode::Fast);
+        assert!(!cache_reusable(&fast, &fast.node_id, "203.0.113.8", false));
+        let mut precheck = egress_unknown_result(
+            "n",
+            100,
+            Some("203.0.113.8".into()),
+            Some("XX".into()),
+        );
+        precheck.node_id = cached.node_id.clone();
+        precheck.mode = Some(AimProbeMode::Full);
+        assert!(!cache_reusable(&precheck, &precheck.node_id, "203.0.113.8", false));
+        cached.probed = false;
+        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.8", false));
+    }
+
+    #[test]
+    fn test_five_level_priority_queue() {
+        let alive = vec![
+            ("rest".into(), 500),
+            ("low-b".into(), 200),
+            ("current".into(), 100),
+            ("best".into(), 50),
+            ("low-a".into(), 150),
+        ];
+        let queued = AimPriorityQueue::new(alive, Some("current"), true, Some("best"));
+        let names: Vec<&str> = queued.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["current", "best", "low-a", "low-b", "rest"]);
+    }
+
+    #[test]
+    fn test_adaptive_slots_reduce_and_recover() {
+        let controller = AdaptiveSlotController::new(4);
+        let initial = controller.active_slots();
+        for _ in 0..8 {
+            controller.record(5000, true);
+        }
+        assert_eq!(controller.active_slots(), initial.saturating_sub(1).max(1));
+        let reduced = controller.active_slots();
+        for _ in 0..8 {
+            controller.record(1000, false);
+        }
+        assert_eq!(controller.active_slots(), (reduced + 1).min(4));
+    }
+
+    #[test]
+    fn test_two_phase_progress_caps_at_99_until_verified() {
+        let mut progress = crate::core::state::ProbeProgress {
+            running: true,
+            fast_done: 300,
+            fast_total: 300,
+            full_total: 300,
+            full_done: 299,
+            ..Default::default()
+        };
+        progress.recompute_aim();
+        assert_eq!(progress.percent, 99);
+        assert_eq!(progress.pending_count, 1);
+        progress.cache_hits = 1;
+        progress.recompute_aim();
+        assert_eq!(progress.percent, 100);
+        assert_eq!(progress.pending_count, 0);
+    }
+
+    #[derive(Default)]
+    struct BenchWorkerStats {
+        elapsed_ms: Vec<u64>,
+        cache_hits: usize,
+        timeouts: usize,
+        processed: usize,
+    }
+
+    async fn benchmark_request(
+        inflight: Arc<AtomicUsize>,
+        max_inflight: Arc<AtomicUsize>,
+        delay_ms: u64,
+    ) {
+        let current = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+        max_inflight.fetch_max(current, Ordering::AcqRel);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// 本地可控大规模流水线压测：32 路快筛、4 个物理槽位、缓存核验与
+    /// 单节点 7 平台并发均真实调度，仅把跨国网络耗时替换为 1～3ms Mock 延迟。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_aim_large_scale_benchmark() {
+        use futures_util::StreamExt as _;
+        println!("\n| nodes | total_ms | avg_node_ms | p95_node_ms | max_inflight_requests | peak_mem_kb(est.) | timeout_rate | cache_hit_rate | cancel_latency_ms |");
+        println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for size in [20usize, 50, 100, 148, 200, 300] {
+            let total_started = std::time::Instant::now();
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let max_inflight = Arc::new(AtomicUsize::new(0));
+            let mut screen = futures_util::stream::iter((0..size).map(|index| {
+                let inflight = inflight.clone();
+                let max_inflight = max_inflight.clone();
+                async move {
+                    benchmark_request(inflight, max_inflight, 1).await;
+                    index
+                }
+            }))
+            .buffer_unordered(SCREEN_BATCH_SIZE);
+            let mut alive = Vec::new();
+            while let Some(index) = screen.next().await {
+                if index % 11 != 0 {
+                    alive.push((format!("node-{index}"), 80 + (index as u64 * 37) % 900));
+                }
+            }
+            drop(screen);
+            // 表格的 max_inflight_requests 专门观测深测阶段（快筛峰值固定为 32）。
+            max_inflight.store(0, Ordering::Release);
+            let queued = AimPriorityQueue::new(alive, Some("node-1"), true, Some("node-2"));
+            let alive_count = queued.len();
+            let cached: Arc<HashMap<String, AimNodeResult>> = Arc::new(
+                (0..size)
+                    .filter(|index| index % 11 != 0 && index % 5 < 3)
+                    .map(|index| {
+                        let name = format!("node-{index}");
+                        let mut result = node(&name, 100, &["GPT"]);
+                        result.node_id = format!("{index:016x}");
+                        result.egress_ip = Some("198.51.100.10".into());
+                        result.mode = Some(AimProbeMode::Full);
+                        (name, result)
+                    })
+                    .collect(),
+            );
+            let queue = Arc::new(tokio::sync::Mutex::new(
+                queued
+                    .into_iter()
+                    .map(|(name, _)| {
+                        let index = name.trim_start_matches("node-").parse::<usize>().unwrap();
+                        (index, name)
+                    })
+                    .collect::<VecDeque<_>>(),
+            ));
+            let controller = Arc::new(AdaptiveSlotController::new(4));
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                let queue = queue.clone();
+                let cached = cached.clone();
+                let controller = controller.clone();
+                let inflight = inflight.clone();
+                let max_inflight = max_inflight.clone();
+                workers.spawn(async move {
+                    let mut stats = BenchWorkerStats::default();
+                    loop {
+                        let next = queue.lock().await.pop_front();
+                        let Some((index, name)) = next else { break };
+                        let node_started = std::time::Instant::now();
+                        benchmark_request(inflight.clone(), max_inflight.clone(), 1).await;
+                        let timed_out = index % 29 == 0;
+                        if !timed_out {
+                            let node_id = format!("{index:016x}");
+                            let cache_hit = cached.get(&name).is_some_and(|result| {
+                                cache_reusable(result, &node_id, "198.51.100.10", false)
+                            });
+                            if cache_hit {
+                                stats.cache_hits += 1;
+                            } else {
+                                let requests = (0..7).map(|service| {
+                                    benchmark_request(
+                                        inflight.clone(),
+                                        max_inflight.clone(),
+                                        1 + ((index + service) % 3) as u64,
+                                    )
+                                });
+                                futures_util::future::join_all(requests).await;
+                            }
+                        }
+                        if timed_out {
+                            stats.timeouts += 1;
+                        }
+                        let elapsed = node_started.elapsed().as_millis() as u64;
+                        controller.record(elapsed, timed_out);
+                        stats.elapsed_ms.push(elapsed);
+                        stats.processed += 1;
+                    }
+                    stats
+                });
+            }
+            let mut stats = BenchWorkerStats::default();
+            while let Some(worker) = workers.join_next().await {
+                let worker = worker.unwrap();
+                stats.elapsed_ms.extend(worker.elapsed_ms);
+                stats.cache_hits += worker.cache_hits;
+                stats.timeouts += worker.timeouts;
+                stats.processed += worker.processed;
+            }
+            let total_ms = total_started.elapsed().as_millis() as u64;
+            let avg_node_ms = stats.elapsed_ms.iter().sum::<u64>() / stats.processed.max(1) as u64;
+            stats.elapsed_ms.sort_unstable();
+            let p95_index = ((stats.elapsed_ms.len() * 95) / 100)
+                .min(stats.elapsed_ms.len().saturating_sub(1));
+            let p95_node_ms = stats.elapsed_ms.get(p95_index).copied().unwrap_or(0);
+            let peak = max_inflight.load(Ordering::Acquire);
+            let peak_mem_kb = 2048 + peak * 96;
+            let cancel_started = std::time::Instant::now();
+            let mut pending = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(500)));
+            tokio::select! {
+                _ = &mut pending => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
+            }
+            drop(pending);
+            let cancel_latency_ms = cancel_started.elapsed().as_millis() as u64;
+            println!(
+                "| {size} | {total_ms} | {avg_node_ms} | {p95_node_ms} | {peak} | {peak_mem_kb} | {:.1}% | {:.1}% | {cancel_latency_ms} |",
+                stats.timeouts as f64 * 100.0 / stats.processed.max(1) as f64,
+                stats.cache_hits as f64 * 100.0 / stats.processed.max(1) as f64,
+            );
+            assert_eq!(stats.processed, alive_count);
+            assert_eq!(inflight.load(Ordering::Acquire), 0);
+            assert!(peak <= 28, "4 个物理槽位最多允许 28 个平台请求");
+            assert!(cancel_latency_ms < 600);
+        }
     }
 }

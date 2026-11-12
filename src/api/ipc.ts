@@ -54,6 +54,15 @@ export interface ProbeProgress {
   total: number;
   percent: number;
   unlockedCount: number;
+  fastDone?: number;
+  fastTotal?: number;
+  fullDone?: number;
+  fullTotal?: number;
+  cacheHits?: number;
+  pendingCount?: number;
+  verifiedCount?: number;
+  unknownCount?: number;
+  elapsedMs?: number;
 }
 
 export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");
@@ -228,6 +237,17 @@ export const ensureKernel = () => invoke<KernelInfo>("ensure_kernel");
 
 // ---- Go AIM ----
 
+export type AimProbeMode = "FAST" | "FULL" | "SELECTED";
+export type ProbeVerdict = "VERIFIED" | "ACCESSIBLE" | "PARTIAL" | "BLOCKED" | "UNKNOWN";
+
+export interface ServiceProbeResult {
+  service: string;
+  verdict: ProbeVerdict;
+  statusCode?: number;
+  evidence: string;
+  failureReason?: string;
+}
+
 export interface AimNodeResult {
   nodeName: string;
   unlockedTags: string[];
@@ -236,8 +256,19 @@ export interface AimNodeResult {
   score: number;
   delayMs: number;
   updatedAt: number;
-  /** 是否已完成探测（APP 任务4：死节点也会生成 probed=true 的空结果） */
+  /** 是否已完成完整探测；FAST 占位结果恒为 false */
   probed?: boolean;
+  nodeId?: string;
+  egressIp?: string;
+  egressCountry?: string;
+  egressAsn?: string;
+  detectedAt?: number;
+  probeVersion?: number;
+  ruleVersion?: number;
+  mode?: AimProbeMode;
+  services?: Record<string, ServiceProbeResult>;
+  evidence?: Record<string, string>;
+  failureReasons?: Record<string, string>;
 }
 
 export interface GoAimStatus {
@@ -254,7 +285,8 @@ export interface GoAimStatus {
 export const getGoAimStatus = () => invoke<GoAimStatus>("get_go_aim_status");
 export const setGoAimEnabled = (enabled: boolean) =>
   invoke<void>("set_go_aim_enabled", { enabled });
-export const runGoAimProbe = () => invoke<boolean>("run_go_aim_probe");
+export const runGoAimProbe = (mode?: AimProbeMode) =>
+  invoke<boolean>("run_go_aim_probe", mode ? { mode } : undefined);
 /** 清除 Go AIM 手动指定节点，回到自动评级选点（APP-4 任务3.3） */
 export const clearGoAimPinnedNode = () =>
   invoke<void>("clear_go_aim_pinned_node");
