@@ -167,7 +167,7 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
         if lan.enabled && crate::core::go_lan::is_configured(&lan) {
             crate::core::logger::info(
                 crate::core::logger::MOD_GO_LAN,
-                "VPN 启动完成，自动触发 go-lan-home 首次握手",
+                "VPN 启动完成，自动触发 go-lan-* 隧道首次握手",
             );
             spawn_go_lan_warmup(
                 state.api_addr.read().clone(),
@@ -4029,10 +4029,12 @@ pub async fn add_traffic_tick(
 pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let mut result = state.kernel_api().get_rules().await.map_err(|e| sanitize_err(&e.to_string()))?;
     // 【APP-9 任务2.1c】Go Lan 启用时，在规则列表最顶部附带展示当前生效的
-    // Go Lan 回家路由规则（type=IP-CIDR / DOMAIN-SUFFIX, proxy=go-lan-home），
+    // Go Lan 回家路由规则（type=IP-CIDR / DOMAIN-SUFFIX，proxy=隧道 tag），
     // 让用户在「代理 -> 规则」页直观看到 Go Lan 与规则系统的联动状态。
     let lan = state.go_lan.read().clone();
     if lan.enabled && !lan.lan_cidrs.is_empty() {
+        // 【APP68】tag 与隧道名严格一致（go-lan-{隧道名拼音}），绝不写死
+        let tunnel_tag = crate::core::go_lan::primary_tunnel_tag(&lan);
         if let Some(obj) = result.as_object_mut() {
             let mut go_lan_rules: Vec<serde_json::Value> = Vec::new();
             // 域名规则（若有）
@@ -4044,14 +4046,14 @@ pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, 
                 go_lan_rules.push(serde_json::json!({
                     "type": "DOMAIN-SUFFIX",
                     "payload": format!("{} (Go Lan 回家域名)", domains.join(", ")),
-                    "proxy": "go-lan-home",
+                    "proxy": tunnel_tag.clone(),
                 }));
             }
             // 网段规则
             go_lan_rules.push(serde_json::json!({
                 "type": "IP-CIDR",
                 "payload": format!("{} (Go Lan 回家内网)", lan.lan_cidrs.join(", ")),
-                "proxy": "go-lan-home",
+                "proxy": tunnel_tag,
             }));
             if let Some(arr) = obj.get_mut("rules").and_then(|r| r.as_array_mut()) {
                 let mut new_rules = go_lan_rules;

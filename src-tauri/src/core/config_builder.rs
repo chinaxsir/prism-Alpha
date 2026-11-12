@@ -3466,6 +3466,8 @@ rules:
             lan_dns: Some("192.168.1.1".into()),
             ..Default::default()
         };
+        // 【APP68】tag 与隧道名严格一致（旧版「家里」→ go-lan-jiali）
+        let home_tag = crate::core::go_lan::primary_tunnel_tag(&lan);
         let dir = std::env::temp_dir().join("prism-cb-test-golan");
         std::fs::create_dir_all(dir.join("kernel")).unwrap();
         let built = build(
@@ -3484,15 +3486,17 @@ rules:
 
         let outbounds = built.config["outbounds"].as_array().unwrap();
         assert!(
-            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-lan-home")),
-            "必须注入 go-lan-home 出站"
+            outbounds
+                .iter()
+                .any(|o| o["tag"].as_str() == Some(home_tag.as_str())),
+            "必须注入 {home_tag} 出站"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
         let pos = |pred: &dyn Fn(&Value) -> bool| -> Option<usize> {
             rules.iter().position(|r| pred(r))
         };
         let lan_ip = pos(&|r| {
-            r.get("outbound").and_then(Value::as_str) == Some("go-lan-home")
+            r.get("outbound").and_then(Value::as_str) == Some(home_tag.as_str())
                 && r.get("ip_cidr").is_some()
         });
         let private_geosite = pos(&|r| {
@@ -3650,8 +3654,8 @@ rules:
             .as_array()
             .unwrap()
             .iter()
-            .find(|o| o["tag"] == crate::core::go_lan::GO_LAN_TAG)
-            .expect("go-lan-home outbound must exist");
+            .find(|o| o["tag"] == crate::core::go_lan::primary_tunnel_tag(&lan))
+            .expect("go-lan-* outbound must exist");
         assert!(
             wg.get("allowed_ips").is_none(),
             "顶层 allowed_ips 会触发内核 unknown field 报错"
@@ -3723,9 +3727,11 @@ rules:
             })
             .expect("WG 服务端豁免规则必须存在");
         assert_eq!(rules[wg_pos]["outbound"].as_str(), Some("direct"));
+        // 【APP68】tag 与隧道名严格一致（旧版「家里」→ go-lan-jiali）
+        let home_tag = crate::core::go_lan::primary_tunnel_tag(&lan);
         let go_lan_first = rules
             .iter()
-            .position(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
+            .position(|r| r.get("outbound").and_then(Value::as_str) == Some(home_tag.as_str()))
             .expect("go-lan 回家规则必须存在");
         assert!(
             wg_pos < go_lan_first,
@@ -3744,7 +3750,7 @@ rules:
         );
         let cidrs: Vec<String> = rules
             .iter()
-            .filter(|r| r.get("outbound").and_then(Value::as_str) == Some("go-lan-home"))
+            .filter(|r| r.get("outbound").and_then(Value::as_str) == Some(home_tag.as_str()))
             .filter_map(|r| r.get("ip_cidr").and_then(Value::as_array))
             .flatten()
             .filter_map(|v| v.as_str().map(String::from))

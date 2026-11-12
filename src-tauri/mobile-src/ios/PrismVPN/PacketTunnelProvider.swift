@@ -2279,7 +2279,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 for s in servers {
                     let tag = (s["tag"] as? String) ?? ""
                     let detour = (s["detour"] as? String) ?? ""
-                    if tag == "dns-home" || detour == "go-lan-home" {
+                    // 【APP68】隧道 tag 与界面显示名一一对应（go-lan-{拼音}），
+                    // 绝不能只匹配历史固定值 go-lan-home
+                    if tag == "dns-home" || detour.hasPrefix("go-lan-") {
                         preservedDnsServers.append(s)
                     } else if tag == "dns-local" {
                         // 【APP19 任务3】内网反向 DNS 等规则引用 dns-local，

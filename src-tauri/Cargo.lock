@@ -3472,6 +3472,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pinyin"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
+
+[[package]]
 name = "piper"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3610,7 +3616,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "prism-proxy"
-version = "0.3.100"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3627,6 +3633,7 @@ dependencies = [
  "libc",
  "once_cell",
  "parking_lot",
+ "pinyin",
  "rand 0.8.8",
  "rcgen",
  "regex",

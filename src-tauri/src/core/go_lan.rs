@@ -5,15 +5,21 @@
 //! 2. Manual 分享链接：粘贴家庭节点分享链接（vless/vmess/ss/trojan/hy2/tuic 等）；
 //! 3. Managed（远端拉取）：设备上报 device_code，由授权服务器下发回家节点。
 //!
-//! 生成的 `go-lan-home` 出站会在 config_builder 中合成最高优先级路由规则：
-//! - `lan_domains`（域名后缀）→ go-lan-home
-//! - `lan_cidrs`（网段）→ go-lan-home
+//! 【APP68】出站 tag 命名铁律：`go-lan-{隧道名}`，与用户在界面上看到的
+//! 隧道名字 100% 一致（中文按汉语拼音转写、ASCII 一律小写），例如
+//! 「Nidec」→ `go-lan-nidec`、「Home」→ `go-lan-home`、「家里」→ `go-lan-jiali`，
+//! 无论启用多少路隧道都遵循同一规则，便于用户与开发者一一对应。
+//!
+//! 生成的 `go-lan-*` 出站会在 config_builder 中合成最高优先级路由规则：
+//! - `lan_domains`（域名后缀）→ 第一个启用隧道的 tag
+//! - `lan_cidrs`（网段）→ 对应档案的 tag
 //! 规则必须位于 `geosite: private` 与 `ip_is_private: true -> direct` 之前，
 //! 否则会被内置"私网直连"规则抢先命中。
 //! iOS 端 PacketTunnelProvider 会做"智能同网段防环回"：本机 Wi-Fi IP 落在
 //! lan_cidrs 内时自动把这些规则的出站改为直连。
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::AppHandle;
@@ -24,6 +30,11 @@ use crate::core::license;
 use crate::core::state::AppState;
 use crate::core::uri_parser;
 
+/// 【APP68】Go Lan 隧道出站 tag 前缀（铁律：`go-lan-{隧道名}`）。
+pub const GO_LAN_TAG_PREFIX: &str = "go-lan-";
+/// 隧道名完全不可转写时的兜底片段（`go-lan-home`）。
+pub const GO_LAN_TAG_FALLBACK_SLUG: &str = "home";
+/// 兜底 tag（历史实现固定使用该值，仅在隧道名不可转写时启用）。
 pub const GO_LAN_TAG: &str = "go-lan-home";
 pub const GO_LAN_DNS_TAG: &str = "dns-home";
 
@@ -345,9 +356,82 @@ fn sanitize_profile_id(id: &str) -> String {
         .to_lowercase()
 }
 
-/// 【APP40 任务2】为每个启用档案分配内核出站 tag：
-/// 第 1 个启用档案恒为 `go-lan-home`（保持旧版完全兼容），
-/// 后续依次为 `go-lan-{id}` / `go-lan-2` / `go-lan-3`（保证唯一）。
+/// 【APP68】隧道名 → tag 片段：与界面显示名严格一一对应。
+/// - ASCII 字母/数字转小写，连字符/下划线/空白折叠为单个 `-`；
+/// - 中文按汉语拼音（无声调）转写，如「家里」→ `jiali`、「公司内网」→ `gongsiwang`；
+/// - 其余符号一律丢弃；结果为空时回退 `home`（历史兜底值）。
+pub fn profile_tag_slug(name: &str) -> String {
+    let mut raw = String::new();
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            raw.push(ch.to_ascii_lowercase());
+        } else if let Some(py) = ch.to_pinyin() {
+            raw.push_str(py.plain());
+        } else {
+            raw.push('-');
+        }
+    }
+    let slug = raw
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        GO_LAN_TAG_FALLBACK_SLUG.to_string()
+    } else {
+        slug
+    }
+}
+
+/// 【APP68】单路档案的内核出站 tag：`go-lan-{隧道名拼音}`。
+/// 名称为空时退化为 id，二者都不可用才落到 `go-lan-home`。
+pub fn profile_tunnel_tag(profile: &GoLanProfile) -> String {
+    let name = profile.name.trim();
+    let base = if !name.is_empty() {
+        profile_tag_slug(name)
+    } else {
+        let id = sanitize_profile_id(&profile.id);
+        if id.is_empty() {
+            GO_LAN_TAG_FALLBACK_SLUG.to_string()
+        } else {
+            id
+        }
+    };
+    format!("{GO_LAN_TAG_PREFIX}{base}")
+}
+
+/// 【APP40 任务2 / APP68】旧版单配置（无 profiles）等价档案：
+/// 界面显示名优先取 `home_name`，缺省「家里」。
+fn legacy_profile(lan: &GoLanSettings) -> GoLanProfile {
+    GoLanProfile {
+        id: "home".into(),
+        name: lan
+            .home_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "家里".into()),
+        enabled: true,
+        bypass_on_local_lan: lan.bypass_on_local_lan,
+        local_wifi_ssid: String::new(),
+        lan_cidrs: lan.lan_cidrs.clone(),
+        wg_config: lan.wg_config.clone(),
+        node_uri: lan.node_uri.clone(),
+        probe_target: String::new(),
+    }
+}
+
+/// 【APP68】首选隧道 tag（lan_domains 与家庭 DNS detour 统一走第一路启用隧道；
+/// 无 profiles 时回退旧版单配置的 tag）。
+pub fn primary_tunnel_tag(lan: &GoLanSettings) -> String {
+    enabled_profiles(lan)
+        .first()
+        .map(|(tag, _)| tag.clone())
+        .unwrap_or_else(|| profile_tunnel_tag(&legacy_profile(lan)))
+}
+
+/// 【APP40 任务2 / APP68】为每个启用档案分配内核出站 tag：
+/// **铁律** tag = `go-lan-{隧道名}`（中文转拼音、ASCII 小写），与界面显示名
+/// 一一对应，无论启用多少路隧道都遵守；同名档案自动追加 `-2`/`-3` 保证唯一。
 pub fn enabled_profiles(settings: &GoLanSettings) -> Vec<(String, GoLanProfile)> {
     let mut out: Vec<(String, GoLanProfile)> = Vec::new();
     if !settings.enabled {
@@ -355,23 +439,15 @@ pub fn enabled_profiles(settings: &GoLanSettings) -> Vec<(String, GoLanProfile)>
     }
     let mut used: Vec<String> = Vec::new();
     for profile in settings.profiles.iter().filter(|p| p.enabled) {
-        let tag = if out.is_empty() {
-            GO_LAN_TAG.to_string()
-        } else {
-            let id = sanitize_profile_id(&profile.id);
-            let candidate = if !id.is_empty() && id != "home" {
-                format!("go-lan-{id}")
-            } else {
-                format!("go-lan-{}", out.len() + 1)
-            };
-            if used.contains(&candidate) || candidate == GO_LAN_TAG {
-                format!("go-lan-{}", out.len() + 1)
-            } else {
-                candidate
-            }
-        };
-        used.push(tag.clone());
-        out.push((tag, profile.clone()));
+        let base_tag = profile_tunnel_tag(profile);
+        let mut candidate = base_tag.clone();
+        let mut n = 2;
+        while used.contains(&candidate) {
+            candidate = format!("{base_tag}-{n}");
+            n += 1;
+        }
+        used.push(candidate.clone());
+        out.push((candidate, profile.clone()));
     }
     out
 }
@@ -2470,20 +2546,8 @@ async fn probe_intranet_ip_inner(
             || !lan.lan_cidrs.is_empty())
     {
         // 旧版单配置兜底（尚未执行 normalize_go_lan_settings 的调用方）
-        profiles.push((
-            GO_LAN_TAG.to_string(),
-            GoLanProfile {
-                id: "home".into(),
-                name: "家里".into(),
-                enabled: true,
-                bypass_on_local_lan: lan.bypass_on_local_lan,
-                local_wifi_ssid: String::new(),
-                lan_cidrs: lan.lan_cidrs.clone(),
-                wg_config: lan.wg_config.clone(),
-                node_uri: lan.node_uri.clone(),
-                probe_target: String::new(),
-            },
-        ));
+        let fallback = legacy_profile(lan);
+        profiles.push((profile_tunnel_tag(&fallback), fallback));
     }
     if profiles.is_empty() {
         crate::core::logger::warn(log, "没有任何已启用的内网档案，跳过内网检测");
@@ -2905,7 +2969,8 @@ pub fn build_outbounds(lan: &GoLanSettings) -> (Vec<Value>, Vec<String>) {
         // 旧版兜底（尚未 normalize 的单配置）
         let mut legacy = lan.clone();
         legacy.enabled = true;
-        let (ob, mut w) = build_outbound_with_tag(&legacy, GO_LAN_TAG);
+        let tag = profile_tunnel_tag(&legacy_profile(lan));
+        let (ob, mut w) = build_outbound_with_tag(&legacy, &tag);
         warnings.append(&mut w);
         if let Some(ob) = ob {
             outbounds.push(ob);
@@ -3239,24 +3304,15 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
     let profiles = enabled_profiles(lan);
     if profiles.is_empty() {
         // 旧版兜底（尚未 normalize 的单配置）
-        let legacy_profile = GoLanProfile {
-            id: "home".into(),
-            name: "家里".into(),
-            enabled: true,
-            bypass_on_local_lan: lan.bypass_on_local_lan,
-            local_wifi_ssid: String::new(),
-            lan_cidrs: lan.lan_cidrs.clone(),
-            wg_config: lan.wg_config.clone(),
-            node_uri: lan.node_uri.clone(),
-            probe_target: String::new(),
-        };
+        let legacy_profile = legacy_profile(lan);
+        let legacy_tag = profile_tunnel_tag(&legacy_profile);
         let (tunnel, direct) =
             split_profile_cidrs_for_on_demand(&legacy_profile, &detect_physical_lan_ipv4s());
         if !direct.is_empty() {
             rules.push(json!({ "ip_cidr": direct, "outbound": "direct" }));
         }
         if !tunnel.is_empty() {
-            rules.push(json!({ "ip_cidr": tunnel, "outbound": GO_LAN_TAG }));
+            rules.push(json!({ "ip_cidr": tunnel, "outbound": legacy_tag }));
         }
         for raw in &lan.lan_cidrs {
             if sanitize_ip_prefix(raw, 24).is_none()
@@ -3267,7 +3323,7 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
         }
         let domains = cleaned_lan_domains(lan);
         if !domains.is_empty() {
-            rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
+            rules.push(json!({ "domain_suffix": domains, "outbound": legacy_tag }));
         }
         return (rules, warnings);
     }
@@ -3316,10 +3372,10 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
     for (tag, cidrs) in per_tunnel {
         rules.push(json!({ "ip_cidr": cidrs, "outbound": tag }));
     }
-    // ③ 内网域名后缀统一走第一个启用档案（go-lan-home）
+    // ③ 内网域名后缀统一走第一个启用档案（其 tag 与隧道名一一对应）
     let domains = cleaned_lan_domains(lan);
     if !domains.is_empty() {
-        rules.push(json!({ "domain_suffix": domains, "outbound": GO_LAN_TAG }));
+        rules.push(json!({ "domain_suffix": domains, "outbound": profiles[0].0 }));
     }
     (rules, warnings)
 }
@@ -3373,7 +3429,7 @@ pub(crate) fn go_lan_dns(lan: &GoLanSettings) -> (Option<Value>, Option<Value>) 
     let server = json!({
         "tag": GO_LAN_DNS_TAG,
         "address": dns,
-        "detour": GO_LAN_TAG,
+        "detour": primary_tunnel_tag(lan),
     });
     let rule = json!({ "domain_suffix": domains, "server": GO_LAN_DNS_TAG });
     (Some(server), Some(rule))
@@ -3508,7 +3564,7 @@ mod tests {
             "10.1.8.2/24",
             68,
         );
-        let profiles = vec![(GO_LAN_TAG.to_string(), profile)];
+        let profiles = vec![("go-lan-jiali".to_string(), profile)];
         let owner = resolve_probe_owner(
             &profiles,
             "192.168.0.1".parse().unwrap(),
@@ -3560,7 +3616,7 @@ mod tests {
         let (rules, _) = go_lan_route_rules(&lan);
         let all: Vec<String> = rules
             .iter()
-            .filter(|r| r.get("outbound").and_then(|o| o.as_str()) == Some(GO_LAN_TAG))
+            .filter(|r| r.get("outbound").and_then(|o| o.as_str()) == Some("go-lan-jiali"))
             .filter_map(|r| r.get("ip_cidr")?.as_array().cloned())
             .flatten()
             .filter_map(|c| c.as_str().map(str::to_string))
@@ -3771,7 +3827,7 @@ mod tests {
         let (outbound, _) = build_outbound(&lan);
         let ob = outbound.expect("应构建出 WireGuard 出站");
         assert_eq!(ob["type"], "wireguard");
-        assert_eq!(ob["tag"], GO_LAN_TAG);
+        assert_eq!(ob["tag"], "go-lan-jiali");
         // 【APP6 任务2】顶层单节点模式（connect=true）：server/server_port/
         // peer_public_key 全部在顶层，严禁 peers / allowed_ips /
         // persistent_keepalive_interval（peers 数组在 iOS 走 ListenPacket
@@ -4110,7 +4166,7 @@ mod tests {
         };
         let (outbound, _) = build_outbound(&lan);
         let ob = outbound.expect("wireguard:// 链接应构建出出站");
-        assert_eq!(ob["tag"], GO_LAN_TAG);
+        assert_eq!(ob["tag"], "go-lan-jiali");
         assert_eq!(ob["private_key"].as_str(), Some(priv_key.as_str()));
         // 【APP6 任务2】顶层单节点结构：public_key → 顶层 peer_public_key
         assert_eq!(ob["peer_public_key"].as_str(), Some(peer.as_str()));
@@ -4137,7 +4193,7 @@ mod tests {
         assert_eq!(rules.len(), 2);
         // 【APP30 任务2】ip_cidr 规则严格第一，域名规则紧随其后
         assert_eq!(rules[0]["ip_cidr"][0], "192.168.1.0/24");
-        assert_eq!(rules[0]["outbound"], GO_LAN_TAG);
+        assert_eq!(rules[0]["outbound"], "go-lan-jiali");
         assert_eq!(rules[1]["domain_suffix"][0], "nas.home");
     }
 
@@ -4150,7 +4206,7 @@ mod tests {
             ..Default::default()
         };
         let (rules, warnings) = go_lan_route_rules(&lan);
-        let tunnel_rules = rules.iter().filter(|r| r["outbound"] == GO_LAN_TAG).count();
+        let tunnel_rules = rules.iter().filter(|r| r["outbound"] == "go-lan-jiali").count();
         assert_eq!(tunnel_rules, 1);
         assert_eq!(warnings.len(), 2);
     }
@@ -4384,7 +4440,50 @@ mod tests {
         assert_eq!(lan.active_profile_id, "profile1");
     }
 
-    /// 多档案启用：首个档案恒为 go-lan-home，其余为 go-lan-{id}。
+    /// 【APP68】铁律：内核出站 tag 必须与界面隧道名一一对应
+    /// （ASCII 小写 / 中文转汉语拼音），无论多少路隧道都不得再用随机 id
+    /// 或固定 go-lan-home 掩盖真实名称；同名隧道自动追加 -2/-3。
+    #[test]
+    fn test_profile_tag_matches_display_name() {
+        assert_eq!(profile_tag_slug("Nidec"), "nidec");
+        assert_eq!(profile_tag_slug("Home"), "home");
+        assert_eq!(profile_tag_slug("家里"), "jiali");
+        assert_eq!(profile_tag_slug("公司内网"), "gongsineiwang");
+        assert_eq!(profile_tag_slug("My NAS"), "my-nas");
+        assert_eq!(profile_tag_slug("   "), "home");
+
+        let lan = GoLanSettings {
+            enabled: true,
+            profiles: vec![
+                sample_profile("pabc123", "Nidec", &["192.168.1.0/24"], "10.0.0.2/32", 30),
+                sample_profile("pmw3cn11b", "Home", &["192.168.2.0/24"], "10.0.1.2/32", 31),
+                sample_profile("pdup", "Home", &["192.168.3.0/24"], "10.0.2.2/32", 32),
+            ],
+            ..Default::default()
+        };
+        let tags: Vec<String> = enabled_profiles(&lan).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "go-lan-nidec".to_string(),
+                "go-lan-home".to_string(),
+                "go-lan-home-2".to_string()
+            ],
+            "tag 必须严格由隧道名转写而来"
+        );
+        let (outbounds, _) = build_outbounds(&lan);
+        assert_eq!(outbounds[0]["tag"], "go-lan-nidec");
+        assert_eq!(outbounds[1]["tag"], "go-lan-home");
+        let (rules, _) = go_lan_route_rules(&lan);
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["outbound"] == "go-lan-home-2" && r.get("ip_cidr").is_some()),
+            "第三路隧道路由必须指向 go-lan-home-2: {rules:?}"
+        );
+    }
+
+    /// 多档案启用：【APP68】tag 与隧道名一一对应（中文转拼音）。
     #[test]
     fn test_multi_profiles_outbounds_and_rules() {
         let lan = GoLanSettings {
@@ -4410,8 +4509,8 @@ mod tests {
         let (outbounds, warnings) = build_outbounds(&lan);
         assert!(warnings.is_empty(), "合法多档案不应产生警告: {warnings:?}");
         assert_eq!(outbounds.len(), 2);
-        assert_eq!(outbounds[0]["tag"], GO_LAN_TAG);
-        assert_eq!(outbounds[1]["tag"], "go-lan-office");
+        assert_eq!(outbounds[0]["tag"], "go-lan-jiali");
+        assert_eq!(outbounds[1]["tag"], "go-lan-gongsi");
         for ob in &outbounds {
             assert_eq!(ob["type"], "wireguard");
             assert_eq!(ob["mtu"].as_u64(), Some(GO_LAN_RUNTIME_MTU as u64));
@@ -4422,7 +4521,7 @@ mod tests {
             );
         }
         let tags: Vec<String> = enabled_profiles(&lan).into_iter().map(|(t, _)| t).collect();
-        assert_eq!(tags, vec![GO_LAN_TAG.to_string(), "go-lan-office".to_string()]);
+        assert_eq!(tags, vec!["go-lan-jiali".to_string(), "go-lan-gongsi".to_string()]);
 
         // 规则：每个启用档案一条 ip_cidr → 对应 tag
         let (rules, _) = go_lan_route_rules(&lan);
@@ -4434,10 +4533,10 @@ mod tests {
                 Some((out, first))
             })
             .collect();
-        assert!(tunnel.contains(&(GO_LAN_TAG.to_string(), "192.168.10.0/24".to_string())));
-        assert!(tunnel.contains(&("go-lan-office".to_string(), "10.8.0.0/24".to_string())));
+        assert!(tunnel.contains(&("go-lan-jiali".to_string(), "192.168.10.0/24".to_string())));
+        assert!(tunnel.contains(&("go-lan-gongsi".to_string(), "10.8.0.0/24".to_string())));
         assert!(
-            !tunnel.iter().any(|(t, _)| t == "go-lan-studio"),
+            !tunnel.iter().any(|(t, _)| t == "go-lan-gongzuoshi"),
             "未启用档案不得生成规则: {tunnel:?}"
         );
     }
@@ -4791,7 +4890,7 @@ mod tests {
         };
         let meta = profiles_metadata(&lan);
         assert_eq!(meta.len(), 2);
-        assert_eq!(meta[0]["tag"], GO_LAN_TAG);
+        assert_eq!(meta[0]["tag"], "go-lan-jiali");
         assert_eq!(meta[0]["name"], "家里");
         assert_eq!(meta[0]["bypassOnLocalLan"], true);
         assert!(
@@ -4802,7 +4901,7 @@ mod tests {
                 .any(|c| c.as_str() == Some("192.168.10.0/24")),
             "cidrs 必须包含 lan 网段: {meta:?}"
         );
-        assert_eq!(meta[1]["tag"], "go-lan-office");
+        assert_eq!(meta[1]["tag"], "go-lan-gongsi");
         assert_eq!(meta[1]["bypassOnLocalLan"], false);
 
         // 未启用时不产生任何元数据
