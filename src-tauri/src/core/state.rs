@@ -835,6 +835,9 @@ pub fn sanitize_fake_delay(delay: u32) -> u32 {
 
 /// 【APP52 任务1】读取节点指标缓存；文件缺失/损坏一律回退空缓存，绝不阻塞启动。
 /// 【APP56 任务2】加载时立即清洗历史 `< 5 ms` 的虚假延迟（回环 SYN-ACK 假值）。
+/// 【APP67 P3】加载时按 probe_version / rule_version 淘汰旧版假解锁缓存：
+/// 旧版引擎（< 2）产出的"假解锁"结果在加载时立即丢弃，只有新版引擎
+/// 测出的真实 Verified 结果才会持久保留。
 pub fn load_node_metrics(data_dir: &std::path::Path) -> PersistedNodeMetrics {
     let path = data_dir.join("node_metrics_cache.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -847,6 +850,12 @@ pub fn load_node_metrics(data_dir: &std::path::Path) -> PersistedNodeMetrics {
     for d in metrics.delays.values_mut() {
         *d = sanitize_fake_delay(*d);
     }
+    // 【APP67 P3】版本化淘汰：probe_version / rule_version 低于当前引擎版本的
+    // 旧缓存一律丢弃，杜绝此前遗留的"显示已解锁、实际无法使用"假阳性。
+    use crate::core::go_aim::{CURRENT_AIM_PROBE_VERSION, CURRENT_AIM_RULE_VERSION};
+    metrics.aim_results.retain(|_, r| {
+        r.probe_version >= CURRENT_AIM_PROBE_VERSION && r.rule_version >= CURRENT_AIM_RULE_VERSION
+    });
     metrics
 }
 
@@ -1013,6 +1022,73 @@ mod app52_tests {
         assert_eq!(sanitize_fake_delay(4), 0);
         assert_eq!(sanitize_fake_delay(5), 5);
         assert_eq!(sanitize_fake_delay(0), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【APP67 P3】旧版缓存（probe_version < 2 或 rule_version < 2）加载时必须淘汰，
+    /// 只有当前引擎版本（v2）的真实结果才保留，彻底清除遗留假解锁标签。
+    #[test]
+    fn test_old_aim_cache_evicted_on_load() {
+        use crate::core::go_aim::{CURRENT_AIM_PROBE_VERSION, CURRENT_AIM_RULE_VERSION, AimNodeResult};
+        let dir = std::env::temp_dir().join(format!(
+            "prism_app67_aim_cache_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut metrics = PersistedNodeMetrics::default();
+        // 旧版假解锁缓存（probe_version: 0）—— 必须被淘汰
+        metrics.aim_results.insert(
+            "old-fake-gpt".into(),
+            AimNodeResult {
+                node_name: "old-fake-gpt".into(),
+                unlocked_tags: vec!["GPT".into()],
+                probe_version: 0,
+                rule_version: 0,
+                probed: true,
+                ..Default::default()
+            },
+        );
+        // 旧版 rule_version（probe_version 够但 rule_version 不够）—— 也淘汰
+        metrics.aim_results.insert(
+            "old-rule".into(),
+            AimNodeResult {
+                node_name: "old-rule".into(),
+                unlocked_tags: vec!["NF".into()],
+                probe_version: CURRENT_AIM_PROBE_VERSION,
+                rule_version: 1,
+                probed: true,
+                ..Default::default()
+            },
+        );
+        // 新版真实结果 —— 保留
+        metrics.aim_results.insert(
+            "new-real".into(),
+            AimNodeResult {
+                node_name: "new-real".into(),
+                unlocked_tags: vec!["GPT".into(), "YT".into()],
+                probe_version: CURRENT_AIM_PROBE_VERSION,
+                rule_version: CURRENT_AIM_RULE_VERSION,
+                probed: true,
+                ..Default::default()
+            },
+        );
+        save_node_metrics(&dir, &metrics).unwrap();
+        let restored = load_node_metrics(&dir);
+        assert!(
+            !restored.aim_results.contains_key("old-fake-gpt"),
+            "probe_version:0 旧缓存必须淘汰"
+        );
+        assert!(
+            !restored.aim_results.contains_key("old-rule"),
+            "rule_version < 2 旧缓存必须淘汰"
+        );
+        assert!(
+            restored.aim_results.contains_key("new-real"),
+            "v2 真实结果必须保留"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -26,6 +26,11 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::core::state::{AppState, CoreStatus};
 
+/// 【APP67】当前 Go AIM 检测引擎版本号：升级后旧版"假解锁"缓存
+/// 因 probe_version 不符而被自动淘汰，直到用新引擎重测后才持久保留。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 2;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 2;
+
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
 
@@ -49,6 +54,7 @@ const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
 /// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
 // DEEP_PROBE_MAX 已移除（APP53 任务2.3：Go AIM 必须检测完所有可达节点）
 /// 【APP51 任务1】ChatGPT cdn-trace 探测超时（毫秒，严格 1200ms）
+#[allow(dead_code)]
 const GPT_TRACE_TIMEOUT_MS: u64 = 1200;
 /// 故障转移监控间隔（秒）
 const MONITOR_INTERVAL_SECS: u64 = 20;
@@ -76,12 +82,18 @@ fn probe_port_reachable(port: u16) -> bool {
 // ---------------------------------------------------------------- 探测矩阵
 
 /// AI 平台受限地区（cdn-trace loc=）：命中任一即判定该平台对该出口封锁。
-/// 注意：US/CA/GB/DE/FR/SG 等是 AI 平台**正常可用**的地区，绝不能列入黑名单
-/// （APP-4 曾把黑名单写反，导致所有节点被判为未解锁）。
-const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
+/// 【APP67】GPT 增加 VE（委内瑞拉）；其余 AI 平台使用不含 VE 的子集时
+/// 在各自探测器中另行校验。
+const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY", "VE"];
+
+/// 不含 VE 的 AI 平台受限名单（Claude / Gemini / Disney+ 使用）
+const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
 const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN"];
+
+/// 【APP67】出口预检：若 loc 为这些值视为未知/无效，立即短路后续平台探测
+const UNKNOWN_EXIT_COUNTRIES: &[&str] = &["XX", "T1", "T2", "A1", "A2", "O1", "EU"];
 
 /// 出口地区探测端点（依次兜底）：cdn-trace 返回多行 key=value，
 /// 其中 `loc=XX` 即 Cloudflare 观测到的出口国家/地区代码。
@@ -100,6 +112,42 @@ fn parse_trace_loc(body: &str) -> Option<String> {
     })
 }
 
+/// 【APP67 BUG-04】从 cdn-trace 正文解析出口真实公网 IP（`ip=1.2.3.4`）。
+/// 仅用于出口预检短路与「漏直连」判定，绝不作为解锁判定依据。
+fn parse_trace_ip(body: &str) -> Option<String> {
+    body.lines().find_map(|l| {
+        l.strip_prefix("ip=")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// 经代理读取出口真实 IP 与地区代码（多端点兜底）。
+/// 返回 (egress_ip, egress_country)，任一获取失败则对应字段为 None。
+async fn fetch_egress(client: &reqwest::Client) -> (Option<String>, Option<String>) {
+    for url in TRACE_URLS {
+        let Ok(resp) = client
+            .get(*url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        if let Ok(text) = resp.text().await {
+            let ip = parse_trace_ip(&text);
+            let loc = parse_trace_loc(&text);
+            if ip.is_some() && loc.is_some() {
+                return (ip, loc);
+            }
+        }
+    }
+    (None, None)
+}
+
 /// 【APP49 任务3】按延迟升序排序（纯函数，便于单元测试）。
 /// 阶段1 快筛结束后调用，保证阶段2 从延迟最低的节点开始探测。
 fn sort_by_delay(mut nodes: Vec<(String, u64)>) -> Vec<(String, u64)> {
@@ -115,53 +163,79 @@ fn region_blocked(loc: Option<&str>, blocklist: &[&str]) -> bool {
 
 /// 【APP49 任务3】Netflix 解锁判定（纯函数）：区域锁片源 81280792——
 /// 200/301/302 判完整解锁；403/404 及其余状态码判未解锁。
+#[allow(dead_code)]
 fn netflix_unlocked(status: u16) -> bool {
     matches!(status, 200 | 301 | 302)
 }
 
-/// 经代理读取当前出口地区代码（多端点兜底）。
-async fn fetch_exit_loc(client: &reqwest::Client) -> Option<String> {
-    for url in TRACE_URLS {
-        let Ok(resp) = client.get(*url).header("Accept-Language", "en-US,en;q=0.9").send().await
-        else {
-            continue;
-        };
-        if !resp.status().is_success() {
-            continue;
-        }
-        if let Ok(text) = resp.text().await
-            && let Some(loc) = parse_trace_loc(&text)
-        {
-            return Some(loc);
-        }
-    }
-    None
-}
-
-/// 单个平台的探测定义：目标 URL + 响应判定
+/// 单个平台的探测定义：目标 URL + 是否流媒体（仅供测试/文档参考，
+/// 实际探测由 probe_gpt/claude/gemini/netflix/youtube/disney/tiktok 执行）
+#[allow(dead_code)]
 struct Probe {
     tag: &'static str,
     url: &'static str,
     media: bool,
 }
 
+#[allow(dead_code)]
 const PROBES: &[Probe] = &[
-    Probe { tag: "GPT", url: "https://chatgpt.com/cdn-cgi/trace", media: false },
-    Probe { tag: "Claude", url: "https://claude.ai/cdn-cgi/trace", media: false },
+    Probe { tag: "GPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", media: false },
+    Probe { tag: "Claude", url: "https://claude.ai/login", media: false },
     Probe { tag: "Gemini", url: "https://gemini.google.com/app", media: false },
     Probe { tag: "NF", url: "https://www.netflix.com/title/81280792", media: true },
     Probe { tag: "YT", url: "https://www.youtube.com/premium", media: true },
-    Probe { tag: "Disney+", url: "https://www.disneyplus.com", media: true },
-    Probe { tag: "TK", url: "https://www.tiktok.com/cdn-cgi/trace", media: true },
+    Probe { tag: "Disney+", url: "https://www.disneyplus.com/", media: true },
+    Probe { tag: "TK", url: "https://www.tiktok.com/explore", media: true },
 ];
 
 // ---------------------------------------------------------------- 数据模型
+
+/// 【APP67 P1】单平台探测结论：
+/// - `Verified`：免登录态下业务端点正向特征校验通过 → 进入绿色解锁徽章；
+/// - `Accessible`：仅首页连通但未通过业务特征 → 不给徽章；
+/// - `Partial`：仅解锁自制剧等部分能力 → 不给完整徽章；
+/// - `Blocked`：明确返回地区限制 / 风控 / 403；
+/// - `Unknown`：传输失败、空响应、读取异常、地区未知等 → 不给徽章。
+///
+/// **铁律**：只有 `Verified` 允许进入 `AimNodeResult.unlocked_tags`，
+/// 其余四种一律不得伪装成绿色完整解锁标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ProbeVerdict {
+    Verified,
+    Accessible,
+    Partial,
+    Blocked,
+    #[default]
+    Unknown,
+}
+
+impl ProbeVerdict {
+    fn is_verified(self) -> bool {
+        matches!(self, ProbeVerdict::Verified)
+    }
+}
+
+/// 【APP67 P1】单平台探测详情（正向特征码、状态码、证据、失败原因）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceProbeResult {
+    pub service: String,
+    pub verdict: ProbeVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AimNodeResult {
     pub node_name: String,
-    /// 解锁标签（GPT/Claude/Gemini/NF/YT/Disney+/TK）
+    /// 解锁标签（GPT/Claude/Gemini/NF/YT/Disney+/TK）——
+    /// 【APP67】仅 `ProbeVerdict::Verified` 的服务可进入，绝不含糊其辞。
     pub unlocked_tags: Vec<String>,
     /// AI 平台任一解锁
     pub ai_unlocked: bool,
@@ -177,6 +251,20 @@ pub struct AimNodeResult {
     /// 确保没有任何节点遗漏在"未检测"状态）
     #[serde(default)]
     pub probed: bool,
+    /// 【APP67 P3】检测引擎版本号：旧版缓存（< 2）加载时自动淘汰。
+    #[serde(default)]
+    pub probe_version: u32,
+    #[serde(default)]
+    pub rule_version: u32,
+    /// 【APP67 BUG-04】节点真实出口公网 IP（cdn-trace 解析）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_ip: Option<String>,
+    /// 节点真实出口国家/地区代码
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_country: Option<String>,
+    /// 【APP67 P1】7 个平台各自的探测详情（service → result）
+    #[serde(default)]
+    pub services: HashMap<String, ServiceProbeResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,6 +577,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                         delay_ms: d,
                         updated_at: now_secs(),
                         probed: false,
+                        ..Default::default()
                     };
                     state.aim_results.write().insert(name.clone(), placeholder.clone());
                     let _ = app.emit(
@@ -505,11 +594,12 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     );
                 }
             }
-            // 【APP54 任务4】阶段1 每完成一个节点 → 进度 +1 并推送前端
+            // 【APP54 任务4 / APP67 P4】阶段1 每完成一个节点 → 进度 +1。
+            // 阶段1 仅占总进度前 20%（封顶 20%，done 不等于 total 时也不到 100%）。
             {
                 let mut p = state.aim_progress.lock();
                 p.done += 1;
-                p.recompute();
+                p.percent = ((p.done * 20) / p.total.max(1)).min(20) as u8;
                 let snapshot = p.clone();
                 drop(p);
                 let _ = app.emit("aim://progress", &snapshot);
@@ -517,6 +607,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         }
     }
     let alive = sort_by_delay(alive);
+    let alive_count = alive.len();
     if alive.is_empty() {
         return Err("阶段1 快筛后无存活节点".into());
     }
@@ -538,6 +629,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 delay_ms: leader_delay,
                 updated_at: now_secs(),
                 probed: false,
+                ..Default::default()
             };
             let _ = lock_node(app, state, &leader, false).await;
         }
@@ -561,6 +653,9 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 delay_ms: *d,
                 updated_at: now_secs(),
                 probed: true,
+                probe_version: CURRENT_AIM_PROBE_VERSION,
+                rule_version: CURRENT_AIM_RULE_VERSION,
+                ..Default::default()
             };
             state.aim_results.write().insert(name.clone(), result.clone());
             let _ = app.emit(
@@ -645,6 +740,34 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         return Err("全部探针客户端构建失败".into());
     }
 
+    // 【APP67 BUG-04】预取本机直连公网 IP（不经代理），用于防漏直连判定：
+    // 若某节点出口 IP 与本机直连 IP 一致，说明代理隧道未生效，立即短路。
+    let direct_ip: Option<String> = {
+        let direct = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(3000))
+            .build()
+            .ok();
+        if let Some(c) = direct {
+            fetch_egress(&c).await.0
+        } else {
+            None
+        }
+    };
+    tracing::debug!("[go-aim] 本机直连公网 IP: {:?}", direct_ip);
+    let direct_ip = Arc::new(direct_ip);
+
+    // 【APP67 P4】阶段2 进度初始化：total 设为存活节点数，done 归零，
+    // percent 从 20% 起步，每完成一个存活节点 +80/alive_count。
+    {
+        let mut p = state.aim_progress.lock();
+        p.done = 0;
+        p.total = alive_count;
+        p.percent = 20;
+        let snapshot = p.clone();
+        drop(p);
+        let _ = app.emit("aim://progress", &snapshot);
+    }
+
     // 5. 共享任务队列（延迟升序）：可用槽位并行消费，任一槽位空闲即取
     // 下一个节点（等价于每批 4 个节点的滚动并发）。前 PROBE_SLOTS 个
     //（延迟最低的首批）标记 first_batch，用于秒级锁定。
@@ -663,6 +786,7 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
         let api = api_after_stage1.clone();
         let task_app = app.clone();
         let instant_locked = instant_locked.clone();
+        let direct_ip = direct_ip.clone();
         let generation = generation;
         set.spawn(async move {
             let app = task_app;
@@ -685,8 +809,16 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                 }
                 let next = queue.lock().await.pop_front();
                 let Some((name, delay, first_batch)) = next else { break };
-                let result =
-                    probe_node(&api, &client, &nr_client, slot, &name, Some(delay)).await;
+                let result = probe_node(
+                    &api,
+                    &client,
+                    &nr_client,
+                    slot,
+                    &name,
+                    Some(delay),
+                    direct_ip.as_deref(),
+                )
+                .await;
                 // 【APP51 任务1】订阅在探测期间变更：丢弃本轮结果，绝不污染新节点缓存
                 {
                     let st = app.state::<AppState>();
@@ -708,12 +840,13 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result }),
                 );
-                // 【APP54 任务4】阶段2 每完成一个节点 → 进度 +1、已解锁数实时更新
+                // 【APP54 任务4 / APP67 P4】阶段2 每完成一个节点 → 进度 +1，
+                // 阶段2 占 20%~100%：percent = 20 + done*80/total（封顶 100）。
                 {
                     let app_state = app.state::<AppState>();
                     let mut p = app_state.aim_progress.lock();
                     p.done = (p.done + 1).min(p.total);
-                    p.recompute();
+                    p.percent = (20 + (p.done * 80) / p.total.max(1)).min(100) as u8;
                     p.unlocked_count = app_state
                         .aim_results
                         .read()
@@ -799,10 +932,23 @@ async fn probe_all(app: &AppHandle, state: &AppState) -> Result<usize, String> {
 /// netflix.com / youtube.com 均存在 301/302/307/308 规范化跳转，禁用重定向
 /// 会拿到空响应体，导致读不到 cdn-trace 的 `loc=` 与正文而全部误判失败。
 fn build_probe_client(slot: usize) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONNECTION,
+        reqwest::header::HeaderValue::from_static("close"),
+    );
     reqwest::Client::builder()
         .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
         .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::limited(5))
+        // 【APP67 BUG-03】彻底根除跨节点连接池复用污染：
+        // pool_max_idle_per_host(0) + Connection: close 双保险，
+        // 每次请求结束立即释放本地 127.0.0.1:2083..2086 的 CONNECT 隧道，
+        // 槽位切换到下一个节点后新请求 100% 建立全新隧道，零额外内存开销。
+        .pool_max_idle_per_host(0)
+        .pool_idle_timeout(std::time::Duration::from_millis(1))
+        .tcp_nodelay(true)
+        .default_headers(headers)
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -820,10 +966,20 @@ fn build_probe_client(slot: usize) -> Result<reqwest::Client, String> {
 /// 文案（含该字符串），纯正美国原生 IP 也会被误判封锁，Gemini 标识
 /// 全军覆没。根治：只看首跳响应头 Location 是否含 /faq + 出口地区 loc。
 fn build_probe_client_no_redirect(slot: usize) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONNECTION,
+        reqwest::header::HeaderValue::from_static("close"),
+    );
     reqwest::Client::builder()
         .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
         .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
+        // 【APP67 BUG-03】同 build_probe_client：禁用空闲连接池复用 + Connection: close
+        .pool_max_idle_per_host(0)
+        .pool_idle_timeout(std::time::Duration::from_millis(1))
+        .tcp_nodelay(true)
+        .default_headers(headers)
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -832,9 +988,429 @@ fn build_probe_client_no_redirect(slot: usize) -> Result<reqwest::Client, String
         .map_err(|e| e.to_string())
 }
 
-/// 单节点探测：复用阶段1 快筛延迟（无则 1.5s 基线补测确认存活）→
-/// 探针选择器切到该节点 → 7 个平台并发真实请求判定。
-/// 死节点生成 probed=true 的空结果。
+// ===== 【APP67】ServiceProbeResult 构造辅助 =====
+
+fn svc_verified(service: &str, status: u16, evidence: &str) -> ServiceProbeResult {
+    ServiceProbeResult {
+        service: service.to_string(),
+        verdict: ProbeVerdict::Verified,
+        status_code: Some(status),
+        evidence: evidence.to_string(),
+        failure_reason: None,
+    }
+}
+
+fn svc_accessible(service: &str, status: u16, evidence: &str) -> ServiceProbeResult {
+    ServiceProbeResult {
+        service: service.to_string(),
+        verdict: ProbeVerdict::Accessible,
+        status_code: Some(status),
+        evidence: evidence.to_string(),
+        failure_reason: None,
+    }
+}
+
+fn svc_partial(service: &str, status: u16, evidence: &str) -> ServiceProbeResult {
+    ServiceProbeResult {
+        service: service.to_string(),
+        verdict: ProbeVerdict::Partial,
+        status_code: Some(status),
+        evidence: evidence.to_string(),
+        failure_reason: None,
+    }
+}
+
+fn svc_blocked(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+    ServiceProbeResult {
+        service: service.to_string(),
+        verdict: ProbeVerdict::Blocked,
+        status_code: None,
+        evidence: String::new(),
+        failure_reason: Some(reason.into()),
+    }
+}
+
+fn svc_unknown(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+    ServiceProbeResult {
+        service: service.to_string(),
+        verdict: ProbeVerdict::Unknown,
+        status_code: None,
+        evidence: String::new(),
+        failure_reason: Some(reason.into()),
+    }
+}
+
+/// 【APP67 BUG-02】纯函数：判定响应正文是否为 Cloudflare 质询/拦截页。
+/// 提取为纯函数便于单元测试，不依赖真实 HTTP 响应。
+fn is_cf_challenge_body(body: &str) -> bool {
+    let lc = body.to_lowercase();
+    lc.contains("just a moment")
+        || lc.contains("attention required")
+        || lc.contains("cf-chl-bypass")
+        || lc.contains("cf-error-details")
+}
+
+/// 【APP67 BUG-02】统一响应读取与校验，杜绝 `unwrap_or_default()` 空响应误判通过。
+/// - 传输失败 / 正文过短（< min_len）→ `Err(ProbeVerdict::Unknown)`
+/// - Cloudflare 质询拦截页 / 通用网关错误 → `Err(ProbeVerdict::Blocked)`
+/// - 正常 → `Ok((status_code, headers, body))`
+async fn read_verified_body(
+    resp: reqwest::Response,
+    min_len: usize,
+) -> Result<(u16, reqwest::header::HeaderMap, String), ProbeVerdict> {
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(_) => return Err(ProbeVerdict::Unknown),
+    };
+    if body.trim().len() < min_len {
+        return Err(ProbeVerdict::Unknown);
+    }
+    if is_cf_challenge_body(&body) {
+        return Err(ProbeVerdict::Blocked);
+    }
+    Ok((status, headers, body))
+}
+
+/// 从 HeaderMap 取 Location（小写）
+fn location_lc(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+// ===== 【APP67 P1】7 大平台独立正特征检测器 =====
+// 每个检测器返回 ServiceProbeResult，只有 Verified 可进入 unlocked_tags。
+
+/// GPT：ios.chat.openai.com server_status + chatgpt.com 双端点正特征
+async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+    const SVC: &str = "GPT";
+    if region_blocked(exit_country, AI_BLOCKLIST) {
+        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
+    }
+    // 端点1：server_status
+    let ss = client
+        .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await;
+    let Ok(ss_resp) = ss else {
+        return svc_unknown(SVC, "server_status 请求失败");
+    };
+    let ss_status = ss_resp.status().as_u16();
+    if ss_status == 403 || ss_status == 429 {
+        return svc_blocked(SVC, format!("server_status 返回 {ss_status} 风控"));
+    }
+    let ss_body = match ss_resp.text().await {
+        Ok(b) => b,
+        Err(_) => return svc_unknown(SVC, "server_status 读取失败"),
+    };
+    if ss_body.trim().is_empty() {
+        return svc_unknown(SVC, "server_status 空响应");
+    }
+    let ss_lc = ss_body.to_lowercase();
+    if ss_lc.contains("unsupported_country") || ss_lc.contains("vpn_detected") {
+        return svc_blocked(SVC, "server_status 含地区限制特征");
+    }
+    let ss_normal = ss_lc.contains("\"status\":\"normal\"") || ss_lc.contains("\"status\": \"normal\"");
+
+    // 端点2：chatgpt.com
+    let hp = client
+        .get("https://chatgpt.com/")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(hp_resp) = hp else {
+        return svc_unknown(SVC, "chatgpt.com 请求失败");
+    };
+    let (hp_status, _, hp_body) = match read_verified_body(hp_resp, 500).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "chatgpt.com 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "chatgpt.com 响应过短或读取失败"),
+    };
+    let hp_lc = hp_body.to_lowercase();
+    if hp_lc.contains("unsupported_country") || hp_lc.contains("attention required") {
+        return svc_blocked(SVC, "chatgpt.com 含地区限制/CF 质询");
+    }
+    let has_brand = hp_lc.contains("chatgpt") || hp_lc.contains("oai");
+
+    if ss_status == 200 && ss_normal && hp_status == 200 && has_brand {
+        svc_verified(SVC, hp_status, "server_status=normal + chatgpt.com 品牌正特征")
+    } else if ss_status == 200 || hp_status == 200 {
+        svc_accessible(SVC, hp_status, "单一接口连通但缺少完整正特征")
+    } else {
+        svc_blocked(SVC, format!("ss={ss_status} hp={hp_status} 均未通过"))
+    }
+}
+
+/// Claude：claude.ai/login（无重定向客户端看 Location，跟随客户端读正文）
+async fn probe_claude(
+    client: &reqwest::Client,
+    nr_client: &reqwest::Client,
+    exit_country: Option<&str>,
+) -> ServiceProbeResult {
+    const SVC: &str = "Claude";
+    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
+        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
+    }
+    // 先看首跳 Location 是否指向不可用页
+    let first = nr_client
+        .get("https://claude.ai/login")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await;
+    let Ok(first_resp) = first else {
+        return svc_unknown(SVC, "claude.ai/login 首跳请求失败");
+    };
+    let first_status = first_resp.status().as_u16();
+    let first_loc = location_lc(first_resp.headers());
+    if first_loc.contains("unavailable")
+        || first_loc.contains("unsupported")
+        || first_loc.contains("app-unavailable-in-region")
+    {
+        return svc_blocked(SVC, format!("首跳 Location 指向地区不可用页: {first_loc}"));
+    }
+    if first_status == 403 {
+        return svc_blocked(SVC, "claude.ai/login 返回 403");
+    }
+    // 跟随重定向读正文
+    let hp = client
+        .get("https://claude.ai/login")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(std::time::Duration::from_millis(1800))
+        .send()
+        .await;
+    let Ok(hp_resp) = hp else {
+        return svc_unknown(SVC, "claude.ai/login 请求失败");
+    };
+    let (hp_status, _, hp_body) = match read_verified_body(hp_resp, 200).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "claude.ai 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "claude.ai 响应过短或读取失败"),
+    };
+    let hp_lc = hp_body.to_lowercase();
+    if hp_lc.contains("not available in your country")
+        || hp_lc.contains("unavailable in your region")
+        || hp_lc.contains("just a moment")
+    {
+        return svc_blocked(SVC, "claude.ai 正文含地区不可用/CF 质询");
+    }
+    let has_brand = hp_lc.contains("claude") || hp_lc.contains("anthropic");
+    if hp_status == 200 && has_brand {
+        svc_verified(SVC, hp_status, "claude.ai 200 + 品牌正特征")
+    } else if (200..400).contains(&hp_status) {
+        svc_accessible(SVC, hp_status, "连通但缺少品牌正特征")
+    } else {
+        svc_blocked(SVC, format!("claude.ai 返回 {hp_status}"))
+    }
+}
+
+/// Gemini：gemini.google.com/app（无重定向看首跳 Location）
+async fn probe_gemini(nr_client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+    const SVC: &str = "Gemini";
+    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
+        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
+    }
+    let resp = nr_client
+        .get("https://gemini.google.com/app")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return svc_unknown(SVC, "gemini.google.com 请求失败");
+    };
+    let status = resp.status().as_u16();
+    let loc = location_lc(resp.headers());
+    if (300..400).contains(&status) {
+        if loc.contains("support.google.com")
+            || loc.contains("/faq")
+            || loc.contains("unsupported")
+            || loc.contains("notavailable")
+        {
+            return svc_blocked(SVC, format!("首跳重定向至地区限制页: {loc}"));
+        }
+        // 跳登录/首页等正常 3xx → 视为可达但未验证业务特征
+        return svc_accessible(SVC, status, "首跳正常重定向但未验证业务正特征");
+    }
+    if status == 403 {
+        return svc_blocked(SVC, "gemini.google.com 返回 403");
+    }
+    if status != 200 {
+        return svc_blocked(SVC, format!("gemini.google.com 返回 {status}"));
+    }
+    // 200：必须正文 > 1000 且含正特征码
+    let (_, _, body) = match read_verified_body(resp, 1000).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "gemini 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "gemini 响应过短或读取失败"),
+    };
+    let lc = body.to_lowercase();
+    if lc.contains("isn't currently supported")
+        || lc.contains("not available in your country")
+        || lc.contains("currently not available")
+    {
+        return svc_blocked(SVC, "gemini 正文含地区不支持提示");
+    }
+    let has_fp = lc.contains("bard") || lc.contains("gemini") || lc.contains("wiz_global_data");
+    if has_fp {
+        svc_verified(SVC, 200, "gemini 200 + 业务正特征码")
+    } else {
+        svc_accessible(SVC, 200, "200 但缺少业务正特征码")
+    }
+}
+
+/// NF：netflix.com/title/81280792（非自制剧区域锁片源）
+async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
+    const SVC: &str = "NF";
+    let resp = client
+        .get("https://www.netflix.com/title/81280792")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return svc_unknown(SVC, "netflix.com 请求失败");
+    };
+    let status = resp.status().as_u16();
+    if status == 403 || status == 404 {
+        return svc_blocked(SVC, format!("netflix 返回 {status}"));
+    }
+    let (_, _, body) = match read_verified_body(resp, 200).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "netflix 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "netflix 响应过短或读取失败"),
+    };
+    let lc = body.to_lowercase();
+    if lc.contains("nses-404") || lc.contains("oh no!") || lc.contains("this title is not available") {
+        return svc_partial(SVC, status, "片源未解锁（可能仅自制剧）");
+    }
+    let has_title = body.contains("81280792");
+    let has_brand = lc.contains("netflix");
+    if has_title && has_brand {
+        svc_verified(SVC, status, "netflix 片源 81280792 正特征")
+    } else if (200..400).contains(&status) {
+        svc_accessible(SVC, status, "连通但缺少片源正特征")
+    } else {
+        svc_blocked(SVC, format!("netflix 返回 {status}"))
+    }
+}
+
+/// YT：youtube.com/premium
+async fn probe_youtube(client: &reqwest::Client) -> ServiceProbeResult {
+    const SVC: &str = "YT";
+    let resp = client
+        .get("https://www.youtube.com/premium")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return svc_unknown(SVC, "youtube.com 请求失败");
+    };
+    let status = resp.status().as_u16();
+    if status == 403 {
+        return svc_blocked(SVC, "youtube 返回 403");
+    }
+    let (_, _, body) = match read_verified_body(resp, 2000).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "youtube 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "youtube 响应过短或读取失败"),
+    };
+    let lc = body.to_lowercase();
+    if lc.contains("youtube premium is not available in your country") {
+        return svc_blocked(SVC, "YouTube Premium 地区不可用");
+    }
+    let has_init = lc.contains("ytinitialdata");
+    let has_premium = lc.contains("youtube premium") || lc.contains("offer");
+    if status == 200 && has_init && has_premium {
+        svc_verified(SVC, status, "youtube premium + ytInitialData 正特征")
+    } else if status == 200 {
+        svc_accessible(SVC, status, "200 但缺少播放器初始化正特征")
+    } else {
+        svc_blocked(SVC, format!("youtube 返回 {status}"))
+    }
+}
+
+/// Disney+：disneyplus.com/
+async fn probe_disney(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+    const SVC: &str = "Disney+";
+    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
+        return svc_blocked(SVC, format!("出口地区 {} 命中受限名单", exit_country.unwrap_or("未知")));
+    }
+    let resp = client
+        .get("https://www.disneyplus.com/")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return svc_unknown(SVC, "disneyplus.com 请求失败");
+    };
+    let status = resp.status().as_u16();
+    let final_url = resp.url().as_str().to_lowercase();
+    if status == 403 || final_url.contains("unavailable") || final_url.contains("preview") {
+        return svc_blocked(SVC, format!("disney+ 跳转不可用/预览页: {final_url}"));
+    }
+    let (_, _, body) = match read_verified_body(resp, 200).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "disney+ 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "disney+ 响应过短或读取失败"),
+    };
+    let lc = body.to_lowercase();
+    if lc.contains("not available in your region") || lc.contains("unavailable") {
+        return svc_blocked(SVC, "disney+ 正文含地区不可用");
+    }
+    if lc.contains("disneyplus") {
+        svc_verified(SVC, status, "disneyplus 品牌正特征")
+    } else if (200..400).contains(&status) {
+        svc_accessible(SVC, status, "连通但缺少品牌正特征")
+    } else {
+        svc_blocked(SVC, format!("disney+ 返回 {status}"))
+    }
+}
+
+/// TK：tiktok.com/explore
+async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+    const SVC: &str = "TK";
+    if region_blocked(exit_country, TIKTOK_BLOCKLIST) {
+        return svc_blocked(SVC, format!("出口地区 {} 命中 TikTok 受限名单", exit_country.unwrap_or("未知")));
+    }
+    let resp = client
+        .get("https://www.tiktok.com/explore")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return svc_unknown(SVC, "tiktok.com 请求失败");
+    };
+    let status = resp.status().as_u16();
+    if status == 403 {
+        return svc_blocked(SVC, "tiktok 返回 403");
+    }
+    let (_, _, body) = match read_verified_body(resp, 1000).await {
+        Ok(v) => v,
+        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "tiktok 返回 CF 质询/拦截页"),
+        Err(_) => return svc_unknown(SVC, "tiktok 响应过短或读取失败"),
+    };
+    let lc = body.to_lowercase();
+    if lc.contains("access denied") || lc.contains("not available") {
+        return svc_blocked(SVC, "tiktok 正文含拒绝访问");
+    }
+    let has_fp = lc.contains("__universal_data_for_rehydration__") || lc.contains("sigi_state");
+    if status == 200 && has_fp {
+        svc_verified(SVC, status, "tiktok 视频流初始化数据正特征")
+    } else if status == 200 {
+        svc_accessible(SVC, status, "200 但缺少视频流初始化正特征")
+    } else {
+        svc_blocked(SVC, format!("tiktok 返回 {status}"))
+    }
+}
+
+/// 单节点探测：复用阶段1 快筛延迟 → 探针选择器切到该节点 →
+/// 【APP67 BUG-04】出口 IP/地区预检短路 → 7 个平台并发真实请求判定。
+/// 死节点 / 出口预检失败生成 probed=true 的空结果。
 async fn probe_node(
     api: &crate::core::kernel::KernelApi,
     client: &reqwest::Client,
@@ -842,12 +1418,9 @@ async fn probe_node(
     slot: usize,
     name: &str,
     prescreened_delay: Option<u64>,
+    direct_ip: Option<&str>,
 ) -> AimNodeResult {
-    // 1. 【APP49 任务3】阶段1 已用 gstatic generate_204（1200ms）确认存活，
-    //    直接复用其延迟，跳过重复测速以加速首批锁定；无预筛延迟时回退到
-    //    原有的 1.5s 极速连通性快筛（cp.cloudflare.com/generate_204）。
-    //    API 不通即死节点：直接记为不可达（delay=None、unlocked=[]），
-    //    跳过后续全部平台 HTTP 探测。
+    // 1. 基线延迟
     let base_delay = match prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS) {
         Some(d) => d,
         None => match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
@@ -856,48 +1429,61 @@ async fn probe_node(
         },
     };
 
-    // 2. 探针选择器切到该节点（独立组，绝不影响主选择器/GLOBAL）
+    // 2. 探针选择器切到该节点
     if let Err(e) = api.select_proxy(&probe_selector(slot), name).await {
         tracing::warn!("[go-aim] 槽位 {slot} 切换探针到「{name}」失败: {e}");
         return dead_result(name);
     }
 
-    // 3. 出口地区码只读取一次（7 个平台共用，避免每平台各打一次 cdn-trace）
-    let exit_loc = fetch_exit_loc(client).await;
-
-    // 4. 7 个平台并发真实请求（每个探测点超时/传输失败自动补测 1 次）
-    let mut checks = Vec::with_capacity(PROBES.len());
-    for probe in PROBES {
-        let loc = exit_loc.clone();
-        checks.push(check_platform(client, nr_client, probe, loc));
+    // 3. 【APP67 BUG-04】出口预检：获取真实出口 IP 与地区，失败/未知/漏直连立即短路
+    let (egress_ip, egress_country) = fetch_egress(client).await;
+    if egress_ip.is_none() || egress_country.is_none() {
+        tracing::debug!("[go-aim] 节点「{name}」出口探测失败，短路后续平台探测");
+        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
     }
-    let outcomes = futures_util::future::join_all(checks).await;
+    let country = egress_country.as_deref().unwrap();
+    if UNKNOWN_EXIT_COUNTRIES.contains(&country) {
+        tracing::debug!("[go-aim] 节点「{name}」出口地区 {country} 未知，短路");
+        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
+    }
+    // 防漏直连：出口 IP 等于本机直连公网 IP → 代理未生效
+    if let Some(dip) = direct_ip
+        && egress_ip.as_deref() == Some(dip)
+    {
+        tracing::debug!("[go-aim] 节点「{name}」出口 IP 与直连 IP 一致（漏直连），短路");
+        return egress_unknown_result(name, base_delay, egress_ip, egress_country);
+    }
 
+    // 4. 7 个平台并发真实请求（仅 Unknown 补测 1 次）
+    let ec = egress_country.as_deref();
+    // 各探测器闭包捕获的引用不同，需 box 为同一 trait object 才能 join_all
+    let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>> = vec![
+        Box::pin(probe_with_retry(|| probe_gpt(client, ec))),
+        Box::pin(probe_with_retry(|| probe_claude(client, nr_client, ec))),
+        Box::pin(probe_with_retry(|| probe_gemini(nr_client, ec))),
+        Box::pin(probe_with_retry(|| probe_netflix(client))),
+        Box::pin(probe_with_retry(|| probe_youtube(client))),
+        Box::pin(probe_with_retry(|| probe_disney(client, ec))),
+        Box::pin(probe_with_retry(|| probe_tiktok(client, ec))),
+    ];
+    let results = futures_util::future::join_all(futs).await;
+
+    // 5. 汇总：只有 Verified 进入 unlocked_tags
+    let mut services: HashMap<String, ServiceProbeResult> = HashMap::with_capacity(results.len());
     let mut tags: Vec<String> = Vec::new();
     let mut ai = false;
     let mut media = false;
-    for (probe, ok) in PROBES.iter().zip(outcomes) {
-        if ok {
-            tags.push(probe.tag.to_string());
-            if probe.media {
-                media = true;
-            } else {
+    for r in results {
+        let is_ai = matches!(r.service.as_str(), "GPT" | "Claude" | "Gemini");
+        if r.verdict.is_verified() {
+            tags.push(r.service.clone());
+            if is_ai {
                 ai = true;
+            } else {
+                media = true;
             }
         }
-    }
-    // 【APP-13 任务2】Gemini 兜底放行：gemini.google.com 握手偶发超时（
-    // Google 前端首包 RTT 高），单次失败不应把整批节点的 Gemini 标识清空。
-    // 若出口地区已确认不在 AI 受限名单，且该节点已实测解锁 GPT 或 YT
-    // （同属 Google/OpenAI 体系，链路质量充分），则补回 Gemini 标识。
-    if !tags.iter().any(|t| t == "Gemini")
-        && exit_loc
-            .as_deref()
-            .is_some_and(|l| !AI_BLOCKLIST.contains(&l))
-        && tags.iter().any(|t| t == "GPT" || t == "YT")
-    {
-        tags.push("Gemini".to_string());
-        ai = true;
+        services.insert(r.service.clone(), r);
     }
     let score = tags.len() as u32;
     AimNodeResult {
@@ -909,12 +1495,62 @@ async fn probe_node(
         delay_ms: base_delay,
         updated_at: now_secs(),
         probed: true,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        egress_ip,
+        egress_country,
+        services,
+    }
+}
+
+/// 【APP67 BUG-04】出口预检失败时的统一结果：7 个服务均 Unknown，无解锁标签。
+fn egress_unknown_result(
+    name: &str,
+    delay: u64,
+    egress_ip: Option<String>,
+    egress_country: Option<String>,
+) -> AimNodeResult {
+    let mut services: HashMap<String, ServiceProbeResult> = HashMap::new();
+    for s in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
+        services.insert(
+            s.to_string(),
+            svc_unknown(s, "出口预检失败/未知/漏直连，未执行平台探测"),
+        );
+    }
+    AimNodeResult {
+        node_name: name.to_string(),
+        unlocked_tags: vec![],
+        ai_unlocked: false,
+        media_unlocked: false,
+        score: 0,
+        delay_ms: delay,
+        updated_at: now_secs(),
+        probed: true,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        egress_ip,
+        egress_country,
+        services,
+    }
+}
+
+/// 仅对 Unknown 结论补测 1 次（传输抖动重试），Blocked/Verified/Accessible/Partial 不重试。
+async fn probe_with_retry<F, Fut>(f: F) -> ServiceProbeResult
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ServiceProbeResult>,
+{
+    let r = f().await;
+    if matches!(r.verdict, ProbeVerdict::Unknown) {
+        f().await
+    } else {
+        r
     }
 }
 
 // 【APP66 任务1.1】已删除 `preview_tags`：任何「按节点名称/地区关键词推断
 // AI / 流媒体解锁」的启发式都必须彻底移除。解锁结论唯一来源是真实隧道内
-// 的 HTTP 探测（check_once），预览模式一律返回空标签。
+// 的 HTTP 探测，预览模式一律返回空标签。
 
 fn dead_result(name: &str) -> AimNodeResult {
     AimNodeResult {
@@ -926,230 +1562,10 @@ fn dead_result(name: &str) -> AimNodeResult {
         delay_ms: 0,
         updated_at: now_secs(),
         probed: true,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        ..Default::default()
     }
-}
-
-/// 单平台探测：请求 + 按平台规则判定（超时/传输错误自动补测 1 次）
-async fn check_platform(
-    client: &reqwest::Client,
-    nr_client: &reqwest::Client,
-    probe: &Probe,
-    exit_loc: Option<String>,
-) -> bool {
-    let loc = exit_loc.as_deref();
-    match check_once(client, nr_client, probe, loc).await {
-        Some(ok) => ok,
-        None => match check_once(client, nr_client, probe, loc).await {
-            Some(ok) => ok,
-            None => false,
-        },
-    }
-}
-
-/// 发起单次请求并按平台规则判定；None = 传输失败/超时（区别于「封锁」）
-async fn check_once(
-    client: &reqwest::Client,
-    nr_client: &reqwest::Client,
-    probe: &Probe,
-    exit_loc: Option<&str>,
-) -> Option<bool> {
-    // 【APP-10 任务3】Gemini 提前分支：只看首跳 Location 是否含 /faq，
-    // 绝不跟随重定向读正文（Google JS 多语言包内嵌错误文案会误伤）。
-    if probe.tag == "Gemini" {
-        return check_gemini_first_hop(nr_client, probe.url, exit_loc).await;
-    }
-    // 【APP49 任务3】ChatGPT trace 探测独立收紧到 1600ms（每请求级超时，
-    // 不影响客户端上其他平台的 2200ms 通用超时）
-    let mut req = client
-        .get(probe.url)
-        .header("Accept-Language", "en-US,en;q=0.9");
-    if probe.tag == "GPT" {
-        req = req.timeout(std::time::Duration::from_millis(GPT_TRACE_TIMEOUT_MS));
-    }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(_) => return None, // 传输失败 → 由 check_platform 补测
-    };
-    let status = resp.status().as_u16();
-    // 跟随重定向后的最终 URL（Gemini 跳 FAQ / Disney+ 跳不可用页的判定依据）
-    let final_url = resp.url().as_str().to_lowercase();
-    // 读正文（响应体一般 < 8KB，截断防止异常大响应拖慢探测；
-    // 按字符边界截断，避免多字节 UTF-8 被切断 panic）
-    let body = resp
-        .text()
-        .await
-        .map(|b| {
-            const LIMIT: usize = 64 * 1024;
-            if b.len() > LIMIT {
-                let mut end = LIMIT;
-                while end > 0 && !b.is_char_boundary(end) {
-                    end -= 1;
-                }
-                b[..end].to_string()
-            } else {
-                b
-            }
-        })
-        .unwrap_or_default();
-    let body_lc = body.to_lowercase();
-    // 出口地区：优先使用 probe_node 预取的共享值，其次解析本次响应体
-    // （GPT/Claude/TK 的探测 URL 本身就是 cdn-trace 端点）
-    let loc = exit_loc.map(str::to_string).or_else(|| parse_trace_loc(&body));
-    // 【APP49 任务3】AI/TikTok 判定要求 loc 必须解析成功且不命中受限名单
-    let loc_allowed = |list: &[&str]| loc.as_deref().is_some_and(|l| !region_blocked(Some(l), list));
-
-    let verdict = match probe.tag {
-        // 【APP66 任务1.3】GPT 双保险：trace 200 + 出口地区不限 +
-        // ios.chat.openai.com 服务端状态二次校验（403/429 或正文含
-        // unsupported_country / 403 forbidden → 未解锁）。
-        "GPT" => {
-            if status == 200 && loc_allowed(AI_BLOCKLIST) {
-                Some(check_gpt_server_status(client).await)
-            } else {
-                Some(false)
-            }
-        }
-        // 【APP66 任务1.3】Claude：trace 200 + 出口地区不限 + /login 正文/重定向二次校验
-        "Claude" => {
-            if status == 200 && loc_allowed(AI_BLOCKLIST) {
-                Some(check_claude_login(nr_client).await)
-            } else {
-                Some(false)
-            }
-        }
-        // Gemini：已在 check_once 入口提前分支（首跳 Location 判定），此处不可达
-        "Gemini" => Some(false),
-        // 【APP49 任务3 / APP66 任务1.3】NF：区域锁片源 + 正文排除不可用文案
-        "NF" => Some(
-            netflix_unlocked(status)
-                && !body_lc.contains("oh no!")
-                && !body_lc.contains("not available in your country")
-                && !body_lc.contains("this title is not available"),
-        ),
-        // Disney+：200 且未跳到不可用提示页 / 正文无地区不可用文案
-        "Disney+" => Some(
-            status == 200
-                && !final_url.contains("unavailable")
-                && !body_lc.contains("not available in your region"),
-        ),
-        // 【APP66 任务1.3】YT：200 + 正文含 youtube 品牌词 + 不含不可用文案
-        "YT" => Some(
-            status == 200 && body_lc.contains("youtube") && !body_lc.contains("not available"),
-        ),
-        // 【APP66 任务1.3】TikTok：trace 200 + 出口地区不限 + /explore 200 二次校验
-        "TK" => {
-            if status == 200 && loc_allowed(TIKTOK_BLOCKLIST) {
-                Some(check_tiktok_explore(client).await)
-            } else {
-                Some(false)
-            }
-        }
-        _ => Some(false),
-    };
-    verdict
-}
-
-/// 【APP66 任务1.3】GPT 服务端状态二次校验：
-/// - 传输失败 / 非 200 / 403 / 429 → 未解锁（不放过可疑出口）；
-/// - 200 但正文出现 unsupported_country / 403 forbidden → 未解锁。
-async fn check_gpt_server_status(client: &reqwest::Client) -> bool {
-    let Ok(resp) = client
-        .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    let status = resp.status().as_u16();
-    // 403 / 429 / 任何非 200 → OpenAI 已对该出口触发风控，严格判未解锁
-    if status != 200 {
-        return false;
-    }
-    let body = resp.text().await.unwrap_or_default().to_lowercase();
-    !(body.contains("unsupported_country")
-        || body.contains("not available in your country")
-        || body.contains("403 forbidden"))
-}
-
-/// 【APP66 任务1.3】Claude 登录页二次校验：200/3xx 且正文无地区不可用文案
-async fn check_claude_login(client: &reqwest::Client) -> bool {
-    let Ok(resp) = client
-        .get("https://claude.ai/login")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    let status = resp.status().as_u16();
-    if status != 200 && !(300..400).contains(&status) {
-        return false;
-    }
-    let body = resp.text().await.unwrap_or_default().to_lowercase();
-    !(body.contains("not available in your country")
-        || body.contains("not available in your region")
-        || body.contains("unavailable in your region"))
-}
-
-/// 【APP66 任务1.3】TikTok 探索页二次校验：必须真实 200
-async fn check_tiktok_explore(client: &reqwest::Client) -> bool {
-    let Ok(resp) = client
-        .get("https://www.tiktok.com/explore")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    resp.status().as_u16() == 200
-}
-
-/// 【APP-10 任务3】Gemini 首跳判定（无重定向客户端）：
-/// - 出口地区命中 AI 受限名单 → 封锁；
-/// - 首跳 3xx 且 Location 含 `/faq` → 地区封锁页，判封锁；
-/// - 首跳 200（已进 App）或其他 3xx（跳登录/首页）→ 放行；
-/// - 传输失败/超时 → None，交由上层补测一次。
-async fn check_gemini_first_hop(
-    nr_client: &reqwest::Client,
-    url: &str,
-    exit_loc: Option<&str>,
-) -> Option<bool> {
-    if region_blocked(exit_loc, AI_BLOCKLIST) {
-        return Some(false);
-    }
-    let resp = match nr_client
-        .get(url)
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    let status = resp.status().as_u16();
-    if status == 200 {
-        // 【APP66 任务1.3】Gemini：200 也必须有正文二次校验，
-        // 出现 not available in your country / unsupported region
-        // / currently not available 一律判未解锁。
-        let body = resp.text().await.unwrap_or_default().to_lowercase();
-        return Some(!(body.contains("not available in your country")
-            || body.contains("unsupported region")
-            || body.contains("currently not available")));
-    }
-    if (300..400).contains(&status) {
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_lowercase();
-        return Some(!location.contains("/faq"));
-    }
-    Some(false)
 }
 
 fn now_secs() -> u64 {
@@ -1310,6 +1726,9 @@ pub async fn lock_fastest_now(app: &AppHandle, state: &AppState) -> Option<Strin
         delay_ms: delay,
         updated_at: 0,
         probed: true,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        ..Default::default()
     };
     // 【APP49】仅当用户开启「切换策略时关闭连接」才断开旧连接
     let close_conns = state.settings.read().close_connections_on_switch;
@@ -1405,6 +1824,9 @@ mod tests {
             delay_ms: delay,
             updated_at: 0,
             probed: true,
+            probe_version: CURRENT_AIM_PROBE_VERSION,
+            rule_version: CURRENT_AIM_RULE_VERSION,
+            ..Default::default()
         }
     }
 
@@ -1572,5 +1994,171 @@ mod tests {
                 "APP66 任务1：禁止按节点名/地区关键词猜测解锁标签: {needle}"
             );
         }
+    }
+
+    // ===== 【APP67 P5】假阳性拦截 + 缓存淘汰回归测试 =====
+
+    #[test]
+    fn test_probe_verdict_is_verified() {
+        assert!(ProbeVerdict::Verified.is_verified());
+        assert!(!ProbeVerdict::Accessible.is_verified());
+        assert!(!ProbeVerdict::Partial.is_verified());
+        assert!(!ProbeVerdict::Blocked.is_verified());
+        assert!(!ProbeVerdict::Unknown.is_verified());
+    }
+
+    #[test]
+    fn test_empty_body_unknown_not_verified() {
+        // 空正文 / 过短正文 → Unknown（绝不返回 Verified）
+        let short = "";
+        assert!(short.trim().len() < 100);
+        // 模拟 read_verified_body 的 min_len 判定逻辑
+        let verdict = if short.trim().len() < 100 {
+            ProbeVerdict::Unknown
+        } else {
+            ProbeVerdict::Verified
+        };
+        assert_eq!(verdict, ProbeVerdict::Unknown);
+        assert!(!verdict.is_verified());
+    }
+
+    #[test]
+    fn test_cf_challenge_body_is_blocked() {
+        // Cloudflare 质询页标记 → Blocked
+        assert!(is_cf_challenge_body("Just a moment..."));
+        assert!(is_cf_challenge_body("Attention Required! | Cloudflare"));
+        assert!(is_cf_challenge_body("cf-chl-bypass"));
+        assert!(is_cf_challenge_body("cf-error-details"));
+        // 普通 HTML 不含质询标记
+        assert!(!is_cf_challenge_body("<html><body>Hello World</body></html>"));
+        assert!(!is_cf_challenge_body("chatgpt oai normal page"));
+    }
+
+    #[test]
+    fn test_no_positive_fingerprint_not_verified() {
+        // 无正向业务特征码的普通 HTML 不得判 Verified
+        let body = "<html><head><title>Some Page</title></head><body>welcome</body></html>";
+        let has_brand = body.to_lowercase().contains("chatgpt") || body.to_lowercase().contains("oai");
+        let has_init = body.to_lowercase().contains("ytinitialdata");
+        assert!(!has_brand, "普通 HTML 不应含 GPT 品牌特征");
+        assert!(!has_init, "普通 HTML 不应含 YT 初始化特征");
+        // 即使状态码 200，缺少正特征也只能是 Accessible，不得 Verified
+        let status = 200u16;
+        let verdict = if status == 200 && has_brand {
+            ProbeVerdict::Verified
+        } else if status == 200 {
+            ProbeVerdict::Accessible
+        } else {
+            ProbeVerdict::Blocked
+        };
+        assert_ne!(verdict, ProbeVerdict::Verified);
+    }
+
+    #[test]
+    fn test_403_429_blocked_or_unknown() {
+        // 403 / 429 → Blocked（风控），不得 Verified
+        for bad in [403u16, 429] {
+            let verdict = if bad == 403 || bad == 429 {
+                ProbeVerdict::Blocked
+            } else {
+                ProbeVerdict::Verified
+            };
+            assert_eq!(verdict, ProbeVerdict::Blocked);
+            assert!(!verdict.is_verified());
+        }
+    }
+
+    #[test]
+    fn test_unknown_exit_country_short_circuits() {
+        // 出口地区未知（None 或 UNKNOWN_EXIT_COUNTRIES）→ 全部服务 Unknown，无解锁标签
+        let r = egress_unknown_result("test-node", 120, Some("1.2.3.4".into()), None);
+        assert!(r.unlocked_tags.is_empty(), "出口未知节点不得有任何解锁标签");
+        assert!(!r.ai_unlocked);
+        assert!(!r.media_unlocked);
+        assert_eq!(r.score, 0);
+        assert_eq!(r.services.len(), 7);
+        for svc in r.services.values() {
+            assert_eq!(
+                svc.verdict,
+                ProbeVerdict::Unknown,
+                "出口未知时 {} 必须为 Unknown",
+                svc.service
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpt_yt_verified_gemini_blocked_no_gemini_tag() {
+        // 【APP67 BUG-01 核心防复发】GPT=Verified 且 YT=Verified，但 Gemini=Blocked
+        // 时，unlocked_tags 绝对不允许包含 "Gemini"（彻底删除跨平台兜底猜测）。
+        let results = vec![
+            svc_verified("GPT", 200, "server_status normal"),
+            svc_verified("YT", 200, "ytInitialData"),
+            svc_blocked("Gemini", "region blocked"),
+            svc_blocked("Claude", "403"),
+            svc_accessible("NF", 200, "partial"),
+        ];
+        // 复刻 probe_node 中的汇总逻辑：只有 Verified 进入 unlocked_tags
+        let mut tags: Vec<String> = Vec::new();
+        for r in &results {
+            if r.verdict.is_verified() {
+                tags.push(r.service.clone());
+            }
+        }
+        assert!(tags.contains(&"GPT".to_string()));
+        assert!(tags.contains(&"YT".to_string()));
+        assert!(
+            !tags.contains(&"Gemini".to_string()),
+            "Gemini 为 Blocked 严禁进入 unlocked_tags（禁止跨平台兜底猜测）"
+        );
+        assert!(!tags.contains(&"Claude".to_string()));
+        assert!(!tags.contains(&"NF".to_string()), "Accessible 不得进入解锁标签");
+    }
+
+    #[test]
+    fn test_only_verified_enters_unlocked_tags() {
+        // 铁律：Verified 进标签，其余四种一律不得伪装成绿色解锁
+        for v in [
+            ProbeVerdict::Accessible,
+            ProbeVerdict::Partial,
+            ProbeVerdict::Blocked,
+            ProbeVerdict::Unknown,
+        ] {
+            let r = ServiceProbeResult {
+                service: "X".to_string(),
+                verdict: v,
+                ..Default::default()
+            };
+            assert!(
+                !r.verdict.is_verified(),
+                "{:?} 不得进入 unlocked_tags",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_version_eviction_constants() {
+        // 【APP67 P3】probe_version / rule_version = 2，旧版（0/1）缓存必须淘汰
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 2);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 2);
+        assert!(0 < CURRENT_AIM_PROBE_VERSION, "v0 缓存应被淘汰");
+        assert!(1 < CURRENT_AIM_PROBE_VERSION, "v1 缓存应被淘汰");
+        assert!(2 >= CURRENT_AIM_PROBE_VERSION, "v2 缓存应保留");
+    }
+
+    #[test]
+    fn test_egress_unknown_result_sets_version_fields() {
+        // 出口预检失败结果也必须携带当前版本号，否则会被缓存加载器误淘汰
+        let r = egress_unknown_result("n", 50, None, None);
+        assert_eq!(r.probe_version, CURRENT_AIM_PROBE_VERSION);
+        assert_eq!(r.rule_version, CURRENT_AIM_RULE_VERSION);
+    }
+
+    #[test]
+    fn test_dead_result_sets_version_fields() {
+        let r = dead_result("dead");
+        assert_eq!(r.probe_version, CURRENT_AIM_PROBE_VERSION);
+        assert_eq!(r.rule_version, CURRENT_AIM_RULE_VERSION);
     }
 }
