@@ -15,7 +15,7 @@ import {
   type AimNodeResult,
   type GoAimStatus,
 } from "@/api/ipc";
-import { useCoreStore, isDummyNodeName } from "@/stores/core";
+import { useCoreStore, isDummyNodeName, ensureAimListenersRegistered, syncAimSnapshot } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
@@ -71,6 +71,129 @@ const AIM_BADGE_STYLE: Record<string, string> = {
 /** 节点当前支持的 AIM 徽章集合（后端已按 GPT/Claude/Gemini/NF/YT/TK 归一） */
 const aimBadgesOf = (r?: AimNodeResult): string[] => r?.unlockedTags ?? [];
 
+/// 【APP71 任务4】7 平台固定展示顺序（与后端探测顺序一致）
+const AIM_DETAIL_ORDER = ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"];
+
+/// 五态样式：仅 VERIFIED 为绿色完整解锁，其余保持灰/警示色，绝不伪装
+const AIM_VERDICT_STYLE: Record<string, string> = {
+  VERIFIED: "bg-[#24B414]/15 text-[#24B414] border-[#24B414]/30",
+  ACCESSIBLE: "bg-glass text-gray-300 border-border",
+  PARTIAL: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+  BLOCKED: "bg-[#FF453A]/10 text-[#FF453A] border-[#FF453A]/25",
+  UNKNOWN: "bg-glass text-gray-500 border-border",
+};
+
+/// 【APP71 任务4】单节点 7 平台五态详情弹窗：出口、耗时、补测次数、
+/// 判定依据（永不包含完整 HTTP 响应正文），并支持导出单节点 JSON 报告。
+function AimNodeDetailModal({
+  node,
+  result,
+  onClose,
+}: {
+  node: string;
+  result?: AimNodeResult;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const services = result?.services ?? {};
+  const rows = AIM_DETAIL_ORDER.filter((s) => services[s]);
+
+  const exportReport = () => {
+    const report = {
+      node,
+      exportedAt: new Date().toISOString(),
+      result: result ?? null,
+    };
+    const blob = new Blob([JSON.stringify(report, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `aim-${node.replace(/[^\w.-]+/g, "_")}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[82vh] w-full max-w-lg flex-col gap-2 overflow-y-auto rounded-2xl border border-border bg-surface-card p-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-sm font-bold text-gray-100">
+            {t("proxies.aimDetail.title")} · {node}
+          </span>
+          <button
+            onClick={onClose}
+            className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] text-gray-400 hover:text-accent"
+          >
+            {t("proxies.aimDetail.close")}
+          </button>
+        </div>
+        <div className="text-[11px] text-gray-400">
+          {t("proxies.aimDetail.egress")}: {result?.egressIp ?? "—"}
+          {result?.egressCountry ? ` (${result.egressCountry})` : ""}
+          {result?.egressAsn ? ` · AS${result.egressAsn}` : ""} · score{" "}
+          {result?.score ?? 0} · {result?.delayMs ?? 0}ms
+        </div>
+        {rows.length === 0 ? (
+          <div className="rounded-lg bg-glass px-3 py-4 text-center text-[11px] text-gray-500">
+            {t("proxies.aimDetail.empty")}
+          </div>
+        ) : (
+          rows.map((service) => {
+            const r = services[service];
+            const basis = r.verdictBasis || r.evidence || r.failureReason || "—";
+            return (
+              <div
+                key={service}
+                className="rounded-lg bg-glass px-2.5 py-1.5 text-[11px]"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-gray-200">{service}</span>
+                  <span
+                    className={clsx(
+                      "rounded border px-1.5 py-0.5 font-mono text-[10px]",
+                      AIM_VERDICT_STYLE[r.verdict] ?? AIM_VERDICT_STYLE.UNKNOWN,
+                    )}
+                  >
+                    {r.verdict}
+                  </span>
+                </div>
+                <div className="mt-0.5 flex flex-wrap gap-x-2 text-gray-400">
+                  {r.elapsedMs != null && (
+                    <span className="tabular-nums">{r.elapsedMs}ms</span>
+                  )}
+                  {r.statusCode != null && (
+                    <span className="tabular-nums">HTTP {r.statusCode}</span>
+                  )}
+                  {(r.retryCount ?? 0) > 0 && (
+                    <span>{t("proxies.aimDetail.retry", { n: r.retryCount ?? 0 })}</span>
+                  )}
+                </div>
+                <div className="mt-0.5 break-words text-[11px] text-gray-500">
+                  {t("proxies.aimDetail.basis")}: {basis}
+                </div>
+              </div>
+            );
+          })
+        )}
+        <button
+          onClick={exportReport}
+          className="mt-1 rounded-xl border border-border px-3 py-2 text-[12px] font-bold text-gray-200 hover:border-accent/40"
+        >
+          {t("proxies.aimDetail.export")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function Proxies() {
   const { t } = useTranslation();
 
@@ -84,6 +207,9 @@ export default function Proxies() {
   // 【APP54 任务5】测速 / Go AIM 实时进度（全局 store 收口，事件驱动）
   const delayProgress = useCoreStore((s) => s.delayProgress);
   const aimProgress = useCoreStore((s) => s.aimProgress);
+  // 【APP71 任务3/4】结构化事件失败原因与快照结果（节点详情弹窗数据源）
+  const aimLastError = useCoreStore((s) => s.aimLastError);
+  const storeAim = useCoreStore((s) => s.goAimStatus);
   const mergeNodeDelays = useCoreStore((s) => s.mergeNodeDelays);
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
   const proReady = useProStore((s) => s.ready);
@@ -101,6 +227,13 @@ export default function Proxies() {
   const [keyword, setKeyword] = useState("");
   /// Go AIM 解锁评级结果（APP56 任务1.1 起不再提供分类胶囊）
   const [aim, setAim] = useState<GoAimStatus | null>(null);
+  /// 【APP71 任务4】单节点详情弹窗
+  const [detailNode, setDetailNode] = useState<string | null>(null);
+  /// 【APP71 任务3】合并快照结果（store 实时 NODE_RESULT 优先）
+  const aimResults = useMemo(
+    () => ({ ...(aim?.results ?? {}), ...(storeAim?.results ?? {}) }),
+    [aim?.results, storeAim?.results],
+  );
 
   // 授权是否可用（启动瞬间 ready=false 时保持可用，避免闪烁误锁）
   const proActive = proUnlocked || !proReady;
@@ -130,14 +263,24 @@ export default function Proxies() {
       .catch(() => loadProxies());
 
     // Go AIM 评级结果：挂载时拉取，探测/评级更新经事件实时刷新
-    getGoAimStatus().then(setAim).catch(() => undefined);
+    getGoAimStatus()
+      .then((d) => {
+        setAim(d);
+        useCoreStore.getState().setGoAimStatus(d);
+      })
+      .catch(() => undefined);
 
     // 事件名与后端一致（commands.rs emit "proxies://changed"）：
     // 启动自动选点/手动切换后刷新当前选中项与延迟
     const unStatus = listen("core://status", () => loadProxies());
     const unProxies = listen("proxies://changed", () => loadProxies());
     const unAim = listen("go-aim://updated", () => {
-      getGoAimStatus().then(setAim).catch(() => undefined);
+      getGoAimStatus()
+        .then((d) => {
+          setAim(d);
+          useCoreStore.getState().setGoAimStatus(d);
+        })
+        .catch(() => undefined);
     });
     // 测速增量事件：后端逐节点推送 { group, name, delay }（delay=null 为超时）。
     // 仅应用与当前主选择组匹配的节点，测试中实时刷新延迟显示。
@@ -181,6 +324,18 @@ export default function Proxies() {
       unDelays.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 【APP71 任务3】页面挂载 / 回到前台：先确保事件监听已注册，再拉一次
+  // 全量快照合并，彻底消除「listen 尚未生效」窗口内的进度与结果丢包。
+  useEffect(() => {
+    void ensureAimListenersRegistered().catch(() => undefined);
+    void syncAimSnapshot();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void syncAimSnapshot();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   const loadProxies = async (preferred?: string) => {
@@ -385,7 +540,6 @@ export default function Proxies() {
     (n) => !keywordLower || n.name.toLowerCase().includes(keywordLower),
   );
 
-  const aimResults = aim?.results ?? {};
   /// 已探测到的结果数：为 0 说明还没跑过探测
   const aimResultCount = Object.keys(aimResults).length;
   const aimProbing = Boolean(aim?.probing);
@@ -413,6 +567,23 @@ export default function Proxies() {
       ? Math.min(100, Math.round((aimDone * 100) / totalCount))
       : 0;
   const progressPct = isProAimMode ? aimPct : delayPct;
+
+  // 【APP71 任务2.4/2.5】双阶段看板文案与并发槽位实时详情
+  const aimPhase = aimProgress.phase ?? "";
+  const aimPhaseText =
+    aimPhase === "SCREEN"
+      ? t("proxies.aimBoard.screen")
+      : aimPhase === "DEEP_PROBE"
+        ? t("proxies.aimBoard.deep")
+        : aimPhase === "FINISHED"
+          ? t("proxies.aimBoard.finished")
+          : aimPhase === "ERROR"
+            ? t("proxies.aimBoard.error")
+            : aimPhase === "CANCELLED"
+              ? t("proxies.aimBoard.cancelled")
+              : t("proxies.aimBoard.start");
+  const activeServiceLines = (aimProgress.currentServices ?? []).filter(Boolean);
+  const aimBoardError = aimProgress.errorMessage || aimLastError;
 
   // 【APP56 任务2.2】Pro + Go AIM 且尚无解锁标识时自动补一次全量探测
   const aimAutoProbeRef = useRef(false);
@@ -601,6 +772,56 @@ export default function Proxies() {
             style={{ width: `${progressPct}%` }}
           />
         </div>
+
+        {/* 【APP71 任务2.4】双阶段看板：快筛最高 20%，深测 20~99%，
+            完成才 100%；并发槽位 / 存活 / 耗时 / 失败原因一目了然 */}
+        {isProAimMode &&
+          (aimRunning || aimPhase === "ERROR" || aimPhase === "CANCELLED") && (
+            <div className="mt-0.5 flex flex-col gap-1 rounded-xl border border-border bg-surface-card px-3 py-2 text-[11px]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-gray-200">{aimPhaseText}</span>
+                <span className="tabular-nums font-semibold text-gray-300">
+                  {aimProgress.percent}%
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-400">
+                <span className="tabular-nums">
+                  {t("proxies.aimBoard.alive", {
+                    alive: aimProgress.fastAlive ?? 0,
+                    total: aimProgress.fastTotal ?? aimProgress.total ?? 0,
+                  })}
+                </span>
+                {(aimProgress.fullTotal ?? 0) > 0 && (
+                  <span className="tabular-nums">
+                    {t("proxies.aimBoard.deepProgress", {
+                      done: aimProgress.fullDone ?? 0,
+                      total: aimProgress.fullTotal ?? 0,
+                    })}
+                  </span>
+                )}
+                {(aimProgress.activeSlots ?? 0) > 0 && (
+                  <span className="tabular-nums">
+                    {t("proxies.aimBoard.slots", {
+                      n: aimProgress.activeSlots ?? 0,
+                    })}
+                  </span>
+                )}
+                {(aimProgress.elapsedMs ?? 0) > 0 && (
+                  <span className="tabular-nums">
+                    {Math.round((aimProgress.elapsedMs ?? 0) / 1000)}s
+                  </span>
+                )}
+              </div>
+              {activeServiceLines.length > 0 && (
+                <div className="truncate text-gray-500">
+                  {activeServiceLines.join(" · ")}
+                </div>
+              )}
+              {aimBoardError && (
+                <div className="text-[#FF453A] dark:text-[#FF6961]">{aimBoardError}</div>
+              )}
+            </div>
+          )}
       </div>
 
       {/* 节点列表流（Shadowrocket 风格；测速完成后按延迟升序） */}
@@ -620,7 +841,7 @@ export default function Proxies() {
         {sorted.map((node, idx) => {
           const delay = lastDelay(node);
           const selected = current === node.name;
-          const aimResult = aim?.results[node.name];
+          const aimResult = aimResults[node.name];
           /// 未激活授权不渲染解锁徽章（与原先 Pro 守卫保持一致）
           const unlockedTags = proActive ? (aimResult?.unlockedTags ?? []) : [];
           return (
@@ -674,8 +895,8 @@ export default function Proxies() {
               </div>
 
               {/* 第二行（自适应）：协议标签 + 全部 Go AIM 平台徽章，flex-wrap
-                  自然换行，不挤占第一行的名称与延迟；无徽章时不渲染 */}
-              {unlockedTags.length > 0 && (
+                  自然换行，不挤占第一行的名称与延迟；无结果时不渲染 */}
+              {(unlockedTags.length > 0 || aimResult?.probed) && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-4">
                   <span className="px-1.5 py-0.5 rounded bg-surface-hover text-[11px] font-mono uppercase tracking-wide text-gray-400">
                     {protocolTag(node.type)}
@@ -692,12 +913,33 @@ export default function Proxies() {
                       {tag}
                     </span>
                   ))}
+                  {aimResult?.probed && (
+                    <span
+                      role="button"
+                      tabIndex={-1}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDetailNode(node.name);
+                      }}
+                      className="px-1.5 py-0.5 rounded border border-border text-[11px] text-gray-400 hover:border-accent/40 hover:text-accent"
+                    >
+                      {t("proxies.aimDetail.detail")}
+                    </span>
+                  )}
                 </div>
               )}
             </button>
           );
         })}
       </div>
+      )}
+      {/* 【APP71 任务4】单节点 7 平台五态详情 */}
+      {detailNode && (
+        <AimNodeDetailModal
+          node={detailNode}
+          result={aimResults[detailNode]}
+          onClose={() => setDetailNode(null)}
+        />
       )}
     </div>
   );

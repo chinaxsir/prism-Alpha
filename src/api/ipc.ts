@@ -63,6 +63,56 @@ export interface ProbeProgress {
   verifiedCount?: number;
   unknownCount?: number;
   elapsedMs?: number;
+  // ---- 【APP71 任务2】双阶段实时进度扩展字段 ----
+  /** 本轮探测批次号（aim-xxxxxxxx），用于事件去重 */
+  runId?: string;
+  /** 事件序号（严格单调递增） */
+  sequence?: number;
+  /** IDLE | START | SCREEN | DEEP_PROBE | FINISHED | CANCELLED | ERROR */
+  phase?: string;
+  fastAlive?: number;
+  currentNodes?: string[];
+  currentServices?: string[];
+  activeSlots?: number;
+  failedCount?: number;
+  timeoutCount?: number;
+  retryCount?: number;
+  errorMessage?: string;
+}
+
+/** 【APP71 任务2】Go AIM 结构化实时事件（runId + sequence 严格去重） */
+export interface GoAimEvent {
+  runId: string;
+  sequence: number;
+  timestamp: number;
+  phase:
+    | "START"
+    | "SCREEN"
+    | "DEEP_PROBE"
+    | "NODE_RESULT"
+    | "FINISHED"
+    | "CANCELLED"
+    | "ERROR";
+  nodeName?: string;
+  slot?: number;
+  service?: string;
+  status?: string;
+  elapsedMs?: number;
+  message: string;
+  progress: ProbeProgress;
+  details?: AimNodeResult;
+}
+
+/** 【APP71 任务3】Go AIM 全量快照（页面挂载 / 后台唤醒同步） */
+export interface GoAimSnapshot {
+  progress: ProbeProgress;
+  events: GoAimEvent[];
+  results: Record<string, AimNodeResult>;
+  bestNode: string | null;
+  lastError: string | null;
+  enabled: boolean;
+  probing: boolean;
+  pinnedNode: string | null;
 }
 
 export const getCoreStatus = () => invoke<CoreStatusDto>("get_core_status");
@@ -246,6 +296,10 @@ export interface ServiceProbeResult {
   statusCode?: number;
   evidence: string;
   failureReason?: string;
+  // 【APP71 任务4】证据级详情字段
+  elapsedMs?: number;
+  retryCount?: number;
+  verdictBasis?: string;
 }
 
 export interface AimNodeResult {
@@ -283,6 +337,8 @@ export interface GoAimStatus {
 }
 
 export const getGoAimStatus = () => invoke<GoAimStatus>("get_go_aim_status");
+/** 【APP71 任务3】一次性拉取 Go AIM 全量快照（进度 / 最近事件 / 结果） */
+export const getGoAimSnapshot = () => invoke<GoAimSnapshot>("get_go_aim_snapshot");
 export const setGoAimEnabled = (enabled: boolean) =>
   invoke<void>("set_go_aim_enabled", { enabled });
 export const runGoAimProbe = (mode?: AimProbeMode) =>
@@ -463,6 +519,12 @@ export interface AppLogEntry {
   level: "INFO" | "WARN" | "ERROR" | string;
   module: string;
   message: string;
+  /** 【APP71 任务5】Go AIM 结构化上下文（其余模块为 undefined） */
+  runId?: string;
+  nodeName?: string;
+  slot?: number;
+  service?: string;
+  elapsedMs?: number;
 }
 export interface AppLogsPayload {
   entries: AppLogEntry[];

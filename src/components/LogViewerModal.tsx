@@ -154,6 +154,11 @@ export default function LogViewerModal({
   const [exporting, setExporting] = useState(false);
   /** 【APP63 任务2.2】导出成功提示条（翠绿色） */
   const [exportedTip, setExportedTip] = useState(false);
+  // 【APP71 任务5】Go AIM 多维筛选（批次 / 节点 / 平台 / 级别）
+  const [aimRunId, setAimRunId] = useState("");
+  const [aimNode, setAimNode] = useState("");
+  const [aimService, setAimService] = useState("");
+  const [aimLevel, setAimLevel] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
 
   /** 【APP62 任务4】拉取分类聚合日志：失败自动重试 3 次（指数退避），
@@ -185,7 +190,32 @@ export default function LogViewerModal({
   const visibleEntries = useMemo(() => {
     const bucket = buckets.find((b) => b.module === activeModule);
     if (!bucket) return [];
-    return logs.slice(bucket.start, bucket.end);
+    let rows = logs.slice(bucket.start, bucket.end);
+    // 【APP71 任务5】GoAIM 桶内再按 runId / 节点 / 平台 / 级别精确筛选
+    if (activeModule === "GoAIM") {
+      if (aimRunId) rows = rows.filter((e) => (e.runId ?? "") === aimRunId);
+      if (aimNode) rows = rows.filter((e) => (e.nodeName ?? "") === aimNode);
+      if (aimService) rows = rows.filter((e) => (e.service ?? "") === aimService);
+      if (aimLevel) rows = rows.filter((e) => (e.level ?? "") === aimLevel);
+    }
+    return rows;
+  }, [logs, buckets, activeModule, aimRunId, aimNode, aimService, aimLevel]);
+
+  /** 【APP71 任务5】GoAIM 筛选下拉选项（来自当前桶内真实出现过的值） */
+  const aimFilterOptions = useMemo(() => {
+    const empty = { runs: [] as string[], nodes: [] as string[], services: [] as string[], levels: [] as string[] };
+    if (activeModule !== "GoAIM") return empty;
+    const bucket = buckets.find((b) => b.module === "GoAIM");
+    if (!bucket) return empty;
+    const rows = logs.slice(bucket.start, bucket.end);
+    const uniq = (values: (string | undefined)[]) =>
+      Array.from(new Set(values.filter((v): v is string => Boolean(v))));
+    return {
+      runs: uniq(rows.map((e) => e.runId)).slice(-10).reverse(),
+      nodes: uniq(rows.map((e) => e.nodeName)),
+      services: uniq(rows.map((e) => e.service)),
+      levels: uniq(rows.map((e) => e.level)),
+    };
   }, [logs, buckets, activeModule]);
 
   /** 每个分类标签的实时条数（直接取自后端桶区间，与切片同源） */
@@ -247,6 +277,30 @@ export default function LogViewerModal({
       toast.success(t("logs.exported"));
     } catch (e) {
       console.error("[LogViewer] 导出诊断日志失败:", e);
+      toast.error(String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  /** 【APP71 任务5】仅导出 Go AIM 诊断日志（后端按模块过滤 + 结构化上下文） */
+  const handleExportAim = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const text = await invoke<string>("export_diagnostic_logs", {
+        module: "GoAIM",
+      });
+      try {
+        await navigator.clipboard?.writeText(text);
+      } catch {
+        // 剪贴板不可用时忽略：iOS 原生层已在主线程写入剪贴板
+      }
+      setExportedTip(true);
+      window.setTimeout(() => setExportedTip(false), 4000);
+      toast.success(t("logs.exported"));
+    } catch (e) {
+      console.error("[LogViewer] 导出 AIM 诊断日志失败:", e);
       toast.error(String(e));
     } finally {
       setExporting(false);
@@ -342,6 +396,67 @@ export default function LogViewerModal({
             );
           })()}
         </div>
+
+        {/* 【APP71 任务5】GoAIM 多维筛选 + 一键导出 AIM 诊断 */}
+        {activeModule === "GoAIM" && (
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-3 py-2">
+            <select
+              value={aimRunId}
+              onChange={(e) => setAimRunId(e.target.value)}
+              className="min-w-0 rounded-lg border border-border bg-surface-hover px-2 py-1 text-[11px] text-gray-300"
+            >
+              <option value="">{t("logs.aimRunAll")}</option>
+              {aimFilterOptions.runs.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={aimNode}
+              onChange={(e) => setAimNode(e.target.value)}
+              className="min-w-0 max-w-[8rem] rounded-lg border border-border bg-surface-hover px-2 py-1 text-[11px] text-gray-300"
+            >
+              <option value="">{t("logs.aimNodeAll")}</option>
+              {aimFilterOptions.nodes.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={aimService}
+              onChange={(e) => setAimService(e.target.value)}
+              className="rounded-lg border border-border bg-surface-hover px-2 py-1 text-[11px] text-gray-300"
+            >
+              <option value="">{t("logs.aimServiceAll")}</option>
+              {aimFilterOptions.services.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <select
+              value={aimLevel}
+              onChange={(e) => setAimLevel(e.target.value)}
+              className="rounded-lg border border-border bg-surface-hover px-2 py-1 text-[11px] text-gray-300"
+            >
+              <option value="">{t("logs.aimLevelAll")}</option>
+              {aimFilterOptions.levels.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => void handleExportAim()}
+              disabled={exporting}
+              className="ml-auto rounded-lg border border-border px-2 py-1 text-[11px] text-gray-300 hover:border-accent/40 disabled:opacity-50"
+            >
+              {t("logs.exportAim")}
+            </button>
+          </div>
+        )}
 
         {/* 日志列表：每条为上下两行全宽卡片。
             【APP62 任务4】key={activeModule} 强制切换分类时重建列表，

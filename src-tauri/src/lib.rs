@@ -333,6 +333,7 @@ pub fn run() {
             ipc::commands::get_go_aim_status,
             ipc::commands::set_go_aim_enabled,
             ipc::commands::run_go_aim_probe,
+            ipc::commands::get_go_aim_snapshot,
             ipc::commands::clear_go_aim_pinned_node,
             ipc::commands::get_go_lan_settings,
             ipc::commands::get_go_lan_status,

@@ -206,6 +206,25 @@ const zh: Record<string, string> = {
   "proxies.goCus.tpl.privacy.name": "🧹 隐私头净化",
   "proxies.goCus.tpl.privacy.desc":
     "对主流站点删除 X-Forwarded-For 追踪请求头（当前仅 HTTP 明文生效）",
+
+  // ---- 【APP71】Go AIM 双阶段看板 / 单节点详情 ----
+  "proxies.aimBoard.start": "Go AIM 启动中…",
+  "proxies.aimBoard.screen": "阶段一 · 极速存活快筛",
+  "proxies.aimBoard.deep": "阶段二 · 7 平台深度探测",
+  "proxies.aimBoard.finished": "检测完成",
+  "proxies.aimBoard.cancelled": "检测已中止",
+  "proxies.aimBoard.error": "检测失败",
+  "proxies.aimBoard.alive": "存活 {alive}/{total}",
+  "proxies.aimBoard.deepProgress": "深测 {done}/{total}",
+  "proxies.aimBoard.slots": "并发 {n}",
+  "proxies.aimDetail.title": "节点解锁详情",
+  "proxies.aimDetail.detail": "详情",
+  "proxies.aimDetail.close": "关闭",
+  "proxies.aimDetail.export": "导出单节点报告",
+  "proxies.aimDetail.egress": "出口",
+  "proxies.aimDetail.basis": "依据",
+  "proxies.aimDetail.retry": "补测 {n} 次",
+  "proxies.aimDetail.empty": "该节点暂无平台详情，请先运行 AIM 检测",
 };
 
 const en: Record<string, string> = {
@@ -427,6 +446,25 @@ const en: Record<string, string> = {
   "proxies.goCus.tpl.privacy.name": "HTTP Privacy Header",
   "proxies.goCus.tpl.privacy.desc":
     "Strip tracking headers & protect privacy",
+
+  // ---- 【APP71】Go AIM dual-phase board / node detail ----
+  "proxies.aimBoard.start": "Go AIM starting…",
+  "proxies.aimBoard.screen": "Phase 1 · Fast alive screening",
+  "proxies.aimBoard.deep": "Phase 2 · 7-platform deep probe",
+  "proxies.aimBoard.finished": "Completed",
+  "proxies.aimBoard.cancelled": "Cancelled",
+  "proxies.aimBoard.error": "Probe failed",
+  "proxies.aimBoard.alive": "Alive {alive}/{total}",
+  "proxies.aimBoard.deepProgress": "Deep {done}/{total}",
+  "proxies.aimBoard.slots": "Slots {n}",
+  "proxies.aimDetail.title": "Node unlock detail",
+  "proxies.aimDetail.detail": "Detail",
+  "proxies.aimDetail.close": "Close",
+  "proxies.aimDetail.export": "Export node report",
+  "proxies.aimDetail.egress": "Egress",
+  "proxies.aimDetail.basis": "Basis",
+  "proxies.aimDetail.retry": "Retried {n}x",
+  "proxies.aimDetail.empty": "No platform detail yet. Run AIM probe first.",
 };
 
 export default { zh, en };

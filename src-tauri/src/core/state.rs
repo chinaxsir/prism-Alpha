@@ -298,6 +298,40 @@ pub struct ProbeProgress {
     pub unknown_count: usize,
     #[serde(default)]
     pub elapsed_ms: u64,
+    // ---- 【APP71 任务2.1】双阶段实时进度扩展字段（全部默认值，向下兼容）----
+    /// 本轮探测唯一批次号（aim-xxxxxxxx）
+    #[serde(default)]
+    pub run_id: String,
+    /// 事件序号（严格单调递增，供前端去重）
+    #[serde(default)]
+    pub sequence: u64,
+    /// IDLE | START | SCREEN | DEEP_PROBE | FINISHED | CANCELLED | ERROR
+    #[serde(default)]
+    pub phase: String,
+    /// 阶段一快筛存活节点数
+    #[serde(default)]
+    pub fast_alive: usize,
+    /// 各并发槽位正在检测的节点名称
+    #[serde(default)]
+    pub current_nodes: Vec<String>,
+    /// 各并发槽位正在检测的平台（`#0: 节点 · GPT`）
+    #[serde(default)]
+    pub current_services: Vec<String>,
+    /// 当前活跃并发槽位数
+    #[serde(default)]
+    pub active_slots: usize,
+    /// 失败 / 淘汰节点数
+    #[serde(default)]
+    pub failed_count: usize,
+    /// 超时次数
+    #[serde(default)]
+    pub timeout_count: usize,
+    /// 重试次数
+    #[serde(default)]
+    pub retry_count: usize,
+    /// 异常或无存活节点时的明确失败原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 impl ProbeProgress {
@@ -310,26 +344,72 @@ impl ProbeProgress {
         };
     }
 
-    /// 【APP68】真实两阶段进度：快筛 0~20%，深测 + 缓存核验 20~100%。
-    /// 未完成全部阶段二节点时封顶 99%，绝不提前显示完成。
+    /// 【APP68/APP71】真实两阶段进度：
+    /// - SCREEN 阶段（含 START）最高仅 20%，绝不因快筛结束提前显示 100%；
+    /// - DEEP_PROBE 阶段 20%~99%，全部存活节点完成才允许 100%；
+    /// - ERROR / CANCELLED 终态永不超过 99%，绝不伪装成成功完成。
     pub fn recompute_aim(&mut self) {
+        let phase = self.phase.clone();
         if self.full_total > 0 {
             self.total = self.full_total;
             self.done = (self.full_done + self.cache_hits).min(self.full_total);
             self.pending_count = self.full_total.saturating_sub(self.done);
-            let percent = 20 + (self.done * 80) / self.full_total.max(1);
-            self.percent = if self.pending_count == 0 {
+            let computed = 20 + (self.done * 79) / self.full_total.max(1);
+            self.percent = if matches!(phase.as_str(), "ERROR" | "CANCELLED") {
+                computed.min(99) as u8
+            } else if phase == "START" {
+                1
+            } else if self.pending_count == 0 {
                 100
             } else {
-                percent.min(99) as u8
+                computed.min(99) as u8
             };
         } else {
             self.total = self.fast_total;
             self.done = self.fast_done.min(self.fast_total);
             self.pending_count = self.fast_total.saturating_sub(self.fast_done);
-            self.percent = ((self.fast_done * 20) / self.fast_total.max(1)).min(20) as u8;
+            self.percent = match phase.as_str() {
+                "START" => 1,
+                "FINISHED" => 100,
+                _ => ((self.fast_done * 20) / self.fast_total.max(1)).min(20) as u8,
+            };
         }
     }
+
+    /// 【APP71】标记异常终态：明确失败原因，running=false，绝不显示 100%。
+    pub fn mark_error(&mut self, message: impl Into<String>) {
+        self.running = false;
+        self.phase = "ERROR".into();
+        self.error_message = Some(message.into());
+        self.recompute_aim();
+    }
+}
+
+/// 【APP71 任务2.1】Go AIM 结构化实时事件（`go-aim://event`）。
+/// 前端按 (runId, sequence) 严格去重排序，旧 runId 的迟到事件直接丢弃。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoAimEvent {
+    pub run_id: String,
+    pub sequence: u64,
+    pub timestamp: u64,
+    /// START | SCREEN | DEEP_PROBE | NODE_RESULT | FINISHED | CANCELLED | ERROR
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub message: String,
+    pub progress: ProbeProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// 【APP52 任务1】节点测速 / Go AIM 探测持久化缓存（`node_metrics_cache.json`）。
@@ -411,6 +491,10 @@ pub struct AppState {
     /// 【APP51 任务1】Go AIM 探测代数计数器：订阅删除/停用/刷新时 +1，
     /// 正在运行的探测任务发现代数变化立即中止，杜绝旧节点结果污染缓存
     pub aim_generation: std::sync::atomic::AtomicU64,
+    /// 【APP71 任务3】最近 30 条 Go AIM 结构化事件（页面重开/后台唤醒快照同步）
+    pub aim_events: Mutex<VecDeque<GoAimEvent>>,
+    /// 【APP71 任务3】最近一次 Go AIM 明确失败原因
+    pub aim_last_error: RwLock<Option<String>>,
     /// Go Lan：回家网络配置（go_lan.json）
     pub go_lan: RwLock<super::go_lan::GoLanSettings>,
     /// Go Cus：覆写引擎配置（go_cus.json）
@@ -502,6 +586,8 @@ impl AppState {
             delay_progress: Mutex::new(ProbeProgress::default()),
             aim_progress: Mutex::new(ProbeProgress::default()),
             aim_generation: std::sync::atomic::AtomicU64::new(0),
+            aim_events: Mutex::new(VecDeque::new()),
+            aim_last_error: RwLock::new(None),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
             go_cus: RwLock::new(super::go_cus::load(&data_dir)),
             traffic_history: RwLock::new(VecDeque::new()),
@@ -1151,5 +1237,126 @@ mod app52_tests {
             "当前版本真实结果必须保留"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【APP71 任务6-3】SCREEN 阶段最高 20%：快筛全部完成也不得提前 100%。
+    #[test]
+    fn test_screen_phase_caps_at_20() {
+        let mut progress = ProbeProgress {
+            running: true,
+            phase: "SCREEN".into(),
+            fast_done: 120,
+            fast_total: 120,
+            ..Default::default()
+        };
+        progress.recompute_aim();
+        assert_eq!(progress.percent, 20);
+        assert_eq!(progress.pending_count, 0);
+
+        let mut partial = ProbeProgress {
+            running: true,
+            phase: "SCREEN".into(),
+            fast_done: 6,
+            fast_total: 120,
+            ..Default::default()
+        };
+        partial.recompute_aim();
+        assert!(partial.percent <= 20, "快筛阶段严禁超过 20%");
+    }
+
+    /// 【APP71 任务6-3】DEEP_PROBE 阶段 20%~99%，全部完成才 100%；
+    /// START 阶段固定 1%。
+    #[test]
+    fn test_deep_probe_range_and_finished_100() {
+        let mut progress = ProbeProgress {
+            running: true,
+            phase: "DEEP_PROBE".into(),
+            fast_done: 100,
+            fast_total: 100,
+            full_total: 100,
+            full_done: 40,
+            ..Default::default()
+        };
+        progress.recompute_aim();
+        // 20 + 40*79/100 = 51
+        assert_eq!(progress.percent, 51);
+        assert_eq!(progress.pending_count, 60);
+
+        progress.full_done = 99;
+        progress.recompute_aim();
+        // 20 + 99*79/100 = 20 + 78 = 98：仍有 1 个待检测节点，严禁到 100%。
+        assert_eq!(progress.percent, 98);
+        assert!(progress.percent < 100);
+
+        progress.full_done = 100;
+        progress.phase = "FINISHED".into();
+        progress.recompute_aim();
+        assert_eq!(progress.percent, 100);
+
+        let mut start = ProbeProgress {
+            running: true,
+            phase: "START".into(),
+            full_total: 50,
+            ..Default::default()
+        };
+        start.recompute_aim();
+        assert_eq!(start.percent, 1);
+    }
+
+    /// 【APP71 任务6-2】ERROR / CANCELLED 终态永不超过 99%，且必须带明确原因。
+    #[test]
+    fn test_error_and_cancelled_never_exceed_99() {
+        let mut progress = ProbeProgress {
+            running: true,
+            phase: "DEEP_PROBE".into(),
+            full_total: 10,
+            full_done: 10,
+            ..Default::default()
+        };
+        progress.mark_error("全部节点探测失败（0 存活）");
+        assert!(!progress.running);
+        assert_eq!(progress.phase, "ERROR");
+        assert_eq!(progress.percent, 99);
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("全部节点探测失败（0 存活）")
+        );
+
+        let mut cancelled = ProbeProgress {
+            running: true,
+            phase: "CANCELLED".into(),
+            full_total: 10,
+            full_done: 10,
+            ..Default::default()
+        };
+        cancelled.recompute_aim();
+        assert_eq!(cancelled.percent, 99);
+    }
+
+    /// 【APP71 任务6-5/6】结构化事件字段命名与空值裁剪（camelCase + skip_none）。
+    #[test]
+    fn test_go_aim_event_serialization_contract() {
+        let event = GoAimEvent {
+            run_id: "aim-1a2b3c".into(),
+            sequence: 7,
+            timestamp: 1_700_000_000_000,
+            phase: "NODE_RESULT".into(),
+            node_name: Some("HK-01".into()),
+            slot: Some(2),
+            service: Some("GPT".into()),
+            status: Some("VERIFIED".into()),
+            elapsed_ms: Some(321),
+            message: "节点检测完成".into(),
+            progress: ProbeProgress::default(),
+            details: None,
+        };
+        let value = serde_json::to_value(&event).expect("事件必须可序列化");
+        assert_eq!(value["runId"], "aim-1a2b3c");
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["nodeName"], "HK-01");
+        assert_eq!(value["slot"], 2);
+        assert_eq!(value["elapsedMs"], 321);
+        assert!(value.get("details").is_none(), "None 字段不得序列化");
+        assert!(value.get("progress").is_some(), "进度快照必须随事件下发");
     }
 }

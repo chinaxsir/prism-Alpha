@@ -4360,9 +4360,20 @@ pub async fn run_go_aim_probe(
     mode: Option<crate::core::go_aim::AimProbeMode>,
 ) -> Result<bool, String> {
     if !state.settings.read().go_aim_enabled {
+        // 【APP71】明确回传失败原因，前端显示「Go AIM 功能未启用」而非静默无响应
+        crate::core::go_aim::notify_aim_error(
+            &app,
+            "DISABLED",
+            "Go AIM 功能未启用，请先在仪表盘开启",
+        );
         return Ok(false);
     }
     if !state.is_pro_active() {
+        crate::core::go_aim::notify_aim_error(
+            &app,
+            "NOT_PRO",
+            "Go AIM 是 Pro 专属功能，请先激活授权",
+        );
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
     // 内核未运行时只做真实离线延迟快筛，不猜测任何解锁能力；
@@ -4372,6 +4383,12 @@ pub async fn run_go_aim_probe(
         crate::core::go_aim::start_probe_with_mode(app, mode);
     }
     Ok(already)
+}
+
+/// 【APP71 任务3】Go AIM 全量快照（页面挂载 / 后台唤醒时同步真实状态）。
+#[tauri::command]
+pub fn get_go_aim_snapshot(state: State<'_, AppState>) -> serde_json::Value {
+    crate::core::go_aim::snapshot_dto(&state)
 }
 
 /// 清除 Go AIM 手动指定的锁定节点，回到自动评级选点（APP-4 任务3.3）。
@@ -5081,8 +5098,12 @@ pub async fn export_app_logs(
 /// - 桌面：写入 `Downloads/prism-diagnostic-log.txt`。
 /// 同时把全文返回前端，供剪贴板冗余兜底。
 #[tauri::command]
-pub async fn export_diagnostic_logs(state: State<'_, AppState>) -> Result<String, String> {
-    let text = crate::core::logger::export_diagnostic_text(&state.data_dir);
+pub async fn export_diagnostic_logs(
+    state: State<'_, AppState>,
+    module: Option<String>,
+) -> Result<String, String> {
+    let text =
+        crate::core::logger::export_diagnostic_text_filtered(&state.data_dir, module.as_deref());
 
     #[cfg(target_os = "ios")]
     {

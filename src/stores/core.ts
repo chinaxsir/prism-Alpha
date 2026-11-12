@@ -1,7 +1,12 @@
 import { create } from "zustand";
+import { listen } from "@tauri-apps/api/event";
+import { getGoAimSnapshot } from "@/api/ipc";
 
 import type { Language, ThemePref } from "@/stores/prefs";
 import type {
+  AimNodeResult,
+  GoAimEvent,
+  GoAimSnapshot,
   GoAimStatus,
   GoCusSettings,
   GoLanSettings,
@@ -289,6 +294,15 @@ interface CoreState {
   delayProgress: ProbeProgress;
   /** 【APP54 任务4】Go AIM 探测进度 */
   aimProgress: ProbeProgress;
+  /** 【APP71 任务2.3】最近一条 Go AIM 结构化事件（单节点详情弹窗 / 看板） */
+  aimEvent: GoAimEvent | null;
+  /** 【APP71 任务2.3】最近 30 条事件环形缓冲（页面切回可回放） */
+  aimEvents: GoAimEvent[];
+  /** 【APP71 任务2.3】当前活跃 runId 与已接收最大 sequence（去重游标） */
+  aimRunId: string | null;
+  aimSequence: number;
+  /** 【APP71】最近一次明确失败原因（0 存活 / 未启用 / 未激活） */
+  aimLastError: string | null;
   setGoAimStatus: (s: GoAimStatus | null) => void;
   setGoLanSettings: (s: GoLanSettings | null) => void;
   setGoCusSettings: (s: GoCusSettings | null) => void;
@@ -299,6 +313,10 @@ interface CoreState {
   retainNodeDelays: (validNames: string[]) => void;
   setDelayProgress: (p: ProbeProgress) => void;
   setAimProgress: (p: ProbeProgress) => void;
+  /** 【APP71 任务2.3】应用一条结构化事件（runId + sequence 去重，丢弃迟到旧事件） */
+  applyAimEvent: (ev: GoAimEvent) => void;
+  /** 【APP71 任务3】应用一次性快照（页面挂载 / 后台唤醒同步） */
+  applyAimSnapshot: (snap: GoAimSnapshot) => void;
 }
 
 // 环形缓冲：仅保留最近 60 个采样点（1 分钟）
@@ -456,6 +474,11 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   nodeDelays: loadNodeMetricsMirror().delays,
   delayProgress: { running: false, done: 0, total: 0, percent: 0, unlockedCount: 0 },
   aimProgress: { running: false, done: 0, total: 0, percent: 0, unlockedCount: 0 },
+  aimEvent: null,
+  aimEvents: [],
+  aimRunId: null,
+  aimSequence: 0,
+  aimLastError: null,
   setGoAimStatus: (goAimStatus) => set({ goAimStatus }),
   setGoLanSettings: (goLanSettings) => set({ goLanSettings }),
   setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
@@ -484,7 +507,118 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   },
   setDelayProgress: (delayProgress) => set({ delayProgress }),
   setAimProgress: (aimProgress) => set({ aimProgress }),
+
+  // 【APP71 任务2.3】严格按 (runId, sequence) 去重：旧 runId 的迟到事件、
+  // 同一 runId 的重复/乱序事件一律丢弃，绝不回退进度或覆盖新结果。
+  applyAimEvent: (ev) => {
+    const state = get();
+    const currentRun = state.aimRunId;
+    if (currentRun && ev.runId !== currentRun) {
+      const newer = aimRunIdNum(ev.runId) > aimRunIdNum(currentRun);
+      if (ev.phase === "START") {
+        if (!newer) return;
+      } else if (ev.phase === "ERROR") {
+        // 运行中的旧错误不得覆盖新会话；非运行态只接受更新的独立失败事件
+        if (!newer || state.aimProgress.running) return;
+      } else {
+        return; // 旧 run 的迟到进度 / 结果事件
+      }
+    } else if (currentRun === ev.runId && ev.sequence <= state.aimSequence) {
+      return;
+    }
+    const patch: Partial<CoreState> = {
+      aimProgress: ev.progress,
+      aimEvent: ev,
+      aimRunId: ev.runId,
+      aimSequence: ev.sequence,
+      aimEvents: [...state.aimEvents, ev].slice(-30),
+    };
+    if (ev.phase === "ERROR") {
+      patch.aimLastError = ev.message;
+    } else if (ev.phase === "START") {
+      patch.aimLastError = null;
+    }
+    // NODE_RESULT 携带单节点完整结果：直接合并到状态缓存，无需再拉全量
+    if (ev.phase === "NODE_RESULT" && ev.details) {
+      const result = ev.details as AimNodeResult;
+      const current = state.goAimStatus;
+      if (current && result?.nodeName) {
+        patch.goAimStatus = {
+          ...current,
+          results: { ...current.results, [result.nodeName]: result },
+        };
+      }
+    }
+    set(patch);
+  },
+
+  // 【APP71 任务3】快照同步：页面首次挂载 / 后台唤醒 / visibilitychange 时拉取，
+  // 与事件流合并后进度、事件、结果完全一致，彻底消除 listen 注册前的丢包。
+  applyAimSnapshot: (snap) => {
+    if (!snap) return;
+    const events = Array.isArray(snap.events) ? snap.events.slice(-30) : [];
+    const last = events.length > 0 ? events[events.length - 1] : null;
+    const runId = snap.progress?.runId || last?.runId || null;
+    const sequence = Math.max(snap.progress?.sequence ?? 0, last?.sequence ?? 0);
+    const patch: Partial<CoreState> = {
+      aimProgress: snap.progress,
+      aimEvents: events,
+      aimEvent: last,
+      aimRunId: runId,
+      aimSequence: sequence,
+      aimLastError: snap.lastError ?? null,
+    };
+    const current = get().goAimStatus;
+    if (current) {
+      patch.goAimStatus = {
+        ...current,
+        enabled: snap.enabled,
+        probing: snap.probing,
+        pinnedNode: snap.pinnedNode,
+        lockedNode: snap.bestNode ?? current.lockedNode,
+        results: snap.results ?? current.results,
+      };
+    }
+    set(patch);
+  },
 }));
+
+/** 【APP71】runId 内嵌毫秒时间戳（aim-xxxxxxxx），按数值比较新旧。 */
+function aimRunIdNum(runId: string): number {
+  const parsed = Number.parseInt(runId.replace(/^aim-/, ""), 16);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// 【APP71 任务2.3】Go AIM 事件监听单例：整个 APP 生命周期只注册一次，
+// 任意页面挂载/卸载都不会重复监听或漏接事件。
+let aimListenersReady: Promise<void> | null = null;
+
+/** 注册 `go-aim://event` 与兼容 `aim://progress` 监听（幂等）。 */
+export function ensureAimListenersRegistered(): Promise<void> {
+  if (aimListenersReady) return aimListenersReady;
+  aimListenersReady = (async () => {
+    await listen<GoAimEvent>("go-aim://event", (e) => {
+      if (e.payload) useCoreStore.getState().applyAimEvent(e.payload);
+    });
+    await listen<ProbeProgress>("aim://progress", (e) => {
+      if (e.payload) useCoreStore.getState().setAimProgress(e.payload);
+    });
+  })().catch((err) => {
+    aimListenersReady = null;
+    throw err;
+  });
+  return aimListenersReady;
+}
+
+/** 拉取并应用一次 Go AIM 全量快照（页面挂载 / 回到前台时调用）。 */
+export async function syncAimSnapshot(): Promise<void> {
+  try {
+    const snap = await getGoAimSnapshot();
+    useCoreStore.getState().applyAimSnapshot(snap);
+  } catch {
+    // Tauri IPC 不可用（纯浏览器预览）时静默，不影响页面渲染
+  }
+}
 
 /**
  * 【APP33 任务3.2】信息/广告类假节点名称识别（前端版，与后端

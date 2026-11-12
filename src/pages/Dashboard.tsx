@@ -33,7 +33,12 @@ import {
   isGoLanConfigured,
   type GoLanStatus,
 } from "@/api/ipc";
-import { useCoreStore, isDummyNodeName } from "@/stores/core";
+import {
+  useCoreStore,
+  isDummyNodeName,
+  ensureAimListenersRegistered,
+  syncAimSnapshot,
+} from "@/stores/core";
 import { useProStore } from "@/stores/pro";
 import { useTranslation } from "@/i18n";
 import { useAppVisible } from "@/hooks/useAppVisible";
@@ -221,6 +226,18 @@ export default function Dashboard() {
       unSubs.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 【APP71 任务3】Go AIM 快照同步：挂载与回前台时对齐真实进度 / 结果，
+  // 与 go-aim://event 事件流合并后不会出现「进度停在中途 / 结果缺失」。
+  useEffect(() => {
+    void ensureAimListenersRegistered().catch(() => undefined);
+    void syncAimSnapshot();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void syncAimSnapshot();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // 本地运行时长时钟（IPA-12）：禁止每秒 +1 计数器（锁屏/切后台时

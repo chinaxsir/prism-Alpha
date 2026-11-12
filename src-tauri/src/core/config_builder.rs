@@ -148,6 +148,39 @@ pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
     "ctrip.com", "12306.cn", "didiglobal.com", "didichuxing.com",
     "apple.com", "icloud.com", "icloud.com.cn", "icloud-content.com", "mzstatic.com",
     "cdn-apple.com", "aaplimg.com",
+    // 【APP71 任务7】扩充：主流非 .cn 后缀的大陆服务 / CDN / 云厂商域名。
+    // iOS 扩展剥离 geosite.db 后，未命中该名单的大陆站点会掉进策略组，
+    // 经海外节点回源导致首包数秒延迟；补齐后域名级直接判定 → direct，
+    // 零额外解析、零额外探测。本清单与 PacketTunnelProvider.swift 中
+    // cnDirectDomainSuffixes 必须保持 100% 同步（顺序也需一致）。
+    // 百度生态
+    "baiducontent.com", "bdimg.com", "bdurl.net", "baidustatic.com",
+    "bcebos.com", "yunjiasu-cdn.net", "baifubao.com",
+    // 腾讯生态扩展
+    "weixin.com", "foxmail.com", "tencent.cn", "tencent-cloud.com",
+    "qcloud.com", "qcloudimg.com", "tencentcloudapi.com",
+    "tencentmusic.com", "qqmusic.com", "kugou.com", "kuwo.cn", "weiyun.com",
+    "dnspod.cn", "dnspod.com",
+    // 阿里生态扩展
+    "alibabacloud.com", "aliyuncdn.com", "aliuser.com", "cnzz.com", "umeng.com",
+    "alipay-eco.com",
+    // 字节生态扩展
+    "ixigua.com", "douyinvod.com", "douyinstatic.com", "amemv.com", "feishucdn.com",
+    // 网易生态扩展
+    "netease.im", "youdao.com", "163yun.com", "neteasegames.com", "lofter.com",
+    // 门户 / 视频 / 音乐
+    "sina.cn", "sina.com", "sohu.com", "ifeng.com",
+    "iqiyi.com", "qiyi.com", "qy.net", "mgtv.com", "pptv.com", "letv.com", "le.com",
+    // 社区 / 生活 / 出行 / 招聘 / 电商扩展
+    "douban.com", "doubanio.com", "58.com", "anjuke.com", "lianjia.com", "ke.com",
+    "zhaopin.com", "51job.com", "zhipin.com", "bosszhipin.com", "lagou.com",
+    "ele.me", "elemecdn.com", "smzdm.com", "hupu.com",
+    "qunar.com", "ly.com", "tuniu.com", "autonavi.com",
+    "sf-express.com", "unionpay.com", "unionpaysecure.com", "21cn.com",
+    // 对象存储 / 云 CDN
+    "qiniu.com", "qiniucdn.com", "qnssl.com", "clouddn.com", "upyun.com",
+    // 开发 / 工具
+    "cnblogs.com", "51cto.com", "chinaz.com", "runoob.com",
 ];
 
 /// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段。
@@ -170,6 +203,18 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     "114.115.0.0/16", "121.36.0.0/16", "122.112.0.0/16", "139.9.0.0/16",
     "111.13.0.0/16", "119.3.0.0/16", "180.101.0.0/16", "210.22.0.0/16",
     "58.216.0.0/16", "221.204.0.0/16",
+    // 【APP71 任务7】补充：大陆公有云确定归属网段（不含海外区域与私网段）。
+    // 仅用于 geosite/geoip 规则缺失时按目标 IP 兜底直连，收敛大陆站点
+    // 首包绕行海外节点的延迟；与 Swift cnDirectCIDRs 100% 同步。
+    // 阿里云北京 / 杭州 / 青岛
+    "39.96.0.0/13", "101.200.0.0/16", "118.178.0.0/16",
+    "120.55.0.0/16", "121.43.0.0/16", "123.57.0.0/16",
+    // 腾讯云华南 / 华东
+    "81.68.0.0/14",
+    // 百度云北京
+    "106.12.0.0/14",
+    // UCloud 上海
+    "106.75.0.0/16",
 ];
 
 pub struct BuiltConfig {

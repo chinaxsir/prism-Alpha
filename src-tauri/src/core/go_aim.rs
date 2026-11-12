@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
 /// 【APP67】当前 Go AIM 检测引擎版本号：升级后旧版"假解锁"缓存
@@ -34,6 +35,14 @@ pub const CURRENT_AIM_RULE_VERSION: u32 = 3;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
+/// 【APP71 任务2.1】结构化实时事件流（携带 runId + sequence + ProbeProgress）
+pub const AIM_EVENT_STRUCTURED: &str = "go-aim://event";
+/// 【APP71 任务3】快照保留的最近结构化事件条数
+pub const AIM_RECENT_EVENTS: usize = 30;
+/// 【APP71 任务2.3】SCREEN 事件节流：每完成 2 个节点或 120ms 发射一次
+const SCREEN_EMIT_NODES: usize = 2;
+const SCREEN_EMIT_INTERVAL_MS: u64 = 120;
+
 
 /// 探测槽位数（与 config_builder 注入的探针入站/选择组数量严格一致）
 pub const PROBE_SLOTS: usize = 4;
@@ -423,6 +432,17 @@ impl ProbeVerdict {
     fn is_verified(self) -> bool {
         matches!(self, ProbeVerdict::Verified)
     }
+
+    /// 【APP71】五态可读标签（写入证据级详情，供前端核对判定依据）
+    fn label(self) -> &'static str {
+        match self {
+            ProbeVerdict::Verified => "VERIFIED",
+            ProbeVerdict::Accessible => "ACCESSIBLE",
+            ProbeVerdict::Partial => "PARTIAL",
+            ProbeVerdict::Blocked => "BLOCKED",
+            ProbeVerdict::Unknown => "UNKNOWN",
+        }
+    }
 }
 
 /// 【APP68】检查状态：供后续分阶段 UI 使用；FAST 绝不冒充 Passed。
@@ -456,6 +476,16 @@ pub struct ServiceProbeResult {
     pub evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    // ---- 【APP71 任务4】证据级详情字段（旧缓存缺失时自动补默认值）----
+    /// 单平台请求实际耗时（含重试）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    /// 补测次数（仅 Unknown 会补测 1 次）
+    #[serde(default)]
+    pub retry_count: u32,
+    /// 最终判定依据（可读文本，便于用户核对）
+    #[serde(default)]
+    pub verdict_basis: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -551,21 +581,56 @@ fn is_running(state: &AppState) -> bool {
 
 // ---------------------------------------------------------------- 探测实现
 
-/// 【APP68】RAII 运行守卫：正常完成、取消或 panic 都复位运行标志与进度。
-struct ProbeRunGuard(AppHandle);
+/// 【APP68/APP71】RAII 运行守卫：正常完成、取消或 panic 都复位运行标志与进度；
+/// 未走终态时补发 CANCELLED 事件与 [AIM-21] 日志，前端绝不永久转圈。
+struct ProbeRunGuard {
+    app: AppHandle,
+    run: Arc<AimRunCtx>,
+    terminal: std::sync::atomic::AtomicBool,
+}
+
+impl ProbeRunGuard {
+    fn new(app: AppHandle, run: Arc<AimRunCtx>) -> Self {
+        Self {
+            app,
+            run,
+            terminal: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 主流程已发射 FINISHED / ERROR / CANCELLED 后调用，Drop 不再重复补发。
+    fn mark_terminal(&self) {
+        self.terminal.store(true, Ordering::Release);
+    }
+}
 
 impl Drop for ProbeRunGuard {
     fn drop(&mut self) {
-        let state = self.0.state::<AppState>();
+        let state = self.app.state::<AppState>();
         state.aim_probing.store(false, Ordering::Release);
-        {
+        if !self.terminal.load(Ordering::Acquire) {
+            self.run.log(
+                21,
+                "WARN",
+                AimLogMeta::default(),
+                "检测任务结束: status=CANCELLED（Go AIM 关闭 / VPN 停止 / 任务中止）",
+            );
+            let _ = self.run.emit(
+                &self.app,
+                "CANCELLED",
+                &AimLogMeta::default(),
+                Some("CANCELLED"),
+                "Go AIM 检测已中止",
+                None,
+            );
+        } else {
             let mut progress = state.aim_progress.lock();
             progress.running = false;
             let snapshot = progress.clone();
             drop(progress);
-            let _ = self.0.emit("aim://progress", &snapshot);
+            let _ = self.app.emit("aim://progress", &snapshot);
         }
-        let _ = self.0.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
+        let _ = self.app.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
     }
 }
 
@@ -590,39 +655,165 @@ pub fn start_probe(app: AppHandle) {
         return;
     }
     LAST_AUTO_PROBE_SECS.store(now, Ordering::Release);
-    start_probe_with_mode(app, None);
+    start_probe_inner(app, None, "auto");
 }
 
 /// 【APP68】启动 FAST / FULL / SELECTED 或默认自动分级探测。
 /// 用户手动触发同样刷新冷却基准，避免紧接其后再自动跑一轮。
 pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
+    start_probe_inner(app, mode, "manual");
+}
+
+/// 【APP71 任务2.5】被拒绝的探测请求也必须留下明确的 ERROR 事件与日志，
+/// 前端绝不无反馈地停在旧进度（功能未启用 / 未激活 / 正在运行）。
+pub fn notify_aim_error(app: &AppHandle, status: &str, message: &str) {
+    let run = AimRunCtx::new();
+    run.log(
+        21,
+        "WARN",
+        AimLogMeta::default(),
+        format!("检测任务结束: status=ERROR（{status}）: {message}"),
+    );
+    let _ = run.emit(
+        app,
+        "ERROR",
+        &AimLogMeta::default(),
+        Some(status),
+        message,
+        None,
+    );
+}
+
+/// 【APP71 任务3】Go AIM 全量快照：进度 + 最近 30 条结构化事件 + 结果 +
+/// 最优节点 + 最近错误。页面挂载 / 后台唤醒时一次性同步，杜绝事件丢包。
+pub fn snapshot_dto(state: &AppState) -> serde_json::Value {
+    let progress = state.aim_progress.lock().clone();
+    let events: Vec<crate::core::state::GoAimEvent> =
+        state.aim_events.lock().iter().cloned().collect();
+    let results = state.aim_results.read().clone();
+    let best = pick_best(&results).map(|r| r.node_name);
+    let settings = state.settings.read();
+    serde_json::json!({
+        "progress": progress,
+        "events": events,
+        "results": results,
+        "bestNode": best,
+        "lastError": state.aim_last_error.read().clone(),
+        "enabled": settings.go_aim_enabled,
+        "probing": state.aim_probing.load(Ordering::Acquire),
+        "pinnedNode": settings.go_aim_pinned_node.clone(),
+    })
+}
+
+fn aim_mode_label(mode: Option<AimProbeMode>) -> &'static str {    match mode {
+        Some(AimProbeMode::Fast) => "FAST",
+        Some(AimProbeMode::Full) => "FULL",
+        Some(AimProbeMode::Selected) => "SELECTED",
+        None => "AUTO",
+    }
+}
+
+/// 【APP71 任务2.2】统一启动入口：生成 runId、发射 START、终态兜底。
+fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) {
     LAST_AUTO_PROBE_SECS.store(now_secs(), Ordering::Release);
+    let run = AimRunCtx::new();
+    let empty_meta = AimLogMeta::default();
+    // [AIM-01] 收到请求
+    run.log(
+        1,
+        "INFO",
+        empty_meta.clone(),
+        format!(
+            "收到 Go AIM 检测请求: runId={}, mode={}, trigger={trigger}",
+            run.run_id,
+            aim_mode_label(mode)
+        ),
+    );
+
     let state = app.state::<AppState>();
+    // [AIM-02] 开关 / Pro 状态
+    let enabled = state.settings.read().go_aim_enabled;
+    let pro = state.is_pro_active();
+    run.log(
+        2,
+        "INFO",
+        empty_meta.clone(),
+        format!("检查 Go AIM 开关状态: enabled={enabled}, pro={pro}"),
+    );
     // APP34：Go AIM 未开启时严禁触发全量探测。148 个节点并发真实 HTTP
     // 探测会在 iOS 扩展进程内瞬间冲顶 50MB Jetsam 硬红线，导致隧道被
     // 系统强杀（表现为「启动一会儿自动停止」）。手动触发/启动钩子/
     // 订阅刷新等所有入口都必须先过这道硬闸。
-    if !state.settings.read().go_aim_enabled {
+    if !enabled {
         tracing::debug!("[go-aim] Go AIM 未开启，跳过全量探测");
+        let msg = "Go AIM 功能未启用，请先在仪表盘开启";
+        run.log(
+            21,
+            "WARN",
+            empty_meta.clone(),
+            "检测任务结束: status=ERROR（功能未启用）",
+        );
+        let _ = run.emit(
+            &app,
+            "ERROR",
+            &empty_meta,
+            Some("DISABLED"),
+            msg,
+            None,
+        );
         return;
     }
+    // [AIM-04] 在途任务 / 代数
+    let prev_running = state.aim_probing.load(Ordering::Acquire);
+    let generation = state.aim_generation.load(Ordering::Acquire);
+    run.log(
+        4,
+        "INFO",
+        empty_meta.clone(),
+        format!("检查在途探测任务: prev_running={prev_running}, generation={generation}"),
+    );
     // 【APP54 任务2】防重复：swap 返回 true 表示上一轮仍在进行，直接跳过；
     // 返回 false 表示刚抢到执行权，继续启动本轮探测。
     if state.aim_probing.swap(true, Ordering::AcqRel) {
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
+        let msg = "已有 Go AIM 检测任务在运行，请稍候";
+        run.log(
+            21,
+            "WARN",
+            empty_meta.clone(),
+            "检测任务结束: status=ERROR（重复触发）",
+        );
+        let _ = run.emit(&app, "ERROR", &empty_meta, Some("BUSY"), msg, None);
         return;
     }
     // 预览模式（内核未运行）只做离线 TCP/TLS 基线测速，不生成任何解锁标签；
     // 内核运行时走真实隧道出口预检与 AI / 流媒体独立业务探测。
+    {
+        let mut p = state.aim_progress.lock();
+        *p = crate::core::state::ProbeProgress {
+            running: true,
+            phase: "START".into(),
+            run_id: run.run_id.clone(),
+            ..Default::default()
+        };
+        p.recompute_aim();
+    }
+    let _ = run.emit(
+        &app,
+        "START",
+        &empty_meta,
+        Some("START"),
+        "Go AIM 检测已启动",
+        None,
+    );
     drop(state);
 
     tauri::async_runtime::spawn(async move {
-        let _run_guard = ProbeRunGuard(app.clone());
+        let guard = ProbeRunGuard::new(app.clone(), run.clone());
         let state = app.state::<AppState>();
-        let mut completed = false;
-        match probe_all(&app, &state, mode).await {
+        let outcome = probe_all(&app, &state, mode, &run).await;
+        match outcome {
             Ok(count) => {
-                completed = true;
                 // 【APP37 任务3.2】探测只被「Go AIM 开关关闭 / VPN 停止」
                 // 中止；完成日志必须携带参与评级总数与最优节点。
                 let best = pick_best(&state.aim_results.read())
@@ -648,14 +839,38 @@ pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
                     }
                     state.record_aim_results(&snapshot, best_node.as_deref());
                 }
+                // [AIM-18] 缓存持久化
+                let (cache_hits, updated, version) = {
+                    let p = state.aim_progress.lock();
+                    (p.cache_hits, state.aim_results.read().len(), CURRENT_AIM_PROBE_VERSION)
+                };
+                run.log(
+                    18,
+                    "INFO",
+                    AimLogMeta::default(),
+                    format!(
+                        "缓存持久化完成: updated={updated}, cache_hits={cache_hits}, probe_version={version}"
+                    ),
+                );
                 tracing::info!(
                     "[go-aim] 全量真实探测完成，共 {count} 个节点参与评级，最优节点: {best}"
+                );
+                // [AIM-19] 最优节点
+                let (best_score, best_delay) = pick_best(&state.aim_results.read())
+                    .map(|r| (r.score, r.delay_ms))
+                    .unwrap_or((0, 0));
+                run.log(
+                    19,
+                    "INFO",
+                    AimLogMeta::default(),
+                    format!("最优节点: {best}, score={best_score}, delay={best_delay}ms"),
                 );
                 // 【APP6 任务1】[GoAim] 模块日志
                 crate::core::logger::info(
                     crate::core::logger::MOD_GO_AIM,
                     &format!("AIM 全量探测完成，共 {count} 个节点参与评级，最优节点: {best}"),
                 );
+                let mut lock_mode = "SKIPPED";
                 if mode != Some(AimProbeMode::Fast)
                     && state.settings.read().go_aim_enabled
                     && is_running(&state)
@@ -666,25 +881,82 @@ pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
                             crate::core::logger::MOD_GO_AIM,
                             &format!("锁定节点选择失败: {e}"),
                         );
+                        lock_mode = "FAILED";
+                    } else {
+                        lock_mode = if state.settings.read().go_aim_pinned_node.is_some() {
+                            "MANUAL_KEPT"
+                        } else {
+                            "AUTO_LOCKED"
+                        };
                     }
                 }
+                // [AIM-20] 锁定状态
+                let active = state
+                    .settings
+                    .read()
+                    .selected_node
+                    .clone()
+                    .unwrap_or_else(|| "无".to_string());
+                run.log(
+                    20,
+                    "INFO",
+                    AimLogMeta::default(),
+                    format!("锁定状态: mode={lock_mode}, active_node={active}"),
+                );
+                // 只有正常完成才允许 100%
+                {
+                    let mut p = state.aim_progress.lock();
+                    p.done = p.total;
+                    p.pending_count = 0;
+                }
+                if count == 0 {
+                    // [AIM-21] 零存活：明确 ERROR，绝不显示 100%/成功
+                    let msg = "本轮 0 个节点存活，探测结束（可能节点全部失效或网络不可用）";
+                    run.log(
+                        21,
+                        "ERROR",
+                        AimLogMeta::default(),
+                        "检测任务结束: status=ERROR（0 存活节点）",
+                    );
+                    let _ = run.emit(&app, "ERROR", &AimLogMeta::default(), Some("NO_ALIVE_NODES"), msg, None);
+                } else {
+                    run.log(
+                        21,
+                        "INFO",
+                        AimLogMeta::default(),
+                        format!("检测任务结束: status=FINISHED, rated={count}, elapsed={}ms", run.elapsed_ms()),
+                    );
+                    let _ = run.emit(
+                        &app,
+                        "FINISHED",
+                        &AimLogMeta::default(),
+                        Some("FINISHED"),
+                        format!("检测完成，共 {count} 个节点参与评级"),
+                        None,
+                    );
+                }
             }
-            Err(e) => tracing::warn!("[go-aim] 探测中止: {e}"),
-        }
-        // 只有正常完成才允许 100%；取消/报错由 RAII 守卫复位 running，
-        // 但保留真实完成百分比，绝不把失败伪装成全部检测成功。
-        {
-            let mut p = state.aim_progress.lock();
-            if p.running && completed {
-                p.running = false;
-                p.done = p.total;
-                p.pending_count = 0;
-                p.percent = 100;
-                let snapshot = p.clone();
-                drop(p);
-                let _ = app.emit("aim://progress", &snapshot);
+            Err(e) => {
+                tracing::warn!("[go-aim] 探测中止: {e}");
+                let cancelled = e.contains("中止") || e.contains("取消");
+                let phase = if cancelled { "CANCELLED" } else { "ERROR" };
+                run.log(
+                    21,
+                    if cancelled { "WARN" } else { "ERROR" },
+                    AimLogMeta::default(),
+                    format!("检测任务结束: status={phase}, reason={e}"),
+                );
+                let _ = run.emit(
+                    &app,
+                    phase,
+                    &AimLogMeta::default(),
+                    Some(phase),
+                    e,
+                    None,
+                );
             }
         }
+        guard.mark_terminal();
     });
 }
 
@@ -734,10 +1006,21 @@ async fn probe_all(
     app: &AppHandle,
     state: &AppState,
     mode: Option<AimProbeMode>,
+    run: &Arc<AimRunCtx>,
 ) -> Result<usize, String> {
     let started = std::time::Instant::now();
     let api = state.kernel_api();
     let preview_mode = !is_running(state);
+    // [AIM-03] 内核运行状态（预览模式 = 仅离线测速，不产生解锁标签）
+    run.log(
+        3,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "检查内核运行状态: running={}, preview_mode={preview_mode}",
+            !preview_mode
+        ),
+    );
     // 必须在阶段一占位结果覆盖内存前保存上一轮完整结果，否则缓存永远无法命中。
     let cached_results = Arc::new(state.aim_results.read().clone());
     let node_ids = Arc::new(load_node_identities(&state.data_dir));
@@ -810,6 +1093,28 @@ async fn probe_all(
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
+    // [AIM-05] 节点列表加载完成 / [AIM-06] 节点总数
+    run.log(
+        5,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "节点列表加载完成: count={}, source={}",
+            nodes.len(),
+            if preview_mode { "subscription_cache" } else { "clash_api" }
+        ),
+    );
+    run.log(
+        6,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "本轮节点总数: {}, mode={}, generation={}",
+            nodes.len(),
+            aim_mode_label(mode),
+            state.aim_generation.load(Ordering::Acquire)
+        ),
+    );
     // 节点被删除时精准淘汰对应缓存；旧完整结果已另行保存在 cached_results 中。
     let current_names: std::collections::HashSet<&str> =
         nodes.iter().map(|(name, _)| name.as_str()).collect();
@@ -818,19 +1123,36 @@ async fn probe_all(
         .write()
         .retain(|name, _| current_names.contains(name.as_str()));
     // 【APP54 任务4】初始化 Go AIM 进度（全部节点 100% 全量纳入统计）
+    // 【APP71】保留 START 阶段写入的 runId，切换到 SCREEN 阶段，禁止整体重置。
     {
         let mut p = state.aim_progress.lock();
-        *p = crate::core::state::ProbeProgress::default();
         p.running = true;
+        p.phase = "SCREEN".into();
+        p.run_id = run.run_id.clone();
         p.total = nodes.len();
         p.fast_total = nodes.len();
+        p.fast_done = 0;
+        p.fast_alive = 0;
+        p.failed_count = 0;
         p.pending_count = nodes.len();
         p.recompute_aim();
         p.elapsed_ms = started.elapsed().as_millis() as u64;
-        let snapshot = p.clone();
-        drop(p);
-        let _ = app.emit("aim://progress", &snapshot);
     }
+    // [AIM-07] 快筛开始
+    run.log(
+        7,
+        "INFO",
+        AimLogMeta::default(),
+        format!("阶段一快筛开始: concurrency={SCREEN_BATCH_SIZE}, total={}", nodes.len()),
+    );
+    let _ = run.emit(
+        app,
+        "SCREEN",
+        &AimLogMeta::default(),
+        Some("SCREEN"),
+        format!("阶段一极速存活快筛开始，共 {} 个节点", nodes.len()),
+        None,
+    );
     // 【APP37 任务3.2】严禁任何 .take/.truncate 节点截断：全部有效真实
     // 节点（148+ 个）必须 100% 纳入探测队列。
 
@@ -901,6 +1223,7 @@ async fn probe_all(
             {
                 return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
             }
+            let alive_now = matches!(delay, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS);
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
                     alive.push((name.clone(), d));
@@ -938,16 +1261,43 @@ async fn probe_all(
                     );
                 }
             }
+            // [AIM-08] 单节点快筛结果
+            run.log(
+                8,
+                "INFO",
+                AimLogMeta::default()
+                    .node(&name)
+                    .elapsed(delay.unwrap_or(0)),
+                format!(
+                    "快筛节点结果: {} ({}ms)",
+                    if alive_now { "ALIVE" } else { "DEAD" },
+                    delay.unwrap_or(0)
+                ),
+            );
             // 【APP54 任务4 / APP67 P4】阶段1 每完成一个节点 → 进度 +1。
-            // 阶段1 仅占总进度前 20%（封顶 20%，done 不等于 total 时也不到 100%）。
-            {
+            // 阶段1 仅占总进度前 20%；【APP71】事件按 2 节点/120ms 节流，
+            // 避免 100+ 节点高频事件洪峰拖垮前端与 iOS 扩展。
+            let (fast_done, fast_total, fast_alive) = {
                 let mut p = state.aim_progress.lock();
                 p.fast_done += 1;
+                if alive_now {
+                    p.fast_alive += 1;
+                } else {
+                    p.failed_count += 1;
+                }
                 p.recompute_aim();
                 p.elapsed_ms = started.elapsed().as_millis() as u64;
-                let snapshot = p.clone();
-                drop(p);
-                let _ = app.emit("aim://progress", &snapshot);
+                (p.fast_done, p.fast_total, p.fast_alive)
+            };
+            if run.should_emit_screen() {
+                let _ = run.emit(
+                    app,
+                    "SCREEN",
+                    &AimLogMeta::default(),
+                    Some("SCREEN"),
+                    format!("阶段一快筛 {fast_done}/{fast_total}，存活 {fast_alive}"),
+                    None,
+                );
             }
         }
     }
@@ -962,6 +1312,18 @@ async fn probe_all(
         return Err("阶段1 快筛后无存活节点".into());
     }
     tracing::info!("[go-aim] 阶段1 快筛完成：{} 个节点存活", alive.len());
+    // [AIM-09] 快筛结束
+    run.log(
+        9,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "阶段一快筛结束: alive={}, dead={}, elapsed={}ms",
+            alive.len(),
+            nodes.len().saturating_sub(alive.len()),
+            run.elapsed_ms()
+        ),
+    );
 
     // 【APP68】显式 FAST：只输出真实延迟与 Fast 模式，不发起平台请求、
     // 不产生 Verified 标签，也不改变用户当前节点选择。
@@ -1081,6 +1443,17 @@ async fn probe_all(
     // 3. 探针槽位可用性检测：只使用本机实际可连通的探针入站。
     // 若扩展配置裁剪掉了探针入站，宁可明确失败也绝不用主混合端口兜底——
     // 经主选择器探测会污染用户当前节点，并产出错误的解锁徽章。
+    // [AIM-10] 阶段二深测开始
+    run.log(
+        10,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "阶段二深度探测开始: alive={alive_count}, ports={}..{}",
+            PROBE_PORT_BASE,
+            PROBE_PORT_BASE + PROBE_SLOTS as u16 - 1
+        ),
+    );
     let slots: Vec<usize> = (0..PROBE_SLOTS)
         .filter(|slot| probe_port_reachable(PROBE_PORT_BASE + *slot as u16))
         .collect();
@@ -1090,6 +1463,13 @@ async fn probe_all(
             PROBE_PORT_BASE + PROBE_SLOTS as u16 - 1
         ));
     }
+    // [AIM-11] 槽位端口检查
+    run.log(
+        11,
+        "INFO",
+        AimLogMeta::default(),
+        format!("探针槽位检查完成: available={slots:?}"),
+    );
     tracing::info!("[go-aim] 可用探针槽位: {slots:?}");
 
     // 4. 【APP49 任务3】阶段2 开始前一次性预建全部槽位探针客户端
@@ -1117,6 +1497,16 @@ async fn probe_all(
     if slot_clients.is_empty() {
         return Err("全部探针客户端构建失败".into());
     }
+    // [AIM-12] 探测客户端初始化
+    run.log(
+        12,
+        "INFO",
+        AimLogMeta::default(),
+        format!(
+            "探测客户端初始化完成: clients={}, timeout={PROBE_TIMEOUT_MS}ms",
+            slot_clients.len()
+        ),
+    );
 
     // 【APP67 BUG-04】预取本机直连公网 IP（不经代理），用于防漏直连判定：
     // 若某节点出口 IP 与本机直连 IP 一致，说明代理隧道未生效，立即短路。
@@ -1148,18 +1538,28 @@ async fn probe_all(
     let direct_ip = Arc::new(direct_ip);
 
     // 【APP67 P4】阶段2 进度初始化：total 设为存活节点数，done 归零，
-    // percent 从 20% 起步，每完成一个存活节点 +80/alive_count。
+    // percent 从 20% 起步，每完成一个存活节点 +79/alive_count（封顶 99%）。
     {
         let mut p = state.aim_progress.lock();
+        p.phase = "DEEP_PROBE".into();
+        p.run_id = run.run_id.clone();
         p.full_total = alive_count;
         p.full_done = 0;
         p.cache_hits = 0;
+        p.active_slots = slot_clients.len();
+        p.current_services.clear();
+        p.error_message = None;
         p.recompute_aim();
         p.elapsed_ms = started.elapsed().as_millis() as u64;
-        let snapshot = p.clone();
-        drop(p);
-        let _ = app.emit("aim://progress", &snapshot);
     }
+    let _ = run.emit(
+        app,
+        "DEEP_PROBE",
+        &AimLogMeta::default(),
+        Some("DEEP_PROBE"),
+        format!("阶段二深度探测开始，存活节点 {alive_count} 个，并发槽位 {}", slot_clients.len()),
+        None,
+    );
 
     // 5. 共享任务队列（延迟升序）：可用槽位并行消费，任一槽位空闲即取
     // 下一个节点（等价于每批 4 个节点的滚动并发）。前 PROBE_SLOTS 个
@@ -1187,6 +1587,7 @@ async fn probe_all(
         let node_ids = node_ids.clone();
         let controller = controller.clone();
         let generation = generation;
+        let run = run.clone();
         set.spawn(async move {
             let app = task_app;
             let mut done = 0usize;
@@ -1208,6 +1609,16 @@ async fn probe_all(
                 let Some((name, delay, first_batch)) = next else { break };
                 let node_id = node_ids.get(&name).cloned().unwrap_or_default();
                 let cached = cached_results.get(&name);
+                // [AIM-13] 节点进入检测队列
+                run.log(
+                    13,
+                    "DEBUG",
+                    AimLogMeta::default().node(&name).slot(slot),
+                    format!(
+                        "节点进入检测队列: delay={delay}ms, cached={}",
+                        cached.is_some()
+                    ),
+                );
                 let mut probe = Box::pin(probe_node(
                     &api,
                     &client,
@@ -1220,6 +1631,8 @@ async fn probe_all(
                     cached,
                     result_mode,
                     force_full,
+                    &run,
+                    &app,
                 ));
                 // 探针 future 可被直接 drop：取消响应不等待最慢平台请求超时。
                 let outcome = loop {
@@ -1265,6 +1678,52 @@ async fn probe_all(
                 let _ = app.emit(
                     AIM_EVENT,
                     serde_json::json!({ "name": result.node_name, "result": result.clone() }),
+                );
+                // [AIM-17] 单节点汇总 + NODE_RESULT 结构化事件
+                let node_status = if result
+                    .services
+                    .values()
+                    .any(|s| s.verdict == ProbeVerdict::Verified)
+                {
+                    "VERIFIED"
+                } else if result
+                    .services
+                    .values()
+                    .any(|s| s.verdict == ProbeVerdict::Blocked)
+                {
+                    "BLOCKED"
+                } else if !result.services.is_empty()
+                    && result
+                        .services
+                        .values()
+                        .all(|s| s.verdict == ProbeVerdict::Unknown)
+                {
+                    "UNKNOWN"
+                } else {
+                    "ACCESSIBLE"
+                };
+                run.log(
+                    17,
+                    "INFO",
+                    AimLogMeta::default()
+                        .node(&result.node_name)
+                        .slot(slot)
+                        .elapsed(result.delay_ms),
+                    format!(
+                        "节点汇总: status={node_status}, score={}, delay={}ms, unlocked={:?}, cache_hit={cache_hit}",
+                        result.score, result.delay_ms, result.unlocked_tags
+                    ),
+                );
+                let _ = run.emit(
+                    &app,
+                    "NODE_RESULT",
+                    &AimLogMeta::default()
+                        .node(&result.node_name)
+                        .slot(slot)
+                        .elapsed(result.delay_ms),
+                    Some(node_status),
+                    format!("节点「{}」完成检测：{node_status}", result.node_name),
+                    serde_json::to_value(&result).ok(),
                 );
                 // 实际深测与缓存命中分别计数，共同推进 20%～100% 的真实进度。
                 {
@@ -1439,6 +1898,7 @@ fn svc_verified(service: &str, status: u16, evidence: &str) -> ServiceProbeResul
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        ..Default::default()
     }
 }
 
@@ -1449,6 +1909,7 @@ fn svc_accessible(service: &str, status: u16, evidence: &str) -> ServiceProbeRes
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        ..Default::default()
     }
 }
 
@@ -1459,6 +1920,7 @@ fn svc_partial(service: &str, status: u16, evidence: &str) -> ServiceProbeResult
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        ..Default::default()
     }
 }
 
@@ -1469,6 +1931,7 @@ fn svc_blocked(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
         status_code: None,
         evidence: String::new(),
         failure_reason: Some(reason.into()),
+        ..Default::default()
     }
 }
 
@@ -1479,6 +1942,7 @@ fn svc_unknown(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
         status_code: None,
         evidence: String::new(),
         failure_reason: Some(reason.into()),
+        ..Default::default()
     }
 }
 
@@ -1859,9 +2323,46 @@ async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> S
     }
 }
 
+/// 【APP71 任务2.4】槽位实时状态守卫：节点开始时登记，结束/取消/panic 时清空，
+/// 前端「当前并发详情」绝不残留已结束节点。
+struct SlotGuard {
+    app: AppHandle,
+    slot: usize,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let state = self.app.state::<AppState>();
+        let mut p = state.aim_progress.lock();
+        if let Some(v) = p.current_nodes.get_mut(self.slot) {
+            v.clear();
+        }
+        if let Some(v) = p.current_services.get_mut(self.slot) {
+            v.clear();
+        }
+        p.active_slots = p.current_nodes.iter().filter(|s| !s.is_empty()).count();
+    }
+}
+
+/// 登记槽位当前节点与平台（固定 4 槽长度，前端按槽位渲染）。
+fn set_slot_state(app: &AppHandle, slot: usize, node: &str, services: String) {
+    let state = app.state::<AppState>();
+    let mut p = state.aim_progress.lock();
+    if p.current_nodes.len() < PROBE_SLOTS {
+        p.current_nodes.resize(PROBE_SLOTS, String::new());
+    }
+    if p.current_services.len() < PROBE_SLOTS {
+        p.current_services.resize(PROBE_SLOTS, String::new());
+    }
+    p.current_nodes[slot] = node.to_string();
+    p.current_services[slot] = services;
+    p.active_slots = p.current_nodes.iter().filter(|s| !s.is_empty()).count();
+}
+
 /// 单节点探测：复用阶段1 快筛延迟 → 探针选择器切到该节点 →
 /// 【APP67 BUG-04】出口 IP/地区预检短路 → 7 个平台并发真实请求判定。
 /// 死节点 / 出口预检失败生成 probed=true 的空结果。
+#[allow(clippy::too_many_arguments)]
 async fn probe_node(
     api: &crate::core::kernel::KernelApi,
     client: &reqwest::Client,
@@ -1874,8 +2375,20 @@ async fn probe_node(
     cached: Option<&AimNodeResult>,
     mode: AimProbeMode,
     force_full: bool,
+    run: &Arc<AimRunCtx>,
+    app: &AppHandle,
 ) -> NodeProbeOutcome {
     let started = std::time::Instant::now();
+    let _slot_guard = SlotGuard {
+        app: app.clone(),
+        slot,
+    };
+    set_slot_state(
+        app,
+        slot,
+        name,
+        format!("#{slot}: {name} · GPT/Claude/Gemini/NF/YT/Disney+/TK"),
+    );
     let stamp = |mut result: AimNodeResult| {
         result.node_id = node_id.to_string();
         result.mode = Some(mode);
@@ -1938,6 +2451,13 @@ async fn probe_node(
 
     // 5. 仅缓存未命中时执行 7 平台并发真实请求（Unknown 最多补测 1 次）。
     let ec = egress.country.as_deref();
+    // [AIM-14] 发起 7 平台并发检测（绝不等待完整正文，仅读状态码/头/关键特征）
+    run.log(
+        14,
+        "INFO",
+        AimLogMeta::default().node(name).slot(slot),
+        "发起 7 平台并发真实探测（GPT/Claude/Gemini/NF/YT/Disney+/TK）",
+    );
     let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>> = vec![
         Box::pin(probe_with_retry(|| probe_gpt(client, ec))),
         Box::pin(probe_with_retry(|| probe_claude(client, nr_client, ec))),
@@ -1948,6 +2468,37 @@ async fn probe_node(
         Box::pin(probe_with_retry(|| probe_tiktok(client, ec))),
     ];
     let results = futures_util::future::join_all(futs).await;
+    // [AIM-15] 单平台探测结果；[AIM-16] 异常 / 重试
+    for r in &results {
+        run.log(
+            15,
+            "INFO",
+            AimLogMeta::default()
+                .node(name)
+                .slot(slot)
+                .service(&r.service)
+                .elapsed(r.elapsed_ms.unwrap_or(0)),
+            format!(
+                "平台探测结果: verdict={}, status={:?}, basis={}, elapsed={}ms",
+                r.verdict.label(),
+                r.status_code,
+                r.verdict_basis,
+                r.elapsed_ms.unwrap_or(0)
+            ),
+        );
+        if r.retry_count > 0 {
+            run.log(
+                16,
+                "WARN",
+                AimLogMeta::default().node(name).slot(slot).service(&r.service),
+                format!(
+                    "平台探测异常触发补测 {} 次: {}",
+                    r.retry_count,
+                    r.failure_reason.as_deref().unwrap_or("无明确原因")
+                ),
+            );
+        }
+    }
 
     // 6. 汇总：只有 Verified 进入 unlocked_tags。
     let mut services: HashMap<String, ServiceProbeResult> = HashMap::with_capacity(results.len());
@@ -2057,17 +2608,32 @@ fn egress_unknown_result(
 }
 
 /// 仅对 Unknown 结论补测 1 次（传输抖动重试），Blocked/Verified/Accessible/Partial 不重试。
+/// 【APP71 任务4】同时记录真实耗时、重试次数与可读判定依据。
 async fn probe_with_retry<F, Fut>(f: F) -> ServiceProbeResult
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ServiceProbeResult>,
 {
-    let r = f().await;
-    if matches!(r.verdict, ProbeVerdict::Unknown) {
-        f().await
-    } else {
-        r
+    let started = std::time::Instant::now();
+    let mut result = f().await;
+    let mut retry_count = 0u32;
+    if matches!(result.verdict, ProbeVerdict::Unknown) {
+        retry_count = 1;
+        result = f().await;
     }
+    result.retry_count = retry_count;
+    result.elapsed_ms = Some(started.elapsed().as_millis() as u64);
+    if result.verdict_basis.is_empty() {
+        result.verdict_basis = if !result.evidence.is_empty() {
+            result.evidence.clone()
+        } else {
+            match &result.failure_reason {
+                Some(reason) => format!("{}：{reason}", result.verdict.label()),
+                None => result.verdict.label().to_string(),
+            }
+        };
+    }
+    result
 }
 
 // 【APP66 任务1.1】已删除 `preview_tags`：任何「按节点名称/地区关键词推断
@@ -2095,6 +2661,127 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ================= 【APP71 任务1.2 / 任务2】AIM 运行上下文 =================
+
+/// 单轮 Go AIM 检测的运行上下文：唯一 runId、严格单调 sequence、
+/// 21 阶段结构化日志与 `go-aim://event` 事件发射。
+struct AimRunCtx {
+    run_id: String,
+    seq: AtomicU64,
+    started: std::time::Instant,
+    /// SCREEN 事件节流计数
+    screen_emitted: AtomicUsize,
+    screen_last_ms: AtomicU64,
+}
+
+impl AimRunCtx {
+    fn new() -> Arc<Self> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Arc::new(Self {
+            run_id: format!("aim-{:x}", now_ms & 0xFFFF_FFFF),
+            seq: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            screen_emitted: AtomicUsize::new(0),
+            screen_last_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 记录一个生命周期阶段日志（自动补 `[AIM-xx]` 前缀与 runId）。
+    fn log(&self, stage: u8, level: &str, mut meta: AimLogMeta, message: impl AsRef<str>) {
+        meta.run_id = Some(self.run_id.clone());
+        crate::core::logger::log_aim(
+            level,
+            &meta,
+            &format!("[AIM-{stage:02}] {}", message.as_ref()),
+        );
+    }
+
+    /// SCREEN 事件节流：每完成 2 个节点或距上次发射 >=120ms 放行一次。
+    fn should_emit_screen(&self) -> bool {
+        let n = self.screen_emitted.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = self.elapsed_ms();
+        let last = self.screen_last_ms.load(Ordering::Relaxed);
+        if n >= SCREEN_EMIT_NODES || now.saturating_sub(last) >= SCREEN_EMIT_INTERVAL_MS {
+            self.screen_emitted.store(0, Ordering::Relaxed);
+            self.screen_last_ms.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 发射结构化事件 + 兼容旧 `aim://progress`，并写入最近 30 条快照。
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        app: &AppHandle,
+        phase: &str,
+        meta: &AimLogMeta,
+        status: Option<&str>,
+        message: impl Into<String>,
+        details: Option<serde_json::Value>,
+    ) -> crate::core::state::ProbeProgress {
+        let state = app.state::<AppState>();
+        let sequence = self.next_seq();
+        let message = message.into();
+        let progress = {
+            let mut p = state.aim_progress.lock();
+            p.run_id = self.run_id.clone();
+            p.sequence = sequence;
+            // NODE_RESULT 是节点级事件，不得把所属阶段从 DEEP_PROBE 覆盖掉
+            if phase != "NODE_RESULT" {
+                p.phase = phase.to_string();
+            }
+            p.elapsed_ms = self.elapsed_ms();
+            if matches!(phase, "FINISHED" | "CANCELLED" | "ERROR") {
+                p.running = false;
+            } else if matches!(phase, "START" | "SCREEN" | "DEEP_PROBE") {
+                p.running = true;
+            }
+            p.recompute_aim();
+            p.clone()
+        };
+        let event = crate::core::state::GoAimEvent {
+            run_id: self.run_id.clone(),
+            sequence,
+            timestamp: now_secs(),
+            phase: phase.to_string(),
+            node_name: meta.node_name.clone(),
+            slot: meta.slot,
+            service: meta.service.clone(),
+            status: status.map(str::to_string),
+            elapsed_ms: Some(self.elapsed_ms()),
+            message: message.clone(),
+            progress: progress.clone(),
+            details,
+        };
+        {
+            let mut recent = state.aim_events.lock();
+            recent.push_back(event.clone());
+            while recent.len() > AIM_RECENT_EVENTS {
+                recent.pop_front();
+            }
+        }
+        if phase == "ERROR" {
+            *state.aim_last_error.write() = Some(message);
+        }
+        let _ = app.emit(AIM_EVENT_STRUCTURED, &event);
+        let _ = app.emit("aim://progress", &progress);
+        progress
+    }
 }
 
 // ---------------------------------------------------------------- 锁定选择
@@ -2863,7 +3550,10 @@ mod tests {
             ..Default::default()
         };
         progress.recompute_aim();
-        assert_eq!(progress.percent, 99);
+        // 整数整除：299/300 深测完成时 20 + 299*79/300 = 20 + 78 = 98，
+        // 只要仍有 1 个待检测节点就严禁显示 100%。
+        assert!(progress.percent < 100, "仍有待检测节点时严禁显示 100%");
+        assert!((20..=99).contains(&progress.percent));
         assert_eq!(progress.pending_count, 1);
         progress.cache_hits = 1;
         progress.recompute_aim();
@@ -3022,5 +3712,42 @@ mod tests {
             assert!(peak <= 28, "4 个物理槽位最多允许 28 个平台请求");
             assert!(cancel_latency_ms < 600);
         }
+    }
+
+    /// 【APP71 任务6-4/7】五态判定标签：仅 VERIFIED 视为解锁，其余四态
+    /// 绝不允许伪装成绿色完整解锁徽章。
+    #[test]
+    fn test_probe_verdict_five_labels_and_only_verified() {
+        assert_eq!(ProbeVerdict::Verified.label(), "VERIFIED");
+        assert_eq!(ProbeVerdict::Accessible.label(), "ACCESSIBLE");
+        assert_eq!(ProbeVerdict::Partial.label(), "PARTIAL");
+        assert_eq!(ProbeVerdict::Blocked.label(), "BLOCKED");
+        assert_eq!(ProbeVerdict::Unknown.label(), "UNKNOWN");
+        assert!(ProbeVerdict::Verified.is_verified());
+        for verdict in [
+            ProbeVerdict::Accessible,
+            ProbeVerdict::Partial,
+            ProbeVerdict::Blocked,
+            ProbeVerdict::Unknown,
+        ] {
+            assert!(!verdict.is_verified(), "{} 不得进入解锁标签", verdict.label());
+        }
+    }
+
+    /// 【APP71 任务6-4】证据级字段向下兼容：旧缓存只有 service/verdict 时，
+    /// elapsedMs / retryCount / verdictBasis 必须安全补默认值。
+    #[test]
+    fn test_service_probe_result_evidence_fields_default() {
+        let result = ServiceProbeResult::default();
+        assert!(result.elapsed_ms.is_none());
+        assert_eq!(result.retry_count, 0);
+        assert!(result.verdict_basis.is_empty());
+
+        let restored: ServiceProbeResult =
+            serde_json::from_str(r#"{"service":"GPT","verdict":"VERIFIED"}"#).unwrap();
+        assert_eq!(restored.verdict, ProbeVerdict::Verified);
+        assert_eq!(restored.retry_count, 0);
+        assert!(restored.elapsed_ms.is_none());
+        assert!(restored.verdict_basis.is_empty());
     }
 }

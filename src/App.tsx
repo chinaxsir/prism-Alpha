@@ -13,7 +13,9 @@ import Analytics from "@/pages/Analytics";
 import Settings from "@/pages/Settings";
 import {
   applyThemeToDom,
+  ensureAimListenersRegistered,
   resolveSystemLanguage,
+  syncAimSnapshot,
   useCoreStore,
   type CoreStatus,
   type OutboundMode,
@@ -339,13 +341,14 @@ export default function App() {
     const memory = listen<{ inuse: number }>("memory://tick", (e) => {
       useCoreStore.getState().setMemoryUsage(e.payload.inuse);
     });
-    // 【APP54 任务4/5】测速 / Go AIM 进度广播：全局 store 收口，任意页面实时渲染
+    // 【APP54 任务4/5】测速进度广播：全局 store 收口，任意页面实时渲染
     const delayProgress = listen<ProbeProgress>("delays://progress", (e) => {
       if (e.payload) useCoreStore.getState().setDelayProgress(e.payload);
     });
-    const aimProgress = listen<ProbeProgress>("aim://progress", (e) => {
-      if (e.payload) useCoreStore.getState().setAimProgress(e.payload);
-    });
+    // 【APP71 任务2.3】Go AIM 事件单例监听 + 首次快照：
+    // 启动即注册，杜绝「定时器延迟 + listen 异步注册」期间的丢包。
+    void ensureAimListenersRegistered().catch(() => undefined);
+    void syncAimSnapshot();
     // 【APP57 任务2】后端在启动 / 停止 / 重启 / 内核计数器归零时广播，
     // 前端立即清空分析统计，避免旧数据残留或显示旧会话排行
     const analyticsReset = listen("analytics://reset", () => {
@@ -356,7 +359,6 @@ export default function App() {
       telemetry.then((fn) => fn());
       memory.then((fn) => fn());
       delayProgress.then((fn) => fn());
-      aimProgress.then((fn) => fn());
       analyticsReset.then((fn) => fn());
     };
   }, []);

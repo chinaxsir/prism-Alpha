@@ -30,6 +30,18 @@ pub const MAX_ENTRIES: usize = 800;
 pub const PER_CATEGORY_MAX: usize = 150;
 /// 持久化文件容量上限：512 KB（524,288 字节）
 pub const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
+/// 【APP71 任务1.1】Go AIM 专属有界队列上限：400 条，超出自动弹出最旧条目。
+/// 与其余 6 个分类桶（150 条）物理隔离，AIM 高频日志绝不挤掉其他模块。
+pub const AIM_BUCKET_MAX: usize = 400;
+/// 【APP71 任务1.1】Go AIM 结构化日志落盘防抖窗口（毫秒）
+pub const AIM_FLUSH_DEBOUNCE_MS: u64 = 250;
+/// 【APP71 任务1.1】待落盘 AIM 日志硬上限：超过立即同步刷盘，防内存无限增长
+const AIM_PENDING_MAX: usize = 300;
+
+/// 【APP71 任务1.1】DEBUG 级别 AIM 日志开关（默认关闭，诊断时开启）。
+/// INFO / WARN / ERROR 始终写入，不受该开关影响。
+pub static AIM_DEBUG_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 【APP59 任务2.2】结构化 JSONL 持久化文件名（旧版纯文本 prism_app.log
 /// 在升级首次启动时自动清理，防止历史混排数据继续被读出）。
@@ -64,6 +76,75 @@ pub struct LogEntry {
     /// "GoLan" | "Kernel" | "GoAIM" | "GoCus" | "Sub" | "Pro"
     pub module: String,
     pub message: String,
+    // ---- 【APP71 任务1.1】Go AIM 结构化上下文字段 ----
+    // 全部可选且 `skip_serializing_if`：其余模块与旧前端 100% 向下兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+impl LogEntry {
+    /// 基础条目（无 AIM 上下文），供旧调用点零改动复用。
+    pub fn plain(id: u64, timestamp: String, level: &str, module: &str, message: String) -> Self {
+        Self {
+            id,
+            timestamp,
+            level: level.to_string(),
+            module: module.to_string(),
+            message,
+            run_id: None,
+            node_name: None,
+            slot: None,
+            service: None,
+            elapsed_ms: None,
+        }
+    }
+}
+
+/// 【APP71 任务1.1】Go AIM 结构化日志上下文（runId / 节点 / 槽位 / 平台 / 耗时）。
+#[derive(Debug, Clone, Default)]
+pub struct AimLogMeta {
+    pub run_id: Option<String>,
+    pub node_name: Option<String>,
+    pub slot: Option<usize>,
+    pub service: Option<String>,
+    pub elapsed_ms: Option<u64>,
+}
+
+impl AimLogMeta {
+    pub fn run(run_id: &str) -> Self {
+        Self {
+            run_id: Some(run_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn node(mut self, node: &str) -> Self {
+        self.node_name = Some(node.to_string());
+        self
+    }
+
+    pub fn slot(mut self, slot: usize) -> Self {
+        self.slot = Some(slot);
+        self
+    }
+
+    pub fn service(mut self, service: &str) -> Self {
+        self.service = Some(service.to_string());
+        self
+    }
+
+    pub fn elapsed(mut self, ms: u64) -> Self {
+        self.elapsed_ms = Some(ms);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +213,33 @@ fn state() -> Option<&'static Mutex<LogState>> {
     STATE.get()
 }
 
+/// 【APP71 任务1.1】分类桶容量：GoAIM 专属 400 条，其余分类维持 150 条。
+pub fn bucket_capacity(module: &str) -> usize {
+    if module == MOD_GO_AIM {
+        AIM_BUCKET_MAX
+    } else {
+        PER_CATEGORY_MAX
+    }
+}
+
+/// 【APP71 任务1.1】有界入队（纯函数，便于单元测试）：
+/// 超出容量自动弹出最旧条目，内存占用严格封顶。
+fn push_bounded(bucket: &mut VecDeque<LogEntry>, entry: LogEntry, cap: usize) {
+    bucket.push_back(entry);
+    while bucket.len() > cap {
+        bucket.pop_front();
+    }
+}
+
+/// 【APP71 任务1.1】待落盘的 AIM JSONL 行（250ms 防抖批量追加）
+static AIM_PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static AIM_WRITER_STARTED: OnceLock<()> = OnceLock::new();
+static AIM_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+fn aim_pending() -> &'static Mutex<Vec<String>> {
+    AIM_PENDING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 /// APP 启动时初始化（lib.rs setup 调用）：绑定持久化文件路径
 pub fn init(data_dir: &std::path::Path) {
     // 【APP59 任务2.2】升级清理：旧版纯文本混排日志整体删除，
@@ -144,7 +252,10 @@ pub fn init(data_dir: &std::path::Path) {
     for module in [
         MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
     ] {
-        buckets.insert(module, VecDeque::with_capacity(PER_CATEGORY_MAX));
+        buckets.insert(
+            module,
+            VecDeque::with_capacity(bucket_capacity(module)),
+        );
     }
     let _ = STATE.set(Mutex::new(LogState {
         seq: AtomicU64::new(1),
@@ -152,6 +263,14 @@ pub fn init(data_dir: &std::path::Path) {
         file_path: Some(data_dir.join(JSONL_FILE_NAME)),
         writes_since_check: 0,
     }));
+    // 【APP71 任务1.1】250ms 防抖刷盘线程：只服务 GoAIM 结构化日志，
+    // 与既有同步写入路径完全隔离，不影响其他模块。
+    let _ = AIM_WRITER_STARTED.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(AIM_FLUSH_DEBOUNCE_MS));
+            flush_aim_pending();
+        });
+    });
 }
 
 /// 【APP54 任务3】北京时间字符串（UTC+8 固定偏移，格式 `YYYY-MM-DD HH:mm:ss.SSS`）。
@@ -204,25 +323,18 @@ fn push_entry(level: &str, module: &str, message: &str) {
     };
     // 【APP56 任务4】写内存缓冲前强制归入唯一分类（严禁 Kernel 混装）
     let module = enforce_strict_log_category(module, &message);
-    let entry = LogEntry {
-        id: 0,
-        timestamp: now_timestamp(),
-        level: level.to_string(),
-        module: module.to_string(),
-        message,
-    };
+    let entry = LogEntry::plain(0, now_timestamp(), level, module, message);
 
     let Some(mutex) = state() else { return };
     let Ok(mut st) = mutex.lock() else { return };
     let id = st.seq.fetch_add(1, Ordering::Relaxed);
     let mut entry = entry;
     entry.id = id;
-    // 【APP59 任务2.2】写入对应分类的独立环形队列，单分类上限 150 条
+    // 【APP59 任务2.2】写入对应分类的独立环形队列；【APP71】GoAIM 桶 400 条，
+    // 其余分类维持 150 条，互不挤占。
+    let cap = bucket_capacity(module);
     let bucket = st.buckets.entry(module).or_default();
-    bucket.push_back(entry.clone());
-    while bucket.len() > PER_CATEGORY_MAX {
-        bucket.pop_front();
-    }
+    push_bounded(bucket, entry.clone(), cap);
     // 追加写磁盘（每 20 条做一次 512 KB 容量检查）
     st.writes_since_check += 1;
     if let Some(path) = st.file_path.clone() {
@@ -256,6 +368,221 @@ fn truncate_log_file(path: &std::path::Path) {
     let keep_from = lines.len() / 2;
     let kept: String = lines[keep_from..].join("\n");
     let _ = std::fs::write(path, kept.as_bytes());
+}
+
+// ================= 【APP71 任务1.1】Go AIM 结构化日志 =================
+
+/// Go AIM 日志脱敏：自动抹除 UUID、节点密码、订阅 URL 凭据、
+/// Authorization / Cookie 头、WireGuard 私钥与 License Key。
+/// 只用于 AIM 日志；不改变既有 `sanitize_sensitive` 行为。
+pub fn sanitize_aim_log_message(raw: &str) -> String {
+    use regex::Regex;
+    let mut out = raw.to_string();
+    // 1) UUID（节点 uuid / 订阅标识）
+    if let Ok(re) = Regex::new(
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    ) {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                let s = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                format!("{}****{}", &s[..4], &s[s.len() - 4..])
+            })
+            .into_owned();
+    }
+    // 2) Authorization / Cookie 头
+    if let Ok(re) =
+        Regex::new(r"(?i)\b(authorization|cookie)\b(\s*[:=]\s*)[^\r\n,;]+")
+    {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                format!(
+                    "{}{}***",
+                    caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+                    caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
+                )
+            })
+            .into_owned();
+    }
+    // 3) 节点口令 / 认证串
+    if let Ok(re) = Regex::new(
+        r#"(?i)\b(password|passwd|pwd|auth-str|auth_str|token)\b(\s*[:=]\s*"?)[^\s",}]+"#,
+    ) {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                format!(
+                    "{}{}***",
+                    caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+                    caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
+                )
+            })
+            .into_owned();
+    }
+    // 4) 订阅 URL：仅保留 scheme + host（含查询串 / 超长 token 的 URL 一律折叠）
+    if let Ok(re) = Regex::new(r"(?i)\b(https?)://([^/\s:?#]+)([^\s]*)") {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                let scheme = caps.get(1).map(|m| m.as_str()).unwrap_or("https");
+                let host = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                if rest.len() > 24 || rest.contains('?') {
+                    format!("{scheme}://{host}/***")
+                } else {
+                    format!("{scheme}://{host}{rest}")
+                }
+            })
+            .into_owned();
+    }
+    // 5) WireGuard 私钥 / License Key（复用导出脱敏规则）
+    sanitize_sensitive(&out)
+}
+
+fn aim_level(raw: &str) -> &'static str {
+    match raw.trim().to_uppercase().as_str() {
+        "ERROR" => "ERROR",
+        "WARN" | "WARNING" => "WARN",
+        "DEBUG" => "DEBUG",
+        _ => "INFO",
+    }
+}
+
+/// 【APP71 任务1.1】Go AIM 专属结构化日志入口：
+/// - DEBUG 受 `AIM_DEBUG_LOG_ENABLED` 开关控制，INFO/WARN/ERROR 始终写入；
+/// - 写入 GoAIM 独立有界队列（400 条），与其余分类物理隔离；
+/// - 250ms 防抖批量追加 `logs_v2.jsonl`（超过 300 条立即刷盘）；
+/// - 同步输出一次 tracing 事件（不再回调 logger，杜绝重复）。
+pub fn log_aim(level: &str, meta: &AimLogMeta, message: &str) {
+    let level = aim_level(level);
+    if level == "DEBUG" && !AIM_DEBUG_LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut message = sanitize_aim_log_message(message);
+    if message.chars().count() > 2000 {
+        message = message.chars().take(2000).collect();
+    }
+    let run_id = meta.run_id.as_deref().unwrap_or("-");
+    // tracing 单次输出：开发态控制台可见，且不回调 logger（无环）
+    match level {
+        "ERROR" => tracing::error!(target: "go_aim", "[{run_id}] {message}"),
+        "WARN" => tracing::warn!(target: "go_aim", "[{run_id}] {message}"),
+        "DEBUG" => tracing::debug!(target: "go_aim", "[{run_id}] {message}"),
+        _ => tracing::info!(target: "go_aim", "[{run_id}] {message}"),
+    }
+
+    let Some(mutex) = state() else {
+        // logger 尚未初始化：关键错误绝不静默丢弃
+        AIM_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let entry = {
+        let Ok(mut st) = mutex.lock() else {
+            AIM_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let id = st.seq.fetch_add(1, Ordering::Relaxed);
+        let entry = LogEntry {
+            id,
+            timestamp: now_timestamp(),
+            level: level.to_string(),
+            module: MOD_GO_AIM.to_string(),
+            message,
+            run_id: meta.run_id.clone(),
+            node_name: meta.node_name.clone(),
+            slot: meta.slot,
+            service: meta.service.clone(),
+            elapsed_ms: meta.elapsed_ms,
+        };
+        let bucket = st.buckets.entry(MOD_GO_AIM).or_default();
+        push_bounded(bucket, entry.clone(), AIM_BUCKET_MAX);
+        entry
+    };
+
+    let mut line = serde_json::json!({
+        "category": entry.module,
+        "level": entry.level,
+        "timestamp": entry.timestamp,
+        "message": entry.message,
+    });
+    if let Some(obj) = line.as_object_mut() {
+        if let Some(v) = entry.run_id.clone() {
+            obj.insert("runId".into(), serde_json::Value::String(v));
+        }
+        if let Some(v) = entry.node_name.clone() {
+            obj.insert("nodeName".into(), serde_json::Value::String(v));
+        }
+        if let Some(v) = entry.slot {
+            obj.insert("slot".into(), serde_json::json!(v));
+        }
+        if let Some(v) = entry.service.clone() {
+            obj.insert("service".into(), serde_json::Value::String(v));
+        }
+        if let Some(v) = entry.elapsed_ms {
+            obj.insert("elapsedMs".into(), serde_json::json!(v));
+        }
+    }
+    let mut need_flush = false;
+    if let Ok(mut pending) = aim_pending().lock() {
+        pending.push(line.to_string());
+        need_flush = pending.len() >= AIM_PENDING_MAX;
+    }
+    if need_flush {
+        flush_aim_pending();
+    }
+}
+
+/// 将待落盘的 AIM 日志批量追加到 `logs_v2.jsonl`，并做文件容量轮转检查。
+pub fn flush_aim_pending() {
+    let lines: Vec<String> = {
+        let Ok(mut pending) = aim_pending().lock() else { return };
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+    };
+    let Some(mutex) = state() else { return };
+    let Ok(mut st) = mutex.lock() else { return };
+    let Some(path) = st.file_path.clone() else { return };
+    st.writes_since_check += lines.len() as u32;
+    let need_truncate = st.writes_since_check >= 20
+        && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_FILE_BYTES;
+    if need_truncate {
+        st.writes_since_check = 0;
+        truncate_log_file(&path);
+    }
+    drop(st);
+    use std::io::Write;
+    let mut failed = 0usize;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        for line in lines {
+            if f.write_all(line.as_bytes()).is_err() || f.write_all(b"\n").is_err() {
+                failed += 1;
+            }
+        }
+    } else {
+        failed = 1;
+    }
+    if failed > 0 {
+        let total = AIM_WRITE_ERRORS.fetch_add(failed as u64, Ordering::Relaxed) + failed as u64;
+        // 严禁静默丢弃：落盘异常必须留下可检索告警（低频，避免刷屏）
+        if total <= 1 || total % 64 == 0 {
+            tracing::warn!(target: "go_aim", "AIM 日志落盘异常（累计 {total} 条），内存队列仍保留");
+            push_entry(
+                "WARN",
+                MOD_GO_AIM,
+                &format!("AIM 日志落盘异常（累计 {total} 条），内存队列仍保留"),
+            );
+        }
+    }
+}
+
+/// 【APP71】当前分类桶实际条数（用于有界队列回归测试与内存诊断）。
+pub fn bucket_len(module: &str) -> usize {
+    state()
+        .and_then(|m| m.lock().ok().map(|st| st.buckets.get(module).map_or(0, |b| b.len())))
+        .unwrap_or(0)
 }
 
 /// 各模块埋点入口（INFO）
@@ -696,13 +1023,13 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
         let timestamp = parse_kernel_timestamp(line)
             .or_else(|| parse_leading_epoch(line))
             .unwrap_or_else(now_timestamp);
-        out.push(LogEntry {
-            id: seq.fetch_add(1, Ordering::Relaxed),
+        out.push(LogEntry::plain(
+            seq.fetch_add(1, Ordering::Relaxed),
             timestamp,
-            level: level.into(),
-            module: module.into(),
-            message: classified.chars().take(500).collect(),
-        });
+            &level,
+            module,
+            classified.chars().take(500).collect(),
+        ));
     }
 }
 
@@ -966,6 +1293,10 @@ pub fn clear_logs(data_dir: &std::path::Path) {
     {
         o.clear();
     }
+    // 【APP71】清空待落盘的 AIM 日志，防止清空后旧内容回弹
+    if let Ok(mut pending) = aim_pending().lock() {
+        pending.clear();
+    }
 
     if let Some(mutex) = state()
         && let Ok(mut st) = mutex.lock()
@@ -1091,6 +1422,8 @@ pub fn safe_truncate_str(s: &str, max_chars: usize) -> String {
 
 /// 生成带设备环境头信息的格式化纯文本日志全文（供前端复制 / 导出 .log）
 pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> String {
+    // 【APP71】导出前强制刷盘，保证最新 AIM 结构化日志一并落盘
+    flush_aim_pending();
     let payload = get_logs(data_dir, module_filter);
     let mut out = String::new();
     out.push_str("================ Prism 诊断日志 ================\n");
@@ -1150,6 +1483,16 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
 /// 全程使用字符级安全截断 `safe_truncate_str`，**绝不做字节切片**
 /// （`&s[..n]`），中文 / emoji 日志永不 panic。
 pub fn export_diagnostic_text(data_dir: &std::path::Path) -> String {
+    export_diagnostic_text_filtered(data_dir, None)
+}
+
+/// 【APP71 任务5】按模块导出诊断日志（`Some("GoAIM")` 仅导出 AIM 诊断）。
+/// AIM 行附带 runId / 节点 / 平台 / 槽位 / 耗时结构化上下文。
+pub fn export_diagnostic_text_filtered(
+    data_dir: &std::path::Path,
+    module_filter: Option<&str>,
+) -> String {
+    flush_aim_pending();
     let payload = get_logs_categorized(data_dir);
     let mut out = String::new();
     out.push_str("================ Prism 诊断日志 ================\n");
@@ -1172,14 +1515,34 @@ pub fn export_diagnostic_text(data_dir: &std::path::Path) -> String {
         (MOD_SUB, "=== [订阅 Sub] ==="),
     ];
     for (module, title) in SECTIONS {
+        if let Some(filter) = module_filter {
+            if *module != filter {
+                continue;
+            }
+        }
         out.push_str(title);
         out.push('\n');
         for e in payload.logs.iter().filter(|e| e.module == *module) {
             let msg = safe_truncate_str(&sanitize_sensitive(&e.message), 4000);
-            out.push_str(&format!(
-                "[{}][{}][{}] {}\n",
-                e.timestamp, e.level, e.module, msg
-            ));
+            if e.run_id.is_some() || e.node_name.is_some() || e.service.is_some() {
+                out.push_str(&format!(
+                    "[{}][{}][{}][run={}][node={}][slot={}][service={}][{}ms] {}\n",
+                    e.timestamp,
+                    e.level,
+                    e.module,
+                    e.run_id.as_deref().unwrap_or("-"),
+                    e.node_name.as_deref().unwrap_or("-"),
+                    e.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                    e.service.as_deref().unwrap_or("-"),
+                    e.elapsed_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    msg
+                ));
+            } else {
+                out.push_str(&format!(
+                    "[{}][{}][{}] {}\n",
+                    e.timestamp, e.level, e.module, msg
+                ));
+            }
         }
         out.push('\n');
     }
@@ -1374,6 +1737,45 @@ mod tests {
         ));
     }
 
+    /// 【APP71 任务6 测试8】AIM 日志脱敏：UUID / 口令 / 订阅凭据 / 认证头全覆盖
+    #[test]
+    fn test_sanitize_aim_log_message() {
+        let raw = "uuid=123e4567-e89b-12d3-a456-426614174000 password=secret123 \
+                   sub=https://sub.example.com/api/v1/client/subscribe?token=abcdef1234567890 \
+                   Authorization: Bearer abc.def.ghi Cookie: sid=xyz987";
+        let out = super::sanitize_aim_log_message(raw);
+        assert!(!out.contains("123e4567-e89b-12d3-a456-426614174000"), "{out}");
+        assert!(!out.contains("secret123"), "{out}");
+        assert!(!out.contains("abcdef1234567890"), "{out}");
+        assert!(!out.contains("Bearer"), "{out}");
+        assert!(!out.contains("sid=xyz987"), "{out}");
+        assert!(out.contains("https://sub.example.com/***"), "{out}");
+        // 普通探针 URL（短路径、无凭据）必须保留，便于诊断
+        let keep = super::sanitize_aim_log_message("probe https://chatgpt.com/ 200");
+        assert!(keep.contains("https://chatgpt.com/"), "{keep}");
+    }
+
+    /// 【APP71 任务6 测试9】GoAIM 有界队列：写入 1000 条后严格保持 400 条
+    #[test]
+    fn test_aim_bucket_bounded_400() {
+        let cap = super::bucket_capacity(super::MOD_GO_AIM);
+        assert_eq!(cap, super::AIM_BUCKET_MAX);
+        assert_eq!(cap, 400);
+        assert_eq!(super::bucket_capacity(super::MOD_KERNEL), super::PER_CATEGORY_MAX);
+        let mut q: std::collections::VecDeque<super::LogEntry> =
+            std::collections::VecDeque::new();
+        for i in 0..1000u64 {
+            super::push_bounded(
+                &mut q,
+                super::LogEntry::plain(i, "2026-11-12 00:00:00.000".into(), "INFO", super::MOD_GO_AIM, format!("line {i}")),
+                cap,
+            );
+        }
+        assert_eq!(q.len(), 400, "有界队列必须恒定封顶 400 条");
+        assert_eq!(q.front().map(|e| e.id), Some(600), "应淘汰最旧 600 条");
+        assert_eq!(q.back().map(|e| e.id), Some(999));
+    }
+
     /// 【APP52 任务4】四阶段日志前缀必须齐全、互不重复且分类为 Node
     #[test]
     fn test_four_phase_logs_complete() {
@@ -1531,6 +1933,39 @@ mod tests {
         assert!(text.contains("中文诊断日志😀"));
         // 字符级安全截断：中文 / emoji 不得被截成半个字符（无替换符 U+FFFD）
         assert!(!text.contains('\u{FFFD}'));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【APP71 任务6-9】AIM 诊断导出支持按模块过滤：只输出指定分类章节，
+    /// 其余分类既不出现标题也不出现正文；无过滤时仍导出完整 7 章节。
+    #[test]
+    fn test_export_diagnostic_text_filtered_by_module() {
+        let dir = std::env::temp_dir().join(format!(
+            "prism-log-aim-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        super::init(&dir);
+
+        let kernel_tag = format!("内核唯一标记-{}", std::process::id());
+        let node_tag = format!("节点唯一标记-{}", std::process::id());
+        super::info(MOD_KERNEL, &kernel_tag);
+        super::info(MOD_NODE, &node_tag);
+
+        let aim_only = super::export_diagnostic_text_filtered(&dir, Some(MOD_GO_AIM));
+        assert!(aim_only.contains("=== [Go AIM] ==="));
+        assert!(!aim_only.contains("=== [内核 Kernel] ==="));
+        assert!(!aim_only.contains(&kernel_tag));
+        assert!(!aim_only.contains(&node_tag));
+
+        let full = super::export_diagnostic_text_filtered(&dir, None);
+        assert!(full.contains(&kernel_tag));
+        assert!(full.contains(&node_tag));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
