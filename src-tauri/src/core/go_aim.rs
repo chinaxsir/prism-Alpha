@@ -569,13 +569,34 @@ impl Drop for ProbeRunGuard {
     }
 }
 
+/// 【APP69 任务4】自动触发冷却：同一订阅列表 / 内核会话内 30 分钟内
+/// 最多自动全量探测一次。用户手动「AIM 检测 / 重测」直接走
+/// start_probe_with_mode，不受冷却限制。
+const AUTO_PROBE_COOLDOWN_SECS: u64 = 30 * 60;
+static LAST_AUTO_PROBE_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// 【APP69 任务4】纯函数判定：首次触发放行，之后必须满 30 分钟。
+fn auto_probe_allowed(last: u64, now: u64) -> bool {
+    last == 0 || now.saturating_sub(last) >= AUTO_PROBE_COOLDOWN_SECS
+}
+
 /// 启动一轮自动分级探测（保持既有调用方 100% 兼容）。
+/// 自动入口（启动内核 / 订阅刷新等）统一受 30 分钟冷却保护。
 pub fn start_probe(app: AppHandle) {
+    let now = now_secs();
+    let last = LAST_AUTO_PROBE_SECS.load(Ordering::Acquire);
+    if !auto_probe_allowed(last, now) {
+        tracing::debug!("[go-aim] 自动探测处于 30 分钟冷却期，跳过");
+        return;
+    }
+    LAST_AUTO_PROBE_SECS.store(now, Ordering::Release);
     start_probe_with_mode(app, None);
 }
 
 /// 【APP68】启动 FAST / FULL / SELECTED 或默认自动分级探测。
+/// 用户手动触发同样刷新冷却基准，避免紧接其后再自动跑一轮。
 pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
+    LAST_AUTO_PROBE_SECS.store(now_secs(), Ordering::Release);
     let state = app.state::<AppState>();
     // APP34：Go AIM 未开启时严禁触发全量探测。148 个节点并发真实 HTTP
     // 探测会在 iOS 扩展进程内瞬间冲顶 50MB Jetsam 硬红线，导致隧道被
@@ -2761,6 +2782,16 @@ mod tests {
         assert_eq!(fingerprint.len(), 16);
         assert_eq!(fingerprint, node_fingerprint(&renamed));
         assert_ne!(fingerprint, node_fingerprint(&changed));
+    }
+
+    /// 【APP69 任务4】自动 AIM 探测 30 分钟冷却：首次放行，冷却期内跳过
+    #[test]
+    fn test_auto_probe_cooldown() {
+        assert!(auto_probe_allowed(0, 1_700_000_000));
+        let last = 1_700_000_000;
+        assert!(!auto_probe_allowed(last, last + 29 * 60));
+        assert!(auto_probe_allowed(last, last + 30 * 60));
+        assert!(auto_probe_allowed(last, last + 31 * 60));
     }
 
     #[test]

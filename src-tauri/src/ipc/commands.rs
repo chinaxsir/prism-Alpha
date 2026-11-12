@@ -3685,6 +3685,63 @@ pub async fn get_traffic_stats(
     }))
 }
 
+/// 【APP69 任务4】目标地址是否为内网 / 回环 / FakeIP（这类流量不代表“转发已开始”）
+fn is_private_destination(ip: &str) -> bool {
+    let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // CGNAT 100.64.0.0/10
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // sing-box FakeIP 198.18.0.0/15
+                || (o[0] == 198 && (18..=19).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+/// 【APP69 任务4】[流量开始转发] 只认“真实代理转发”连接：
+/// chains 必须存在且不含 direct / dns-direct / go-lan / reject，
+/// 目标 IP 不能是内网、回环或 FakeIP。直连与 DNS 流量绝不触发该日志，
+/// 杜绝刚启动（尚未真正转发）就误报。
+fn is_forwarded_proxy_conn(conn: &serde_json::Value) -> bool {
+    let Some(chains) = conn.get("chains").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if chains.is_empty() {
+        return false;
+    }
+    for chain in chains {
+        let name = chain
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if name.contains("go-lan")
+            || name == "golan"
+            || name == "direct"
+            || name.contains("dns-direct")
+            || name == "reject"
+            || name == "block"
+            || name.contains("reject")
+        {
+            return false;
+        }
+    }
+    let dest = conn
+        .get("metadata")
+        .and_then(|m| m.get("destinationIP"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    !is_private_destination(dest)
+}
+
 /// 【APP52 任务2 / APP58 任务1.2 / APP66 任务3】常驻后台遥测协程：
 /// 1000ms 一轮低功耗采样（APP66 由 1500ms 收紧到稳定 1s，仪表盘丝滑插值）；
 /// APP 处于后台（锁屏 / 切到其他 App）时**完全跳过 `/connections` 网络请求**，
@@ -3815,7 +3872,7 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                 let first = conns.iter().find(|c| {
                     let dl = c.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
                     let ul = c.get("upload").and_then(|v| v.as_u64()).unwrap_or(0);
-                    dl > 0 || ul > 0
+                    (dl > 0 || ul > 0) && is_forwarded_proxy_conn(c)
                 });
                 if let Some(c) = first {
                     let node_name = selected.clone().unwrap_or_else(|| "自动".into());

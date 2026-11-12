@@ -413,8 +413,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeGoLanProbes: [[String: String]] = []
     /// 当前绑定的物理网卡 IPv4（5G 基站切换时网卡名可能不变，但 IP 会变）
     private var activeBoundIPv4: String = ""
-    /// 25 秒轻量保活定时器（仅当存在 go-lan-* 隧道时运行）
-    private var goLanKeepaliveTimer: Timer?
+    /// 【APP69 任务2】25 秒保活定时器已彻底移除：它会在内核软重启期间
+    /// 持续发起 /proxies/*/delay 请求，阻塞 Go 侧 Close 并放大内存尖峰。
+    /// 现仅在 kernel-start 与 device-wake 两个时机主动握手。
+    /// 扩展侧在途握手探测任务（软重启前必须全部取消）
+    private var goLanProbeTasks: [URLSessionDataTask] = []
+    /// 上一次扩展侧主动握手时间（device-wake 60 秒节流用）
+    private var lastGoLanHandshakeAt: Date?
+    /// 内核软重启串行锁：防止重入导致 PrismVPNStop/Start 交叠
+    private var isReloadingKernel: Bool = false
     /// 同网卡 IP 变化（基站切换）后的延迟软重启任务（可被下一轮切网取消）
     private var pendingCellHandoverRestart: DispatchWorkItem?
     /// 当前内核 Clash API 地址与密钥（清空死连接 / 触发握手用）
@@ -754,9 +761,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.activeBoundIPv4 = latestPhy.ipv4
                 self.refreshOnDemandBypassIfNeeded(phyName: newIf, phyIPv4: latestPhy.ipv4)
                 self.isReloadingForNetworkChange = false
-                // 【APP62 任务1 机制2】软重启完成后立即由扩展自主重握手，
-                // 不依赖主 APP 是否在前台
-                self.triggerExtensionGoLanHandshakes(reason: "net-switch")
+                // 【APP69 任务2】软重启完成后的握手由 scheduleGoLanWarmup
+                // 内部的 kernel-start 统一触发，不再额外叠加 net-switch。
             }
             return
         }
@@ -771,7 +777,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         vpnQueue.async { [weak self] in
             guard let self = self else { return }
             self.clearClashConnections()
-            self.triggerExtensionGoLanHandshakes(reason: "cell-handover")
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 guard !self.isReloadingForNetworkChange,
@@ -783,7 +788,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.restartKernelOnCurrentQueue(newPhy: latestPhy)
                 self.refreshOnDemandBypassIfNeeded(phyName: latestPhy.name, phyIPv4: latestPhy.ipv4)
                 self.isReloadingForNetworkChange = false
-                self.triggerExtensionGoLanHandshakes(reason: "cell-handover-restart")
             }
             self.pendingCellHandoverRestart = work
             self.vpnQueue.asyncAfter(deadline: .now() + 4.0, execute: work)
@@ -807,13 +811,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 网卡重新 sanitize（route.default_interface 与全部出站 bind_interface
     /// 指向新网卡）→ PrismVPNStart。隧道会话不销毁，UI 侧计时器不重置。
     private func restartKernelOnCurrentQueue(newPhy: PhysicalInterface) {
+        // 【APP69 任务2】串行锁：任一时刻只允许一次软重启，杜绝并发
+        // PrismVPNStop/Start 交叠导致的 44 秒卡死。
+        guard !isReloadingKernel else { return }
         guard let workDir = activeWorkDir,
               let rawConfig = try? loadRawConfigText()
         else { return }
+        isReloadingKernel = true
+        defer { isReloadingKernel = false }
+        // 先取消在途握手探测，避免其阻塞 Go 侧 Close（内存尖峰根因）
+        cancelPendingGoLanProbes()
         PrismVPNStop()
         // 旧内核非阻塞关闭（内部 1500ms 上限），等待其完全释放 mixed-in /
-        // Clash API 端口与 utun fd，避免新内核 bind 冲突
-        Thread.sleep(forTimeInterval: 1.8)
+        // Clash API 端口与 utun fd，避免新内核 bind 冲突。
+        // 【APP69 任务2】1.8s → 0.4s：PrismVPNStop 已同步等待关闭完成，
+        // 过长的 sleep 只会放大切网卡顿。
+        Thread.sleep(forTimeInterval: 0.4)
         let sanitized = sanitizeConfigForExtension(
             rawConfig,
             workDir: workDir,
@@ -937,9 +950,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self?.checkAndReloadIfNetworkChanged()
                 }
                 self.pendingPathCheck = work
-                // 【APP50 任务1】2.0s 去抖：等待交换机/基带完成路由收敛，
+                // 【APP69 任务2】2.5s 去抖：等待交换机/基带完成路由收敛，
                 // 避免半切换状态下软重启内核导致隧道反复重建
-                self.vpnQueue.asyncAfter(deadline: .now() + 2.0, execute: work)
+                self.vpnQueue.asyncAfter(deadline: .now() + 2.5, execute: work)
             }
         }
         monitor.start(queue: vpnQueue)
@@ -988,7 +1001,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.restartKernelOnCurrentQueue(newPhy: phy)
                 self.refreshOnDemandBypassIfNeeded(phyName: phy.name, phyIPv4: phy.ipv4)
                 self.isReloadingForNetworkChange = false
-                self.triggerExtensionGoLanHandshakes(reason: "config-reload")
             }
         }
         RunLoop.main.add(t, forMode: .common)
@@ -1045,9 +1057,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.configWatchTimer?.invalidate()
             self.configWatchTimer = nil
             self.lastConfigMTime = nil
-            // 【APP62 任务1】停止 25 秒保活巡检与待执行的基站切换软重启
-            self.goLanKeepaliveTimer?.invalidate()
-            self.goLanKeepaliveTimer = nil
+            // 【APP69 任务2】停止在途 Go Lan 握手探测（25 秒保活已移除），
+            // 并取消待执行的基站切换软重启
+            self.cancelPendingGoLanProbes()
             self.pendingCellHandoverRestart?.cancel()
             self.pendingCellHandoverRestart = nil
         }
@@ -1267,11 +1279,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 NEIPv4Route(destinationAddress: epIP, subnetMask: "255.255.255.255")
             )
         }
-        // 【APP65 任务2.3】直连 DNS 上游（223.5.5.5 主 / 119.29.29.29 备）以
-        // /32 写入 excludedRoutes：iOS 内核强制这两条 UDP 53 报文绕开 utun，
-        // 从当前活跃物理网卡（en0/pdp_ip0）直接发出，**永远不可能回环**，
-        // 与 NEDNSSettings 中的虚拟地址 172.19.0.2 彻底解耦。
-        for upstreamDNS in ["223.5.5.5", "119.29.29.29"] {
+        // 【APP65 任务2.3 / APP69 任务1】直连 DNS 上游（223.5.5.5 主 /
+        // 223.6.6.6、119.29.29.29 备）以 /32 写入 excludedRoutes：iOS 内核
+        // 强制这些 UDP 53 报文绕开 utun，从当前活跃物理网卡直接发出，
+        // **永远不可能回环**，与 NEDNSSettings 中的虚拟地址 172.19.0.2 解耦。
+        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29"] {
             excluded.append(
                 NEIPv4Route(destinationAddress: upstreamDNS, subnetMask: "255.255.255.255")
             )
@@ -1563,11 +1575,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         activeGoLanProbes = probes
         guard !probes.isEmpty else {
-            stopGoLanKeepaliveTimer()
+            cancelPendingGoLanProbes()
             return
         }
-        startGoLanKeepaliveTimer()
-        vpnQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        // 【APP69 任务2】启动完成后仅做一次 kernel-start 握手，不再启动
+        // 任何周期性保活定时器。
+        vpnQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.fireGoLanHandshakeProbes(reason: "kernel-start")
         }
     }
@@ -1578,7 +1591,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 结果不重要（家庭网关多半不开 HTTP），只要 UDP 包穿过隧道即可。
     private func fireGoLanHandshakeProbes(reason: String) {
         let probes = activeGoLanProbes
-        guard !probes.isEmpty, !activeClashBase.isEmpty else { return }
+        guard !probes.isEmpty, !activeClashBase.isEmpty, !isReloadingKernel else { return }
+        cancelPendingGoLanProbes()
+        lastGoLanHandshakeAt = Date()
         for item in probes {
             guard let tag = item["tag"], !tag.isEmpty,
                   let gw = item["gateway"], !gw.isEmpty
@@ -1595,44 +1610,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if !activeClashSecret.isEmpty {
                 req.setValue("Bearer \(activeClashSecret)", forHTTPHeaderField: "Authorization")
             }
-            URLSession.shared.dataTask(with: req).resume()
+            let task = URLSession.shared.dataTask(with: req)
+            goLanProbeTasks.append(task)
+            task.resume()
         }
         writeExtLog("INFO", "[GoLan-Ext] 自主握手已触发 reason=\(reason) probes=\(probes.count)")
     }
 
-    /// 【APP62 任务1 机制2】扩展内主动握手：软重启 / 切网 / 休眠唤醒后
-    /// 0.6 秒自动唤醒全部 go-lan-* 隧道，主 APP 无需在前台参与。
+    /// 【APP69 任务2】取消全部在途 Go Lan 握手探测，防止其与内核软重启
+    /// 交叠造成 Go 侧 Close 阻塞（44 秒卡死）与 207MB 内存尖峰。
+    private func cancelPendingGoLanProbes() {
+        guard !goLanProbeTasks.isEmpty else { return }
+        for task in goLanProbeTasks { task.cancel() }
+        goLanProbeTasks.removeAll()
+    }
+
+    /// 【APP69 任务2】仅允许两个握手时机，其余 reason 一律丢弃：
+    /// - kernel-start：启动完成后延迟 1.5 秒；
+    /// - device-wake：距离上次握手超过 60 秒才执行。
     private func triggerExtensionGoLanHandshakes(reason: String) {
         let probes = activeGoLanProbes
         if probes.isEmpty { return }
-        vpnQueue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.fireGoLanHandshakeProbes(reason: reason)
-        }
-    }
-
-    /// 【APP62 任务1 机制4】25 秒轻量保活巡检：保持运营商 5G NAT 与
-    /// 家用路由器 UDP 映射不断开（仅当存在 go-lan-* 隧道时运行）。
-    private func startGoLanKeepaliveTimer() {
-        guard !activeGoLanProbes.isEmpty else {
-            stopGoLanKeepaliveTimer()
-            return
-        }
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.goLanKeepaliveTimer?.invalidate()
-            let t = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
-                guard let self = self, !self.activeGoLanProbes.isEmpty else { return }
-                self.fireGoLanHandshakeProbes(reason: "keepalive")
+        switch reason {
+        case "kernel-start":
+            vpnQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.fireGoLanHandshakeProbes(reason: reason)
             }
-            RunLoop.main.add(t, forMode: .common)
-            self.goLanKeepaliveTimer = t
-        }
-    }
-
-    private func stopGoLanKeepaliveTimer() {
-        DispatchQueue.main.async { [weak self] in
-            self?.goLanKeepaliveTimer?.invalidate()
-            self?.goLanKeepaliveTimer = nil
+        case "device-wake":
+            if let last = lastGoLanHandshakeAt, Date().timeIntervalSince(last) < 60 {
+                return
+            }
+            vpnQueue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.fireGoLanHandshakeProbes(reason: reason)
+            }
+        default:
+            return
         }
     }
 
@@ -2676,6 +2688,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "outbound": "direct"
             ])
         }
+        // 【APP69 任务1】直连公共 DNS 免拦截：必须排在 `port: 53 → dns-out`
+        // 之前。否则 dns-direct 发往 223.5.5.5:53 的查询会再次命中 53 劫持，
+        // 触发 `DNS query loopback in transport[dns-direct]` 无限自环。
+        finalHead.append([
+            "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32", "119.29.29.29/32"],
+            "outbound": "direct"
+        ])
         finalHead.append(contentsOf: headRules)
         finalHead.append(contentsOf: goLanRules.filter { $0["ip_cidr"] == nil })
         finalHead.append([

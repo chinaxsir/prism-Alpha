@@ -1426,7 +1426,12 @@ pub fn build(
     // 拦截；erro-2.txt 显示 https://223.5.5.5/dns-query 仍被阿里云 WAF
     // 拦截返回 403。纯 223.5.5.5（53 端口）零加密零 Host 头，配合
     // direct 出站 ipv4_only，彻底告别 403 与 EPERM。
-    let dns_local_addr = cus_dns_override.unwrap_or_else(|| "223.5.5.5".to_string());
+    // 【APP69 任务1】国内直连 DNS 只接受纯 IPv4（走 UDP 53）：任何 DoH/DoT
+    // 域名或不可达的第三方 IP（如日志里的 172.64.229.88）一律回退到阿里
+    // 223.5.5.5，杜绝 `connect: network is unreachable` 刷屏与解析全失败。
+    let dns_local_addr = cus_dns_override
+        .filter(|addr| addr.parse::<std::net::Ipv4Addr>().is_ok())
+        .unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
         // 【APP66 任务5.2】dns-remote 改为 tcp://8.8.8.8 经主代理出境：
         // 明文 TCP 53 由 sing-box 自己封装进代理隧道，规避 UDP 53 在部分
@@ -1535,9 +1540,11 @@ pub fn build(
     // ③ go-lan-* 隧道网段 ip_cidr → go-lan-{tag}（必须在 QUIC 拦截与 DNS
     //    劫持之前：内网 NAS 的 UDP/443 不能被 quic 规则误杀；本网段内的
     //    DNS（如 192.168.10.1:53）也应留在隧道/局域网内而非被远端解析）
-    // ④ 协议规则：DNS 劫持（protocol dns / port 53 → dns-out）、853 拦截、
+    // ④ 直连 DNS 旁路（223.5.5.5 / 223.6.6.6 / 119.29.29.29 → direct）：
+    //    必须先于 protocol dns，否则 dns-direct 自身会再次命中 dns-out 自环
+    // ⑤ 协议规则：DNS 劫持（protocol dns / port 53 → dns-out）、853 拦截、
     //    公共 DNS 的 DoH/DoT 直连拦截、QUIC 拦截（强制 Safari 走 TCP）
-    // ⑤ go-lan 域名后缀规则（置于 DNS 劫持之后，保证域名先被解析再按域名
+    // ⑥ go-lan 域名后缀规则（置于 DNS 劫持之后，保证域名先被解析再按域名
     //    分流进隧道）
     let mut lan_ip_direct: Vec<Value> = Vec::new();
     let mut lan_ip_tunnel: Vec<Value> = Vec::new();
@@ -1566,6 +1573,14 @@ pub fn build(
     }
     // ③ go-lan-* 隧道网段
     head_rules.append(&mut lan_ip_tunnel);
+    // 【APP69 任务1】直连公共 DNS 免拦截：必须排在 `port: 53 → dns-out` 之前。
+    // 否则 dns-direct 发往 223.5.5.5:53 / 119.29.29.29:53 的查询进入路由表后
+    // 又被送回 dns-out，触发 `DNS query loopback in transport[dns-direct]`
+    // 无限自环风暴，节点域名与系统域名会全部解析失败。
+    head_rules.push(json!({
+        "ip_cidr": ["223.5.5.5/32", "223.6.6.6/32", "119.29.29.29/32"],
+        "outbound": "direct"
+    }));
     // ④ 协议规则
     head_rules.extend([
         json!({ "protocol": "dns", "outbound": "dns-out" }),
@@ -1583,7 +1598,7 @@ pub fn build(
         head_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
         head_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
     }
-    // ⑤ go-lan 域名后缀规则
+    // ⑥ go-lan 域名后缀规则
     head_rules.append(&mut lan_other);
     for (i, rule) in head_rules.into_iter().enumerate() {
         route_rules.insert(i, rule);
@@ -3710,10 +3725,14 @@ rules:
             .iter()
             .position(|r| r.get("protocol").and_then(Value::as_str) == Some("dns"))
             .expect("必须存在 protocol dns 劫持规则");
-        // 【APP60 任务3.2】黄金顺序 aim-probe(0-3) → On-Demand direct →
-        // WG 服务端豁免 → go-lan 隧道 → protocol dns。GoLanSettings::default()
-        // 下 On-Demand 空，wg_server 1 条，go-lan tunnel 1 条，故 dns_pos=6
-        assert_eq!(dns_pos, 6, "aim-probe + WG豁免 + go-lan隧道 之后才是 protocol dns");
+        // 【APP60 任务3.2 / APP69 任务1】黄金顺序 aim-probe(0-3) →
+        // On-Demand direct → WG 服务端豁免 → go-lan 隧道 → 直连 DNS 旁路 →
+        // protocol dns。GoLanSettings::default() 下 On-Demand 空，
+        // wg_server 1 条，go-lan tunnel 1 条，DNS 旁路 1 条，故 dns_pos=7
+        assert_eq!(
+            dns_pos, 7,
+            "aim-probe + WG豁免 + go-lan隧道 + 直连DNS旁路 之后才是 protocol dns"
+        );
         assert_eq!(rules[dns_pos + 1]["port"].as_u64(), Some(53), "缺 port 53 劫持");
         assert_eq!(rules[dns_pos + 2]["port"].as_u64(), Some(853), "缺 853 拦截");
         let wg_pos = rules
@@ -4231,6 +4250,62 @@ rules:
                 }
             }
         }
+    }
+
+    /// 【APP69 任务1】直连 DNS 旁路必须排在 53/dns 劫持之前，
+    /// 否则 dns-direct 的查询会再次命中 dns-out，形成自回环。
+    #[test]
+    fn direct_dns_bypass_precedes_dns_hijack() {
+        let clash = r#"
+proxies:
+  - {name: HK-01, type: vless, server: 1.2.3.4, port: 443, uuid: 2d3f4b4c-1c2e-4d5f-8a9b-0c1d2e3f4a5b}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK-01]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), clash.into())],
+            &[],
+            RunMode::SystemProxy,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-dns-bypass"),
+            &std::env::temp_dir().join("prism-cb-test-dns-bypass/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+
+        let bypass = rules
+            .iter()
+            .position(|rule| {
+                rule["ip_cidr"]
+                    .as_array()
+                    .is_some_and(|cidrs| cidrs.iter().any(|c| c == "223.5.5.5/32"))
+            })
+            .expect("直连 DNS 旁路规则缺失");
+        let hijack = rules
+            .iter()
+            .position(|rule| {
+                rule["port"] == 53 || rule["protocol"] == "dns"
+            })
+            .expect("DNS 劫持规则缺失");
+        assert!(
+            bypass < hijack,
+            "直连 DNS 旁路（#{bypass}）必须早于 DNS 劫持（#{hijack}）"
+        );
+
+        // 国内解析器必须是纯 IPv4，绝不允许第三方 DoH 地址
+        let servers = built.config["dns"]["servers"].as_array().unwrap();
+        let local = servers
+            .iter()
+            .find(|s| s["tag"] == "dns-local")
+            .expect("dns-local 缺失");
+        let addr = local["address"].as_str().unwrap();
+        assert_eq!(addr, "223.5.5.5");
     }
 
     /// 【APP63 任务1.2】白名单净化器：未知类型被剔除、selector 引用同步清理。

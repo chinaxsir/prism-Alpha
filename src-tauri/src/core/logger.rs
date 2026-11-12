@@ -290,19 +290,104 @@ pub fn classify_external_log_line(raw_line: &str) -> (&'static str, String) {
     } else {
         MOD_KERNEL
     };
-    // GoLan 扩展日志剥离 `[GoLan-Ext]` 前缀，正文更干净
-    let message = if module == MOD_GO_LAN {
-        let trimmed = raw_line.trim_start();
-        match trimmed.get(..11) {
-            Some(prefix) if prefix.eq_ignore_ascii_case("[GoLan-Ext]") => {
-                trimmed[11..].trim_start().to_string()
-            }
-            _ => trimmed.to_string(),
-        }
-    } else {
-        raw_line.trim().to_string()
-    };
+    // 【APP69 任务4】彻底剥离 `±HHMM / epoch + 日期 + ERROR + [id 12ms]`
+    // 等前缀，卡片右上角已单独展示时间戳与级别，正文只保留有效信息。
+    let message = strip_log_prefix(raw_line);
     (module, message)
+}
+
+/// 【APP69 任务4】清理日志正文前缀（时区偏移 / epoch / 日期 / 级别 / 耗时括号）。
+fn strip_log_prefix(line: &str) -> String {
+    let mut s = line.trim();
+    // `+0000 ` / `-0700 ` 时区前缀
+    if let Some(rest) = s.strip_prefix('+').or_else(|| s.strip_prefix('-'))
+        && rest.len() > 5
+        && rest[..4].bytes().all(|c| c.is_ascii_digit())
+        && rest.as_bytes()[4] == b' '
+    {
+        s = rest[5..].trim_start();
+    }
+    // 10 位 Unix 秒时间戳
+    let first = s.split_whitespace().next().unwrap_or("");
+    if first.len() == 10 && first.bytes().all(|c| c.is_ascii_digit()) {
+        s = s[first.len()..].trim_start();
+    }
+    s = strip_leading_datetime(s);
+    // 级别词
+    for level in [
+        "ERROR", "WARN", "INFO", "DEBUG", "FATAL", "TRACE",
+    ] {
+        if let Some(rest) = s.strip_prefix(level)
+            && (rest.starts_with(' ') || rest.starts_with('['))
+        {
+            s = rest.trim_start();
+            break;
+        }
+    }
+    // `[123 456ms]` / `[12ms]` 耗时括号
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let inside = &rest[..end];
+        if inside.contains("ms")
+            && inside.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            s = rest[end + 1..].trim_start();
+        }
+    }
+    // `[GoLan-Ext]` / `[GoLan]` 标签
+    for tag in ["[GoLan-Ext]", "[GoLan]"] {
+        if let Some(rest) = s.strip_prefix(tag) {
+            s = rest.trim_start();
+            break;
+        }
+    }
+    // 扩展日志的 `🌐 ` 图标前缀（`INFO 🌐 内核已切换至 ...`）
+    if let Some(rest) = s.strip_prefix('🌐') {
+        s = rest.trim_start();
+    }
+    s.to_string()
+}
+
+/// 【APP69 任务4】重复报错抑制：同一级别 + 模块 + 正文前 80 字符，
+/// 60 秒窗口内最多记录前 3 条，杜绝 DNS/连接错误刷屏淹没有效日志。
+fn should_suppress_repeated(level: &str, module: &str, message: &str) -> bool {
+    if level == "INFO" {
+        return false;
+    }
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<String, (Instant, u32)>>> =
+        OnceLock::new();
+    let map = SEEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    // 【APP69 任务4】按“错误类型”归一，而非按完整报文：
+    // `dns: exchange failed for a.com` 与 `... for b.com` 属同一类型，
+    // `dial tcp 1.2.3.4:443: i/o timeout` 也统一折叠。
+    let normalized = if let Some(pos) = message.find(" for ") {
+        &message[..pos]
+    } else if let Some(pos) = message.find("i/o timeout") {
+        &message[..(pos + "i/o timeout".len()).min(message.len())]
+    } else {
+        message
+    };
+    let key: String = format!(
+        "{level}|{module}|{}",
+        normalized.chars().take(80).collect::<String>()
+    );
+    let Ok(mut map) = map.lock() else { return false };
+    if map.len() > 512 {
+        map.clear();
+    }
+    let now = Instant::now();
+    let entry = map.entry(key).or_insert((now, 0));
+    if now.duration_since(entry.0) > Duration::from_secs(60) {
+        *entry = (now, 0);
+    }
+    if entry.1 >= 3 {
+        return true;
+    }
+    entry.1 += 1;
+    false
 }
 
 /// 【APP11 任务5.2】解析 sing-box 内核日志行自带的时间戳。
@@ -335,7 +420,7 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
             && d(i + 18)
         {
             let base = &line[i..i + 19];
-            // 【APP54 任务3】ISO/RFC3339 形式（如 sing-box `2025-11-06T12:34:56.789Z`）
+            // 【APP69 任务4】ISO/RFC3339 形式（如 sing-box `2025-11-06T12:34:56.789Z`）
             // 先按原时区解析，再强制转换为北京时间（UTC+8）。
             if i + 19 < n && (b[i + 10] == b'T' || b[i + 10] == b't') {
                 let end = line[i..]
@@ -372,6 +457,53 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
                     }
                     ms = frac;
                 }
+            }
+            // 【APP69 任务4】带 `±HHMM ` 前缀时按该时区解析并换算到 UTC+8：
+            // `+0000 2026-11-12 03:05:21` 应显示为 `11:05:21`，而非 03:05:21。
+            let offset_minutes: Option<i32> = if i >= 6 {
+                let p = &line[i - 6..i];
+                let pb = p.as_bytes();
+                if (pb[0] == b'+' || pb[0] == b'-')
+                    && pb[1..5].iter().all(|c| c.is_ascii_digit())
+                    && pb[5] == b' '
+                {
+                    let hh: i32 = p[1..3].parse().ok()?;
+                    let mm: i32 = p[3..5].parse().ok()?;
+                    Some(if pb[0] == b'-' { -(hh * 60 + mm) } else { hh * 60 + mm })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(minutes) = offset_minutes {
+                use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
+                let year: i32 = line[i..i + 4].parse().ok()?;
+                let month: u8 = line[i + 5..i + 7].parse().ok()?;
+                let day: u8 = line[i + 8..i + 10].parse().ok()?;
+                let hour: u8 = line[i + 11..i + 13].parse().ok()?;
+                let minute: u8 = line[i + 14..i + 16].parse().ok()?;
+                let second: u8 = line[i + 17..i + 19].parse().ok()?;
+                let millis: i32 = ms.parse().unwrap_or(0);
+                let date = Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()?;
+                let time_of_day =
+                    Time::from_hms_milli(hour, minute, second, millis as u16).ok()?;
+                let source_offset =
+                    UtcOffset::from_whole_seconds(minutes * 60).ok()?;
+                let beijing = UtcOffset::from_hms(8, 0, 0).unwrap_or(UtcOffset::UTC);
+                let local = PrimitiveDateTime::new(date, time_of_day)
+                    .assume_offset(source_offset)
+                    .to_offset(beijing);
+                return Some(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                    local.year(),
+                    u8::from(local.month()),
+                    local.day(),
+                    local.hour(),
+                    local.minute(),
+                    local.second(),
+                    local.millisecond()
+                ));
             }
             return Some(format!("{base}.{ms}"));
         }
@@ -546,12 +678,16 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
         } else {
             "INFO"
         };
-        // 连续重复行去重
-        let key = format!("{level}|{module}|{line}");
+        // 连续重复行去重（使用已清理前缀的正文，避免时间戳差异导致漏判）
+        let key = format!("{level}|{module}|{classified}");
         if last_key.as_deref() == Some(key.as_str()) {
             continue;
         }
         last_key = Some(key);
+        // 【APP69 任务4】高频报错熔断：同签名 60 秒内最多 3 条
+        if should_suppress_repeated(level, module, &classified) {
+            continue;
+        }
         if count >= max_lines {
             break;
         }
@@ -565,7 +701,7 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
             timestamp,
             level: level.into(),
             module: module.into(),
-            message: strip_leading_datetime(&classified).chars().take(500).collect(),
+            message: classified.chars().take(500).collect(),
         });
     }
 }
@@ -1054,11 +1190,62 @@ pub fn export_diagnostic_text(data_dir: &std::path::Path) -> String {
 mod tests {
     use super::{
         beijing_now_string, classify_external_log_line, enforce_strict_log_category,
-        is_benign_close_line, is_noise_eperm_line, safe_truncate_str, strip_leading_datetime,
+        is_benign_close_line, is_noise_eperm_line, parse_kernel_timestamp, safe_truncate_str,
+        should_suppress_repeated, strip_leading_datetime, strip_log_prefix,
         MOD_GO_AIM, MOD_GO_CUS,
         MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING,
         PHASE_HANDSHAKE, PHASE_NODE_IDENT,
     };
+
+    /// 【APP69 任务4】同类型错误 60 秒内最多记录 3 条，INFO 永不抑制
+    #[test]
+    fn test_repeated_error_suppression() {
+        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for a.com"));
+        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for b.com"));
+        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for c.com"));
+        // 第 4 条同类型（不同域名）必须被抑制
+        assert!(should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for d.com"));
+        // 不同类型不受影响
+        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dial tcp: connection refused"));
+        // INFO 永不抑制
+        for _ in 0..10 {
+            assert!(!should_suppress_repeated("INFO", "dedupe-test", "节点已切换"));
+        }
+        assert_eq!(
+            strip_log_prefix("1794452721 INFO 🌐 内核已切换至 pdp_ip0"),
+            "内核已切换至 pdp_ip0"
+        );
+    }
+
+    /// 【APP69 任务4】`+0000` 前缀必须按 UTC 解析并换算为北京时间（+8h）
+    #[test]
+    fn test_kernel_timestamp_utc_offset() {
+        let ts = parse_kernel_timestamp("+0000 2026-11-12 03:05:21 ERROR [1 2ms] dns: x")
+            .expect("must parse");
+        assert_eq!(ts, "2026-11-12 11:05:21.000");
+        // 已是 +0800 的日志保持原时分
+        let ts = parse_kernel_timestamp("+0800 2026-11-12 11:05:21 INFO started")
+            .expect("must parse");
+        assert_eq!(ts, "2026-11-12 11:05:21.000");
+    }
+
+    /// 【APP69 任务4】正文前缀（时区 / 日期 / 级别 / 耗时括号 / epoch）全部剥离
+    #[test]
+    fn test_strip_log_prefix() {
+        assert_eq!(
+            strip_log_prefix("+0000 2026-11-12 03:05:21 ERROR [123 4ms] dns: exchange failed"),
+            "dns: exchange failed"
+        );
+        assert_eq!(
+            strip_log_prefix("1793015059 INFO [GoLan-Ext] 自主握手已触发"),
+            "自主握手已触发"
+        );
+        assert_eq!(
+            classify_external_log_line("+0000 2026-11-12 03:05:21 INFO [GoLan-Ext] 握手")
+                .1,
+            "握手"
+        );
+    }
 
     /// 【APP58 任务5】强制分类器（第一道铁闸）：显式模块名先归一化；
     /// **绝不读取 message 做关键词猜测**，Kernel 底层日志无论正文含什么

@@ -254,6 +254,9 @@ pub struct AnalyticsAgg {
     pub last_total_down: u64,
     #[serde(default)]
     pub last_total_up: u64,
+    /// 【APP69 任务3】上次分析统计重置时刻（30 秒冷却），不参与序列化
+    #[serde(skip)]
+    pub last_reset_at: Option<std::time::Instant>,
 }
 
 /// 【APP54 任务4】测速 / Go AIM 探测进度（原子统计，供前端进度条实时渲染）。
@@ -915,9 +918,12 @@ pub fn is_port_free(host: &str, port: u16) -> bool {
     std::net::TcpListener::bind((host, port)).is_ok()
 }
 
-/// 选择 clash_api 监听地址：优先 9090，被占用则让系统分配随机端口
-pub fn pick_api_addr() -> String {
-    if is_port_free("127.0.0.1", 9090) {
+/// 【APP69 任务3】移动端 Clash API 端口必须恒定：iOS NEPacketTunnelProvider
+/// 与 Android VpnService 在重载时，主 App / 看门狗若按随机端口重连会反复
+/// `12 UNAVAILABLE`（Android 侧更是写死 http://127.0.0.1:9090）。
+/// 桌面端保持 9090 优先、被占用则随机兜底。
+pub fn pick_api_addr_for(is_mobile: bool) -> String {
+    if is_mobile || is_port_free("127.0.0.1", 9090) {
         return super::kernel::PREFERRED_API_ADDR.to_string();
     }
     match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -930,6 +936,11 @@ pub fn pick_api_addr() -> String {
             super::kernel::PREFERRED_API_ADDR.to_string()
         }
     }
+}
+
+/// 选择 clash_api 监听地址（桌面：9090 优先，占用则随机；移动端恒定 9090）
+pub fn pick_api_addr() -> String {
+    pick_api_addr_for(cfg!(any(target_os = "ios", target_os = "android")))
 }
 
 /// 【APP52 任务1】节点延迟统一排序键（后端 get_proxies / 前端 Proxies 双重排序）：
@@ -947,6 +958,15 @@ pub fn node_delay_sort_key(delay: Option<u32>) -> (u8, u32) {
 #[cfg(test)]
 mod app52_tests {
     use super::*;
+
+    /// 【APP69 任务3】移动端 Clash API 端口必须恒定 9090，绝不随机分配
+    #[test]
+    fn test_pick_api_addr_fixed_on_mobile() {
+        assert_eq!(
+            pick_api_addr_for(true),
+            super::super::kernel::PREFERRED_API_ADDR
+        );
+    }
 
     #[test]
     fn test_node_delay_sort_key_order() {

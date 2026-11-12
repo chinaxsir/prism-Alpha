@@ -887,15 +887,21 @@ try {
   const ptt = readFileSync(resolve(ROOT, pttRel), 'utf8');
   const wireMust = [
     ['activeGoLanProbes', 3, 'go-lan 握手清单（声明 + 赋值 + 发包）'],
-    ['triggerExtensionGoLanHandshakes', 3, '扩展自主重握手（声明 + 切网/唤醒调用）'],
+    ['triggerExtensionGoLanHandshakes', 2, '扩展自主重握手（仅 kernel-start / device-wake）'],
+    ['cancelPendingGoLanProbes', 3, '在途握手取消（声明 + 停止 + 软重启）'],
     ['activeBoundIPv4', 3, '物理 IPv4 跟踪（声明 + 赋值 + 比对）'],
     ['override func wake()', 1, '休眠唤醒自愈入口'],
-    ['goLanKeepaliveTimer', 3, '25 秒保活定时器'],
   ];
   for (const [token, min, desc] of wireMust) {
     const n = ptt.split(token).length - 1;
     if (n >= min) pass(`${desc}：${token} 出现 ${n} 次 ✓`);
     else fail(`${desc}：${token} 仅出现 ${n} 次（至少 ${min} 次），可能只声明未接线`);
+  }
+  // 【APP69 任务2】25 秒保活定时器必须彻底移除，禁止复发
+  if (ptt.includes('goLanKeepaliveTimer') || ptt.includes('reason: "keepalive"')) {
+    fail('APP69 已删除 25 秒保活巡检，不得再引入 goLanKeepaliveTimer / keepalive 触发');
+  } else {
+    pass('25 秒保活定时器已彻底移除 ✓');
   }
   const scopeBans = [
     [/(?<![\w.])as!/, '`as!` 强制转换'],

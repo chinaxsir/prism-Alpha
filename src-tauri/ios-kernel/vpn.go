@@ -142,10 +142,8 @@ func PrismVPNStart(configContent *C.char, workDir *C.char) *C.char {
 // vpnMu 永远无法释放，后续 PrismVPNStart 死锁超时 60 秒触发
 // code=12: The VPN session failed to connect in a timely manner。
 func PrismVPNStop() {
-	// 【APP48 任务1.1】隧道停止时只做一次 GC 归还堆内存；运行期不再有
-	// 每 30 秒强制 GC 的 STW 停顿，大流量（内网 SMB/WebDAV）不再被卡在 600KB/s。
-	runtime.GC()
-
+	// 【APP69 任务2】先摘除全局指针，确保关闭窗口内不可能再被 PrismVPNStart
+	// 拿到同一个已关闭实例。
 	vpnMu.Lock()
 	inst := vpnService
 	vpnService = nil
@@ -164,6 +162,11 @@ func PrismVPNStop() {
 			vpnLogf("vpn: close abandoned after 1500ms (deadlock guard)")
 		}
 	}
+	// 【APP69 任务2】关闭完成后主动回收 ：APP68 日志证实软重启期间
+	// Go 堆冲到 207MB → Jetsam 杀死扩展（44 秒卡死）。这里在 Close 之后
+	// 强制 GC 并把空闲页归还操作系统，压低下一次启动的内存基线。
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 // ---------------- 内部辅助 ----------------

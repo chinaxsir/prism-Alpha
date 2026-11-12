@@ -54,17 +54,39 @@ fn trim_analytics_map(map: &mut std::collections::HashMap<String, AggStat>) {
     }
 }
 
+/// 【APP69 任务3】会话重置判定（纯函数，便于单测）：
+/// 只有“此前确有流量、当前仍有非零流量、且腰斩”才视为内核重启归零。
+/// `cur_total == 0`（隧道首帧空快照）绝不触发，避免一启动就清空统计。
+fn should_reset_session(prev_total: u64, cur_total: u64, cooldown_ok: bool) -> bool {
+    cooldown_ok && prev_total > 65_536 && cur_total > 0 && cur_total < prev_total / 2
+}
+
 /// 启动全部内核事件流订阅，返回任务句柄（调用方在停止内核时 abort）
+/// 【APP69 任务3】进程级单实例：每次 spawn_all 先 abort 上一轮订阅，
+/// 杜绝 reattach / 热重启后两条 /connections 流并存导致的分析重复统计、
+/// 日志双写（日志里 `.145` 与 `.254` 两条相同重置记录即由此产生）。
 pub fn spawn_all(
     api_addr: &str,
     api_secret: &str,
     app: AppHandle,
 ) -> Vec<JoinHandle<()>> {
-    vec![
+    let handles = vec![
         spawn_stream(api_addr, api_secret, "/traffic", "traffic://tick", app.clone()),
         spawn_stream(api_addr, api_secret, "/connections", "connections://tick", app.clone()),
         spawn_stream(api_addr, api_secret, "/memory", "memory://tick", app),
-    ]
+    ];
+    static STREAMS: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+        std::sync::OnceLock::new();
+    let registry = STREAMS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut prev) = registry.lock() {
+        for handle in prev.drain(..) {
+            handle.abort();
+        }
+        for handle in &handles {
+            prev.push(handle.abort_handle());
+        }
+    }
+    handles
 }
 
 fn spawn_stream(
@@ -343,10 +365,18 @@ pub(crate) fn apply_connections_update(
     //    新 id 视为 count+1，随后刷新 last_seen（已消失的从 last_seen 移除）
     {
         let mut agg = state.analytics.write();
-        // 【APP57 任务2】内核 / 扩展重启导致累计字节数归零（downloadTotal +
-        // uploadTotal 小于上帧采样）时，立即清零本次会话分析统计，绝不把
-        // 旧会话数据继续累加到新会话（分流占比与 Top 主机名从 0 重新统计）。
-        if download_total < agg.last_total_down || upload_total < agg.last_total_up {
+        // 【APP69 任务3】会话重置采用严格条件 + 30 秒冷却：
+        // 1. 上一帧总量 > 64 KiB（排除刚启动的空窗口）；
+        // 2. 当前帧总量 > 0（cur_total == 0 只是隧道首帧空快照，绝不清空）；
+        // 3. 当前总量 < 上一帧的一半（确属内核重启归零，而非正常波动）；
+        // 4. 距上次重置超过 30 秒（两条 WS 流同时到达也只记一次）。
+        let prev_total = agg.last_total_down.saturating_add(agg.last_total_up);
+        let cur_total = download_total.saturating_add(upload_total);
+        let cooldown_ok = agg
+            .last_reset_at
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(30))
+            .unwrap_or(true);
+        if should_reset_session(prev_total, cur_total, cooldown_ok) {
             agg.hosts.clear();
             agg.domains.clear();
             agg.ips.clear();
@@ -360,6 +390,7 @@ pub(crate) fn apply_connections_update(
             agg.lan_bytes = 0;
             agg.last_total_down = download_total;
             agg.last_total_up = upload_total;
+            agg.last_reset_at = Some(std::time::Instant::now());
             crate::core::logger::info(
                 crate::core::logger::MOD_KERNEL,
                 "检测到内核累计流量归零，分析统计已重置并开始新会话统计",
@@ -625,9 +656,25 @@ fn local_hhmmss() -> String {
 mod tests {
     use super::{
         allocate_untracked, builtin_ip_domain, is_ip_literal, looks_like_domain_suffix,
-        resolve_domain, route_category, OutboundMode, RouteCategory,
+        resolve_domain, route_category, should_reset_session, OutboundMode, RouteCategory,
     };
     use std::collections::HashMap;
+
+    /// 【APP69 任务3】cur_total == 0 / 冷却期内 / 未腰斩 均不得重置分析统计
+    #[test]
+    fn test_should_reset_session_strict() {
+        // 内核重启：上一帧 2MB，本帧 1KB → 重置
+        assert!(should_reset_session(2_000_000, 1024, true));
+        // 隧道首帧空快照：cur_total == 0 → 绝不重置
+        assert!(!should_reset_session(2_000_000, 0, true));
+        // 30 秒冷却期内：即便腰斩也不重置（防双流重复清空）
+        assert!(!should_reset_session(2_000_000, 1024, false));
+        // 上一帧流量过小（< 64KiB）→ 视为启动空窗口，不重置
+        assert!(!should_reset_session(65_536, 1024, true));
+        // 正常增长 / 轻微回落 → 不重置
+        assert!(!should_reset_session(2_000_000, 1_800_000, true));
+        assert!(!should_reset_session(2_000_000, 2_400_000, true));
+    }
 
     /// 【APP39 任务3】域名解析优先级：嗅探 host > 反向缓存 > 规则后缀 > 内置映射
     #[test]
