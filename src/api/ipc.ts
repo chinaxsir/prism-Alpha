@@ -339,6 +339,9 @@ export interface GoAimStatus {
 export const getGoAimStatus = () => invoke<GoAimStatus>("get_go_aim_status");
 /** 【APP71 任务3】一次性拉取 Go AIM 全量快照（进度 / 最近事件 / 结果） */
 export const getGoAimSnapshot = () => invoke<GoAimSnapshot>("get_go_aim_snapshot");
+/** 【APP72 任务1.4】导出单节点 AIM 报告（iOS 系统分享 / 桌面 Downloads） */
+export const exportSingleNodeReport = (nodeName: string, content: string) =>
+  invoke<string>("export_single_node_report", { nodeName, content });
 export const setGoAimEnabled = (enabled: boolean) =>
   invoke<void>("set_go_aim_enabled", { enabled });
 export const runGoAimProbe = (mode?: AimProbeMode) =>

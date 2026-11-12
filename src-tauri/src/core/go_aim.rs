@@ -60,6 +60,16 @@ const PROBE_TIMEOUT_MS: u64 = 2800;
 const SCREEN_BATCH_SIZE: usize = 32;
 /// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
 const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
+/// 【APP72 任务1.3】阶段1 首次测速超时后的备用测速地址（Cloudflare 204），
+/// 单次失败不再直接判死。
+const SCREEN_FALLBACK_URL: &str = "http://cp.cloudflare.com/generate_204";
+
+/// 【APP72 任务1.3】阶段1 延迟裁决：首测 → 备用地址重测 → 历史真实缓存（>0ms）。
+/// 任一环节拿到合法延迟即视为存活，全部不可用才判死。
+fn resolve_screen_delay(first: Option<u64>, retry: Option<u64>, cached: Option<u64>) -> Option<u64> {
+    let valid = |d: Option<u64>| d.filter(|v| *v > 0 && *v < PROBE_MAX_DELAY_MS);
+    valid(first).or_else(|| valid(retry)).or_else(|| valid(cached))
+}
 /// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
 /// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
 // DEEP_PROBE_MAX 已移除（APP53 任务2.3：Go AIM 必须检测完所有可达节点）
@@ -101,9 +111,6 @@ const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", 
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
 const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN", "RU", "AF"];
-
-/// 【APP67】出口预检：若 loc 为这些值视为未知/无效，立即短路后续平台探测
-const UNKNOWN_EXIT_COUNTRIES: &[&str] = &["XX", "T1", "T2", "A1", "A2", "O1", "EU"];
 
 /// 出口地区探测端点（依次兜底）：cdn-trace 返回多行 key=value，
 /// 其中 `loc=XX` 即 Cloudflare 观测到的出口国家/地区代码。
@@ -1174,6 +1181,15 @@ async fn probe_all(
                 .collect()
         })
         .unwrap_or_default();
+    // 【APP72 任务1.3】阶段1 引入重试与缓存回退：单次超时不再直接判死，
+    // 避免大批可用节点（如 34 个中 19 个）被误淘汰导致阶段2 样本过少。
+    let cached_delays: std::collections::HashMap<String, u64> = state
+        .aim_results
+        .read()
+        .iter()
+        .filter(|(_, r)| r.delay_ms > 0)
+        .map(|(name, r)| (name.clone(), r.delay_ms))
+        .collect();
     {
         use futures_util::StreamExt as _;
         let sem = Arc::new(tokio::sync::Semaphore::new(SCREEN_BATCH_SIZE));
@@ -1194,8 +1210,15 @@ async fn probe_all(
                         )
                         .await
                     } else {
-                        // 内核运行：真实隧道 HTTP 测速
-                        api.test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32).await
+                        // 内核运行：真实隧道 HTTP 测速；首次失败立即用备用地址重试一次
+                        let first =
+                            api.test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32).await;
+                        if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
+                            first
+                        } else {
+                            api.test_delay(&name, SCREEN_FALLBACK_URL, PROBE_TIMEOUT_MS as u32)
+                                .await
+                        }
                     };
                     (name, delay)
                 }
@@ -1216,6 +1239,8 @@ async fn probe_all(
                 }
             };
             let Some((name, delay)) = next else { break };
+            // 重试仍失败时回退到历史真实测速缓存（>0ms 才认），避免误杀可用节点
+            let delay = resolve_screen_delay(delay, None, cached_delays.get(&name).copied());
             // 中止条件：关闭 Go AIM / 订阅变更（代数变化）
             if !state.settings.read().go_aim_enabled
                 || (!preview_mode && !is_running(state))
@@ -1508,42 +1533,20 @@ async fn probe_all(
         ),
     );
 
-    // 【APP67 BUG-04】预取本机直连公网 IP（不经代理），用于防漏直连判定：
-    // 若某节点出口 IP 与本机直连 IP 一致，说明代理隧道未生效，立即短路。
-    let direct_ip: Option<String> = {
-        let direct = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(3000))
-            .build()
-            .ok();
-        if let Some(c) = direct {
-            let mut fetch = Box::pin(fetch_egress(&c));
-            loop {
-                tokio::select! {
-                    egress = &mut fetch => break egress.ip,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                        if !state.settings.read().go_aim_enabled
-                            || !is_running(state)
-                            || generation_changed(state)
-                        {
-                            return Err("探测中止（Go AIM 已关闭、VPN 已停止或订阅已变更）".into());
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        }
-    };
-    tracing::debug!("[go-aim] 本机直连公网 IP: {:?}", direct_ip);
-    let direct_ip = Arc::new(direct_ip);
+    // 【APP72 任务1.2】删除「预取本机直连公网 IP」与出口 IP 一致性短路：
+    // 出口 IP 与直连 IP 相同并不能证明隧道未生效（同城出口/运营商级 NAT
+    // 都会出现相同 IP），该判定会在网关节点上误杀全部 7 个平台探测。
+    // 现在只以 cdn-cgi/trace 的 egress_ip + country 作为参考证据，
+    // 即使 trace 偶发超时也照常执行 7 平台实测，绝不提前短路。
 
-    // 【APP67 P4】阶段2 进度初始化：total 设为存活节点数，done 归零，
-    // percent 从 20% 起步，每完成一个存活节点 +79/alive_count（封顶 99%）。
+    // 【APP72 任务1.3】阶段2 进度初始化：full_total 必须是「全部候选节点总数」
+    //（含阶段1 已淘汰节点），processed = failed_count + full_done + cache_hits，
+    // 只有 processed == total 时进度才允许到达 100%。
     {
         let mut p = state.aim_progress.lock();
         p.phase = "DEEP_PROBE".into();
         p.run_id = run.run_id.clone();
-        p.full_total = alive_count;
+        p.full_total = p.total.max(alive_count);
         p.full_done = 0;
         p.cache_hits = 0;
         p.active_slots = slot_clients.len();
@@ -1582,7 +1585,6 @@ async fn probe_all(
         let api = api_after_stage1.clone();
         let task_app = app.clone();
         let instant_locked = instant_locked.clone();
-        let direct_ip = direct_ip.clone();
         let cached_results = cached_results.clone();
         let node_ids = node_ids.clone();
         let controller = controller.clone();
@@ -1626,7 +1628,6 @@ async fn probe_all(
                     slot,
                     &name,
                     Some(delay),
-                    direct_ip.as_deref(),
                     &node_id,
                     cached,
                     result_mode,
@@ -2360,8 +2361,8 @@ fn set_slot_state(app: &AppHandle, slot: usize, node: &str, services: String) {
 }
 
 /// 单节点探测：复用阶段1 快筛延迟 → 探针选择器切到该节点 →
-/// 【APP67 BUG-04】出口 IP/地区预检短路 → 7 个平台并发真实请求判定。
-/// 死节点 / 出口预检失败生成 probed=true 的空结果。
+/// 【APP72 任务1.2】出口信息仅作参考证据，绝不短路 7 平台真实探测。
+/// 死节点（基线延迟失败）生成 probed=true 的空结果。
 #[allow(clippy::too_many_arguments)]
 async fn probe_node(
     api: &crate::core::kernel::KernelApi,
@@ -2370,7 +2371,6 @@ async fn probe_node(
     slot: usize,
     name: &str,
     prescreened_delay: Option<u64>,
-    direct_ip: Option<&str>,
     node_id: &str,
     cached: Option<&AimNodeResult>,
     mode: AimProbeMode,
@@ -2410,28 +2410,12 @@ async fn probe_node(
         return NodeProbeOutcome::new(stamp(dead_result(name)), false, started);
     }
 
-    // 3. 每个节点都先做一次轻量出口预检；缓存命中也绝不跳过。
+    // 3. 每个节点都先做一次轻量出口预检（仅采集证据，失败也继续 7 平台探测）。
     let egress = fetch_egress(client).await;
     if egress.ip.is_none() || egress.country.is_none() {
-        tracing::debug!("[go-aim] 节点「{name}」出口探测失败，短路后续平台探测");
-        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
-        result.egress_asn = egress.asn;
-        return NodeProbeOutcome::new(stamp(result), false, started);
-    }
-    let country = egress.country.as_deref().unwrap();
-    if UNKNOWN_EXIT_COUNTRIES.contains(&country) {
-        tracing::debug!("[go-aim] 节点「{name}」出口地区 {country} 未知，短路");
-        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
-        result.egress_asn = egress.asn;
-        return NodeProbeOutcome::new(stamp(result), false, started);
-    }
-    if let Some(dip) = direct_ip
-        && egress.ip.as_deref() == Some(dip)
-    {
-        tracing::debug!("[go-aim] 节点「{name}」出口 IP 与直连 IP 一致（漏直连），短路");
-        let mut result = egress_unknown_result(name, base_delay, egress.ip, egress.country);
-        result.egress_asn = egress.asn;
-        return NodeProbeOutcome::new(stamp(result), false, started);
+        tracing::debug!(
+            "[go-aim] 节点「{name}」cdn-cgi/trace 未取到完整出口信息，继续执行 7 平台实测"
+        );
     }
 
     // 4. 配置指纹 + 双版本 + 出口 IP 全一致：0 平台请求直接复用。
@@ -2576,6 +2560,9 @@ impl NodeProbeOutcome {
 }
 
 /// 【APP67 BUG-04】出口预检失败时的统一结果：7 个服务均 Unknown，无解锁标签。
+/// 【APP72 任务1.2】在线探测路径已不再短路；该构造函数保留给回归测试与
+/// 诊断导出复用，因此显式允许未使用。
+#[allow(dead_code)]
 fn egress_unknown_result(
     name: &str,
     delay: u64,
@@ -3749,5 +3736,16 @@ mod tests {
         assert_eq!(restored.retry_count, 0);
         assert!(restored.elapsed_ms.is_none());
         assert!(restored.verdict_basis.is_empty());
+    }
+
+    /// 【APP72 测试2】阶段1 单次超时不得直接判死：首测 → 备用地址重测 →
+    /// 历史缓存（>0ms）三级裁决，全部不可用才淘汰。
+    #[test]
+    fn test_app72_screen_retry_and_cached_fallback() {
+        assert_eq!(resolve_screen_delay(Some(120), Some(300), None), Some(120));
+        assert_eq!(resolve_screen_delay(None, Some(180), Some(90)), Some(180));
+        assert_eq!(resolve_screen_delay(Some(0), None, Some(95)), Some(95));
+        assert_eq!(resolve_screen_delay(None, None, Some(0)), None);
+        assert_eq!(resolve_screen_delay(None, None, None), None);
     }
 }

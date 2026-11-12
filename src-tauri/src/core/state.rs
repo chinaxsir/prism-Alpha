@@ -352,7 +352,10 @@ impl ProbeProgress {
         let phase = self.phase.clone();
         if self.full_total > 0 {
             self.total = self.full_total;
-            self.done = (self.full_done + self.cache_hits).min(self.full_total);
+            // 【APP72 任务1.3】processed = 阶段1 已淘汰 + 阶段2 已处理（含缓存命中）：
+            // 只有全部候选节点都处理完（如 34/34）时进度才允许到 100%。
+            self.done = (self.full_done + self.cache_hits + self.failed_count)
+                .min(self.full_total);
             self.pending_count = self.full_total.saturating_sub(self.done);
             let computed = 20 + (self.done * 79) / self.full_total.max(1);
             self.percent = if matches!(phase.as_str(), "ERROR" | "CANCELLED") {

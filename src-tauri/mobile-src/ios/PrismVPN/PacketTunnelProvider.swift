@@ -71,7 +71,15 @@ private let cnDirectDomainSuffixes: [String] = [
     // 对象存储 / 云 CDN
     "qiniu.com", "qiniucdn.com", "qnssl.com", "clouddn.com", "upyun.com",
     // 开发 / 工具
-    "cnblogs.com", "51cto.com", "chinaz.com", "runoob.com"
+    "cnblogs.com", "51cto.com", "chinaz.com", "runoob.com",
+    // 【APP72 任务3.2】补齐高频大陆域名（与 Rust 100% 同步）
+    "1688.com", "servicewechat.com", "douyinpic.com", "volcengine.com",
+    "zjcdn.com", "gifshow.com", "jcloudcs.com", "jdpay.com", "pddpic.com",
+    "sankuai.com", "xiaomi.net", "honor.com", "oppo.com", "vivo.com",
+    "coloros.com", "acgvideo.com", "bilivideo.cn", "71.am", "cainiao.com",
+    "fliggy.com", "nga.cn", "v2ex.com", "music.163.com", "ydstatic.com",
+    "ccb.com", "abchina.com", "cmbchina.com", "bankcomm.com", "psbc.com",
+    "95516.com", "apple-cloudkit.com", "local", "lan"
 ]
 
 /// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段
@@ -94,7 +102,36 @@ private let cnDirectCIDRs: [String] = [
     "120.55.0.0/16", "121.43.0.0/16", "123.57.0.0/16",
     "81.68.0.0/14",
     "106.12.0.0/14",
-    "106.75.0.0/16"
+    "106.75.0.0/16",
+    // 【APP72 任务3.2】大陆运营商/宽带大网段（与 Rust CN_DIRECT_CIDRS 同步）
+    "14.112.0.0/12", "58.144.0.0/16", "203.209.0.0/16",
+    "110.0.0.0/7", "112.0.0.0/6", "116.0.0.0/6", "120.0.0.0/6",
+    "124.0.0.0/7", "182.0.0.0/8", "183.0.0.0/8",
+    "202.96.0.0/12", "210.21.0.0/16", "211.136.0.0/13",
+    "218.0.0.0/7", "219.128.0.0/11", "221.0.0.0/8", "222.0.0.0/8",
+    "223.64.0.0/11"
+]
+
+/// 【APP72 任务3.2】常见海外站点后缀：DNS 走 dns-remote，避免污染 IP
+/// 导致直连失败；与 Rust PROXY_DOMAIN_SUFFIXES 100% 同步。
+private let proxyDomainSuffixes: [String] = [
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "anthropic.com", "claude.ai", "gemini.google.com",
+    "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
+    "youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com",
+    "netflix.com", "nflxvideo.net", "nflximg.net", "nflxext.com", "nflxso.net",
+    "disneyplus.com", "disney-plus.net", "bamgrid.com", "dssott.com",
+    "tiktok.com", "tiktokv.com", "byteoversea.com", "ibytedtos.com",
+    "twitter.com", "x.com", "twimg.com", "facebook.com", "instagram.com",
+    "whatsapp.net", "telegram.org", "t.me", "github.com", "githubusercontent.com",
+    "figma.com", "notion.so", "dropbox.com", "spotify.com", "soundcloud.com",
+    "twitch.tv", "reddit.com", "wikipedia.org"
+]
+
+/// 【APP72 任务3.2】海外站点关键词兜底：仅用于 DNS 走 dns-remote。
+private let proxyDomainKeywords: [String] = [
+    "openai", "anthropic", "claude", "gemini", "netflix", "disney",
+    "tiktok", "telegram"
 ]
 
 /// 缓存当前活跃的物理网卡索引与名称（en0 / pdp_ip0）
@@ -1890,7 +1927,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 100% 命中顶部 ip_cidr → go-lan-* 规则，绝不被改写漏进代理。
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = false
-                    inbounds[i]["sniff_timeout"] = "50ms"
+                    inbounds[i]["sniff_timeout"] = "30ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }
@@ -2515,6 +2552,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         dnsRules.append([
             "clash_mode": "global",
+            "server": "dns-remote"
+        ])
+        // 【APP72 任务3.2】常见海外站点 → dns-remote（与 Rust 一致）
+        dnsRules.append([
+            "domain_suffix": proxyDomainSuffixes,
+            "server": "dns-remote"
+        ])
+        dnsRules.append([
+            "domain_keyword": proxyDomainKeywords,
             "server": "dns-remote"
         ])
         root["dns"] = [

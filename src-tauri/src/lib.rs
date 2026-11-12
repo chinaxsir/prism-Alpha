@@ -353,6 +353,7 @@ pub fn run() {
             ipc::commands::clear_app_logs,
             ipc::commands::export_app_logs,
             ipc::commands::export_diagnostic_logs,
+            ipc::commands::export_single_node_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

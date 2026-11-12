@@ -4359,15 +4359,6 @@ pub async fn run_go_aim_probe(
     state: State<'_, AppState>,
     mode: Option<crate::core::go_aim::AimProbeMode>,
 ) -> Result<bool, String> {
-    if !state.settings.read().go_aim_enabled {
-        // 【APP71】明确回传失败原因，前端显示「Go AIM 功能未启用」而非静默无响应
-        crate::core::go_aim::notify_aim_error(
-            &app,
-            "DISABLED",
-            "Go AIM 功能未启用，请先在仪表盘开启",
-        );
-        return Ok(false);
-    }
     if !state.is_pro_active() {
         crate::core::go_aim::notify_aim_error(
             &app,
@@ -4375,6 +4366,24 @@ pub async fn run_go_aim_probe(
             "Go AIM 是 Pro 专属功能，请先激活授权",
         );
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
+    }
+    // 【APP72 任务1.1】用户点击「AIM检测」即视为明确启用意图：
+    // 后端第一行自动把 go_aim_enabled 置 true 并持久化，彻底消除
+    // settings.go_aim_enabled 与界面开关不同步导致的
+    // 「Go AIM 功能未启用，请先在仪表盘开启」误报中断。
+    if !state.settings.read().go_aim_enabled {
+        let mut settings = state.settings.read().clone();
+        settings.go_aim_enabled = true;
+        settings.go_aim_pinned_node = None;
+        settings.user_manually_selected_node = false;
+        *state.user_manually_selected_node.write() = false;
+        state
+            .save_settings(settings)
+            .map_err(|e| format!("保存设置失败: {e}"))?;
+        let _ = app.emit(
+            "settings://updated",
+            serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
+        );
     }
     // 内核未运行时只做真实离线延迟快筛，不猜测任何解锁能力；
     // 运行时经独立探针验证出口与七个平台，手动指定状态始终保留。
@@ -5122,6 +5131,56 @@ pub async fn export_diagnostic_logs(
             .map_err(|e| format!("写入导出日志失败：{e}"))?;
     }
     Ok(text)
+}
+
+/// 【APP72 任务1.4】导出单节点 AIM 报告：
+/// - iOS：调用 `prism_ios_share_text_file`（剪贴板兜底 + 系统分享面板）；
+/// - 桌面：写入 `Downloads/aim-report-<节点>.txt`。
+/// 返回最终文件名，供前端 Toast 提示。
+#[tauri::command]
+pub async fn export_single_node_report(
+    state: State<'_, AppState>,
+    node_name: String,
+    content: String,
+) -> Result<String, String> {
+    let _ = &state;
+    if content.trim().is_empty() {
+        return Err("报告内容为空，无法导出".into());
+    }
+    let safe: String = node_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.trim_matches('_').is_empty() {
+        "node".to_string()
+    } else {
+        safe
+    };
+    let filename = format!("aim-report-{safe}.txt");
+
+    #[cfg(target_os = "ios")]
+    {
+        crate::platform::ios::share_text_file(&filename, &content);
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let dir = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join("Downloads"))
+            .unwrap_or_else(|| state.data_dir.clone());
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(&filename);
+        std::fs::write(&path, content.as_bytes())
+            .map_err(|e| format!("写入单节点报告失败：{e}"))?;
+    }
+    Ok(filename)
 }
 
 #[cfg(test)]

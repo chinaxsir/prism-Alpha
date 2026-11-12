@@ -181,6 +181,15 @@ pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
     "qiniu.com", "qiniucdn.com", "qnssl.com", "clouddn.com", "upyun.com",
     // 开发 / 工具
     "cnblogs.com", "51cto.com", "chinaz.com", "runoob.com",
+    // 【APP72 任务3.2】补齐：微信生态 / 电商 / 短视频 / 手机厂商 /
+    // 金融 / 内容社区等高频大陆域名（仍不含任何海外通用后缀）。
+    "1688.com", "servicewechat.com", "douyinpic.com", "volcengine.com",
+    "zjcdn.com", "gifshow.com", "jcloudcs.com", "jdpay.com", "pddpic.com",
+    "sankuai.com", "xiaomi.net", "honor.com", "oppo.com", "vivo.com",
+    "coloros.com", "acgvideo.com", "bilivideo.cn", "71.am", "cainiao.com",
+    "fliggy.com", "nga.cn", "v2ex.com", "music.163.com", "ydstatic.com",
+    "ccb.com", "abchina.com", "cmbchina.com", "bankcomm.com", "psbc.com",
+    "95516.com", "apple-cloudkit.com", "local", "lan",
 ];
 
 /// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段。
@@ -215,6 +224,39 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     "106.12.0.0/14",
     // UCloud 上海
     "106.75.0.0/16",
+    // 【APP72 任务3.2】大陆运营商/宽带大网段：覆盖家庭宽带与移动网络的
+    // CDN 回源地址（仅 China 注册段，不含海外段），让「域名未命中但 IP
+    // 属于大陆」的请求也能直连而不是绕行海外节点。
+    "14.112.0.0/12", "58.144.0.0/16", "203.209.0.0/16",
+    "110.0.0.0/7", "112.0.0.0/6", "116.0.0.0/6", "120.0.0.0/6",
+    "124.0.0.0/7", "182.0.0.0/8", "183.0.0.0/8",
+    "202.96.0.0/12", "210.21.0.0/16", "211.136.0.0/13",
+    "218.0.0.0/7", "219.128.0.0/11", "221.0.0.0/8", "222.0.0.0/8",
+    "223.64.0.0/11",
+];
+
+/// 【APP72 任务3.2】常见海外站点域名后缀：DNS 走 dns-remote（经主代理出境），
+/// 避免国内 DNS 污染导致「域名正确但 IP 被投毒 → 直连失败」。大陆站点由更
+/// 靠前的 CN 后缀 / geosite 规则命中 dns-direct，不受影响。
+/// 与 PacketTunnelProvider.swift 中 proxyDomainSuffixes 保持 100% 同步。
+pub(crate) const PROXY_DOMAIN_SUFFIXES: &[&str] = &[
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "anthropic.com", "claude.ai", "gemini.google.com",
+    "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
+    "youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com",
+    "netflix.com", "nflxvideo.net", "nflximg.net", "nflxext.com", "nflxso.net",
+    "disneyplus.com", "disney-plus.net", "bamgrid.com", "dssott.com",
+    "tiktok.com", "tiktokv.com", "byteoversea.com", "ibytedtos.com",
+    "twitter.com", "x.com", "twimg.com", "facebook.com", "instagram.com",
+    "whatsapp.net", "telegram.org", "t.me", "github.com", "githubusercontent.com",
+    "figma.com", "notion.so", "dropbox.com", "spotify.com", "soundcloud.com",
+    "twitch.tv", "reddit.com", "wikipedia.org",
+];
+
+/// 【APP72 任务3.2】海外站点关键词（后缀未覆盖时的兜底），仅用于 DNS 走远端。
+pub(crate) const PROXY_DOMAIN_KEYWORDS: &[&str] = &[
+    "openai", "anthropic", "claude", "gemini", "netflix", "disney",
+    "tiktok", "telegram",
 ];
 
 pub struct BuiltConfig {
@@ -1357,9 +1399,10 @@ pub fn build(
             // 绝不会被改写后漏进公网代理或 DNS 解析失败。
             "sniff": true,
             "sniff_override_destination": false,
-            // 【APP60 任务3.3】嗅探超时 100ms → 50ms：非 HTTP 协议快速放行，
-            // 进一步压缩首包等待（网页/小文件请求不再为等 SNI 多付延迟）。
-            "sniff_timeout": "50ms",
+            // 【APP72 任务3.2】嗅探超时 50ms → 30ms：非 HTTP 协议更快放行，
+            // 首包不再为等 SNI 额外付出等待时间（大陆站点可达性已由
+            // 域名后缀 + 大网段 CIDR 兜底，短超时不会导致分流失效）。
+            "sniff_timeout": "30ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -1451,6 +1494,17 @@ pub fn build(
         dns_rules.push(json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }));
     }
     dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
+    // 【APP72 任务3.2】常见海外站点 → dns-remote（经主代理出境解析）：
+    // 国内 DNS 对部分海外站点返回污染结果，应用按错误 IP 直连必然失败；
+    // 这些后缀/关键词位于所有大陆直连规则之后，不影响国内域名解析速度。
+    dns_rules.push(json!({
+        "domain_suffix": PROXY_DOMAIN_SUFFIXES,
+        "server": "dns-remote"
+    }));
+    dns_rules.push(json!({
+        "domain_keyword": PROXY_DOMAIN_KEYWORDS,
+        "server": "dns-remote"
+    }));
     // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，VPN
     // 场景下无意义，固定在 index 0 快速拦截。
     dns_rules.insert(
@@ -4026,8 +4080,8 @@ rules:
         );
         assert_eq!(
             tun["sniff_timeout"].as_str(),
-            Some("50ms"),
-            "【APP60 任务3.3】tun-in 嗅探超时已压缩为 50ms（原 100ms）"
+            Some("30ms"),
+            "【APP72 任务3.2】tun-in 嗅探超时已压缩为 30ms（原 50ms）"
         );
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启被动嗅探");
         assert_eq!(
@@ -5474,6 +5528,205 @@ rules:
             assert_eq!(
                 rules[slot]["outbound"].as_str(),
                 Some(format!("GO-AIM-PROBE-{slot}").as_str())
+            );
+        }
+    }
+
+    // ================= 【APP72】回归测试 =================
+
+    /// APP72 测试1：Rust 与 iOS Swift 的大陆直连 / 海外域名清单逐项一致。
+    #[test]
+    fn app72_test1_cn_and_proxy_lists_match_ios_swift() {
+        let swift = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/mobile-src/ios/PrismVPN/PacketTunnelProvider.swift"
+        ))
+        .expect("必须能读取 iOS PacketTunnelProvider.swift");
+
+        let extract = |name: &str| -> Vec<String> {
+            let marker = format!("private let {name}: [String] = [");
+            let start = swift
+                .find(&marker)
+                .unwrap_or_else(|| panic!("Swift 缺少数组 {name}"));
+            let rest = &swift[start + marker.len()..];
+            let end = rest.find(']').expect("Swift 数组未闭合");
+            rest[..end]
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                .flat_map(|l| l.split(','))
+                .map(str::trim)
+                .filter(|t| t.len() >= 2 && t.starts_with('"') && t.ends_with('"'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            extract("cnDirectDomainSuffixes"),
+            CN_DIRECT_DOMAIN_SUFFIXES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "大陆域名后缀清单 Rust/Swift 必须 100% 一致"
+        );
+        assert_eq!(
+            extract("cnDirectCIDRs"),
+            CN_DIRECT_CIDRS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "大陆 ip_cidr 清单 Rust/Swift 必须 100% 一致"
+        );
+        assert_eq!(
+            extract("proxyDomainSuffixes"),
+            PROXY_DOMAIN_SUFFIXES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "海外域名后缀清单 Rust/Swift 必须 100% 一致"
+        );
+        assert_eq!(
+            extract("proxyDomainKeywords"),
+            PROXY_DOMAIN_KEYWORDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "海外域名关键词清单 Rust/Swift 必须 100% 一致"
+        );
+    }
+
+    /// APP72 测试3：大陆分流黄金顺序 / DNS 分流优先级 / 真实大陆 IP 命中。
+    #[test]
+    fn app72_test3_mainland_routing_golden_priority() {
+        let settings = UserSettings {
+            outbound_mode: OutboundMode::Rule,
+            ..UserSettings::default()
+        };
+        let built = build(
+            &app70_sub(),
+            &[],
+            RunMode::Tun,
+            &settings,
+            &std::env::temp_dir().join("prism-cb-test-app72-t3"),
+            &std::env::temp_dir().join("prism-cb-test-app72-t3/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+
+        let rules = built.config["route"]["rules"].as_array().unwrap();
+        for slot in 0..4 {
+            assert_eq!(
+                rules[slot]["inbound"][0].as_str(),
+                Some(format!("aim-probe-in-{slot}").as_str()),
+                "AIM 探针规则必须固定在最前 4 条"
+            );
+        }
+        let bypass = rules
+            .iter()
+            .position(|r| {
+                r["ip_cidr"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|c| c == "223.5.5.5/32"))
+            })
+            .expect("直连 DNS 旁路缺失");
+        let hijack = rules
+            .iter()
+            .position(|r| r["port"].as_u64() == Some(53))
+            .expect("53 劫持缺失");
+        assert!(bypass < hijack, "直连 DNS 旁路必须早于 53 劫持");
+
+        let cn_domain = rules
+            .iter()
+            .position(|r| {
+                r["outbound"] == "direct"
+                    && r["domain_suffix"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "taobao.com"))
+            })
+            .expect("大陆域名直连规则缺失");
+        let cn_cidr = rules
+            .iter()
+            .position(|r| {
+                r["outbound"] == "direct"
+                    && r["ip_cidr"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "58.144.0.0/16"))
+            })
+            .expect("大陆 ip_cidr 直连规则缺失");
+        if let Some(foreign) = rules
+            .iter()
+            .position(|r| r["geosite"] == "geolocation-!cn")
+        {
+            assert!(
+                cn_domain < foreign && cn_cidr < foreign,
+                "大陆直连规则必须早于海外域名代理规则"
+            );
+        }
+
+        let dns_rules = built.config["dns"]["rules"].as_array().unwrap();
+        let dns_any = dns_rules
+            .iter()
+            .position(|r| r["outbound"] == "any")
+            .expect("dns.rules 缺少 outbound: any");
+        assert_eq!(dns_rules[dns_any]["server"].as_str(), Some("dns-direct"));
+        let dns_cn = dns_rules
+            .iter()
+            .position(|r| {
+                r["server"] == "dns-direct"
+                    && r["domain_suffix"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "taobao.com"))
+            })
+            .expect("DNS 大陆后缀 → dns-direct 缺失");
+        let dns_global = dns_rules
+            .iter()
+            .position(|r| r["clash_mode"] == "global")
+            .expect("dns.rules 缺少 clash_mode: global");
+        let dns_proxy = dns_rules
+            .iter()
+            .position(|r| {
+                r["server"] == "dns-remote"
+                    && r["domain_suffix"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "openai.com"))
+            })
+            .expect("DNS 海外后缀 → dns-remote 缺失");
+        assert!(
+            dns_any < dns_cn && dns_cn < dns_global && dns_global <= dns_proxy,
+            "DNS 分流顺序必须为：直连上游 → 大陆后缀 → global → 海外后缀"
+        );
+        assert_eq!(built.config["dns"]["final"].as_str(), Some("dns-direct"));
+
+        let to_u32 = |s: &str| -> u32 {
+            let mut v = 0u32;
+            for part in s.split('.') {
+                v = (v << 8) | part.parse::<u32>().unwrap_or(0);
+            }
+            v
+        };
+        let contains = |cidr: &str, ip: u32| -> bool {
+            let (net, bits) = cidr.split_once('/').expect("cidr 必须带前缀");
+            let bits: u32 = bits.parse().unwrap_or(0);
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            (to_u32(net) & mask) == (ip & mask)
+        };
+        for ip in [
+            "14.116.241.17",
+            "203.209.255.199",
+            "58.144.143.17",
+            "116.169.167.239",
+        ] {
+            let ipv = to_u32(ip);
+            assert!(
+                CN_DIRECT_CIDRS.iter().any(|c| contains(c, ipv)),
+                "{ip} 必须命中大陆直连网段"
             );
         }
     }

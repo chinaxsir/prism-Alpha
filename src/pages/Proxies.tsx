@@ -12,6 +12,7 @@ import {
   urlTest,
   getGoAimStatus,
   runGoAimProbe,
+  exportSingleNodeReport,
   type AimNodeResult,
   type GoAimStatus,
 } from "@/api/ipc";
@@ -98,21 +99,31 @@ function AimNodeDetailModal({
   const services = result?.services ?? {};
   const rows = AIM_DETAIL_ORDER.filter((s) => services[s]);
 
-  const exportReport = () => {
-    const report = {
-      node,
-      exportedAt: new Date().toISOString(),
-      result: result ?? null,
-    };
-    const blob = new Blob([JSON.stringify(report, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `aim-${node.replace(/[^\w.-]+/g, "_")}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  // 【APP72 任务1.4】单节点报告导出：剪贴板 + 系统分享（iOS）/ Downloads（桌面）。
+  // 失败时只提示、绝不抛异常中断弹窗。
+  const [exporting, setExporting] = useState(false);
+  const exportReport = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const report = {
+        node,
+        exportedAt: new Date().toISOString(),
+        result: result ?? null,
+      };
+      const text = JSON.stringify(report, null, 2);
+      try {
+        await navigator.clipboard?.writeText(text);
+      } catch {
+        // 剪贴板不可用时静默忽略，不影响文件导出
+      }
+      const filename = await exportSingleNodeReport(node, text);
+      toast.success(t("proxies.aimDetail.exported", { file: filename }));
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -185,7 +196,8 @@ function AimNodeDetailModal({
         )}
         <button
           onClick={exportReport}
-          className="mt-1 rounded-xl border border-border px-3 py-2 text-[12px] font-bold text-gray-200 hover:border-accent/40"
+          disabled={exporting}
+          className="mt-1 rounded-xl border border-border px-3 py-2 text-[12px] font-bold text-gray-200 hover:border-accent/40 disabled:opacity-60"
         >
           {t("proxies.aimDetail.export")}
         </button>
@@ -794,7 +806,7 @@ export default function Proxies() {
                 {(aimProgress.fullTotal ?? 0) > 0 && (
                   <span className="tabular-nums">
                     {t("proxies.aimBoard.deepProgress", {
-                      done: aimProgress.fullDone ?? 0,
+                      done: aimProgress.done ?? aimProgress.fullDone ?? 0,
                       total: aimProgress.fullTotal ?? 0,
                     })}
                   </span>
