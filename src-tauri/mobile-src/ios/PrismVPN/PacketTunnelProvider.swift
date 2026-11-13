@@ -2465,12 +2465,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         var dnsServers: [[String: Any]] = [
-            // 【APP66 任务5.2】dns-remote 改为 tcp://8.8.8.8 经主代理出境：
-            // 明文 TCP 53 由 sing-box 自己封装进隧道，规避 UDP 53 被运营商或
-            // 节点针对性丢包（表现为 `IN A: EOF` / 解析超时）。
+            // 【APP76 任务1.1】dns-remote 改为 HTTPS DoH 443 规避机场 53 端口封禁：
+            // 原先 tcp://8.8.8.8（53 端口）在被机场封禁时所有命中的域名等待 7.5 秒后
+            // 全部以 IN A: EOF 失败，Safari 因拿不到 IP 根本无法发起连接。DoH 走
+            // HTTPS 443 端口经主代理出境，彻底绕过 53 端口封堵。
             [
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://8.8.8.8/dns-query",
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
@@ -2554,15 +2555,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "clash_mode": "global",
             "server": "dns-remote"
         ])
-        // 【APP72 任务3.2】常见海外站点 → dns-remote（与 Rust 一致）
-        dnsRules.append([
-            "domain_suffix": proxyDomainSuffixes,
-            "server": "dns-remote"
-        ])
-        dnsRules.append([
-            "domain_keyword": proxyDomainKeywords,
-            "server": "dns-remote"
-        ])
+        // 【APP76 任务1.1】规则模式 / Direct 模式下所有普通域名统一由
+        // `dns.final = dns-direct`（udp://223.5.5.5）极速返回，不再把
+        // PROXY_DOMAIN_SUFFIXES / PROXY_DOMAIN_KEYWORDS 发往 dns-remote
+        // （机场若封禁 53 端口则全部海外域名等待 7.5 秒后 IN A: EOF 失败）。
+        // Safari/TUN 侧已开启 sniff + sniff_override_destination，会从 TLS
+        // ClientHello 嗅探出真实域名并覆写目标，交由 route.rules 走代理节点。
+        // 已删除以下两条（与 Rust config_builder.rs 完全一致）：
+        //   dnsRules.append(["domain_suffix": proxyDomainSuffixes, "server": "dns-remote"])
+        //   dnsRules.append(["domain_keyword": proxyDomainKeywords, "server": "dns-remote"])
         root["dns"] = [
             "servers": dnsServers,
             "rules": dnsRules,
@@ -2796,7 +2797,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 443/853 会绕过本地 DNS 劫持并反复超时刷屏。
             [
                 "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
-                "port": [443, 853],
+                "port": [853],
                 "outbound": finalBlockTag
             ]
             // 【APP70 任务2.1】已彻底删除扩展层无条件注入的
@@ -2872,9 +2873,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "ip_is_private": true, "outbound": "direct"
         ])
         rules.insert(contentsOf: finalHead, at: 0)
-        // 【APP70 任务2.2】兜底：历史缓存配置若未携带内置大陆直连规则
-        // （Rust 升级前生成的旧 config.json），在 clash_mode: global 之后
-        // 补齐，与 Rust 生成顺序（全局 → 大陆直连 → 可选 QUIC）保持一致。
+        // 【APP76 任务1.2】兜底补齐：历史缓存配置若未携带内置大陆直连规则
+        // （Rust 升级前生成的旧 config.json），按「黄金顺序」补齐：
+        //   ③ PROXY_DOMAIN（海外核心域名强制走 Proxy，如 google.com /
+        //     googleapis.com）→ ④ cnDirectDomainSuffixes → ⑤ cnDirectCIDRs
+        // 彻底根除 googleapis.com 被 geosite:cn 里的 googleapis@cn 误配
+        // 到 direct 的问题；所有域名规则必须在 IP 规则之前。
         let hasCnDirectRule = rules.contains { rule in
             (rule["outbound"] as? String) == "direct"
                 && ((rule["domain_suffix"] as? [String])?.contains("taobao.com") ?? false)
@@ -2886,10 +2890,46 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }) {
                 insertAt = idx + 1
             }
+            // ③ 海外核心域名强制走 Proxy（必须早于大陆直连）
             rules.insert(contentsOf: [
-                ["domain_suffix": cnDirectDomainSuffixes, "outbound": "direct"],
+                ["domain_suffix": proxyDomainSuffixes, "outbound": mainProxyTag],
+                ["domain_keyword": proxyDomainKeywords, "outbound": mainProxyTag]
+            ], at: insertAt)
+            insertAt += 2
+            // ④ 大陆域名直连（域名级）
+            rules.insert(contentsOf: [
+                ["domain_suffix": cnDirectDomainSuffixes, "outbound": "direct"]
+            ], at: insertAt)
+            insertAt += 1
+            // ⑤ 大陆 IP 直连（IP 规则必须在域名规则之后兜底）
+            rules.insert(contentsOf: [
                 ["ip_cidr": cnDirectCIDRs, "outbound": "direct"]
             ], at: insertAt)
+        } else {
+            // 即使 Rust 新 config 已补齐大陆直连，仍要兜底 PROXY_DOMAIN 强制规则：
+            // 它可能在 preservedRules 里丢失（上游旧版规则归一化时未插入）。
+            let hasProxyDomainRule = rules.contains { rule in
+                (rule["outbound"] as? String) == mainProxyTag
+                    && ((rule["domain_suffix"] as? [String])?.contains("googleapis.com") ?? false)
+            }
+            if !hasProxyDomainRule {
+                var insertAt = rules.count
+                // 找到第一条大陆域名直连规则，插在它之前
+                if let idx = rules.firstIndex(where: {
+                    ($0["outbound"] as? String) == "direct"
+                        && (($0["domain_suffix"] as? [String])?.contains("taobao.com") ?? false)
+                }) {
+                    insertAt = idx
+                } else if let idx = rules.firstIndex(where: {
+                    ($0["clash_mode"] as? String) == "global"
+                }) {
+                    insertAt = idx + 1
+                }
+                rules.insert(contentsOf: [
+                    ["domain_suffix": proxyDomainSuffixes, "outbound": mainProxyTag],
+                    ["domain_keyword": proxyDomainKeywords, "outbound": mainProxyTag]
+                ], at: insertAt)
+            }
         }
         route["rules"] = rules
         // 【APP40 任务2】最终路由表锁定日志：确认每路档案网段已真正进入

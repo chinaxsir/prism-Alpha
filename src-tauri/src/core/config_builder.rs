@@ -1647,7 +1647,7 @@ pub fn build(
     if mode == RunMode::Tun || cfg!(any(target_os = "ios", target_os = "android")) {
         // 1.10 起 inet4_address/inet6_address 合并为 address（legacy 字段
         // 需 ENABLE_DEPRECATED_TUN_ADDRESS_X env，check/run 均会 FATAL）
-        let mut tun_addresses = vec!["198.18.0.1/30"];
+        let mut tun_addresses = vec!["172.19.0.1/30"];
         if settings.ipv6 {
             tun_addresses.push("fdfe:dcba:9876::1/126");
         }
@@ -1790,17 +1790,12 @@ pub fn build(
         dns_rules.push(json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }));
     }
     dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
-    // 【APP72 任务3.2】常见海外站点 → dns-remote（经主代理出境解析）：
-    // 国内 DNS 对部分海外站点返回污染结果，应用按错误 IP 直连必然失败；
-    // 这些后缀/关键词位于所有大陆直连规则之后，不影响国内域名解析速度。
-    dns_rules.push(json!({
-        "domain_suffix": PROXY_DOMAIN_SUFFIXES,
-        "server": "dns-remote"
-    }));
-    dns_rules.push(json!({
-        "domain_keyword": PROXY_DOMAIN_KEYWORDS,
-        "server": "dns-remote"
-    }));
+    // 【APP76 任务1.1】规则模式 / Direct 模式下所有普通域名统一交由
+    // `dns.final = dns-direct`（udp://223.5.5.5，53 端口）极速返回，
+    // 不再把 PROXY_DOMAIN_SUFFIXES / PROXY_DOMAIN_KEYWORDS 发往 dns-remote
+    // （机场若封禁 53 端口则全部海外域名等待 7.5 秒后 IN A: EOF 失败）。
+    // Safari/TUN 侧已开启 sniff + sniff_override_destination，会从 TLS
+    // ClientHello 嗅探出真实域名并覆写目标，交由 route.rules 走代理节点。
     // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，VPN
     // 场景下无意义，固定在 index 0 快速拦截。
     dns_rules.insert(
@@ -1821,20 +1816,21 @@ pub fn build(
         .filter(|addr| addr.parse::<std::net::Ipv4Addr>().is_ok())
         .unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
-        // 【APP66 任务5.2】dns-remote 改为 tcp://8.8.8.8 经主代理出境：
-        // 明文 TCP 53 由 sing-box 自己封装进代理隧道，规避 UDP 53 在部分
-        // 运营商/节点被针对性丢包（表现为 `IN A: EOF` / 解析超时）。
+        // 【APP76 任务1.1】dns-remote 改为 HTTPS DoH 443 规避机场 53 端口封禁：
+        // 原先 tcp://8.8.8.8（53 端口）在被机场封禁时所有命中的域名等待 7.5 秒后
+        // 全部以 IN A: EOF 失败，Safari 因拿不到 IP 根本无法发起连接。DoH 走
+        // HTTPS 443 端口经主代理出境，彻底绕过 53 端口封堵。
         if let Some(main_tag) = &main_group_tag {
             json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://8.8.8.8/dns-query",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             })
         } else {
             json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://8.8.8.8/dns-query",
                 "detour": "direct",
                 "strategy": "ipv4_only",
             })
@@ -1868,13 +1864,13 @@ pub fn build(
         }),
     ];
 
-    // Android DNS 清洗：同桌面 / iOS，统一 tcp://8.8.8.8 经主代理出境
+    // Android DNS 清洗：同桌面 / iOS，统一 DoH 443 经主代理出境
     #[cfg(target_os = "android")]
     {
         if let Some(main_tag) = &main_group_tag {
             dns_servers[0] = json!({
                 "tag": "dns-remote",
-                "address": "tcp://8.8.8.8",
+                "address": "https://8.8.8.8/dns-query",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             });
@@ -1983,7 +1979,7 @@ pub fn build(
         json!({ "port": 853, "outbound": "block" }),
         json!({
             "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
-            "port": [443, 853],
+            "port": [853],
             "outbound": "block"
         }),
     ]);
@@ -2008,18 +2004,37 @@ pub fn build(
     // —— 8. 大陆高速直连（Rule 模式，不依赖 geosite.db） ——
     // 广告域名拦截 → 局域网主机名 → 国内域名（geosite cn）→ 内置大陆域名
     // 后缀 → 大陆高频 ip_cidr，全部域名级规则零解析开销
-    final_rules.push(json!({ "geosite": "category-ads-all", "outbound": "block" }));
-    final_rules.push(json!({ "geosite": "private", "outbound": "direct" }));
-    final_rules.push(json!({ "domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES, "outbound": "direct" }));
-    final_rules.push(json!({ "ip_cidr": CN_DIRECT_CIDRS, "outbound": "direct" }));
-    // 桌面/Android 保留 geosite: cn / geoip: cn（iOS 由上方内置名单兜底）
-    final_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
-    // 【APP70 任务2.2】主代理出口：第三方策略组已被归一化为 Prism 标准
-    // 主选择器 Proxy，此处必须同步沿用，严禁再写回第三方组 tag
+    // 【APP76 任务1.2】黄金顺序：
+    // ① 广告拦截 → ② 私有域名直连 → ③ PROXY_DOMAIN 强制走 Proxy（必须在
+    // geosite:cn 之前，防止 googleapis.com / google.com / chatgpt.com 等被
+    // geosite=cn 里的 googleapis@cn 误配到 direct）→ ④ 大陆域名直连（域名
+    // 级：CN_DIRECT_DOMAIN_SUFFIXES + geosite:cn）→ ⑤ 非 CN 域名兜底走 Proxy
+    // （geolocation-!cn，域名级，必须在所有 IP 规则之前，防止污染 IP 命中
+    // geoip cn 被改道直连）→ ⑥ CN_DIRECT_CIDRS + geoip private + geoip cn
+    // （IP 规则兜底，仅对未命中域名的纯 IP 连接生效）。
     let main_proxy_target = prism_proxy_tag
         .clone()
         .unwrap_or_else(|| rule_final.clone());
-    // 非大陆域名 → 策略组：域名级判定，零解析开销，必须先于 geoip，
+    final_rules.push(json!({ "geosite": "category-ads-all", "outbound": "block" }));
+    final_rules.push(json!({ "geosite": "private", "outbound": "direct" }));
+    // ③ 【APP76 任务1.2】海外核心代理域名强制优先走 Proxy——放在大陆直连规则
+    // 之前，彻底根除 safebrowsing.googleapis.com / chatgpt.com 等被 geosite:cn
+    // 中的 googleapis@cn 误配到 direct 的问题。
+    if main_proxy_target != "direct" {
+        final_rules.push(json!({
+            "domain_suffix": PROXY_DOMAIN_SUFFIXES,
+            "outbound": main_proxy_target.clone(),
+        }));
+        final_rules.push(json!({
+            "domain_keyword": PROXY_DOMAIN_KEYWORDS,
+            "outbound": main_proxy_target.clone(),
+        }));
+    }
+    // ④ 大陆域名直连
+    final_rules.push(json!({ "domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES, "outbound": "direct" }));
+    // 桌面/Android 保留 geosite: cn（iOS 由上方内置名单兜底）
+    final_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
+    // ⑤ 非大陆域名 → Proxy：域名级判定，零解析开销，必须在所有 IP 规则之前，
     // 否则被墙域名的污染 IP 会命中 geoip cn 被改道直连
     if main_proxy_target != "direct" {
         final_rules.push(json!({
@@ -2027,6 +2042,8 @@ pub fn build(
             "outbound": main_proxy_target.clone(),
         }));
     }
+    // ⑥ IP 规则兜底（全部排在域名规则之后，仅对未命中域名的纯 IP 连接生效）
+    final_rules.push(json!({ "ip_cidr": CN_DIRECT_CIDRS, "outbound": "direct" }));
     final_rules.push(json!({ "geoip": "private", "outbound": "direct" }));
     final_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
     // 【APP-5 任务1.2】海外公共 DNS IP（Google DoT/DoH 853/443）强制走代理，
@@ -3730,8 +3747,8 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("tcp://8.8.8.8"),
-            "dns-remote 锁定 TCP 8.8.8.8 经主选择器出境（APP66 任务5.2）"
+            Some("https://8.8.8.8/dns-query"),
+            "dns-remote 锁定 DoH 443 经主选择器出境（APP76 任务1.1 规避机场 53 端口封禁）"
         );
 
         let outbound_rule = dns["rules"]
@@ -5508,7 +5525,7 @@ rules:
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-remote"))
             .unwrap();
-        assert_eq!(remote["address"], "tcp://8.8.8.8");
+        assert_eq!(remote["address"], "https://8.8.8.8/dns-query");
         assert_eq!(remote["detour"], "Proxy");
         assert_eq!(dns["final"], "dns-direct", "dns.final 必须固定 dns-direct");
         let rules = dns["rules"].as_array().unwrap();
@@ -5982,7 +5999,7 @@ rules:
                 .map(|s| s["address"].as_str().unwrap_or("").to_string())
                 .unwrap_or_default()
         };
-        assert_eq!(addr("dns-remote"), "tcp://8.8.8.8");
+        assert_eq!(addr("dns-remote"), "https://8.8.8.8/dns-query");
         assert_eq!(addr("dns-direct"), "udp://223.5.5.5");
         assert_eq!(addr("dns-direct-backup"), "udp://119.29.29.29");
         assert_eq!(addr("dns-local"), "223.5.5.5");
@@ -6141,6 +6158,22 @@ rules:
                         .is_some_and(|a| a.iter().any(|x| x == "taobao.com"))
             })
             .expect("大陆域名直连规则缺失");
+        // 【APP76 任务1.2】黄金顺序断言：
+        // ③ PROXY_DOMAIN（海外核心域名强制走 Proxy，如 google.com / googleapis.com）
+        // 必须早于 ④ cn_domain（大陆域名直连）——彻底根除 googleapis.com 被
+        // geosite:cn 里的 googleapis@cn 误配到 direct 的问题。
+        let proxy_domain = rules.iter().position(|r| {
+            r["outbound"].as_str().is_some_and(|o| o != "direct")
+                && r["domain_suffix"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == "googleapis.com"))
+        });
+        if let Some(pd) = proxy_domain {
+            assert!(
+                pd < cn_domain,
+                "海外核心代理域名 PROXY 必须早于大陆域名直连"
+            );
+        }
         let cn_cidr = rules
             .iter()
             .position(|r| {
@@ -6151,10 +6184,10 @@ rules:
             })
             .expect("大陆 ip_cidr 直连规则缺失");
         if let Some(foreign) = rules.iter().position(|r| r["geosite"] == "geolocation-!cn") {
-            assert!(
-                cn_domain < foreign && cn_cidr < foreign,
-                "大陆直连规则必须早于海外域名代理规则"
-            );
+            // 【APP76 任务1.2】所有域名规则必须早于 IP 规则：
+            // cn_domain → foreign → cn_cidr（IP 兜底）
+            assert!(cn_domain < foreign, "大陆域名直连必须早于海外域名代理");
+            assert!(foreign < cn_cidr, "所有域名规则必须早于大陆 IP 兜底规则");
         }
 
         let dns_rules = built.config["dns"]["rules"].as_array().unwrap();
@@ -6176,18 +6209,24 @@ rules:
             .iter()
             .position(|r| r["clash_mode"] == "global")
             .expect("dns.rules 缺少 clash_mode: global");
-        let dns_proxy = dns_rules
-            .iter()
-            .position(|r| {
-                r["server"] == "dns-remote"
-                    && r["domain_suffix"]
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|x| x == "openai.com"))
-            })
-            .expect("DNS 海外后缀 → dns-remote 缺失");
+        // 【APP76 任务1.1】规则模式下所有普通域名统一由 dns.final = dns-direct
+        // （udp://223.5.5.5）极速返回，不再将 PROXY_DOMAIN_SUFFIXES /
+        // PROXY_DOMAIN_KEYWORDS 发往 dns-remote（机场若封禁 53 端口则全部海外
+        // 域名等待 7.5 秒后 IN A: EOF 失败）。验证 dns.rules 中不再存在任何
+        // `openai.com / google.com / *.com → dns-remote` 的 domain_suffix 规则。
+        let has_proxy_domain_to_remote = dns_rules.iter().any(|r| {
+            r["server"] == "dns-remote"
+                && r["domain_suffix"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == "openai.com" || x == "google.com"))
+        });
         assert!(
-            dns_any < dns_cn && dns_cn < dns_global && dns_global <= dns_proxy,
-            "DNS 分流顺序必须为：直连上游 → 大陆后缀 → global → 海外后缀"
+            !has_proxy_domain_to_remote,
+            "【APP76】dns.rules 严禁存在 PROXY_DOMAIN → dns-remote 的 domain_suffix 规则"
+        );
+        assert!(
+            dns_any < dns_cn && dns_cn < dns_global,
+            "DNS 分流顺序必须为：直连上游 → 大陆后缀 → global"
         );
         assert_eq!(built.config["dns"]["final"].as_str(), Some("dns-direct"));
 

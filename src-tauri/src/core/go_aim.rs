@@ -30,10 +30,11 @@ use futures_util::StreamExt;
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP75】当前 Go AIM 检测引擎版本号：统一递增至 7，启动时自动淘汰
-/// `< 7` 的旧缓存（含无 3 目标 HTTPS 门槛、NF/Disney+/TK 一律 PARTIAL 等旧结论）。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 7;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 7;
+/// 【APP76】当前 Go AIM 检测引擎版本号：统一递增至 8，启动时自动淘汰
+/// `< 8` 的旧缓存（含地区名单参与解锁/封锁判定、补测条件过宽、
+/// 出口名单短路等旧结论）。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 8;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 8;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -61,8 +62,9 @@ const PROBE_TIMEOUT_MS: u64 = 2800;
 const PROBE_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// 【APP73 任务2.1】单次 HTTP 请求总超时（8 秒）
 const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
-/// 【APP73 任务2.1】单个平台完整探测硬超时（10 秒，含 1 次补测）
-const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 10;
+/// 【APP76 任务2.2】单个平台完整探测硬超时（8 秒，含 0 次或 1 次补测；
+/// Semaphore 排队时间不计入）。
+const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 8;
 /// 【APP75 任务3.2】单节点内部 7 平台并发上限：同一时刻最多 3 个平台
 /// 同时发起 HTTPS 握手，避免瞬时 7 路突发被中转服务器限流重置。
 const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
@@ -127,6 +129,9 @@ const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", 
 const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
+/// TikTok 停服名单（仅用于回归测试，生产代码已彻底移除所有 exit_country
+/// 地区名单判定逻辑）。
+#[cfg(test)]
 const TIKTOK_BLOCKLIST: &[&str] = &["CN", "HK", "IN", "RU", "AF"];
 
 /// 出口地区探测端点（依次兜底）：cdn-trace 返回多行 key=value，
@@ -400,6 +405,8 @@ impl AdaptiveSlotController {
 
 /// 地区是否命中受限名单（纯函数）：loc 未知（None）时视为未命中，
 /// 是否要求 loc 必须存在由调用方决定。
+/// 地区黑名单判定工具（仅用于测试；生产代码已彻底移除 exit_country 判定）。
+#[cfg(test)]
 fn region_blocked(loc: Option<&str>, blocklist: &[&str]) -> bool {
     matches!(loc, Some(l) if blocklist.contains(&l))
 }
@@ -1974,28 +1981,10 @@ async fn probe_all(
                     serde_json::json!({ "name": result.node_name, "result": result.clone() }),
                 );
                 // [AIM-17] 单节点汇总 + NODE_RESULT 结构化事件
-                let node_status = if result
-                    .services
-                    .values()
-                    .any(|s| s.verdict == ProbeVerdict::Verified)
-                {
-                    "VERIFIED"
-                } else if result
-                    .services
-                    .values()
-                    .any(|s| s.verdict == ProbeVerdict::Blocked)
-                {
-                    "BLOCKED"
-                } else if !result.services.is_empty()
-                    && result
-                        .services
-                        .values()
-                        .all(|s| s.verdict == ProbeVerdict::Unknown)
-                {
-                    "UNKNOWN"
-                } else {
-                    "ACCESSIBLE"
-                };
+                // 【APP76 任务2.4】直接打印 result.overall_status，
+                // 与 probe_node 汇总时写入 AimNodeResult 的状态保持 100% 一致，
+                // 杜绝之前 overall=MIXED 却打印出 status=BLOCKED 的日志错误。
+                let node_status = result.overall_status.label();
                 run.log(
                     17,
                     "INFO",
@@ -2372,7 +2361,7 @@ async fn read_body(
 
 /// GPT：ios.chat.openai.com server_status + chatgpt.com 双端点。
 /// 【APP73】无合法授权账号对话验证时最高只给 PARTIAL，不虚构 VERIFIED。
-async fn probe_gpt(client: &reqwest::Client, _exit_country: Option<&str>) -> ServiceProbeResult {
+async fn probe_gpt(client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "GPT";
     // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let ss = match client
@@ -2540,11 +2529,7 @@ async fn probe_gpt(client: &reqwest::Client, _exit_country: Option<&str>) -> Ser
 }
 
 /// Claude：claude.ai/login（无重定向客户端看 Location，跟随客户端读正文）
-async fn probe_claude(
-    client: &reqwest::Client,
-    nr_client: &reqwest::Client,
-    _exit_country: Option<&str>,
-) -> ServiceProbeResult {
+async fn probe_claude(client: &reqwest::Client, nr_client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "Claude";
     // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let first = match nr_client
@@ -2700,11 +2685,7 @@ async fn probe_claude(
 
 /// Gemini：gemini.google.com/app（无重定向看首跳 Location）。
 /// 【APP73】严禁在整段 HTML/JS 中扫到地区提示串就判 BLOCKED。
-async fn probe_gemini(
-    client: &reqwest::Client,
-    nr_client: &reqwest::Client,
-    _exit_country: Option<&str>,
-) -> ServiceProbeResult {
+async fn probe_gemini(client: &reqwest::Client, nr_client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "Gemini";
     let resp = match nr_client
         .get("https://gemini.google.com/app")
@@ -3113,7 +3094,7 @@ async fn probe_youtube(client: &reqwest::Client) -> ServiceProbeResult {
 
 /// Disney+：disneyplus.com/。
 /// 【APP73】品牌词单独不足以 VERIFIED；真实播放不可免登录验证。
-async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> ServiceProbeResult {
+async fn probe_disney(client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "Disney+";
     // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let resp = match client
@@ -3133,7 +3114,12 @@ async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> 
         }
     };
     let final_url = resp.url().as_str().to_lowercase();
-    if final_url.contains("/unavailable") || final_url.contains("unavailable-in-region") {
+    // 【APP76 任务2.3】客观 BLOCKED：重定向 URL 含 /unavailable / unavailable-in-region
+    // 或 preview（未开通地区预览页）。
+    if final_url.contains("/unavailable")
+        || final_url.contains("unavailable-in-region")
+        || final_url.contains("/preview")
+    {
         return svc_blocked_status(
             SVC,
             Some(resp.status().as_u16()),
@@ -3162,11 +3148,21 @@ async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> 
         );
     }
     let lc = body.to_lowercase();
-    if matches!(status, 403 | 451) && body_region_evidence(&lc) {
+    // 【APP76 任务2.3】客观 BLOCKED：HTTP 403（Disney+ 地区封锁标准响应）
+    // 或 451 + 正文含地区不可用证据。
+    if status == 403 {
         return svc_blocked_status(
             SVC,
             Some(status),
-            "disney+ 返回明确地区不可用",
+            "disney+ 返回 403（地区封锁标准响应）",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if status == 451 && body_region_evidence(&lc) {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "disney+ 返回 451 + 明确地区不可用",
             AimErrorKind::RegionRestricted,
         );
     }
@@ -3203,27 +3199,36 @@ async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> 
         );
     }
     let has_brand = lc.contains("disneyplus") || lc.contains("disney+");
-    // 【APP75 任务3.2】重定向落到有效地区路径（/ja-jp、/en-us、/zh-hk、
-    // /en-sg 等）并返回品牌正特征 → VERIFIED；仅基础品牌页 → PARTIAL。
-    const REGION_PATHS: [&str; 12] = [
-        "/ja-jp", "/en-us", "/zh-hk", "/en-sg", "/en-gb", "/de-de", "/fr-fr", "/es-es", "/it-it",
-        "/pt-br", "/ko-kr", "/zh-tw",
-    ];
-    let region_landed = REGION_PATHS.iter().any(|p| final_url.contains(p));
-    if has_brand && region_landed {
-        return svc_verified(SVC, status, "落地有效地区路径 + 品牌正特征");
-    }
-    if has_brand {
-        svc_partial(SVC, status, "品牌入口可访问，未落地有效地区路径")
+    // 【APP76 任务2.3】客观 VERIFIED：HTTP 200 + 品牌正特征 + 无地区不可用提示。
+    // 彻底修复之前 APP75 强制要求"落地 /ja-jp /en-us /zh-hk 等地区路径才给 VERIFIED"
+    // 的过严逻辑——根路径 disneyplus.com/ 本身就是完全有效的流媒体入口，
+    // 一律应判 VERIFIED，不再降级 PARTIAL。
+    let has_unavailable_text = lc.contains("not available in your region")
+        || lc.contains("not available in your country")
+        || lc.contains("is not available");
+    if has_brand && !has_unavailable_text {
+        svc_verified(
+            SVC,
+            status,
+            "disneyplus.com/ 返回 200 + 品牌正特征（根路径或地区路径均有效）",
+        )
+    } else if has_unavailable_text {
+        svc_blocked_status(
+            SVC,
+            Some(status),
+            "disney+ 响应正文含明确地区不可用提示",
+            AimErrorKind::RegionRestricted,
+        )
     } else {
         svc_accessible(SVC, status, "连通但缺少品牌正特征")
     }
 }
 
 /// TK：tiktok.com/explore。
-/// 【APP73】严禁静态标记 SIGI_STATE 直接 VERIFIED，也严禁脚本含
-/// `access denied` 文本就 BLOCKED。
-async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+/// 【APP76 任务2.1+2.3】纯客观证据判定引擎：彻底删除 exit_country
+/// 地区名单参与的任何解锁或封锁判定，所有结论均来自 HTTP 响应状态码、
+/// 重定向最终落地 URL 与响应正文中的真实业务特征。
+async fn probe_tiktok(client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "TK";
     let resp = match client
         .get("https://www.tiktok.com/explore")
@@ -3241,7 +3246,7 @@ async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> S
             );
         }
     };
-    let (status, _, body) = match read_body(resp, SVC).await {
+    let (status, _final_url, body) = match read_body(resp, SVC).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -3270,27 +3275,34 @@ async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> S
         );
     }
     let lc = body.to_lowercase();
-    if matches!(status, 403 | 451) {
-        if is_compact_body(&body) && body_region_evidence(&lc) {
+    // 【APP76 任务2.3】客观 BLOCKED：HTTP 403/451，或正文含明确停服/拒绝提示。
+    let has_shutdown_text = lc.contains("ceased operations")
+        || lc.contains("no longer operating")
+        || lc.contains("not available in your country");
+    if matches!(status, 403 | 451) || has_shutdown_text {
+        // 【APP76 任务2.3】客观 BLOCKED 证据：完全缺失 Web 应用数据容器（既
+        // 无 __UNIVERSAL_DATA_FOR_REHYDRATION__ 也无 SIGI_STATE）+ 403/451 或
+        // 正文停服文本。彻底修复之前按 HK 地区名单误判 BLOCKED 的问题。
+        if !lc.contains("__universal_data_for_rehydration__") && !lc.contains("sigi_state") {
             return svc_blocked_status(
                 SVC,
                 Some(status),
-                "tiktok 精简地区封锁拒绝页",
+                "tiktok 无 Web 应用数据容器 + 403/451/停服文本",
                 AimErrorKind::RegionRestricted,
             );
         }
-        if region_blocked(exit_country, TIKTOK_BLOCKLIST) && is_compact_body(&body) {
+        if has_shutdown_text {
             return svc_blocked_status(
                 SVC,
                 Some(status),
-                "tiktok 拒绝页且出口地区命中封禁区",
+                "tiktok 响应正文含明确停服/拒绝提示",
                 AimErrorKind::RegionRestricted,
             );
         }
         return svc_unknown_status(
             SVC,
             Some(status),
-            format!("tiktok 普通 {status}（无明确地区证据）"),
+            format!("tiktok 普通 {status}（有数据容器但未收到 200）"),
             AimErrorKind::Http403,
         );
     }
@@ -3310,38 +3322,26 @@ async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> S
             AimErrorKind::EmptyResponse,
         );
     }
-    let has_playaddr = lc.contains("playaddr")
-        || lc.contains("\"vid\"")
+    // 【APP76 任务2.3】客观 VERIFIED：HTTP 200 + 有数据容器 + 有正常业务数据。
+    let has_data_container =
+        lc.contains("__universal_data_for_rehydration__") || lc.contains("sigi_state");
+    let has_feed_data = lc.contains("webapp")
+        || lc.contains("explore")
+        || lc.contains("playaddr")
         || lc.contains("videometadata")
-        || lc.contains("__universal_data_for_rehydration__");
-    // 【APP75 任务3.2】动态视频流列表正特征（真实 feed 数据）→ VERIFIED。
-    let has_feed = has_playaddr
-        && (lc.contains("itemlist")
-            || lc.contains("diggcount")
-            || lc.contains("collectcount")
-            || lc.contains("challengeinfo"));
-    if has_feed {
+        || lc.contains("statuscode\":0")
+        || lc.contains("status_code\":0");
+    if has_data_container && has_feed_data && !has_shutdown_text {
         return svc_verified(
             SVC,
             status,
-            "探索页返回真实视频流数据（itemList + playAddr）",
+            "tiktok.com/explore 返回 200 + Web 应用数据容器 + 正常业务数据",
         );
     }
-    if has_playaddr {
-        return svc_partial(SVC, status, "视频流元数据可获取，缺少完整 feed 数据");
+    if has_data_container {
+        return svc_partial(SVC, status, "有 Web 应用数据容器但缺少完整业务数据特征");
     }
-    if region_blocked(exit_country, TIKTOK_BLOCKLIST) {
-        return svc_blocked_status(
-            SVC,
-            Some(status),
-            "出口地区命中 TK 停服名单且无有效视频流数据",
-            AimErrorKind::RegionRestricted,
-        );
-    }
-    if lc.contains("sigi_state") {
-        return svc_partial(SVC, status, "仅静态 SIGI_STATE 框架，无视频流数据");
-    }
-    svc_accessible(SVC, status, "首页/登录页正常可访问")
+    svc_accessible(SVC, status, "首页/登录页正常可访问（无 Web 应用数据容器）")
 }
 
 /// 【APP71 任务2.4】槽位实时状态守卫：节点开始时登记，结束/取消/panic 时清空，
@@ -3526,9 +3526,10 @@ async fn probe_node(
         return NodeProbeOutcome::new(result, true, started);
     }
 
-    // 5. 仅缓存未命中时执行 7 平台并发真实请求（Unknown 最多补测 1 次）。
-    let ec = egress.country.as_deref();
-    // [AIM-14] 发起 7 平台并发检测（绝不等待完整正文，仅读状态码/头/关键特征）
+    // 5. 仅缓存未命中时执行 7 平台并发真实请求。
+    // 【APP76 任务2.1】彻底删除 exit_country 参与任何解锁/封锁判定——
+    // 所有平台一律通过 HTTP 客观响应状态码、重定向落地 URL 与正文业务证据判定。
+    let _ = &egress; // egress.country 仅用于前端展示，不再参与判定
     run.log(
         14,
         "INFO",
@@ -3547,21 +3548,21 @@ async fn probe_node(
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("GPT", || probe_gpt(client, ec)).await
+            probe_platform("GPT", || probe_gpt(client)).await
         }));
     }
     {
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("Claude", || probe_claude(client, nr_client, ec)).await
+            probe_platform("Claude", || probe_claude(client, nr_client)).await
         }));
     }
     {
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("Gemini", || probe_gemini(client, nr_client, ec)).await
+            probe_platform("Gemini", || probe_gemini(client, nr_client)).await
         }));
     }
     {
@@ -3582,14 +3583,14 @@ async fn probe_node(
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("Disney+", || probe_disney(client, ec)).await
+            probe_platform("Disney+", || probe_disney(client)).await
         }));
     }
     {
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("TK", || probe_tiktok(client, ec)).await
+            probe_platform("TK", || probe_tiktok(client)).await
         }));
     }
     // [AIM-14] 8 阶段追踪：DNS_CONNECT + HTTPS_REQUEST（7 平台并发）
@@ -3972,8 +3973,10 @@ where
     }
 }
 
-/// 仅对 Unknown 结论补测 1 次（传输抖动重试），Blocked/Verified/Accessible/Partial 不重试。
-/// 【APP71 任务4】同时记录真实耗时、重试次数与可读判定依据。
+/// 【APP76 任务2.2】严格收敛补测触发条件：只有首次探测结果为 Unknown 且
+/// status_code.is_none()（即底层网络/TLS 瞬断、完全没收到 HTTP 响应）时
+/// 才重试 1 次。任何已收到 HTTP 状态码（哪怕是 403 / 429 / 5xx）的场景、
+/// 以及 VERIFIED/PARTIAL/BLOCKED/ACCESSIBLE 一律不重试，防止无故触发二次补测。
 async fn probe_with_retry<F, Fut>(f: F) -> ServiceProbeResult
 where
     F: Fn() -> Fut,
@@ -3982,7 +3985,9 @@ where
     let started = std::time::Instant::now();
     let mut result = f().await;
     let mut retry_count = 0u32;
-    if matches!(result.verdict, ProbeVerdict::Unknown) {
+    let first_verdict = result.verdict;
+    let first_status = result.status_code;
+    if matches!(first_verdict, ProbeVerdict::Unknown) && first_status.is_none() {
         retry_count = 1;
         result = f().await;
     }
@@ -4764,8 +4769,9 @@ mod tests {
         assert!(!blocked, "长脚本中的地区字符串绝不能单独构成封锁证据");
     }
 
-    /// 【APP75 任务3.2】TikTok：只有真实视频流 feed 数据（playAddr + itemList
-    /// 等）才允许 VERIFIED；仅静态 SIGI_STATE 框架一律 PARTIAL。
+    /// 【APP76 任务2.3】TikTok 纯客观证据：HTTP 200 + Web 应用数据容器 + 正常
+    /// 业务数据 → VERIFIED；仅数据容器无业务数据 → PARTIAL；403/451 或
+    /// 完全缺失数据容器 → BLOCKED/UNKNOWN。彻底移除按出口地区名单判定 BLOCKED。
     #[test]
     fn test_tiktok_verified_requires_video_feed() {
         let src = include_str!("go_aim.rs");
@@ -4775,17 +4781,29 @@ mod tests {
         let rest = &src[start..];
         let end = rest.find("\n}\n").map(|i| start + i).unwrap_or(src.len());
         let body = &src[start..end];
-        let feed_at = body.find("has_feed").expect("必须存在视频流 feed 判定");
+        // 必须同时存在数据容器判定和业务数据判定，VERIFIED 必须严格位于二者之后
+        let container_at = body
+            .find("has_data_container")
+            .expect("必须存在 Web 应用数据容器判定（SIGI_STATE / UNIVERSAL_DATA_FOR_REHYDRATION）");
+        let feed_at = body
+            .find("has_feed_data")
+            .expect("必须存在正常业务数据判定（webapp / explore / playaddr 等）");
         let verified_at = body
             .find("svc_verified")
-            .expect("真实 feed 命中时应返回 VERIFIED");
+            .expect("业务数据命中时应返回 VERIFIED");
         assert!(
-            feed_at < verified_at,
-            "TikTok VERIFIED 必须严格位于视频流 feed 判定之后"
+            container_at < verified_at && feed_at < verified_at,
+            "TikTok VERIFIED 必须严格位于数据容器和业务数据双重判定之后"
         );
+        // PARTIAL 描述必须存在（仅数据容器无业务数据）
         assert!(
-            body.contains("仅静态 SIGI_STATE 框架，无视频流数据"),
-            "仅静态 SIGI_STATE 框架必须降级为 PARTIAL"
+            body.contains("有 Web 应用数据容器但缺少完整业务数据特征"),
+            "仅数据容器无业务数据必须降级为 PARTIAL"
+        );
+        // 【APP76 任务2.1】彻底删除 exit_country 地区名单判定
+        assert!(
+            !body.contains("region_blocked") && !body.contains("exit_country"),
+            "probe_tiktok 必须彻底删除 exit_country 地区名单判定"
         );
     }
 
@@ -5000,10 +5018,10 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 7);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 7);
-        assert!(6 < CURRENT_AIM_PROBE_VERSION, "v6 及更早缓存应被淘汰");
-        assert!(7 >= CURRENT_AIM_PROBE_VERSION, "v7 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 8);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 8);
+        assert!(7 < CURRENT_AIM_PROBE_VERSION, "v7 及更早缓存应被淘汰");
+        assert!(8 >= CURRENT_AIM_PROBE_VERSION, "v8 真实缓存应保留");
     }
 
     #[test]
