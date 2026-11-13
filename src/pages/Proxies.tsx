@@ -20,6 +20,7 @@ import { useCoreStore, isDummyNodeName, ensureAimListenersRegistered, syncAimSna
 import { useProStore } from "@/stores/pro";
 import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
+import { formatStandardNodeAimReport } from "@/utils/aimReport";
 import { useTranslation } from "@/i18n";
 import clsx from "clsx";
 
@@ -58,29 +59,22 @@ const PROTOCOL_LABEL: Record<string, string> = {
 const isValidDelay = (d: unknown): d is number =>
   typeof d === "number" && d >= 5;
 
-/** Go AIM 平台细分徽章配色（APP 任务3，与指令 1:1 对齐） */
-const AIM_BADGE_STYLE: Record<string, string> = {
-  GPT: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-  Claude: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  Gemini: "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
-  NF: "bg-red-500/15 text-red-400 border-red-500/30",
-  YT: "bg-rose-500/15 text-rose-400 border-rose-500/30",
-  "Disney+": "bg-sky-500/15 text-sky-400 border-sky-500/30",
-  TK: "bg-pink-500/15 text-pink-400 border-pink-500/30",
-};
-
-/** 节点当前支持的 AIM 徽章集合（后端已按 GPT/Claude/Gemini/NF/YT/TK 归一） */
-const aimBadgesOf = (r?: AimNodeResult): string[] => r?.unlockedTags ?? [];
+/** 【APP73 任务3.1】节点当前支持的 AIM 平台集合（含五级状态） */
+const aimBadgesOf = (r?: AimNodeResult): string[] =>
+  AIM_DETAIL_ORDER.filter((s) => r?.services?.[s]);
+/** 【APP73 任务3.4】综合评分 > 0 即视为 AIM 支持节点 */
+const aimScoreOf = (r?: AimNodeResult): number => r?.score ?? 0;
 
 /// 【APP71 任务4】7 平台固定展示顺序（与后端探测顺序一致）
 const AIM_DETAIL_ORDER = ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"];
 
-/// 五态样式：仅 VERIFIED 为绿色完整解锁，其余保持灰/警示色，绝不伪装
+/// 【APP73 任务3.1】五级状态统一配色（列表 / 详情 / 统计共用）：
+/// VERIFIED 翠绿、ACCESSIBLE 皇家蓝、PARTIAL 琥珀橙、BLOCKED 珊瑚红、UNKNOWN 中性灰。
 const AIM_VERDICT_STYLE: Record<string, string> = {
   VERIFIED: "bg-[#24B414]/15 text-[#24B414] border-[#24B414]/30",
-  ACCESSIBLE: "bg-glass text-gray-300 border-border",
-  PARTIAL: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-  BLOCKED: "bg-[#FF453A]/10 text-[#FF453A] border-[#FF453A]/25",
+  ACCESSIBLE: "bg-[#4169E1]/15 text-[#5B8DEF] border-[#4169E1]/30",
+  PARTIAL: "bg-[#FF9F0A]/12 text-[#FF9F0A] border-[#FF9F0A]/30",
+  BLOCKED: "bg-[#FF6B6B]/12 text-[#FF6B6B] border-[#FF6B6B]/30",
   UNKNOWN: "bg-glass text-gray-500 border-border",
 };
 
@@ -88,37 +82,39 @@ const AIM_VERDICT_STYLE: Record<string, string> = {
 /// 判定依据（永不包含完整 HTTP 响应正文），并支持导出单节点 JSON 报告。
 function AimNodeDetailModal({
   node,
+  protocol,
   result,
   onClose,
 }: {
   node: string;
+  protocol?: string;
   result?: AimNodeResult;
   onClose: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, resolved } = useTranslation();
   const services = result?.services ?? {};
   const rows = AIM_DETAIL_ORDER.filter((s) => services[s]);
 
-  // 【APP72 任务1.4】单节点报告导出：剪贴板 + 系统分享（iOS）/ Downloads（桌面）。
-  // 失败时只提示、绝不抛异常中断弹窗。
+  // 【APP73 任务4.2】单节点报告导出：中英双语标准节点报告。
+  // 剪贴板 + 系统分享（iOS）/ Downloads（桌面）；失败只提示、不中断弹窗。
   const [exporting, setExporting] = useState(false);
   const exportReport = async () => {
     if (exporting) return;
     setExporting(true);
     try {
-      const report = {
+      const text = formatStandardNodeAimReport({
         node,
-        exportedAt: new Date().toISOString(),
-        result: result ?? null,
-      };
-      const text = JSON.stringify(report, null, 2);
+        protocol,
+        result,
+        lang: resolved,
+      });
       try {
         await navigator.clipboard?.writeText(text);
       } catch {
         // 剪贴板不可用时静默忽略，不影响文件导出
       }
-      const filename = await exportSingleNodeReport(node, text);
-      toast.success(t("proxies.aimDetail.exported", { file: filename }));
+      await exportSingleNodeReport(node, text);
+      toast.success(t("proxies.aimDetail.exported"));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -566,9 +562,9 @@ export default function Proxies() {
     totalCount > 0
       ? Math.min(100, Math.round((delayDone * 100) / totalCount))
       : 0;
-  /// 【APP56 任务1.2 情况 B】Pro + Go AIM：支持 AIM 节点数 + AIM 检测进度
+  /// 【APP73 任务3.4】AIM 支持节点：综合评分 > 0（ACCESSIBLE 起步）
   const supportedAimCount = nodes.filter(
-    (n) => aimBadgesOf(aimResults[n.name]).length > 0 && isValidDelay(lastDelay(n)),
+    (n) => aimScoreOf(aimResults[n.name]) > 0 && isValidDelay(lastDelay(n)),
   ).length;
   const aimDone = aimProgress.running
     ? aimProgress.done
@@ -619,7 +615,7 @@ export default function Proxies() {
   /// - Pro + Go AIM：AIM 支持节点优先（延迟升序，同延迟徽章多者优先）
   ///   → 其余有效延迟升序 → 未测速/超时末尾。
   const sorted = useMemo(() => {
-    const badges = (n: ProxyEntry) => aimBadgesOf(aimResults[n.name]).length;
+    const badges = (n: ProxyEntry) => aimScoreOf(aimResults[n.name]);
     const byDelay = (a: ProxyEntry, b: ProxyEntry) =>
       (lastDelay(a) as number) - (lastDelay(b) as number);
     const valid = filtered.filter((n) => isValidDelay(lastDelay(n)));
@@ -854,8 +850,8 @@ export default function Proxies() {
           const delay = lastDelay(node);
           const selected = current === node.name;
           const aimResult = aimResults[node.name];
-          /// 未激活授权不渲染解锁徽章（与原先 Pro 守卫保持一致）
-          const unlockedTags = proActive ? (aimResult?.unlockedTags ?? []) : [];
+          /// 【APP73 任务3.1】列表与详情共用五级状态徽章，未激活授权不渲染
+          const aimPlatforms = proActive ? aimBadgesOf(aimResult) : [];
           return (
             <button
               key={node.name}
@@ -886,8 +882,8 @@ export default function Proxies() {
                   >
                     {node.name}
                   </span>
-                  {/* 无解锁徽章时保持紧凑单行：协议标签内联显示 */}
-                  {unlockedTags.length === 0 && (
+                  {/* 无 AIM 平台徽章时保持紧凑单行：协议标签内联显示 */}
+                  {aimPlatforms.length === 0 && (
                     <span className="shrink-0 px-1.5 py-0.5 rounded text-[11px] font-mono uppercase tracking-wide bg-glass text-gray-400">
                       {protocolTag(node.type)}
                     </span>
@@ -908,23 +904,27 @@ export default function Proxies() {
 
               {/* 第二行（自适应）：协议标签 + 全部 Go AIM 平台徽章，flex-wrap
                   自然换行，不挤占第一行的名称与延迟；无结果时不渲染 */}
-              {(unlockedTags.length > 0 || aimResult?.probed) && (
+              {(aimPlatforms.length > 0 || aimResult?.probed) && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-4">
                   <span className="px-1.5 py-0.5 rounded bg-surface-hover text-[11px] font-mono uppercase tracking-wide text-gray-400">
                     {protocolTag(node.type)}
                   </span>
-                  {unlockedTags.map((tag) => (
-                    <span
-                      key={tag}
-                      className={clsx(
-                        "px-1.5 py-0.5 rounded border text-[11px] font-medium",
-                        AIM_BADGE_STYLE[tag] ??
-                          "bg-glass text-gray-400 border-border"
-                      )}
-                    >
-                      {tag}
-                    </span>
-                  ))}
+                  {aimPlatforms.map((tag) => {
+                    const verdict =
+                      aimResult?.services?.[tag]?.verdict ?? "UNKNOWN";
+                    return (
+                      <span
+                        key={tag}
+                        title={`${tag}: ${verdict}`}
+                        className={clsx(
+                          "px-1.5 py-0.5 rounded border text-[11px] font-medium",
+                          AIM_VERDICT_STYLE[verdict] ?? AIM_VERDICT_STYLE.UNKNOWN,
+                        )}
+                      >
+                        {tag}
+                      </span>
+                    );
+                  })}
                   {aimResult?.probed && (
                     <span
                       role="button"
@@ -949,6 +949,9 @@ export default function Proxies() {
       {detailNode && (
         <AimNodeDetailModal
           node={detailNode}
+          protocol={protocolTag(
+            nodes.find((n) => n.name === detailNode)?.type ?? "",
+          )}
           result={aimResults[detailNode]}
           onClose={() => setDetailNode(null)}
         />

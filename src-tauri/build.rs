@@ -19,7 +19,12 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", kernel_dir.display());
             println!("cargo:rustc-link-lib=static=prismkernel");
             // Go runtime / x509 根证书在 Apple 平台的依赖框架
-            for fw in ["Security", "Foundation", "CoreFoundation", "SystemConfiguration"] {
+            for fw in [
+                "Security",
+                "Foundation",
+                "CoreFoundation",
+                "SystemConfiguration",
+            ] {
                 println!("cargo:rustc-link-lib=framework={fw}");
             }
             // Go c-archive iOS 运行时还依赖 libresolv（res_9_ninit/nclose/nsearch）与 libz

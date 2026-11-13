@@ -296,6 +296,8 @@ export interface ServiceProbeResult {
   statusCode?: number;
   evidence: string;
   failureReason?: string;
+  /** 【APP73 任务2.2】标准错误分类（DNS_ERROR / CONNECT_TIMEOUT / ...） */
+  errorKind?: string;
   // 【APP71 任务4】证据级详情字段
   elapsedMs?: number;
   retryCount?: number;

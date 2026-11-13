@@ -20,7 +20,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 // Command 仅桌面手动路由/路由命令使用；移动端不编译（APP27 消除 unused 警告）
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -63,9 +63,7 @@ impl TunGuard {
     /// 启用 TUN（在内核启动成功后调用）
     pub async fn enable(config: TunConfig) -> Result<Self> {
         if !crate::platform::has_elevated_privilege() {
-            bail!(
-                "TUN 模式需要管理员/root 权限，请以管理员身份重启 Prism 后再试"
-            );
+            bail!("TUN 模式需要管理员/root 权限，请以管理员身份重启 Prism 后再试");
         }
 
         let manual_routes_added = if !config.auto_route {
@@ -99,7 +97,10 @@ impl TunGuard {
     }
 
     /// 添加默认路由劫持（拆成两段 /1，避免直接覆盖默认路由，便于回滚）
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        allow(unused_variables)
+    )]
     async fn configure_routes(device: &str) -> Result<()> {
         #[cfg(windows)]
         {
@@ -109,11 +110,7 @@ impl TunGuard {
 
         #[cfg(target_os = "macos")]
         {
-            run_cmd(
-                "route",
-                &["add", "-net", "0.0.0.0/1", "-interface", device],
-            )
-            .await?;
+            run_cmd("route", &["add", "-net", "0.0.0.0/1", "-interface", device]).await?;
             run_cmd(
                 "route",
                 &["add", "-net", "128.0.0.0/1", "-interface", device],
@@ -123,16 +120,8 @@ impl TunGuard {
 
         #[cfg(target_os = "linux")]
         {
-            run_cmd(
-                "ip",
-                &["route", "add", "0.0.0.0/1", "dev", device],
-            )
-            .await?;
-            run_cmd(
-                "ip",
-                &["route", "add", "128.0.0.0/1", "dev", device],
-            )
-            .await?;
+            run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", device]).await?;
+            run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", device]).await?;
         }
 
         Ok(())
@@ -232,10 +221,7 @@ impl Drop for TunGuard {
 
 #[cfg(windows)]
 async fn run_route(args: &[&str]) -> Result<()> {
-    let status = Command::new("route")
-        .args(args)
-        .status()
-        .await?;
+    let status = Command::new("route").args(args).status().await?;
     if !status.success() {
         bail!("route {:?} failed: {}", args, status);
     }

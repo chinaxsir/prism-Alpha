@@ -10,7 +10,9 @@ use crate::core::kernel::{
     sanitize_kernel_error,
 };
 use crate::core::license::EntitlementStatus;
-use crate::core::state::{AppState, CoreStatus, OutboundMode, RunMode, UserSettings, pick_api_addr};
+use crate::core::state::{
+    AppState, CoreStatus, OutboundMode, RunMode, UserSettings, pick_api_addr,
+};
 
 /// 返回前端前的错误文本统一脱敏（抹除内核商标字样）
 fn sanitize_err(msg: &str) -> String {
@@ -85,7 +87,11 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
             .selected_node
             .clone()
             .unwrap_or_else(|| "自动（等待测速）".into());
-        let group = state.main_selector.read().clone().unwrap_or_else(|| "Proxy".into());
+        let group = state
+            .main_selector
+            .read()
+            .clone()
+            .unwrap_or_else(|| "Proxy".into());
         crate::core::logger::info(
             crate::core::logger::MOD_NODE,
             &format!(
@@ -108,7 +114,10 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
 
     // 【APP57 任务2】新会话启动：清零上一会话的全部分析统计并通知前端从 0 展示
     state.reset_analytics_session();
-    let _ = app.emit("analytics://reset", serde_json::json!({ "reason": "start" }));
+    let _ = app.emit(
+        "analytics://reset",
+        serde_json::json!({ "reason": "start" }),
+    );
 
     // 启动失败时统一回滚，避免半成品状态
     if let Err(e) = do_start(app, state).await {
@@ -181,10 +190,7 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
 
 /// 覆盖升级后自动重建隧道（APP-5 任务2，仅 iOS 由 lib.rs setup 调用）。
 /// 升级前隧道在使用中且旧扩展已被清理时，用户无需手动点「连接」。
-pub async fn auto_start_after_upgrade(
-    app: AppHandle,
-    state: &AppState,
-) -> Result<(), String> {
+pub async fn auto_start_after_upgrade(app: AppHandle, state: &AppState) -> Result<(), String> {
     start_core_inner(&app, state).await
 }
 
@@ -212,13 +218,14 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     //   阻塞等待最长 60s，必须放 spawn_blocking，防止卡死 Tokio worker）
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
-        let granted =
-            tauri::async_runtime::spawn_blocking(crate::platform::ensure_vpn_permission)
-                .await
-                .map_err(|e| format!("VPN 授权检查任务异常退出: {e}"))?
-                .map_err(|e| sanitize_err(&e.to_string()))?;
+        let granted = tauri::async_runtime::spawn_blocking(crate::platform::ensure_vpn_permission)
+            .await
+            .map_err(|e| format!("VPN 授权检查任务异常退出: {e}"))?
+            .map_err(|e| sanitize_err(&e.to_string()))?;
         if !granted {
-            return Err("需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into());
+            return Err(
+                "需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into(),
+            );
         }
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -230,8 +237,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     }
 
     let work_dir = state.work_dir();
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("创建内核工作目录失败: {}", e))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("创建内核工作目录失败: {}", e))?;
 
     // 读取全部启用订阅的 profile（多订阅模型；旧版单 profile.yaml 自动兼容）
     let profiles = load_enabled_profiles(state);
@@ -249,17 +255,14 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
                     // Box::pin 打断 prepare_start → refresh_subscription →
                     // restart_core → prepare_start 的静态递归环（运行时已有
                     // status != Running 守卫，实际不会递归执行）
-                    if let Err(e) =
-                        Box::pin(refresh_subscription(app, state, &r.url)).await
-                    {
+                    if let Err(e) = Box::pin(refresh_subscription(app, state, &r.url)).await {
                         tracing::warn!("启动前补拉失败（继续启动流程）：{e}");
                     }
                 }
             }
             // 自动补拉后不再读取 profiles：下方直接返回错误提示
         }
-        let has_records =
-            !crate::core::store::load_subscriptions(&state.data_dir).is_empty();
+        let has_records = !crate::core::store::load_subscriptions(&state.data_dir).is_empty();
         return Err(if has_records {
             "订阅内容缺失（本地缓存不存在）：请在「订阅」页点击更新，成功后再启动内核".into()
         } else {
@@ -281,7 +284,11 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     // 移动端 mixed 入站已移除（流量全走 TUN），无需检查混合端口。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        let listen_host = if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
+        let listen_host = if settings.allow_lan {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         if !crate::core::state::is_port_free(listen_host, settings.mixed_port) {
             return Err(format!(
                 "混合端口 {} 已被占用，请在“设置”中更换端口后重试",
@@ -436,7 +443,10 @@ async fn apply_prepared(
     let api = state.kernel_api();
     let main = resolve_main_selector(&api, &built.final_group).await;
     if let Some(group) = &main {
-        tracing::info!("main selector group: {group} (final: {})", built.final_group);
+        tracing::info!(
+            "main selector group: {group} (final: {})",
+            built.final_group
+        );
     } else {
         tracing::warn!(
             "no main selector resolved from final group '{}'",
@@ -528,16 +538,14 @@ fn load_enabled_profiles(state: &AppState) -> Vec<(String, String, String)> {
         let path = crate::core::store::profile_path(&state.data_dir, &record.url);
         // 已缓存内容必须是含节点的有效 Clash YAML；空壳（如机场返回的
         // JSON 错误页）视为缺失，走旧版迁移兜底恢复
-        let cached_valid = std::fs::read_to_string(&path)
-            .ok()
-            .filter(|text| {
-                crate::core::config_builder::validate_subscription_text(text)
-                    .map(|_| true)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("cached profile invalid for {}: {e}", record.url);
-                        false
-                    })
-            });
+        let cached_valid = std::fs::read_to_string(&path).ok().filter(|text| {
+            crate::core::config_builder::validate_subscription_text(text)
+                .map(|_| true)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("cached profile invalid for {}: {e}", record.url);
+                    false
+                })
+        });
         let text = match cached_valid {
             Some(text) => text,
             None => {
@@ -551,7 +559,10 @@ fn load_enabled_profiles(state: &AppState) -> Vec<(String, String, String)> {
                         tracing::info!("migrated legacy profile.yaml -> {}", path.display());
                         text.clone()
                     } else {
-                        tracing::warn!("profile missing and legacy migration failed: {}", path.display());
+                        tracing::warn!(
+                            "profile missing and legacy migration failed: {}",
+                            path.display()
+                        );
                         continue;
                     }
                 } else {
@@ -610,7 +621,10 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
         .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 【APP57 任务2】重启会话：旧内核已停、统计已清零，通知前端立即重置
-    let _ = app.emit("analytics://reset", serde_json::json!({ "reason": "restart" }));
+    let _ = app.emit(
+        "analytics://reset",
+        serde_json::json!({ "reason": "restart" }),
+    );
 
     // 4. 应用已校验的配置启动新内核；失败仍转 Error 允许重试
     state
@@ -722,9 +736,7 @@ fn ensure_valid_selected_node(state: &AppState) -> Option<String> {
     let cur = state.settings.read().selected_node.clone();
     let needs_correct = match &cur {
         None => true,
-        Some(n) => {
-            crate::core::config_builder::is_info_or_ad_node_name(n) || !valid.contains(n)
-        }
+        Some(n) => crate::core::config_builder::is_info_or_ad_node_name(n) || !valid.contains(n),
     };
     if needs_correct {
         if let Some(pick) = valid.first() {
@@ -882,7 +894,9 @@ async fn auto_select_fastest(
 /// 3. 主程序同级目录 sing-box[.exe]
 /// （iOS/Android 内核内嵌于主程序，无独立二进制可解析）
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
-pub(crate) fn resolve_kernel_path(work_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_kernel_path(
+    work_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
     let exe_name = if cfg!(windows) {
         "sing-box.exe"
     } else {
@@ -892,9 +906,7 @@ pub(crate) fn resolve_kernel_path(work_dir: &std::path::Path) -> anyhow::Result<
     let candidates: Vec<std::path::PathBuf> = match std::env::var("PRISM_KERNEL_PATH") {
         Ok(path) => vec![path.into()],
         Err(_) => {
-            let mut list = vec![
-                crate::core::kernel::kernel_binary_path(work_dir),
-            ];
+            let mut list = vec![crate::core::kernel::kernel_binary_path(work_dir)];
             if let Ok(exe) = std::env::current_exe()
                 && let Some(dir) = exe.parent()
             {
@@ -1017,11 +1029,10 @@ pub async fn get_core_status(
     let (go_lan_any_direct, go_lan_profile_direct_map) = if lan.enabled {
         // 【APP59 任务1】全隧道统一走事件驱动直连缓存（id + name 双键），
         // 签名未变时纯内存读取，零网络探测。
-        let map = tokio::task::spawn_blocking(move || {
-            crate::core::go_lan::lan_direct_state_map(&lan)
-        })
-        .await
-        .unwrap_or_default();
+        let map =
+            tokio::task::spawn_blocking(move || crate::core::go_lan::lan_direct_state_map(&lan))
+                .await
+                .unwrap_or_default();
         let any = map.values().any(|v| *v);
         (any, map)
     } else {
@@ -1182,7 +1193,11 @@ pub async fn set_outbound_mode(
                 OutboundMode::Global => "全局",
                 OutboundMode::Direct => "直连",
             },
-            if *state.status.read() == CoreStatus::Running { "热切换" } else { "已保存" }
+            if *state.status.read() == CoreStatus::Running {
+                "热切换"
+            } else {
+                "已保存"
+            }
         ),
     );
 
@@ -1253,7 +1268,9 @@ pub async fn select_proxy(
         if let Some(map) = proxies_map.get("proxies").and_then(|m| m.as_object()) {
             let mut all_selectors: Vec<String> = Vec::new();
             for (k, v) in map {
-                let Some(t) = v.get("type").and_then(|t| t.as_str()) else { continue };
+                let Some(t) = v.get("type").and_then(|t| t.as_str()) else {
+                    continue;
+                };
                 if t == "Selector"
                     && !crate::core::config_builder::is_builtin_non_proxy_tag(k)
                     // 已经切过的组（用户指定 group + GLOBAL）不再切两次
@@ -1276,12 +1293,16 @@ pub async fn select_proxy(
                     }
                 }
             };
-            if try_select(&group).await { had_404 = true; }
+            if try_select(&group).await {
+                had_404 = true;
+            }
             if group != "GLOBAL" && try_select("GLOBAL").await {
                 had_404 = true;
             }
             for sel in &all_selectors {
-                if try_select(sel).await { had_404 = true; }
+                if try_select(sel).await {
+                    had_404 = true;
+                }
             }
         }
     }
@@ -1427,8 +1448,8 @@ pub(crate) async fn refresh_subscription(
     // 内核运行中时，直连失败的最终兜底是经本地 mixed 入站转发。
     // 移动端 mixed 入站已移除，流量全走 TUN，无需本地代理兜底。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    let local_proxy = (*state.status.read() == CoreStatus::Running)
-        .then(|| state.settings.read().mixed_port);
+    let local_proxy =
+        (*state.status.read() == CoreStatus::Running).then(|| state.settings.read().mixed_port);
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let local_proxy: Option<u16> = None;
     let (mut text, mut quota) = fetch_remote_text(&url, local_proxy, None).await?;
@@ -1446,7 +1467,10 @@ pub(crate) async fn refresh_subscription(
         if subscription_real_node_count(&retry_text) > 0 {
             text = retry_text;
             quota = retry_quota;
-            tracing::info!("v2rayN UA 重试成功，节点数 {}", subscription_real_node_count(&text));
+            tracing::info!(
+                "v2rayN UA 重试成功，节点数 {}",
+                subscription_real_node_count(&text)
+            );
         }
     }
 
@@ -1460,8 +1484,7 @@ pub(crate) async fn refresh_subscription(
     if let Some(parent) = profile_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| sanitize_err(&e.to_string()))?;
     }
-    std::fs::write(&profile_path, &text)
-        .map_err(|e| format!("写入订阅文件失败: {}", e))?;
+    std::fs::write(&profile_path, &text).map_err(|e| format!("写入订阅文件失败: {}", e))?;
     tracing::info!("subscription saved to {}", profile_path.display());
 
     // 持久化订阅记录（机场下发了 subscription-userinfo 则同步流量配额）
@@ -1554,7 +1577,8 @@ async fn hot_reload_mobile_config(app: &AppHandle, state: &AppState) -> Result<(
 /// 机场面板常按 UA 下发不同节点集：v2rayNG UA 拿到的是完整 base64 URI 列表，
 /// Clash.Meta UA 有时只拿到精简 YAML。两个 UA 并发拉取后按节点数取更多者。
 fn count_nodes_in_text(text: &str) -> usize {
-    let prepared = prepare_subscription_payload(text.to_string()).unwrap_or_else(|_| text.to_string());
+    let prepared =
+        prepare_subscription_payload(text.to_string()).unwrap_or_else(|_| text.to_string());
     if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&prepared)
         && let Some(list) = v.get("proxies").and_then(|p| p.as_sequence())
     {
@@ -1589,8 +1613,15 @@ const SUBSCRIPTION_UAS: [&str; 7] = [
 /// clash / meta / shadowsocks），命中后只发该 UA，避免格式来回转换。
 fn ua_for_subscription_flag(url: &str) -> Option<&'static str> {
     let lower = url.to_ascii_lowercase();
-    for flag in ["flag=surge", "flag=loon", "flag=stash", "flag=clash", "flag=meta",
-                 "flag=karing", "flag=shadowsocks"] {
+    for flag in [
+        "flag=surge",
+        "flag=loon",
+        "flag=stash",
+        "flag=clash",
+        "flag=meta",
+        "flag=karing",
+        "flag=shadowsocks",
+    ] {
         if !lower.contains(flag) {
             continue;
         }
@@ -1621,11 +1652,7 @@ fn sanitize_subscription_url(raw: &str) -> String {
         .filter(|c| {
             !matches!(
                 *c,
-                '\u{200B}'..='\u{200F}'
-                    | '\u{2060}'
-                    | '\u{FEFF}'
-                    | '\u{00AD}'
-                    | '\u{180E}'
+                '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' | '\u{180E}'
             ) && !c.is_control()
         })
         .collect::<String>()
@@ -1696,10 +1723,7 @@ fn prepare_subscription_payload(text: String) -> Result<String, String> {
             node["name"] = serde_json::json!(name);
             proxies.push(node);
         }
-        let names: Vec<&str> = proxies
-            .iter()
-            .filter_map(|n| n["name"].as_str())
-            .collect();
+        let names: Vec<&str> = proxies.iter().filter_map(|n| n["name"].as_str()).collect();
         let profile = serde_json::json!({
             "proxies": proxies,
             "proxy-groups": [
@@ -1707,8 +1731,7 @@ fn prepare_subscription_payload(text: String) -> Result<String, String> {
             ],
             "rules": ["MATCH,节点选择"],
         });
-        return serde_yaml::to_string(&profile)
-            .map_err(|e| format!("订阅转换失败: {e}"));
+        return serde_yaml::to_string(&profile).map_err(|e| format!("订阅转换失败: {e}"));
     }
 
     // 兼容旧行为：原样就是内核 JSON 时直接下发
@@ -1793,10 +1816,11 @@ async fn fetch_remote_text(
             .redirect(reqwest::redirect::Policy::limited(5))
             .no_proxy();
         if force_v4 {
-            builder =
-                builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         }
-        builder.build().map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+        builder
+            .build()
+            .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
     };
 
     let mut attempts = FuturesUnordered::new();
@@ -1819,8 +1843,12 @@ async fn fetch_remote_text(
     // Clash.Meta 与 v2rayN 两族都产出结果后，按实际节点数取更多者；
     // 同等节点数时保留先到者。
     let no_force = force_ua.is_none();
-    let mut best: Option<(String, Option<crate::core::store::SubscriptionQuota>, usize, String)> =
-        None;
+    let mut best: Option<(
+        String,
+        Option<crate::core::store::SubscriptionQuota>,
+        usize,
+        String,
+    )> = None;
     let mut got_clash = false;
     let mut got_v2ray = false;
     while let Some((force_v4, ua, result)) = attempts.next().await {
@@ -1916,9 +1944,10 @@ async fn fetch_remote_text(
         if let Some(host) = parsed.host_str() {
             let ips = crate::core::license::doh_resolve_ips(host).await;
             if !ips.is_empty() {
-                let port = parsed
-                    .port()
-                    .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+                let port =
+                    parsed
+                        .port()
+                        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
                 'doh: for ip in ips.iter().take(3) {
                     for ua in &uas {
                         let client = match reqwest::Client::builder()
@@ -1997,10 +2026,7 @@ async fn try_fetch_text(
         .await
         .map_err(|e| describe_reqwest_error(&e))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "HTTP {}（订阅链接可能已失效）",
-            resp.status()
-        ));
+        return Err(format!("HTTP {}（订阅链接可能已失效）", resp.status()));
     }
     // 机场流量配额（Clash / SIP008 通用的 subscription-userinfo 响应头）
     let quota = resp
@@ -2019,10 +2045,7 @@ async fn try_fetch_text(
             Ok(None) => break,
             Err(e) => {
                 if buf.len() > 32 {
-                    tracing::warn!(
-                        "订阅流末尾非致命中断，保留已接收的 {} 字节: {e}",
-                        buf.len()
-                    );
+                    tracing::warn!("订阅流末尾非致命中断，保留已接收的 {} 字节: {e}", buf.len());
                     break;
                 }
                 return Err(format!("读取响应失败: {e}"));
@@ -2038,7 +2061,11 @@ async fn try_fetch_text(
         let mut decoded = Vec::new();
         match flate2::read::GzDecoder::new(&buf[..]).read_to_end(&mut decoded) {
             Ok(_) => {
-                tracing::info!("订阅响应为 gzip 压缩，已手动解压 {} → {} 字节", buf.len(), decoded.len());
+                tracing::info!(
+                    "订阅响应为 gzip 压缩，已手动解压 {} → {} 字节",
+                    buf.len(),
+                    decoded.len()
+                );
                 buf = decoded;
             }
             Err(e) => {
@@ -2085,8 +2112,8 @@ async fn refresh_providers(state: &AppState, sub_url: &str, profile_text: &str) 
 
     // 移动端 mixed 入站已移除，流量全走 TUN，无需本地代理兜底。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    let local_proxy = (*state.status.read() == CoreStatus::Running)
-        .then(|| state.settings.read().mixed_port);
+    let local_proxy =
+        (*state.status.read() == CoreStatus::Running).then(|| state.settings.read().mixed_port);
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let local_proxy: Option<u16> = None;
 
@@ -2108,8 +2135,7 @@ async fn refresh_providers(state: &AppState, sub_url: &str, profile_text: &str) 
             async move {
                 match fetch_remote_text(&url, local_proxy, None).await {
                     Ok((text, _)) => {
-                        let path =
-                            crate::core::store::provider_path(&data_dir, sub_url, &name);
+                        let path = crate::core::store::provider_path(&data_dir, sub_url, &name);
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
@@ -2252,9 +2278,7 @@ pub struct CachedProxyDto {
 /// 内核未运行时从订阅缓存读取节点列表（节点页预览）
 /// 内核运行时优先用 get_proxy_groups（含实时延迟）
 #[tauri::command]
-pub async fn get_cached_proxies(
-    state: State<'_, AppState>,
-) -> Result<Vec<CachedProxyDto>, String> {
+pub async fn get_cached_proxies(state: State<'_, AppState>) -> Result<Vec<CachedProxyDto>, String> {
     Ok(collect_cached_proxies(&state))
 }
 
@@ -2280,8 +2304,16 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
                     let name = crate::core::uri_parser::fix_utf8_mojibake(
                         p.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                     );
-                    let kind = p.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let kind = p
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let server = p
+                        .get("server")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                     if name.is_empty() || server.is_empty() {
                         continue;
@@ -2320,8 +2352,16 @@ fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
                 let name = crate::core::uri_parser::fix_utf8_mojibake(
                     node.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                 );
-                let kind = node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let server = node.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kind = node
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let server = node
+                    .get("server")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let port = node.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                 if name.is_empty() || server.is_empty() {
                     continue;
@@ -2389,14 +2429,12 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
         .into_iter()
         .map(|p| p.name)
         .collect();
-    let valid: std::collections::HashSet<&str> =
-        valid_names.iter().map(|s| s.as_str()).collect();
+    let valid: std::collections::HashSet<&str> = valid_names.iter().map(|s| s.as_str()).collect();
     // 代数自增：旧探测任务立即失效
     state.aim_generation.fetch_add(1, Ordering::AcqRel);
     // 【APP52 任务1】持久化指标缓存同步清理已失效节点（刷新/删除订阅时）
     {
-        let valid_owned: std::collections::HashSet<String> =
-            valid_names.iter().cloned().collect();
+        let valid_owned: std::collections::HashSet<String> = valid_names.iter().cloned().collect();
         state.retain_node_metrics(&valid_owned);
     }
 
@@ -2408,10 +2446,7 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
     // 2) 锁定的节点已失效 → 清空，交由后续探测/自动选点重建
     {
         let mut locked = state.aim_locked_node.write();
-        if locked
-            .as_deref()
-            .is_some_and(|n| !valid.contains(n))
-        {
+        if locked.as_deref().is_some_and(|n| !valid.contains(n)) {
             *locked = None;
         }
     }
@@ -2449,9 +2484,7 @@ static NODE_DNS_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, NodeDnsEntry>>,
 > = std::sync::OnceLock::new();
 
-fn node_dns_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, NodeDnsEntry>,
-> {
+fn node_dns_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, NodeDnsEntry>> {
     NODE_DNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2566,7 +2599,14 @@ pub async fn test_all_delays(
     }
     crate::core::logger::info(
         crate::core::logger::MOD_NODE,
-        &format!("开始全量测速：共 {total} 个节点（{}）", if running { "内核实测" } else { "离线 TCP" }),
+        &format!(
+            "开始全量测速：共 {total} 个节点（{}）",
+            if running {
+                "内核实测"
+            } else {
+                "离线 TCP"
+            }
+        ),
     );
 
     // 第一步：20 路并发预解析去重域名
@@ -2629,7 +2669,10 @@ pub async fn test_all_delays(
                 }),
             );
             if done % 3 == 0 || done == total {
-                let _ = app.emit("delays://updated", serde_json::Value::Object(updates.clone()));
+                let _ = app.emit(
+                    "delays://updated",
+                    serde_json::Value::Object(updates.clone()),
+                );
             }
             if batch.len() >= 6 || done == total {
                 state.record_node_delays(std::mem::take(&mut batch));
@@ -2719,15 +2762,14 @@ pub async fn test_cached_proxies(
     let mut map = serde_json::Map::new();
     let mut all_delays: Vec<(String, u32)> = Vec::new();
     for batch in nodes.chunks(BATCH) {
-        let results: Vec<(String, Option<u64>)> =
-            futures_util::stream::iter(batch.iter().cloned())
-                .map(|n| async move {
-                    let delay = measure_offline_node_delay(&n.server, n.port, timeout).await;
-                    (n.name, delay)
-                })
-                .buffer_unordered(BATCH)
-                .collect()
-                .await;
+        let results: Vec<(String, Option<u64>)> = futures_util::stream::iter(batch.iter().cloned())
+            .map(|n| async move {
+                let delay = measure_offline_node_delay(&n.server, n.port, timeout).await;
+                (n.name, delay)
+            })
+            .buffer_unordered(BATCH)
+            .collect()
+            .await;
         for (name, delay) in results {
             // 【APP52 任务1】完整记录成功与超时（0），供节点页排序与持久化
             let d = delay.unwrap_or(0);
@@ -2740,7 +2782,10 @@ pub async fn test_cached_proxies(
     // 【APP52 任务1】测速结果持久化 + 自动选最低延迟节点（用户未手动指定时）
     state.record_node_delays(all_delays.iter().cloned());
     if !*state.user_manually_selected_node.read()
-        && let Some((best, _)) = all_delays.iter().filter(|(_, d)| *d > 0).min_by_key(|(_, d)| *d)
+        && let Some((best, _)) = all_delays
+            .iter()
+            .filter(|(_, d)| *d > 0)
+            .min_by_key(|(_, d)| *d)
     {
         let mut settings = state.settings.read().clone();
         if settings.selected_node.as_deref() != Some(best.as_str()) {
@@ -2769,9 +2814,7 @@ fn is_valid_public_server_ipv4(ip: std::net::Ipv4Addr) -> bool {
     {
         return false;
     }
-    if (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
-    {
+    if (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) {
         return false;
     }
     if o[0] == 172 && o[1] == 19 {
@@ -2919,11 +2962,9 @@ async fn resolve_ipv4_via_udp_dns(domain: &str) -> Vec<std::net::Ipv4Addr> {
             continue;
         }
         let mut buf = [0u8; 1500];
-        let recv = tokio::time::timeout(
-            std::time::Duration::from_millis(800),
-            socket.recv(&mut buf),
-        )
-        .await;
+        let recv =
+            tokio::time::timeout(std::time::Duration::from_millis(800), socket.recv(&mut buf))
+                .await;
         let Ok(Ok(n)) = recv else {
             continue;
         };
@@ -2935,17 +2976,11 @@ async fn resolve_ipv4_via_udp_dns(domain: &str) -> Vec<std::net::Ipv4Addr> {
     Vec::new()
 }
 
-
-
 static SPEEDTEST_DOH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 /// 解析节点服务器的真实 IPv4：DoH（223.5.5.5）优先，失败回退异步 UDP DNS
 /// 【APP66 任务5.1】不再调用系统 getaddrinfo / lookup_host
-async fn resolve_real_ipv4s(
-    server: &str,
-    _port: u16,
-    _timeout_ms: u32,
-) -> Vec<std::net::Ipv4Addr> {
+async fn resolve_real_ipv4s(server: &str, _port: u16, _timeout_ms: u32) -> Vec<std::net::Ipv4Addr> {
     if let Ok(ip) = server.trim().parse::<std::net::Ipv4Addr>() {
         return if is_virtual_speedtest_ip(std::net::IpAddr::V4(ip)) {
             Vec::new()
@@ -2991,7 +3026,11 @@ async fn resolve_real_ipv4s(
 /// 【APP56 任务2】构造最小 TLS 1.2 ClientHello（携带 SNI）。
 /// 仅用于向真实公网服务器发起一次真实握手往返，不校验证书。
 fn build_tls_client_hello(sni: &str) -> Vec<u8> {
-    let host = if sni.trim().is_empty() { "localhost" } else { sni.trim() };
+    let host = if sni.trim().is_empty() {
+        "localhost"
+    } else {
+        sni.trim()
+    };
     let host_bytes = host.as_bytes();
     // SNI extension body: server_name_list
     let mut sni_ext = Vec::with_capacity(host_bytes.len() + 5);
@@ -3101,9 +3140,8 @@ pub async fn save_custom_rules(
         .filter(|rule| {
             let lower = rule.to_ascii_lowercase();
             let target_auth = crate::core::license::is_stealth_protected_host_or_ip(&lower);
-            let is_block = lower.contains("reject")
-                || lower.contains("block")
-                || lower.contains("drop");
+            let is_block =
+                lower.contains("reject") || lower.contains("block") || lower.contains("drop");
             if target_auth && is_block {
                 tracing::warn!("已忽略针对授权服务的拦截规则: {rule}");
                 false
@@ -3114,21 +3152,23 @@ pub async fn save_custom_rules(
         .collect();
     // 【APP54 任务3】规则模块：保存后输出真实汇总（按类型计数）
     {
-        let mut by_type: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_type: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for r in &filtered {
             let kind = r.split(',').next().unwrap_or("UNKNOWN").trim().to_string();
             *by_type.entry(kind).or_insert(0) += 1;
         }
-        let summary: Vec<String> = by_type
-            .iter()
-            .map(|(k, v)| format!("{k}×{v}"))
-            .collect();
+        let summary: Vec<String> = by_type.iter().map(|(k, v)| format!("{k}×{v}")).collect();
         crate::core::logger::info(
             crate::core::logger::MOD_RULE,
             &format!(
                 "规则已保存：共 {} 条（{}），出站模式: {:?}",
                 filtered.len(),
-                if summary.is_empty() { "无".to_string() } else { summary.join("、") },
+                if summary.is_empty() {
+                    "无".to_string()
+                } else {
+                    summary.join("、")
+                },
                 state.settings.read().outbound_mode
             ),
         );
@@ -3157,9 +3197,7 @@ fn enabled_subscription_count(state: &AppState) -> usize {
 /// 内核运行中至少需要一条启用订阅，避免走"重启时 profile 为空"的异常停机路径
 fn ensure_not_last_enabled(state: &AppState) -> Result<(), String> {
     if *state.status.read() == CoreStatus::Running && enabled_subscription_count(state) <= 1 {
-        return Err(
-            "内核运行中至少需要保留一条启用订阅：请先停止内核，再执行该操作".into(),
-        );
+        return Err("内核运行中至少需要保留一条启用订阅：请先停止内核，再执行该操作".into());
     }
     Ok(())
 }
@@ -3287,11 +3325,17 @@ pub async fn auto_sync_and_refresh_subscriptions(app: AppHandle) {
         match refresh_subscription(&app, &state, &url).await {
             Ok(()) => {
                 ok += 1;
-                crate::core::logger::info(log, &format!("订阅节点更新成功: {}", truncate_for_msg(&url)));
+                crate::core::logger::info(
+                    log,
+                    &format!("订阅节点更新成功: {}", truncate_for_msg(&url)),
+                );
             }
             Err(e) => {
                 fail += 1;
-                crate::core::logger::warn(log, &format!("订阅节点更新失败（{}）: {}", truncate_for_msg(&url), e));
+                crate::core::logger::warn(
+                    log,
+                    &format!("订阅节点更新失败（{}）: {}", truncate_for_msg(&url), e),
+                );
             }
         }
     }
@@ -3340,9 +3384,7 @@ pub async fn activate_pro(
 
 /// 查询当前授权状态（读内存，不联网）
 #[tauri::command]
-pub async fn get_entitlement(
-    state: State<'_, AppState>,
-) -> Result<EntitlementStatus, String> {
+pub async fn get_entitlement(state: State<'_, AppState>) -> Result<EntitlementStatus, String> {
     Ok(state.entitlement.read().clone())
 }
 
@@ -3350,7 +3392,9 @@ pub async fn get_entitlement(
 /// 前端启动时调用一次，保证重启后横幅仍是「设备已解绑」而不是「已到期」。
 #[tauri::command]
 pub async fn get_revoke_reason(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(crate::core::app_control::load_revoke_reason(&state.data_dir))
+    Ok(crate::core::app_control::load_revoke_reason(
+        &state.data_dir,
+    ))
 }
 
 /// 读取本机设备 ID（激活绑定与设置页展示用；首次调用时生成并落盘）
@@ -3499,9 +3543,8 @@ pub(crate) async fn terminate_pro_features_on_expiry(app: &AppHandle, state: &Ap
     }
 
     // 5. 专门的到期通知（前端按 reason 渲染「授权已到期」专属横幅）
-    let (zh, en) = crate::core::app_control::revoke_message(
-        crate::core::app_control::REVOKE_EXPIRED,
-    );
+    let (zh, en) =
+        crate::core::app_control::revoke_message(crate::core::app_control::REVOKE_EXPIRED);
     crate::core::app_control::emit_revoked(
         app,
         crate::core::app_control::REVOKE_EXPIRED,
@@ -3568,7 +3611,10 @@ fn kernel_info(state: &AppState) -> KernelInfoDto {
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         // 【APP12 任务2】移动端始终返回纯版本号，不再带 "（内置）" 后缀
-        let version = state.kernel_version.read().clone()
+        let version = state
+            .kernel_version
+            .read()
+            .clone()
             .or_else(|| Some(crate::core::kernel::EMBEDDED_VERSION.to_string()));
         KernelInfoDto {
             exists: true,
@@ -3597,10 +3643,7 @@ fn kernel_info(state: &AppState) -> KernelInfoDto {
 /// host / destinationIP / rulePayload 任一命中隐身白名单即整条丢弃，
 /// 不计入连接列表，也不进入 ip→domain 缓存与聚合统计。
 fn strip_stealth_connections(mut value: serde_json::Value) -> serde_json::Value {
-    if let Some(arr) = value
-        .get_mut("connections")
-        .and_then(|v| v.as_array_mut())
-    {
+    if let Some(arr) = value.get_mut("connections").and_then(|v| v.as_array_mut()) {
         arr.retain(|c| {
             let meta = c.get("metadata");
             let get = |key: &str| {
@@ -3609,9 +3652,7 @@ fn strip_stealth_connections(mut value: serde_json::Value) -> serde_json::Value 
                     .unwrap_or_default()
             };
             !(crate::core::license::is_stealth_protected_host_or_ip(get("host"))
-                || crate::core::license::is_stealth_protected_host_or_ip(
-                    get("destinationIP"),
-                )
+                || crate::core::license::is_stealth_protected_host_or_ip(get("destinationIP"))
                 || crate::core::license::is_stealth_protected_host_or_ip(get("rulePayload")))
         });
     }
@@ -3630,10 +3671,7 @@ pub async fn get_connections(state: State<'_, AppState>) -> Result<serde_json::V
 
 /// 关闭单条连接（连接页行内按钮）
 #[tauri::command]
-pub async fn close_connection(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn close_connection(id: String, state: State<'_, AppState>) -> Result<(), String> {
     if !state.is_pro_active() {
         return Err("该功能需要有效的 Pro 授权".to_string());
     }
@@ -3668,9 +3706,7 @@ pub async fn reset_analytics_stats(state: State<'_, AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub async fn get_traffic_stats(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_traffic_stats(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     // 实时流量走 WebSocket 事件（traffic://tick），此处返回持久化统计 + 当前连接快照
     let stats = crate::core::store::load_traffic_stats(&state.data_dir);
     let conns = state
@@ -3877,10 +3913,7 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                 if let Some(c) = first {
                     let node_name = selected.clone().unwrap_or_else(|| "自动".into());
                     let meta = c.get("metadata").cloned().unwrap_or_default();
-                    let host = meta
-                        .get("host")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let host = meta.get("host").and_then(|v| v.as_str()).unwrap_or("");
                     let dest_ip = meta
                         .get("destinationIP")
                         .and_then(|v| v.as_str())
@@ -3927,9 +3960,7 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
 /// - dt < 0.15s → 直接沿用缓存的上下行速率（严禁 0,0 闪一下）；
 /// - 超时/失败 → 保留上次速率的一半衰减，曲线不断档、绝不空白。
 #[tauri::command]
-pub async fn get_runtime_snapshot(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_runtime_snapshot(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     // 【APP57 任务3.3 / APP58 任务1.2】遥测请求节流：1 秒内最多拉取一次
     // `/connections`，期间直接复用上次结果；原子开关防止并发重复请求造成
     // 后台流量风暴与手机发热。
@@ -3943,8 +3974,8 @@ pub async fn get_runtime_snapshot(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let due_speed = now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed))
-        >= 1000;
+    let due_speed =
+        now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 1000;
     let due_analytics =
         now_ms.saturating_sub(LAST_ANALYTICS_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 450;
     let due = (due_speed || due_analytics)
@@ -3973,18 +4004,24 @@ pub async fn get_runtime_snapshot(
         let total_down = conn_json
             .get("downloadTotal")
             .and_then(|v| v.as_u64())
-            .or_else(|| conn_json.get("downloadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+            .or_else(|| {
+                conn_json
+                    .get("downloadTotal")
+                    .and_then(|v| v.as_f64().map(|f| f as u64))
+            })?;
         let total_up = conn_json
             .get("uploadTotal")
             .and_then(|v| v.as_u64())
-            .or_else(|| conn_json.get("uploadTotal").and_then(|v| v.as_f64().map(|f| f as u64)))?;
+            .or_else(|| {
+                conn_json
+                    .get("uploadTotal")
+                    .and_then(|v| v.as_f64().map(|f| f as u64))
+            })?;
         Some((total_down, total_up))
     });
 
     // 【APP66 任务4.1】把本次 /connections 快照实时合并进分析聚合
-    if due_analytics
-        && let Some(json) = conn_json.as_ref()
-    {
+    if due_analytics && let Some(json) = conn_json.as_ref() {
         crate::core::events::apply_connections_update(state.inner(), json, true);
     }
 
@@ -4084,7 +4121,11 @@ pub async fn add_traffic_tick(
 
 #[tauri::command]
 pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let mut result = state.kernel_api().get_rules().await.map_err(|e| sanitize_err(&e.to_string()))?;
+    let mut result = state
+        .kernel_api()
+        .get_rules()
+        .await
+        .map_err(|e| sanitize_err(&e.to_string()))?;
     // 【APP-9 任务2.1c】Go Lan 启用时，在规则列表最顶部附带展示当前生效的
     // Go Lan 回家路由规则（type=IP-CIDR / DOMAIN-SUFFIX，proxy=隧道 tag），
     // 让用户在「代理 -> 规则」页直观看到 Go Lan 与规则系统的联动状态。
@@ -4095,7 +4136,9 @@ pub async fn get_rules(state: State<'_, AppState>) -> Result<serde_json::Value, 
         if let Some(obj) = result.as_object_mut() {
             let mut go_lan_rules: Vec<serde_json::Value> = Vec::new();
             // 域名规则（若有）
-            let domains: Vec<&str> = lan.lan_domains.iter()
+            let domains: Vec<&str> = lan
+                .lan_domains
+                .iter()
                 .map(|d| d.trim())
                 .filter(|d| !d.is_empty())
                 .collect();
@@ -4151,9 +4194,7 @@ pub async fn get_lan_ip() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-pub async fn get_proxy_groups(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_proxy_groups(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let mut resp = state
         .kernel_api()
         .get_proxies()
@@ -4222,7 +4263,8 @@ pub async fn save_settings(
     settings.go_aim_pinned_node = prev.go_aim_pinned_node.clone();
 
     // 自启动立即生效
-    crate::platform::set_auto_start(settings.auto_start).map_err(|e| sanitize_err(&e.to_string()))?;
+    crate::platform::set_auto_start(settings.auto_start)
+        .map_err(|e| sanitize_err(&e.to_string()))?;
 
     // 落盘 settings.json，重启后恢复
     let next = settings.clone();
@@ -4243,9 +4285,7 @@ pub async fn save_settings(
     }
     // 出站模式变化时热切换（与 set_outbound_mode 一致：内核不重启，
     // 仅按用户设置决定是否清理旧连接）
-    if prev.outbound_mode != next.outbound_mode
-        && *state.status.read() == CoreStatus::Running
-    {
+    if prev.outbound_mode != next.outbound_mode && *state.status.read() == CoreStatus::Running {
         let mode_str = match next.outbound_mode {
             crate::core::state::OutboundMode::Rule => "rule",
             crate::core::state::OutboundMode::Global => "global",
@@ -4269,8 +4309,10 @@ pub async fn save_settings(
 /// Go AIM 状态：开关 / 锁定节点 / 探测进度 / 全量评级结果
 #[tauri::command]
 pub async fn get_go_aim_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    Ok(serde_json::to_value(crate::core::go_aim::status_dto(&state))
-        .map_err(|e| sanitize_err(&e.to_string()))?)
+    Ok(
+        serde_json::to_value(crate::core::go_aim::status_dto(&state))
+            .map_err(|e| sanitize_err(&e.to_string()))?,
+    )
 }
 
 /// 开关 Go AIM 自动锁定；开启且内核运行中时立即探测并锁定
@@ -4329,7 +4371,10 @@ pub async fn set_go_aim_enabled(
     }
     if !enabled {
         *state.aim_locked_node.write() = None;
-        let _ = app.emit(crate::core::go_aim::AIM_EVENT, serde_json::json!({ "locked": null }));
+        let _ = app.emit(
+            crate::core::go_aim::AIM_EVENT,
+            serde_json::json!({ "locked": null }),
+        );
         // 【APP26 任务2.3 时机3】关闭 Go AIM 且用户未手动点选节点 →
         // 自动回退到实测延迟最低的节点
         if *state.status.read() == CoreStatus::Running
@@ -4403,7 +4448,10 @@ pub fn get_go_aim_snapshot(state: State<'_, AppState>) -> serde_json::Value {
 /// 清除 Go AIM 手动指定的锁定节点，回到自动评级选点（APP-4 任务3.3）。
 /// 内核运行中时立即触发一轮重新探测评级，自动模式即刻生效。
 #[tauri::command]
-pub async fn clear_go_aim_pinned_node(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_go_aim_pinned_node(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if !state.is_pro_active() {
         return Err("Go AIM 是 Pro 专属功能，请先激活授权".into());
     }
@@ -4415,9 +4463,7 @@ pub async fn clear_go_aim_pinned_node(app: AppHandle, state: State<'_, AppState>
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
     // 解除手动指定后立即重新评级选点（运行中才有意义）
-    if state.settings.read().go_aim_enabled
-        && *state.status.read() == CoreStatus::Running
-    {
+    if state.settings.read().go_aim_enabled && *state.status.read() == CoreStatus::Running {
         crate::core::go_aim::spawn_monitor(app.clone());
         crate::core::go_aim::start_probe(app);
     }
@@ -4436,17 +4482,19 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
     // 【APP59 任务1】全隧道事件驱动直连缓存（id + name 双键），不再逐档探测
     let direct_map: std::collections::HashMap<String, bool> = {
         let settings = lan.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::core::go_lan::lan_direct_state_map(&settings)
-        })
-        .await
-        .unwrap_or_default()
+        tokio::task::spawn_blocking(move || crate::core::go_lan::lan_direct_state_map(&settings))
+            .await
+            .unwrap_or_default()
     };
     let mut value = serde_json::to_value(&lan).map_err(|e| sanitize_err(&e.to_string()))?;
     let mut any_direct = false;
     if let Some(profiles) = value.get_mut("profiles").and_then(|v| v.as_array_mut()) {
         for p in profiles.iter_mut() {
-            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let is_direct = direct_map.get(&id).copied().unwrap_or(false);
             if is_direct {
                 any_direct = true;
@@ -4472,9 +4520,7 @@ pub async fn get_go_lan_settings(state: State<'_, AppState>) -> Result<serde_jso
 
 /// 【APP-11 任务1.3 / APP40 任务2】为每路启用档案推导探测目标网关
 /// （取该档案每个 /24 与 WireGuard 虚拟地址的 `.1` 地址），返回 (tag, 网关)。
-fn go_lan_gateway_targets(
-    lan: &crate::core::go_lan::GoLanSettings,
-) -> Vec<(String, String)> {
+fn go_lan_gateway_targets(lan: &crate::core::go_lan::GoLanSettings) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (tag, profile) in crate::core::go_lan::enabled_profiles(lan) {
         let mut gateways: Vec<String> = Vec::new();
@@ -4571,7 +4617,8 @@ pub async fn save_go_lan_settings(
     }
     // 【APP52 任务3】保存前后「有效启用隧道」快照比较：完全相等时只写
     // settings.json + 持久化，绝不触发 vpn_reload / 内核重启。
-    let prev_tunnel_snapshot = crate::core::go_lan::valid_enabled_tunnel_snapshot(&state.go_lan.read());
+    let prev_tunnel_snapshot =
+        crate::core::go_lan::valid_enabled_tunnel_snapshot(&state.go_lan.read());
     let next_tunnel_snapshot = crate::core::go_lan::valid_enabled_tunnel_snapshot(&lan);
     let tunnels_unchanged = prev_tunnel_snapshot == next_tunnel_snapshot;
     crate::core::go_lan::save(&state.data_dir, &lan)?;
@@ -4596,7 +4643,10 @@ pub async fn save_go_lan_settings(
 
     let (_, warnings) = crate::core::go_lan::go_lan_route_rules(&lan);
 
-    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
+    let _ = app.emit(
+        "go-lan://updated",
+        serde_json::to_value(&lan).unwrap_or_default(),
+    );
     let _ = app.emit(
         "settings://updated",
         serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
@@ -4634,9 +4684,7 @@ pub async fn save_go_lan_settings(
 /// - `tunnel`：需要走 WireGuard 隧道；
 /// - iOS 侧由扩展实时判定并写入 `golan_bypass.json` 侧车，主程序读取后保持一致。
 #[tauri::command]
-pub async fn get_go_lan_status(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn get_go_lan_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let lan = state.go_lan.read().clone();
     let physical = crate::core::go_lan::detect_physical_lan_ipv4s();
     let ios_bypass = read_ios_bypass_sidecar(&state.work_dir());
@@ -4654,8 +4702,7 @@ pub async fn get_go_lan_status(
             let splits = crate::core::go_lan::enabled_profiles(&settings)
                 .into_iter()
                 .map(|(tag, p)| {
-                    let (t, d) =
-                        crate::core::go_lan::split_profile_cidrs_for_on_demand(&p, &phys);
+                    let (t, d) = crate::core::go_lan::split_profile_cidrs_for_on_demand(&p, &phys);
                     (tag, (t, d))
                 })
                 .collect();
@@ -4720,9 +4767,7 @@ pub async fn get_go_lan_status(
 
 /// iOS 扩展写入的 On-Demand 侧车（`[{"tag": "...", "cidrs": [...]}]`）。
 /// 其他平台恒为空，由 Rust 侧 `detect_physical_lan_ipv4s` 直接判定。
-fn read_ios_bypass_sidecar(
-    work_dir: &std::path::Path,
-) -> Vec<(String, Vec<String>)> {
+fn read_ios_bypass_sidecar(work_dir: &std::path::Path) -> Vec<(String, Vec<String>)> {
     #[cfg(not(target_os = "ios"))]
     {
         let _ = work_dir;
@@ -4841,11 +4886,7 @@ async fn persist_probe_auto_cidr(
         None
     } else {
         wanted
-            .and_then(|id| {
-                lan.profiles
-                    .iter()
-                    .position(|p| p.id == id || p.name == id)
-            })
+            .and_then(|id| lan.profiles.iter().position(|p| p.id == id || p.name == id))
             .or_else(|| lan.profiles.iter().position(|p| p.enabled))
             .or(Some(0))
     };
@@ -4864,7 +4905,10 @@ async fn persist_probe_auto_cidr(
     }
     *state.go_lan.write() = lan.clone();
     crate::core::go_lan::invalidate_lan_direct_cache();
-    let _ = app.emit("go-lan://updated", serde_json::to_value(&lan).unwrap_or_default());
+    let _ = app.emit(
+        "go-lan://updated",
+        serde_json::to_value(&lan).unwrap_or_default(),
+    );
     if *state.status.read() == CoreStatus::Running {
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -4881,9 +4925,7 @@ async fn persist_probe_auto_cidr(
 /// 隧道握手：iOS 上内核跑在独立扩展进程，主 APP 不在前台时扩展已能
 /// 自愈；前台再补一次可保证用户看到 VPN 图标瞬间即在线。
 #[tauri::command]
-pub async fn trigger_go_lan_handshakes(
-    state: State<'_, AppState>,
-) -> Result<usize, String> {
+pub async fn trigger_go_lan_handshakes(state: State<'_, AppState>) -> Result<usize, String> {
     if !is_vpn_actually_running(&state) {
         return Ok(0);
     }
@@ -5076,16 +5118,17 @@ pub async fn get_app_logs(
     // 即便某次网络抖动也不会出现某个分类列表清空 / 卡在加载中。
     // module_filter 保留参数位以兼容旧前端调用，实际返回全量分类。
     let _ = module_filter;
-    Ok(crate::core::logger::get_logs_categorized(
-        &state.data_dir,
-    ))
+    Ok(crate::core::logger::get_logs_categorized(&state.data_dir))
 }
 
 /// 清空全部日志（内存 + prism_app.log + 内核 kernel.log + iOS 扩展诊断缓存）
 #[tauri::command]
 pub async fn clear_app_logs(state: State<'_, AppState>) -> Result<(), String> {
     crate::core::logger::clear_logs(&state.data_dir);
-    crate::core::logger::info(crate::core::logger::MOD_KERNEL, "日志已清空（内存与本地文件）");
+    crate::core::logger::info(
+        crate::core::logger::MOD_KERNEL,
+        "日志已清空（内存与本地文件）",
+    );
     Ok(())
 }
 
@@ -5127,8 +5170,7 @@ pub async fn export_diagnostic_logs(
             .unwrap_or_else(|| state.data_dir.clone());
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("prism-diagnostic-log.txt");
-        std::fs::write(&path, text.as_bytes())
-            .map_err(|e| format!("写入导出日志失败：{e}"))?;
+        std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入导出日志失败：{e}"))?;
     }
     Ok(text)
 }
@@ -5201,7 +5243,10 @@ mod app51_tests {
             fallback_selected_node(Some("已删除节点"), &valid).as_deref(),
             Some("香港01")
         );
-        assert_eq!(fallback_selected_node(None, &valid).as_deref(), Some("香港01"));
+        assert_eq!(
+            fallback_selected_node(None, &valid).as_deref(),
+            Some("香港01")
+        );
         assert_eq!(fallback_selected_node(Some("任意"), &[]), None);
     }
 }
@@ -5267,8 +5312,7 @@ mod app66_dns_tests {
         assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1, "QDCOUNT=1");
         let qname = &q[12..12 + 13];
         assert_eq!(
-            qname,
-            b"\x07example\x03com\x00",
+            qname, b"\x07example\x03com\x00",
             "QNAME 必须是长度前缀标签格式"
         );
         let tail = &q[25..];

@@ -25,10 +25,8 @@ use crate::core::logger::MOD_PRO;
 //   hex:                    53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9
 //   raw bytes (32):         硬编码下方数组（不再混淆：还原逻辑曾出错导致验签直接失败）
 const PUBKEY_PRISM_1: [u8; 32] = [
-    0x53, 0x32, 0x8a, 0xa9, 0x52, 0xce, 0x14, 0x9b,
-    0xa8, 0xcd, 0x63, 0x36, 0x50, 0x66, 0xe4, 0x28,
-    0x37, 0xb3, 0xbf, 0x33, 0x29, 0x9f, 0xb7, 0x2b,
-    0xab, 0x4d, 0x7d, 0x78, 0xcb, 0x34, 0x17, 0xf9,
+    0x53, 0x32, 0x8a, 0xa9, 0x52, 0xce, 0x14, 0x9b, 0xa8, 0xcd, 0x63, 0x36, 0x50, 0x66, 0xe4, 0x28,
+    0x37, 0xb3, 0xbf, 0x33, 0x29, 0x9f, 0xb7, 0x2b, 0xab, 0x4d, 0x7d, 0x78, 0xcb, 0x34, 0x17, 0xf9,
 ];
 
 pub const PRISM_KEY_ID: &str = "prism-1";
@@ -174,15 +172,13 @@ pub fn verify(
     }
 
     // 方案 2：base64url 无 padding 解码 signature → sig_bytes（必须正好 64 字节）
-    let sig_bytes =
-        base64url_no_pad_decode(&envelope.signature).map_err(VerifyError::SigB64)?;
+    let sig_bytes = base64url_no_pad_decode(&envelope.signature).map_err(VerifyError::SigB64)?;
     if sig_bytes.len() != 64 {
         return Err(VerifyError::SigLength(sig_bytes.len()));
     }
 
     // 方案 4：Ed25519-Verifier.verify(sig, payloadBytes) == true 才继续
-    let sig = Signature::from_slice(&sig_bytes)
-        .map_err(|e| VerifyError::SigB64(e.to_string()))?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|e| VerifyError::SigB64(e.to_string()))?;
     key.verify(&payload_bytes, &sig)
         .map_err(|_| VerifyError::SignatureMismatch)?;
 
@@ -191,9 +187,7 @@ pub fn verify(
         .map_err(|e| VerifyError::PayloadJson(e.to_string()))?;
 
     // 后续 claims 校验：只用于业务判断，不参与验签
-    let exp = claims
-        .token_expires_at
-        .unwrap_or(envelope.token_expires_at);
+    let exp = claims.token_expires_at.unwrap_or(envelope.token_expires_at);
     if now >= exp {
         return Err(VerifyError::TokenExpired(exp, now));
     }
@@ -313,7 +307,10 @@ mod tests {
         // 确保 init_key_map 能构造 VerifyingKey（dalek 的 Curve25519 合法性检查会拒绝
         // 一些特殊形式，但生产公钥是标准 Ed25519 公钥，必须通过）
         let map = init_key_map();
-        assert!(map.contains_key(PRISM_KEY_ID), "keyId prism-1 必须在 map 中");
+        assert!(
+            map.contains_key(PRISM_KEY_ID),
+            "keyId prism-1 必须在 map 中"
+        );
     }
 
     #[test]

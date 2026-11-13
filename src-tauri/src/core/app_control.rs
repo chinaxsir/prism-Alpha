@@ -123,8 +123,7 @@ pub fn persist_runtime(data_dir: &std::path::Path, runtime: &RuntimePerception) 
 pub fn load_runtime_cache(data_dir: &std::path::Path) -> Option<(RuntimePerception, i64)> {
     let raw = std::fs::read_to_string(runtime_cache_path(data_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let runtime: RuntimePerception =
-        serde_json::from_value(v.get("runtime")?.clone()).ok()?;
+    let runtime: RuntimePerception = serde_json::from_value(v.get("runtime")?.clone()).ok()?;
     let saved_at = v.get("saved_at").and_then(|v| v.as_i64()).unwrap_or(0);
     Some((runtime, saved_at))
 }
@@ -180,8 +179,7 @@ pub fn apply_runtime(
     persist_runtime(data_dir, runtime);
 
     let is_unbound = runtime.device_bound == Some(false);
-    let is_expired =
-        !runtime.subscription_active && runtime.plan.as_deref() != Some("team");
+    let is_expired = !runtime.subscription_active && runtime.plan.as_deref() != Some("team");
     let pro_revoked = is_unbound || is_expired || runtime.plan.is_none();
 
     // ---------- 买断超出版本范围（不剥夺授权，只弹升级引导）----------
@@ -332,7 +330,14 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
         return;
     };
     ent.plan = Some(plan.clone());
-    ent.kind = Some(if plan == "team" && !ent.alpha { "lifetime" } else { "subscription" }.into());
+    ent.kind = Some(
+        if plan == "team" && !ent.alpha {
+            "lifetime"
+        } else {
+            "subscription"
+        }
+        .into(),
+    );
     ent.max_seats = runtime.max_seats;
     if let Some(exp_str) = runtime.expires_at.as_deref()
         && let Some(exp) = license::parse_expires_at(exp_str)
@@ -410,9 +415,12 @@ fn device_info() -> (String, String) {
 fn apple_device_info() -> (String, String) {
     unsafe {
         let model = sysctl_string(b"hw.machine").unwrap_or_else(|| "unknown".into());
-        let version =
-            sysctl_string(b"kern.osproductversion").unwrap_or_else(|| "unknown".into());
-        let prefix = if cfg!(target_os = "ios") { "iOS " } else { "macOS " };
+        let version = sysctl_string(b"kern.osproductversion").unwrap_or_else(|| "unknown".into());
+        let prefix = if cfg!(target_os = "ios") {
+            "iOS "
+        } else {
+            "macOS "
+        };
         (model, format!("{prefix}{version}"))
     }
 }
@@ -468,16 +476,22 @@ fn android_device_info() -> (String, String) {
             if libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr()) == 0 {
                 return String::new();
             }
-            CStr::from_ptr(buf.as_ptr())
-                .to_string_lossy()
-                .into_owned()
+            CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
         };
         let release = prop(b"ro.build.version.release");
         let manufacturer = prop(b"ro.product.manufacturer");
         let model = prop(b"ro.product.model");
-        let model = if model.is_empty() { manufacturer } else { model };
+        let model = if model.is_empty() {
+            manufacturer
+        } else {
+            model
+        };
         (
-            if model.is_empty() { "Android".into() } else { model },
+            if model.is_empty() {
+                "Android".into()
+            } else {
+                model
+            },
             if release.is_empty() {
                 "Android".into()
             } else {
@@ -683,8 +697,8 @@ pub async fn force_runtime_check(
 
     let device_id_str =
         license::device_id(&state.data_dir).map_err(|e| sanitize(&e.to_string()))?;
-    let install_id = license::get_or_create_install_id(&state.data_dir)
-        .map_err(|e| sanitize(&e.to_string()))?;
+    let install_id =
+        license::get_or_create_install_id(&state.data_dir).map_err(|e| sanitize(&e.to_string()))?;
 
     let payload = AppCheckRequest {
         platform: platform_name().into(),

@@ -18,14 +18,14 @@
 //! iOS 端 PacketTunnelProvider 会做"智能同网段防环回"：本机 Wi-Fi IP 落在
 //! lan_cidrs 内时自动把这些规则的出站改为直连。
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::AppHandle;
 use tauri::Manager;
 
-use crate::core::config_builder::{node_to_outbound, ClashNode};
+use crate::core::config_builder::{ClashNode, node_to_outbound};
 use crate::core::license;
 use crate::core::state::AppState;
 use crate::core::uri_parser;
@@ -220,9 +220,7 @@ impl GoLanSettings {
 
 impl GoLanProfile {
     pub fn is_empty(&self) -> bool {
-        self.node_uri.is_empty()
-            && self.wg_config.is_none()
-            && self.lan_cidrs.is_empty()
+        self.node_uri.is_empty() && self.wg_config.is_none() && self.lan_cidrs.is_empty()
     }
 
     /// 单路档案是否配置完整（与前端 isGoLanConfigured 对齐）。
@@ -341,7 +339,11 @@ pub fn valid_enabled_tunnel_snapshot(settings: &GoLanSettings) -> Vec<String> {
             profile_route_cidrs(&p).join(","),
             p.local_wifi_ssid,
             p.probe_target,
-            if has_uri { p.node_uri.trim() } else { wg.as_str() }
+            if has_uri {
+                p.node_uri.trim()
+            } else {
+                wg.as_str()
+            }
         ));
     }
     out.sort();
@@ -502,10 +504,8 @@ pub async fn trigger_all_handshakes(
             let api_addr = api_addr.clone();
             let api_secret = api_secret.clone();
             async move {
-                probe_clash_delay_for_tag(
-                    &tag, &gw, 80, "http", "/", &api_addr, &api_secret, 1500,
-                )
-                .await
+                probe_clash_delay_for_tag(&tag, &gw, 80, "http", "/", &api_addr, &api_secret, 1500)
+                    .await
             }
         });
         let _ = futures_util::future::join_all(tasks).await;
@@ -781,7 +781,12 @@ fn detect_physical_lan_ipv4s_uncached() -> Vec<std::net::Ipv4Addr> {
         {
             let output = std::process::Command::new("ifconfig")
                 .output()
-                .or_else(|_| std::process::Command::new("ip").arg("-4").arg("addr").output());
+                .or_else(|_| {
+                    std::process::Command::new("ip")
+                        .arg("-4")
+                        .arg("addr")
+                        .output()
+                });
             if let Ok(out) = output {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let mut current_virtual = false;
@@ -789,11 +794,9 @@ fn detect_physical_lan_ipv4s_uncached() -> Vec<std::net::Ipv4Addr> {
                     let line = raw.trim_end_matches('\r');
                     if !line.starts_with(char::is_whitespace) {
                         let name = line.split(':').next().unwrap_or("").trim();
-                        current_virtual = [
-                            "utun", "tun", "ppp", "wg", "llw", "awdl", "lo",
-                        ]
-                        .iter()
-                        .any(|k| name.starts_with(k));
+                        current_virtual = ["utun", "tun", "ppp", "wg", "llw", "awdl", "lo"]
+                            .iter()
+                            .any(|k| name.starts_with(k));
                     }
                     if current_virtual {
                         continue;
@@ -840,8 +843,25 @@ fn detect_physical_lan_ipv4s_uncached() -> Vec<std::net::Ipv4Addr> {
 fn is_virtual_iface_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     [
-        "utun", "tun", "tap", "ppp", "wg", "lo", "pdp_ip", "rmnet", "clat", "llw", "awdl", "anpi",
-        "bridge", "veth", "docker", "vmnet", "vboxnet", "tailscale", "zt",
+        "utun",
+        "tun",
+        "tap",
+        "ppp",
+        "wg",
+        "lo",
+        "pdp_ip",
+        "rmnet",
+        "clat",
+        "llw",
+        "awdl",
+        "anpi",
+        "bridge",
+        "veth",
+        "docker",
+        "vmnet",
+        "vboxnet",
+        "tailscale",
+        "zt",
     ]
     .iter()
     .any(|k| n.starts_with(k))
@@ -851,12 +871,15 @@ fn is_virtual_iface_name(name: &str) -> bool {
 /// 分号 / 空格分隔的复合文本（企业网 Wi-Fi 常同时下发多个 VLAN 网段）；
 /// 裸 IPv4（未带 `/mask`）自动补齐 `/24`，并剔除与本隧道 WG 虚拟 IP
 /// 同处 `/24` 的纯握手虚拟网段，只保留真实业务内网网段。
-fn profile_business_cidrs(profile: &GoLanProfile, wg_virtual_ip: Option<std::net::Ipv4Addr>) -> Vec<String> {
+fn profile_business_cidrs(
+    profile: &GoLanProfile,
+    wg_virtual_ip: Option<std::net::Ipv4Addr>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in &profile.lan_cidrs {
-        for piece in raw.split(|c: char| {
-            c == '\n' || c == '\r' || c == ',' || c == ';' || c.is_whitespace()
-        }) {
+        for piece in
+            raw.split(|c: char| c == '\n' || c == '\r' || c == ',' || c == ';' || c.is_whitespace())
+        {
             let s = piece.trim();
             if s.is_empty() {
                 continue;
@@ -1057,10 +1080,7 @@ fn lan_direct_cache() -> &'static std::sync::Mutex<Option<(String, LanDirectMap)
 }
 
 /// 直连状态签名：任意一条变化即视为「网络环境或配置已变」，需重算一次。
-fn lan_direct_signature(
-    settings: &GoLanSettings,
-    physical: &[std::net::Ipv4Addr],
-) -> String {
+fn lan_direct_signature(settings: &GoLanSettings, physical: &[std::net::Ipv4Addr]) -> String {
     let mut sig = String::with_capacity(128);
     for ip in physical {
         sig.push_str(&ip.to_string());
@@ -1150,10 +1170,7 @@ pub fn invalidate_lan_direct_cache() {
 /// 条件 2 旧实现（APP59，档案级单次探测）：APP60 起被逐网段 is_cidr_direct
 /// 取代，仅保留供单元测试与排查参考。
 #[allow(dead_code)]
-fn probe_cross_vlan_direct(
-    profile: &GoLanProfile,
-    physical: &[std::net::Ipv4Addr],
-) -> bool {
+fn probe_cross_vlan_direct(profile: &GoLanProfile, physical: &[std::net::Ipv4Addr]) -> bool {
     if physical.is_empty() {
         return false;
     }
@@ -1251,7 +1268,10 @@ fn tcp_reachable_from_source(
     let Ok(socket) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) else {
         return false;
     };
-    if socket.bind(&std::net::SocketAddr::from((src, 0)).into()).is_err() {
+    if socket
+        .bind(&std::net::SocketAddr::from((src, 0)).into())
+        .is_err()
+    {
         return false;
     }
     match socket.connect_timeout(&dst.into(), timeout) {
@@ -1354,9 +1374,9 @@ pub fn is_configured(lan: &GoLanSettings) -> bool {
 /// 返回 None 表示输入不是合法密钥：必填密钥（private_key /
 /// peer_public_key）应跳过注入，可选 pre_shared_key 应忽略。
 pub fn normalize_wg_key(raw: &str) -> Option<String> {
+    use base64::Engine as _;
     use base64::engine::GeneralPurpose;
     use base64::engine::GeneralPurposeConfig;
-    use base64::Engine as _;
     // 宽松解码引擎：允许非规范尾位（与 Go base64.StdEncoding 行为一致），
     // 但输出统一走标准重编码，保证内核拿到的一定是规范 44 位
     let lenient = GeneralPurpose::new(
@@ -1506,8 +1526,8 @@ pub fn resolve_endpoint_host_to_ip(host: &str) -> String {
 const ENDPOINT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 【APP30 任务3】WireGuard Endpoint 域名 → IPv4 的进程内缓存（含时间戳）。
-fn endpoint_ip_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+fn endpoint_ip_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
@@ -1527,10 +1547,7 @@ fn endpoint_cache_get(key: &str) -> Option<String> {
 
 fn endpoint_cache_put(key: &str, ip: &str) {
     if let Ok(mut c) = endpoint_ip_cache().lock() {
-        c.insert(
-            key.to_string(),
-            (ip.to_string(), std::time::Instant::now()),
-        );
+        c.insert(key.to_string(), (ip.to_string(), std::time::Instant::now()));
     }
 }
 
@@ -1590,8 +1607,8 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 // 公网 IPv4 写入 server（SNI/Host 保留原域名），内核 dns-direct 兜底。
 const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-fn node_host_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+fn node_host_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
@@ -1790,8 +1807,7 @@ pub fn parse_wireguard_uri(uri: &str) -> Result<WgManualConfig, String> {
             _ => {}
         }
     }
-    let peer_public_key =
-        peer_public_key.ok_or("publickey 缺失或不是合法的 32 字节密钥")?;
+    let peer_public_key = peer_public_key.ok_or("publickey 缺失或不是合法的 32 字节密钥")?;
     if local_ip.is_empty() {
         local_ip = "10.0.0.2/32".into();
     }
@@ -1863,7 +1879,8 @@ pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
         }
         // 续行：无缝拼接到上一字段末尾（微信折行 / Base64 尾位 = 片段）
         if let Some(last) = entries.last_mut() {
-            last.2.push_str(&line.split_whitespace().collect::<String>());
+            last.2
+                .push_str(&line.split_whitespace().collect::<String>());
         }
     }
     let get = |peer: bool, key: &str| {
@@ -1874,9 +1891,8 @@ pub fn parse_wireguard_conf(text: &str) -> Result<WgManualConfig, String> {
     };
     let private_key = normalize_wg_key(&get(false, "privatekey").ok_or("缺少 PrivateKey")?)
         .ok_or("PrivateKey 不是合法的 32 字节密钥")?;
-    let peer_public_key =
-        normalize_wg_key(&get(true, "publickey").ok_or("缺少 Peer PublicKey")?)
-            .ok_or("Peer PublicKey 不是合法的 32 字节密钥")?;
+    let peer_public_key = normalize_wg_key(&get(true, "publickey").ok_or("缺少 Peer PublicKey")?)
+        .ok_or("Peer PublicKey 不是合法的 32 字节密钥")?;
     let pre_shared_key = get(true, "presharedkey").and_then(|k| normalize_wg_key(&k));
     let local_ip = get(false, "address")
         .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
@@ -2031,7 +2047,16 @@ pub fn resolve_probe_target(target_ip_raw: Option<&str>, lan: &GoLanSettings) ->
         .map(strip_invisible_and_non_ascii)
         .map(|s| s.replace(|c: char| c.is_whitespace(), ""))
         .map(|s| {
-            s.split(';').next().unwrap_or("").split(':').next().unwrap_or("").split('/').next().unwrap_or("").to_string()
+            s.split(';')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
         })
         .filter(|s| !s.is_empty());
     if let Some(t) = explicit {
@@ -2087,7 +2112,10 @@ async fn probe_clash_delay_for_tag(
     let target = format!("{scheme}://{ip}:{port}{path}");
     let mut req = client
         .get(format!("http://{base}/proxies/{tag}/delay"))
-        .query(&[("url", target.as_str()), ("timeout", &timeout_ms.to_string())]);
+        .query(&[
+            ("url", target.as_str()),
+            ("timeout", &timeout_ms.to_string()),
+        ]);
     if !api_secret.is_empty() {
         req = req.bearer_auth(api_secret);
     }
@@ -2132,11 +2160,7 @@ async fn probe_app_layer(
         .map_err(|e| format!("探测客户端构建失败: {e}"))?;
     let url = format!("{scheme}://{ip}:{port}{path}");
     let start = std::time::Instant::now();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
     let ms = start.elapsed().as_millis() as u64;
     // 本地混合代理的 502/504 不算目标真实应答
@@ -2151,12 +2175,7 @@ async fn probe_app_layer(
 async fn probe_single_port_tcp(ip: &str, port: u16) -> Result<u64, String> {
     let start = std::time::Instant::now();
     let fut = tokio::net::TcpStream::connect((ip, port));
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(PROBE_PORT_WINDOW_MS),
-        fut,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(PROBE_PORT_WINDOW_MS), fut).await {
         Ok(Ok(_stream)) => Ok(start.elapsed().as_millis() as u64),
         Ok(Err(e)) => Err(format!("TCP 连接失败: {e}")),
         Err(_) => Err("TCP 握手超时".to_string()),
@@ -2375,14 +2394,15 @@ fn ipv4_in_any_cidr(ip: std::net::Ipv4Addr, cidrs: &[String]) -> bool {
         let Some((net_s, mask_s)) = c.split_once('/') else {
             continue;
         };
-        if let (Ok(net), Ok(mask)) = (
-            net_s.parse::<std::net::Ipv4Addr>(),
-            mask_s.parse::<u8>(),
-        ) {
+        if let (Ok(net), Ok(mask)) = (net_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>()) {
             if mask > 32 {
                 continue;
             }
-            let m: u32 = if mask == 0 { 0 } else { u32::MAX << (32 - mask) };
+            let m: u32 = if mask == 0 {
+                0
+            } else {
+                u32::MAX << (32 - mask)
+            };
             if (ipu & m) == (u32::from(net) & m) {
                 return true;
             }
@@ -2541,9 +2561,7 @@ async fn probe_intranet_ip_inner(
     let mut profiles = enabled_profiles(lan);
     if profiles.is_empty()
         && lan.enabled
-        && (lan.wg_config.is_some()
-            || !lan.node_uri.trim().is_empty()
-            || !lan.lan_cidrs.is_empty())
+        && (lan.wg_config.is_some() || !lan.node_uri.trim().is_empty() || !lan.lan_cidrs.is_empty())
     {
         // 旧版单配置兜底（尚未执行 normalize_go_lan_settings 的调用方）
         let fallback = legacy_profile(lan);
@@ -2597,9 +2615,13 @@ async fn probe_intranet_ip_inner(
     // 「检测 IP 不在允许的网段」。归属顺序：显式 profileId > 网段匹配 >
     // 第一个启用档案；未覆盖时自动推导 /24 交 IPC 层并入档案并热更新。
     let physical_ips = detect_physical_lan_ipv4s();
-    let Some(owner) =
-        resolve_probe_owner(&profiles, target_v4, profile_id, current_cidrs, &physical_ips)
-    else {
+    let Some(owner) = resolve_probe_owner(
+        &profiles,
+        target_v4,
+        profile_id,
+        current_cidrs,
+        &physical_ips,
+    ) else {
         let msg = "没有已启用的内网档案，请先在 Go Lan 中启用一路内网".to_string();
         crate::core::logger::warn(log, &msg);
         return GoLanProbeResult {
@@ -2847,11 +2869,7 @@ async fn probe_web_protocols_direct_only(
 ///   网卡 IP（如 10.66.92.229）会导致 `dial tcp 10.66.92.229:0->8.8.4.4:853:
 ///   i/o timeout`；改用 `domain_strategy: ipv4_only` + 扩展侧
 ///   prism_protect_socket 绑定物理网卡即可保证纯 IPv4 Socket 不被 EPERM。
-fn wg_outbound_value(
-    wg: &WgManualConfig,
-    warnings: &mut Vec<String>,
-    tag: &str,
-) -> Option<Value> {
+fn wg_outbound_value(wg: &WgManualConfig, warnings: &mut Vec<String>, tag: &str) -> Option<Value> {
     let private_key = normalize_wg_key(&wg.private_key)?;
     let peer_public_key = normalize_wg_key(&wg.peer_public_key)?;
     // APP-8 任务2：预解析 WireGuard 对端域名为 IP——内核 post-start 阶段
@@ -3247,9 +3265,7 @@ pub(crate) fn normalize_cidr_list(cidrs: &[String], local_addr: &str) -> Vec<Str
             continue;
         };
         let (ip_s, mask_s) = clean.split_once('/').unwrap_or((clean.as_str(), ""));
-        if let (Ok(ip), Ok(mask)) =
-            (ip_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>())
-        {
+        if let (Ok(ip), Ok(mask)) = (ip_s.parse::<std::net::Ipv4Addr>(), mask_s.parse::<u8>()) {
             if mask >= 32 {
                 // 精确主机路由原样保留
                 push(clean.clone());
@@ -3384,7 +3400,11 @@ pub(crate) fn go_lan_route_rules(lan: &GoLanSettings) -> (Vec<Value>, Vec<String
 fn cleaned_lan_domains(lan: &GoLanSettings) -> Vec<String> {
     lan.lan_domains
         .iter()
-        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
+        .map(|d| {
+            strip_invisible_and_non_ascii(d)
+                .trim_start_matches("*.")
+                .to_lowercase()
+        })
         .filter(|d| !d.is_empty())
         .collect()
 }
@@ -3420,7 +3440,11 @@ pub(crate) fn go_lan_dns(lan: &GoLanSettings) -> (Option<Value>, Option<Value>) 
         .lan_domains
         .iter()
         // 【APP-11B】剔除 \u2060 等隐形字符
-        .map(|d| strip_invisible_and_non_ascii(d).trim_start_matches("*.").to_lowercase())
+        .map(|d| {
+            strip_invisible_and_non_ascii(d)
+                .trim_start_matches("*.")
+                .to_lowercase()
+        })
         .filter(|d| !d.is_empty())
         .collect();
     if domains.is_empty() {
@@ -3483,7 +3507,10 @@ pub async fn sync_managed(app: &AppHandle) -> Result<GoLanSettings, String> {
     if !resp.status().is_success() {
         return Err(format!("授权服务器返回 HTTP {}", resp.status()));
     }
-    let payload: Value = resp.json().await.map_err(|e| format!("响应解析失败: {e}"))?;
+    let payload: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("响应解析失败: {e}"))?;
     if payload.get("valid").and_then(Value::as_bool) != Some(true) {
         let msg = payload
             .get("message")
@@ -3565,24 +3592,13 @@ mod tests {
             68,
         );
         let profiles = vec![("go-lan-jiali".to_string(), profile)];
-        let owner = resolve_probe_owner(
-            &profiles,
-            "192.168.0.1".parse().unwrap(),
-            None,
-            &[],
-            &[],
-        )
-        .expect("必须归属第一个启用档案，而不是拒绝检测");
+        let owner = resolve_probe_owner(&profiles, "192.168.0.1".parse().unwrap(), None, &[], &[])
+            .expect("必须归属第一个启用档案，而不是拒绝检测");
         assert_eq!(owner.auto_cidr.as_deref(), Some("192.168.0.0/24"));
         // 已覆盖的网段不再重复补网段
-        let covered = resolve_probe_owner(
-            &profiles,
-            "192.168.10.253".parse().unwrap(),
-            None,
-            &[],
-            &[],
-        )
-        .expect("网段内目标");
+        let covered =
+            resolve_probe_owner(&profiles, "192.168.10.253".parse().unwrap(), None, &[], &[])
+                .expect("网段内目标");
         assert!(covered.auto_cidr.is_none());
         // 前端正在编辑、尚未保存的网段同样视为已覆盖
         let editing = resolve_probe_owner(
@@ -3689,7 +3705,10 @@ mod tests {
     fn test_parse_probe_target() {
         // 纯 IP（无端口）→ 不再隐式扫描，交由 parse_probe_input 返回友好提示，
         // 兼容接口 parse_probe_target 只回传 IP、端口 None
-        assert_eq!(parse_probe_target("10.1.8.1"), ("10.1.8.1".to_string(), None));
+        assert_eq!(
+            parse_probe_target("10.1.8.1"),
+            ("10.1.8.1".to_string(), None)
+        );
         assert_eq!(
             parse_probe_target("192.168.10.100:5000"),
             ("192.168.10.100".to_string(), Some(5000))
@@ -3755,7 +3774,8 @@ mod tests {
         // 可达性取决于测试环境（本机恰在同网段且目标在线时会真实连通成功），
         // 因此只断言文案结构：含目标 IP、绝无「请输入端口」拦截、
         // 绝无「延迟仅 1 ms」式误报
-        let r = probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan, None, &[]).await;
+        let r =
+            probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan, None, &[]).await;
         assert!(r.message.contains("192.168.10.253"), "{}", r.message);
         assert!(
             !r.message.contains("请输入"),
@@ -3768,7 +3788,17 @@ mod tests {
             r.message
         );
         // 显式 IP:端口 且内核未运行 → 提示启动
-        let r = probe_intranet_ip(Some("192.168.10.253:8001"), "", "", false, true, &lan, None, &[]).await;
+        let r = probe_intranet_ip(
+            Some("192.168.10.253:8001"),
+            "",
+            "",
+            false,
+            true,
+            &lan,
+            None,
+            &[],
+        )
+        .await;
         assert!(r.message.contains("VPN 尚未启动"), "{}", r.message);
     }
 
@@ -3916,7 +3946,11 @@ mod tests {
             "10.196.0.2/32, 192.168.10.222/24",
         ] {
             let (a, c) = parse_all_wg_local_addresses(raw);
-            assert_eq!(a, vec!["10.196.0.2/32", "192.168.10.222/24"], "分隔符 {raw:?} 解析失败");
+            assert_eq!(
+                a,
+                vec!["10.196.0.2/32", "192.168.10.222/24"],
+                "分隔符 {raw:?} 解析失败"
+            );
             assert_eq!(c, vec!["10.196.0.0/24", "192.168.10.0/24"]);
         }
 
@@ -3941,7 +3975,10 @@ mod tests {
     #[test]
     fn test_parse_wg_local_addresses() {
         let (primary, extras) = parse_wg_local_addresses("10.196.0.2/32,192.168.10.222/24");
-        assert_eq!(primary, "10.196.0.2/24", "主隧道地址必须取第 1 个并统一 /24");
+        assert_eq!(
+            primary, "10.196.0.2/24",
+            "主隧道地址必须取第 1 个并统一 /24"
+        );
         assert_eq!(extras, vec!["10.196.0.0/24", "192.168.10.0/24"]);
 
         // 分号 / 中文标点 / 换行 / 空白分隔同样支持
@@ -4202,11 +4239,18 @@ mod tests {
         let lan = GoLanSettings {
             enabled: true,
             bypass_on_local_lan: false,
-            lan_cidrs: vec!["10.77.0.0/24".into(), "bad-cidr".into(), "10.0.0.0/33".into()],
+            lan_cidrs: vec![
+                "10.77.0.0/24".into(),
+                "bad-cidr".into(),
+                "10.0.0.0/33".into(),
+            ],
             ..Default::default()
         };
         let (rules, warnings) = go_lan_route_rules(&lan);
-        let tunnel_rules = rules.iter().filter(|r| r["outbound"] == "go-lan-jiali").count();
+        let tunnel_rules = rules
+            .iter()
+            .filter(|r| r["outbound"] == "go-lan-jiali")
+            .count();
         assert_eq!(tunnel_rules, 1);
         assert_eq!(warnings.len(), 2);
     }
@@ -4217,10 +4261,7 @@ mod tests {
     /// 绝不能因隐形字符清洗把换行吞掉拼成 `10.1.8.0/24192.168.10.0/24`。
     #[test]
     fn test_multi_line_cidrs_preserved() {
-        let cidrs = vec![
-            "10.1.8.0/24".to_string(),
-            "192.168.10.0/24".to_string(),
-        ];
+        let cidrs = vec!["10.1.8.0/24".to_string(), "192.168.10.0/24".to_string()];
         let normalized = normalize_cidr_list(&cidrs, "");
         assert!(
             normalized.contains(&"10.1.8.0/24".to_string()),
@@ -4291,7 +4332,10 @@ mod tests {
         assert_eq!(strip_invisible_and_non_ascii("abc\u{200B}def"), "abcdef");
         assert_eq!(strip_invisible_and_non_ascii("abc\u{200C}def"), "abcdef");
         assert_eq!(strip_invisible_and_non_ascii("abc\u{200D}def"), "abcdef");
-        assert_eq!(strip_invisible_and_non_ascii("\u{FEFF}10.0.0.1"), "10.0.0.1");
+        assert_eq!(
+            strip_invisible_and_non_ascii("\u{FEFF}10.0.0.1"),
+            "10.0.0.1"
+        );
     }
 
     #[test]
@@ -4371,7 +4415,13 @@ mod tests {
         }
     }
 
-    fn sample_profile(id: &str, name: &str, cidrs: &[&str], local_ip: &str, seed: u8) -> GoLanProfile {
+    fn sample_profile(
+        id: &str,
+        name: &str,
+        cidrs: &[&str],
+        local_ip: &str,
+        seed: u8,
+    ) -> GoLanProfile {
         GoLanProfile {
             id: id.into(),
             name: name.into(),
@@ -4516,12 +4566,17 @@ mod tests {
             assert_eq!(ob["mtu"].as_u64(), Some(GO_LAN_RUNTIME_MTU as u64));
             // 【APP40 任务2】多 Local Address 必须完整保留
             assert!(
-                ob["local_address"].as_array().is_some_and(|a| !a.is_empty()),
+                ob["local_address"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
                 "local_address 不得为空"
             );
         }
         let tags: Vec<String> = enabled_profiles(&lan).into_iter().map(|(t, _)| t).collect();
-        assert_eq!(tags, vec!["go-lan-jiali".to_string(), "go-lan-gongsi".to_string()]);
+        assert_eq!(
+            tags,
+            vec!["go-lan-jiali".to_string(), "go-lan-gongsi".to_string()]
+        );
 
         // 规则：每个启用档案一条 ip_cidr → 对应 tag
         let (rules, _) = go_lan_route_rules(&lan);
@@ -4546,12 +4601,14 @@ mod tests {
     fn test_split_profile_cidrs_on_demand() {
         let home = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 60);
         let office = sample_profile("office", "公司", &["10.8.0.0/24"], "10.197.0.2/32", 62);
-        let physical: Vec<std::net::Ipv4Addr> =
-            vec!["192.168.10.88".parse().unwrap()];
+        let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.88".parse().unwrap()];
 
         // 家里：命中同网段 → 直连例外，隧道规则仍完整保留全部网段
         let (tunnel, direct) = split_profile_cidrs_for_on_demand(&home, &physical);
-        assert!(direct.contains(&"192.168.10.0/24".to_string()), "{direct:?}");
+        assert!(
+            direct.contains(&"192.168.10.0/24".to_string()),
+            "{direct:?}"
+        );
         assert!(
             tunnel.contains(&"192.168.10.0/24".to_string()),
             "【APP66】隧道规则必须完整保留业务网段: {tunnel:?}"
@@ -4623,8 +4680,7 @@ mod tests {
     /// 配置都直接判直连
     #[test]
     fn test_same_subnet_short_circuits_probe() {
-        let mut prof =
-            sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 67);
+        let mut prof = sample_profile("home", "家里", &["192.168.10.0/24"], "10.196.0.2/32", 67);
         prof.probe_target = "192.168.10.253:8001".into();
         let physical: Vec<std::net::Ipv4Addr> = vec!["192.168.10.88".parse().unwrap()];
         assert!(is_cidr_direct(&prof, "192.168.10.0/24", &physical));
@@ -4687,8 +4743,7 @@ mod tests {
     /// 【APP59 任务1】跨 VLAN 探测目标：显式目标优先，其次网段 .1/.254 网关
     #[test]
     fn test_cross_vlan_probe_targets_prefers_explicit_and_gateways() {
-        let mut nidec =
-            sample_profile("nidec", "Nidec", &["10.31.2.0/23"], "10.196.0.3/32", 71);
+        let mut nidec = sample_profile("nidec", "Nidec", &["10.31.2.0/23"], "10.196.0.3/32", 71);
         nidec.probe_target = "10.31.2.253:8001".into();
         let targets = cross_vlan_probe_targets(&nidec);
         assert_eq!(targets.first().unwrap().to_string(), "10.31.2.253:8001");
@@ -4776,7 +4831,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_virtual_iface_names_filtered() {
-        for name in ["utun3", "tun0", "tap1", "ppp0", "wg0", "lo0", "pdp_ip0", "rmnet0", "clat4"] {
+        for name in [
+            "utun3", "tun0", "tap1", "ppp0", "wg0", "lo0", "pdp_ip0", "rmnet0", "clat4",
+        ] {
             assert!(is_virtual_iface_name(name), "{name} 应被剔除");
         }
         for name in ["en0", "en1", "wlan0", "eth0"] {
@@ -4870,7 +4927,6 @@ mod tests {
         assert_eq!(before, after, "空白档案不得改变有效启用隧道快照");
         assert!(!before.is_empty());
     }
-
 
     #[test]
     fn test_profiles_metadata() {

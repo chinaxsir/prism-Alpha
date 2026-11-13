@@ -153,13 +153,11 @@ pub fn init(app: AppHandle) -> Result<()> {
     }
 
     // libbox PlatformInterface 回调：Go 线程 → C → JNI → Kotlin
-    crate::core::kernel::mobile_register_vpn_callbacks(
-        crate::core::kernel::MobileVpnCallbacks {
-            open_tun: cb_open_tun,
-            protect_socket: cb_protect,
-            under_extension: cb_under_extension,
-        },
-    );
+    crate::core::kernel::mobile_register_vpn_callbacks(crate::core::kernel::MobileVpnCallbacks {
+        open_tun: cb_open_tun,
+        protect_socket: cb_protect,
+        under_extension: cb_under_extension,
+    });
     Ok(())
 }
 
@@ -244,7 +242,9 @@ fn open_tun(options_json: &str) -> Result<i32> {
             .i()
             .context("openTun return type")?;
         if fd < 0 {
-            return Err(anyhow!("VpnService.establish() failed (service not foreground?)"));
+            return Err(anyhow!(
+                "VpnService.establish() failed (service not foreground?)"
+            ));
         }
         Ok(fd)
     })
@@ -253,12 +253,7 @@ fn open_tun(options_json: &str) -> Result<i32> {
 fn protect_socket(fd: c_int) -> Result<()> {
     with_env(|env| {
         let ok = env
-            .call_static_method(
-                bridge_class()?,
-                "protectSocket",
-                "(I)Z",
-                &[JValue::Int(fd)],
-            )
+            .call_static_method(bridge_class()?, "protectSocket", "(I)Z", &[JValue::Int(fd)])
             .map_err(|e| anyhow!(jni_err(env, "call protectSocket", e)))?
             .z()
             .context("protectSocket return type")?;

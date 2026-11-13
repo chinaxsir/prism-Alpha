@@ -32,7 +32,9 @@ pub const PREFERRED_API_ADDR: &str = "127.0.0.1:9090";
 /// 防止二进制或库自带报错直接露出内核名称。
 pub fn sanitize_kernel_error(msg: &str) -> String {
     let mut out = msg.to_string();
-    for pat in ["sing-box", "Sing-Box", "SING-BOX", "singbox", "SingBox", "libbox"] {
+    for pat in [
+        "sing-box", "Sing-Box", "SING-BOX", "singbox", "SingBox", "libbox",
+    ] {
         out = out.replace(pat, "内核");
     }
     out
@@ -76,7 +78,8 @@ mod mobile_ffi {
     }
 
     pub fn check(config_path: &Path, work_dir: &Path) -> Result<(), String> {
-        let cp = CString::new(config_path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        let cp =
+            CString::new(config_path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         let wd = CString::new(work_dir.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         unsafe {
             let err = PrismKernelCheck(cp.as_ptr(), wd.as_ptr());
@@ -152,8 +155,7 @@ impl KernelHandle {
     /// 启动内核 sidecar 进程
     pub async fn spawn(config: KernelConfig, app_handle: AppHandle) -> Result<Self> {
         // 1. 写入运行时配置（sing-box 只解析 JSON）
-        std::fs::create_dir_all(&config.work_dir)
-            .context("failed to create kernel work dir")?;
+        std::fs::create_dir_all(&config.work_dir).context("failed to create kernel work dir")?;
         let config_path = config.work_dir.join("config.json");
         let config_bytes = serde_json::to_vec_pretty(&config.runtime_config)
             .context("failed to serialize kernel config")?;
@@ -232,13 +234,9 @@ impl KernelHandle {
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            let mut child = cmd
-                .spawn()
-                .context("内核进程启动失败")?;
+            let mut child = cmd.spawn().context("内核进程启动失败")?;
 
-            let pid = child
-                .id()
-                .context("内核进程启动后立即退出")?;
+            let pid = child.id().context("内核进程启动后立即退出")?;
             tracing::info!("sing-box process started, PID: {}", pid);
             register_kernel_pid(pid);
 
@@ -300,11 +298,8 @@ impl KernelHandle {
         // 5. 订阅内核 WebSocket 数据流（traffic / connections / memory）
         // （移动端会追加故障转移/掉线监控任务，桌面端不会 push，故条件允许）
         #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(unused_mut))]
-        let mut stream_tasks = super::events::spawn_all(
-            &config.api_addr,
-            &config.api_secret,
-            app_handle.clone(),
-        );
+        let mut stream_tasks =
+            super::events::spawn_all(&config.api_addr, &config.api_secret, app_handle.clone());
 
         // 5.5 移动端（iOS/Android）：内核就绪后按三级规则自动选点
         // （用户可随后在 UI 手动指定）；桌面平台不自动选点
@@ -366,8 +361,7 @@ impl KernelHandle {
                         if let Some(handle) = handle {
                             let _ = handle.shutdown().await;
                         }
-                        let _ =
-                            state.transition(crate::core::state::CoreStatus::Stopped);
+                        let _ = state.transition(crate::core::state::CoreStatus::Stopped);
                         *state.started_at.write() = None;
                         *state.started_at_ms.write() = None;
                     }
@@ -605,8 +599,7 @@ pub async fn sync_or_recover_running_vpn(
         *last.lock() = Some(std::time::Instant::now());
         return false;
     }
-    let recovered =
-        try_reattach_running_kernel(app, state).await;
+    let recovered = try_reattach_running_kernel(app, state).await;
     *last.lock() = Some(std::time::Instant::now());
     if recovered {
         tracing::info!("[Kernel] 检测到系统 VPN 隧道仍在运行，已自动接管并恢复代理连接状态");
@@ -625,13 +618,12 @@ pub async fn check_config(
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         let _ = binary;
-        mobile_ffi::check(config_path, work_dir)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "{}",
-                    sanitize_kernel_error(&format!("新配置校验未通过，已保留当前内核：\n{e}"))
-                )
-            })?;
+        mobile_ffi::check(config_path, work_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                sanitize_kernel_error(&format!("新配置校验未通过，已保留当前内核：\n{e}"))
+            )
+        })?;
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
@@ -647,10 +639,7 @@ pub async fn check_config(
         {
             cmd.creation_flags(0x0800_0000);
         }
-        let output = cmd
-            .output()
-            .await
-            .context("内核配置校验执行失败")?;
+        let output = cmd.output().await.context("内核配置校验执行失败")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -660,7 +649,10 @@ pub async fn check_config(
             let tail: String = chars[skip..].iter().collect();
             anyhow::bail!(
                 "{}",
-                sanitize_kernel_error(&format!("新配置校验未通过，已保留当前内核：\n{}", tail.trim()))
+                sanitize_kernel_error(&format!(
+                    "新配置校验未通过，已保留当前内核：\n{}",
+                    tail.trim()
+                ))
             );
         }
     }
@@ -671,7 +663,11 @@ pub async fn check_config(
 pub fn generate_secret() -> String {
     fn hash_seed(seed: u64) -> u64 {
         let mut h = DefaultHasher::new();
-        UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0).hash(&mut h);
+        UNIX_EPOCH
+            .elapsed()
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut h);
         std::process::id().hash(&mut h);
         seed.hash(&mut h);
         h.finish()
@@ -703,7 +699,10 @@ pub async fn probe_version(binary: &std::path::Path) -> Option<String> {
         let text = String::from_utf8_lossy(&output.stdout);
         serde_json::from_str::<serde_json::Value>(text.trim())
             .ok()
-            .and_then(|v| v.get("version").and_then(|x| x.as_str().map(str::to_string)))
+            .and_then(|v| {
+                v.get("version")
+                    .and_then(|x| x.as_str().map(str::to_string))
+            })
     }
 }
 
@@ -1005,58 +1004,57 @@ impl KernelApi {
         const BATCH_SIZE: usize = 8;
         let mut map = serde_json::Map::new();
         for batch in members.chunks(BATCH_SIZE) {
-            let batch_results: Vec<(String, Option<u64>)> = futures_util::stream::iter(
-                batch.iter().cloned(),
-            )
-            .map(|member| {
-                // 【APP42 任务1.3】节点名含 emoji/空格/中文，路径段必须显式
-                // 百分号编码，否则 reqwest 构建 URL 失败 → 误判节点不可用
-                let endpoint = format!(
-                    "{}/proxies/{}/delay",
-                    self.base,
-                    encode_path_segment(&member)
-                );
-                let req = shared_client()
-                    .get(&endpoint)
-                    .query(&[
-                        ("url", test_url.to_string()),
-                        ("timeout", timeout.to_string()),
-                    ])
-                    .bearer_auth(self.secret.clone());
-                let app = app.cloned();
-                let group_tag = group_tag.clone();
-                async move {
-                    let delay = match req.send().await {
-                        Ok(resp) if resp.status().is_success() => resp
-                            .json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|j| j.get("delay").and_then(|d| d.as_u64())),
-                        Ok(resp) => {
-                            tracing::warn!("delay test {}: HTTP {}", member, resp.status());
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!("delay test {}: {}", member, e);
-                            None
-                        }
-                    };
-                    if let Some(app) = app {
-                        let _ = app.emit(
-                            "url-test-update",
-                            serde_json::json!({
-                                "group": group_tag,
-                                "name": member,
-                                "delay": delay,
-                            }),
+            let batch_results: Vec<(String, Option<u64>)> =
+                futures_util::stream::iter(batch.iter().cloned())
+                    .map(|member| {
+                        // 【APP42 任务1.3】节点名含 emoji/空格/中文，路径段必须显式
+                        // 百分号编码，否则 reqwest 构建 URL 失败 → 误判节点不可用
+                        let endpoint = format!(
+                            "{}/proxies/{}/delay",
+                            self.base,
+                            encode_path_segment(&member)
                         );
-                    }
-                    (member, delay)
-                }
-            })
-            .buffer_unordered(BATCH_SIZE)
-            .collect::<Vec<_>>()
-            .await;
+                        let req = shared_client()
+                            .get(&endpoint)
+                            .query(&[
+                                ("url", test_url.to_string()),
+                                ("timeout", timeout.to_string()),
+                            ])
+                            .bearer_auth(self.secret.clone());
+                        let app = app.cloned();
+                        let group_tag = group_tag.clone();
+                        async move {
+                            let delay = match req.send().await {
+                                Ok(resp) if resp.status().is_success() => resp
+                                    .json::<serde_json::Value>()
+                                    .await
+                                    .ok()
+                                    .and_then(|j| j.get("delay").and_then(|d| d.as_u64())),
+                                Ok(resp) => {
+                                    tracing::warn!("delay test {}: HTTP {}", member, resp.status());
+                                    None
+                                }
+                                Err(e) => {
+                                    tracing::warn!("delay test {}: {}", member, e);
+                                    None
+                                }
+                            };
+                            if let Some(app) = app {
+                                let _ = app.emit(
+                                    "url-test-update",
+                                    serde_json::json!({
+                                        "group": group_tag,
+                                        "name": member,
+                                        "delay": delay,
+                                    }),
+                                );
+                            }
+                            (member, delay)
+                        }
+                    })
+                    .buffer_unordered(BATCH_SIZE)
+                    .collect::<Vec<_>>()
+                    .await;
             for (member, delay) in &batch_results {
                 if let Some(d) = delay {
                     map.insert(member.clone(), serde_json::json!(d));
@@ -1163,10 +1161,7 @@ impl KernelApi {
     }
 
     /// 【APP52 任务2】可指定超时的 /connections 探测（后台遥测协程用 1200ms）
-    pub async fn get_connections_with_timeout(
-        &self,
-        timeout_ms: u64,
-    ) -> Result<serde_json::Value> {
+    pub async fn get_connections_with_timeout(&self, timeout_ms: u64) -> Result<serde_json::Value> {
         Ok(self
             .authed(shared_client().get(format!("{}/connections", self.base)))
             .timeout(Duration::from_millis(timeout_ms))
@@ -1438,7 +1433,11 @@ async fn run_node_failover(api: KernelApi, final_group: String, app_handle: AppH
             continue;
         }
 
-        if api.test_delay(&current, TEST_URL, TEST_TIMEOUT_MS).await.is_some() {
+        if api
+            .test_delay(&current, TEST_URL, TEST_TIMEOUT_MS)
+            .await
+            .is_some()
+        {
             if consecutive_failures > 0 {
                 tracing::info!("节点 {current} 恢复可用，重置故障计数");
             }
@@ -1447,9 +1446,7 @@ async fn run_node_failover(api: KernelApi, final_group: String, app_handle: AppH
         }
 
         consecutive_failures += 1;
-        tracing::warn!(
-            "节点 {current} 探测失败（连续 {consecutive_failures}/{FAIL_THRESHOLD}）"
-        );
+        tracing::warn!("节点 {current} 探测失败（连续 {consecutive_failures}/{FAIL_THRESHOLD}）");
         if consecutive_failures < FAIL_THRESHOLD {
             continue;
         }
@@ -1505,10 +1502,7 @@ async fn test_fastest(
 /// 订阅缓存解析出真实出口地址。
 /// 【APP37 任务3】全平台可用：go_aim 快筛与整组测速的 Clash API
 /// 失败回退（TcpStream::connect 握手）在桌面端同样需要。
-#[cfg_attr(
-    not(any(target_os = "ios", target_os = "android")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 pub(crate) fn collect_node_endpoints(
     data_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, (String, u16)> {
@@ -1584,7 +1578,11 @@ fn is_private_lan_ip(server: &str) -> bool {
 /// 若握手 < 8ms 且目标不是局域网地址，视为本机劫持/回环假阳性，直接判失败，
 /// 避免用户误以为节点可用。
 #[allow(dead_code)] // iOS 端不使用启动前 TCP 预选（仅桌面/Android 预选路径调用）
-pub(crate) async fn tcp_handshake_delay_ms(server: &str, port: u16, timeout_ms: u64) -> Option<u64> {
+pub(crate) async fn tcp_handshake_delay_ms(
+    server: &str,
+    port: u16,
+    timeout_ms: u64,
+) -> Option<u64> {
     use std::time::Instant;
     let start = Instant::now();
     match tokio::time::timeout(

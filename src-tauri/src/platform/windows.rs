@@ -5,17 +5,14 @@
 
 use std::io;
 
-use windows::core::PCWSTR;
 use windows::Win32::Networking::WinInet::{
-    InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
-use windows::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD,
-    REG_SZ,
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_SZ, RegCloseKey, RegOpenKeyExW, RegSetValueExW,
 };
+use windows::core::PCWSTR;
 // windows 0.52 中 OpenProcessToken 位于 System::Threading
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -76,13 +73,7 @@ fn write_reg_value(key_name: &str, value_name: &str, value: &RegValue) -> io::Re
                     data_wide.as_ptr() as *const u8,
                     data_wide.len() * 2,
                 );
-                RegSetValueExW(
-                    hkey,
-                    PCWSTR(value_wide.as_ptr()),
-                    0,
-                    REG_SZ,
-                    Some(bytes),
-                )
+                RegSetValueExW(hkey, PCWSTR(value_wide.as_ptr()), 0, REG_SZ, Some(bytes))
             }
         };
 
@@ -116,7 +107,8 @@ fn read_reg_dword(key_name: &str, value_name: &str) -> io::Result<u32> {
             0,
             windows::Win32::System::Registry::KEY_READ,
             &mut hkey,
-        ).map_err(|e| io::Error::other(format!("RegOpenKeyExW failed: {:?}", e)))?;
+        )
+        .map_err(|e| io::Error::other(format!("RegOpenKeyExW failed: {:?}", e)))?;
         let mut data = 0u32;
         let mut size = std::mem::size_of::<u32>() as u32;
         let result = windows::Win32::System::Registry::RegQueryValueExW(
@@ -145,7 +137,8 @@ fn read_reg_string(key_name: &str, value_name: &str) -> io::Result<String> {
             0,
             windows::Win32::System::Registry::KEY_READ,
             &mut hkey,
-        ).map_err(|e| io::Error::other(format!("RegOpenKeyExW failed: {:?}", e)))?;
+        )
+        .map_err(|e| io::Error::other(format!("RegOpenKeyExW failed: {:?}", e)))?;
         let mut buffer = vec![0u16; 256];
         let mut size = (buffer.len() * 2) as u32;
         let result = windows::Win32::System::Registry::RegQueryValueExW(
@@ -175,11 +168,7 @@ pub fn get_system_proxy() -> io::Result<ProxyBackup> {
 }
 
 pub fn set_system_proxy(host: &str, port: u16) -> io::Result<()> {
-    write_reg_value(
-        INTERNET_SETTINGS_KEY,
-        "ProxyEnable",
-        &RegValue::Dword(1),
-    )?;
+    write_reg_value(INTERNET_SETTINGS_KEY, "ProxyEnable", &RegValue::Dword(1))?;
     write_reg_value(
         INTERNET_SETTINGS_KEY,
         "ProxyServer",
@@ -189,11 +178,7 @@ pub fn set_system_proxy(host: &str, port: u16) -> io::Result<()> {
 }
 
 pub fn clear_system_proxy() -> io::Result<()> {
-    write_reg_value(
-        INTERNET_SETTINGS_KEY,
-        "ProxyEnable",
-        &RegValue::Dword(0),
-    )?;
+    write_reg_value(INTERNET_SETTINGS_KEY, "ProxyEnable", &RegValue::Dword(0))?;
     notify_settings_changed()
 }
 
@@ -205,17 +190,9 @@ pub fn restore_system_proxy(backup: &ProxyBackup) -> io::Result<()> {
             "ProxyServer",
             &RegValue::Sz(backup.server.clone()),
         )?;
-        write_reg_value(
-            INTERNET_SETTINGS_KEY,
-            "ProxyEnable",
-            &RegValue::Dword(1),
-        )?;
+        write_reg_value(INTERNET_SETTINGS_KEY, "ProxyEnable", &RegValue::Dword(1))?;
     } else {
-        write_reg_value(
-            INTERNET_SETTINGS_KEY,
-            "ProxyEnable",
-            &RegValue::Dword(0),
-        )?;
+        write_reg_value(INTERNET_SETTINGS_KEY, "ProxyEnable", &RegValue::Dword(0))?;
     }
     notify_settings_changed()
 }
@@ -237,9 +214,7 @@ pub fn is_elevated() -> bool {
             return false;
         }
 
-        let mut elevation = TOKEN_ELEVATION {
-            TokenIsElevated: 0,
-        };
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut ret_len = 0u32;
 
         let ok = GetTokenInformation(
@@ -258,8 +233,7 @@ pub fn is_elevated() -> bool {
 /// 开机自启动：写入 HKCU Run 键
 pub fn set_auto_start(enabled: bool) -> io::Result<()> {
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let exe = std::env::current_exe().map_err(|e| io::Error::other(e.to_string()))?;
         // 路径加引号，避免 Program Files 中空格问题
         let command = format!("\"{}\"", exe.display());
         write_reg_value(RUN_KEY, APP_NAME, &RegValue::Sz(command))
@@ -288,10 +262,8 @@ fn delete_reg_value(key_name: &str, value_name: &str) -> io::Result<()> {
         }
 
         // RegSetValueExW 配合 None 数据用于删除（或使用 RegDeleteValueW）
-        let delete = windows::Win32::System::Registry::RegDeleteValueW(
-            hkey,
-            PCWSTR(value_wide.as_ptr()),
-        );
+        let delete =
+            windows::Win32::System::Registry::RegDeleteValueW(hkey, PCWSTR(value_wide.as_ptr()));
         let _ = RegCloseKey(hkey);
 
         // 值不存在时忽略错误（win32 ERROR_FILE_NOT_FOUND = 2，

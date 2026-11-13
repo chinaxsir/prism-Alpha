@@ -5,9 +5,9 @@
 //! `ClashNode`（config_builder 的 Clash 结构），再合并进统一 pipeline。
 //! 语法与各客户端（Clash / Surge / sing-box 订阅转换器）的通行实现保持一致。
 
-use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
 
 /// 检测文本是否为 URI 列表订阅（含 ss:// 等分享链接行）
 pub fn is_uri_list(text: &str) -> bool {
@@ -143,15 +143,33 @@ fn cp1252_to_byte(ch: char) -> Option<u8> {
         return Some(code as u8);
     }
     match ch {
-        '€' => Some(0x80), '‚' => Some(0x82), 'ƒ' => Some(0x83),
-        '„' => Some(0x84), '…' => Some(0x85), '†' => Some(0x86),
-        '‡' => Some(0x87), 'ˆ' => Some(0x88), '‰' => Some(0x89),
-        'Š' => Some(0x8A), '‹' => Some(0x8B), 'Œ' => Some(0x8C),
-        'Ž' => Some(0x8E), '‘' => Some(0x91), '’' => Some(0x92),
-        '“' => Some(0x93), '”' => Some(0x94), '•' => Some(0x95),
-        '–' => Some(0x96), '—' => Some(0x97), '˜' => Some(0x98),
-        '™' => Some(0x99), 'š' => Some(0x9A), '›' => Some(0x9B),
-        'œ' => Some(0x9C), 'ž' => Some(0x9E), 'Ÿ' => Some(0x9F),
+        '€' => Some(0x80),
+        '‚' => Some(0x82),
+        'ƒ' => Some(0x83),
+        '„' => Some(0x84),
+        '…' => Some(0x85),
+        '†' => Some(0x86),
+        '‡' => Some(0x87),
+        'ˆ' => Some(0x88),
+        '‰' => Some(0x89),
+        'Š' => Some(0x8A),
+        '‹' => Some(0x8B),
+        'Œ' => Some(0x8C),
+        'Ž' => Some(0x8E),
+        '‘' => Some(0x91),
+        '’' => Some(0x92),
+        '“' => Some(0x93),
+        '”' => Some(0x94),
+        '•' => Some(0x95),
+        '–' => Some(0x96),
+        '—' => Some(0x97),
+        '˜' => Some(0x98),
+        '™' => Some(0x99),
+        'š' => Some(0x9A),
+        '›' => Some(0x9B),
+        'œ' => Some(0x9C),
+        'ž' => Some(0x9E),
+        'Ÿ' => Some(0x9F),
         _ => None,
     }
 }
@@ -235,15 +253,30 @@ fn parse_query(q: &str) -> Vec<(String, String)> {
 ///  2) verify / cert-verify 值为 "0"/"false"/"no"/"off"。
 /// parse_query 已统一键为小写，这里直接匹配即可。
 fn insecure_flag(params: &std::collections::HashMap<String, String>) -> bool {
-    let truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-    let falsy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+    let truthy = |v: &str| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    };
+    let falsy = |v: &str| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    };
     params.iter().any(|(k, v)| {
         let kl = k.as_str();
         matches!(
             kl,
-            "insecure" | "allowinsecure" | "allow_insecure" | "skip-cert-verify" | "skipcertverify" | "skip_cert_verify"
+            "insecure"
+                | "allowinsecure"
+                | "allow_insecure"
+                | "skip-cert-verify"
+                | "skipcertverify"
+                | "skip_cert_verify"
         ) && truthy(v)
-        || matches!(kl, "verify" | "cert-verify" | "certverify") && falsy(v)
+            || matches!(kl, "verify" | "cert-verify" | "certverify") && falsy(v)
     })
 }
 
@@ -353,14 +386,25 @@ fn parse_vmess(rest: &str) -> Result<Value> {
         .as_i64()
         .or_else(|| j["aid"].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
-    let cipher = j["scy"].as_str().or_else(|| j["security"].as_str()).unwrap_or("auto").to_string();
+    let cipher = j["scy"]
+        .as_str()
+        .or_else(|| j["security"].as_str())
+        .unwrap_or("auto")
+        .to_string();
     let network = j["net"].as_str().unwrap_or("tcp").to_string();
     let host = j["host"].as_str().unwrap_or_default().to_string();
     let path = j["path"].as_str().unwrap_or_default().to_string();
     let tls = j["tls"].as_str().unwrap_or_default().to_string();
-    let sni = j["sni"].as_str().or_else(|| j["servername"].as_str()).unwrap_or_default().to_string();
+    let sni = j["sni"]
+        .as_str()
+        .or_else(|| j["servername"].as_str())
+        .unwrap_or_default()
+        .to_string();
     let alpn = j["alpn"].as_str().map(|s| {
-        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>()
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
     });
     let fp = j["fp"].as_str().unwrap_or_default().to_string();
 
@@ -393,10 +437,18 @@ fn parse_vmess(rest: &str) -> Result<Value> {
         }
         "http" | "h2" => {
             // http / h2 通过 http-opts / h2-opts 补齐
-            let key = if network == "http" { "http-opts" } else { "h2-opts" };
+            let key = if network == "http" {
+                "http-opts"
+            } else {
+                "h2-opts"
+            };
             let mut opts = json!({});
             if !path.is_empty() {
-                opts["path"] = if network == "http" { json!([path]) } else { json!(path) };
+                opts["path"] = if network == "http" {
+                    json!([path])
+                } else {
+                    json!(path)
+                };
             }
             if !host.is_empty() {
                 if network == "http" {
@@ -436,11 +488,18 @@ fn parse_vless(rest: &str) -> Result<Value> {
 
     // 机场返回的提示节点（流量超限/到期/重置引导等）
     // 【APP64 任务1】补全 0.0.0.0 / server=0 / port=0 的伪节点过滤
-    if server == "0.0.0.0" || server == "127.0.0.1" || server.starts_with("127.")
-        || server == "localhost" || port == 0
-        || name.contains("剩余流量") || name.contains("下次重置")
-        || name.contains("超限") || name.contains("重置接入")
-        || name.contains("到期") || name.contains("请至面板") {
+    if server == "0.0.0.0"
+        || server == "127.0.0.1"
+        || server.starts_with("127.")
+        || server == "localhost"
+        || port == 0
+        || name.contains("剩余流量")
+        || name.contains("下次重置")
+        || name.contains("超限")
+        || name.contains("重置接入")
+        || name.contains("到期")
+        || name.contains("请至面板")
+    {
         bail!("AIRPORT_NOTICE:{name}");
     }
 
@@ -460,7 +519,11 @@ fn parse_vless(rest: &str) -> Result<Value> {
         .iter()
         .find_map(|k| params.get(*k).cloned())
         .unwrap_or_default();
-    let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
+    let sni = if sni.trim() == "0.0.0.0" {
+        String::new()
+    } else {
+        sni
+    };
     let fp = params.get("fp").cloned().unwrap_or_default();
     let flow = params.get("flow").cloned().unwrap_or_default();
     let public_key = params.get("pbk").cloned().unwrap_or_default();
@@ -510,7 +573,11 @@ fn parse_vless(rest: &str) -> Result<Value> {
             node["client-fingerprint"] = json!(fp);
         }
         if !alpn.is_empty() {
-            node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+            node["alpn"] = json!(
+                alpn.split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
     if security == "reality" && !public_key.is_empty() {
@@ -534,11 +601,18 @@ fn parse_trojan(rest: &str) -> Result<Value> {
 
     // 机场返回的提示节点
     // 【APP64 任务1】补全 0.0.0.0 / server=0 / port=0 的伪节点过滤
-    if server == "0.0.0.0" || server == "127.0.0.1" || server.starts_with("127.")
-        || server == "localhost" || port == 0
-        || name.contains("剩余流量") || name.contains("下次重置")
-        || name.contains("超限") || name.contains("重置接入")
-        || name.contains("到期") || name.contains("请至面板") {
+    if server == "0.0.0.0"
+        || server == "127.0.0.1"
+        || server.starts_with("127.")
+        || server == "localhost"
+        || port == 0
+        || name.contains("剩余流量")
+        || name.contains("下次重置")
+        || name.contains("超限")
+        || name.contains("重置接入")
+        || name.contains("到期")
+        || name.contains("请至面板")
+    {
         bail!("AIRPORT_NOTICE:{name}");
     }
 
@@ -548,7 +622,11 @@ fn parse_trojan(rest: &str) -> Result<Value> {
         .iter()
         .find_map(|k| params.get(*k).cloned())
         .unwrap_or_default();
-    let sni = if sni.trim() == "0.0.0.0" { String::new() } else { sni };
+    let sni = if sni.trim() == "0.0.0.0" {
+        String::new()
+    } else {
+        sni
+    };
     let alpn = params.get("alpn").cloned().unwrap_or_default();
     let network = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let path = params.get("path").cloned().unwrap_or_default();
@@ -576,7 +654,11 @@ fn parse_trojan(rest: &str) -> Result<Value> {
         node["sni"] = json!(sni);
     }
     if !alpn.is_empty() {
-        node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+        node["alpn"] = json!(
+            alpn.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if network == "ws" {
         let mut ws = json!({});
@@ -641,12 +723,17 @@ fn parse_tuic(rest: &str) -> Result<Value> {
     let (addr_query, name) = rest.split_once('#').unwrap_or((rest, ""));
     let (addr, query) = addr_query.split_once('?').unwrap_or((addr_query, ""));
     let (uuid_pass, hostport) = addr.rsplit_once('@').context("缺少 @")?;
-    let (uuid, password) = uuid_pass.split_once(':').context("TUIC 缺少 uuid:password")?;
+    let (uuid, password) = uuid_pass
+        .split_once(':')
+        .context("TUIC 缺少 uuid:password")?;
     let (server, port) = split_host_port(hostport)?;
     let name = decode_name(name);
 
     let params: std::collections::HashMap<_, _> = parse_query(query).into_iter().collect();
-    let congestion = params.get("congestion_control").cloned().unwrap_or_else(|| "bbr".into());
+    let congestion = params
+        .get("congestion_control")
+        .cloned()
+        .unwrap_or_else(|| "bbr".into());
     let alpn = params.get("alpn").cloned().unwrap_or_else(|| "h3".into());
     let sni = params.get("sni").cloned().unwrap_or_default();
 
@@ -661,7 +748,11 @@ fn parse_tuic(rest: &str) -> Result<Value> {
     });
 
     if !alpn.is_empty() {
-        node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+        node["alpn"] = json!(
+            alpn.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if !sni.is_empty() {
         node["sni"] = json!(sni);
@@ -699,7 +790,11 @@ fn parse_anytls(rest: &str) -> Result<Value> {
         node["client-fingerprint"] = json!(fp);
     }
     if !alpn.is_empty() {
-        node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+        node["alpn"] = json!(
+            alpn.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if insecure == "1" || insecure.eq_ignore_ascii_case("true") {
         node["skip-cert-verify"] = json!(true);
@@ -770,7 +865,6 @@ fn parse_wireguard(rest: &str) -> Result<Value> {
     Ok(node)
 }
 
-
 /// hysteria://host:port?auth=<password>&peer=<sni>&insecure=1#name
 /// （Hysteria 1 分享链接；与 hysteria2 的密码在 userinfo 不同，这里认证在 query）
 fn parse_hysteria(rest: &str) -> Result<Value> {
@@ -807,7 +901,11 @@ fn parse_hysteria(rest: &str) -> Result<Value> {
         node["sni"] = json!(sni);
     }
     if !alpn.is_empty() {
-        node["alpn"] = json!(alpn.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+        node["alpn"] = json!(
+            alpn.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if insecure == "1" || insecure.eq_ignore_ascii_case("true") {
         node["skip-cert-verify"] = json!(true);
@@ -1143,7 +1241,9 @@ mod tests {
         assert!(node.get("username").is_none());
         assert!(node.get("password").is_none());
 
-        let node2 = parse_line("socks5://5.6.7.8:1080?user=bob&pass=qp").unwrap().unwrap();
+        let node2 = parse_line("socks5://5.6.7.8:1080?user=bob&pass=qp")
+            .unwrap()
+            .unwrap();
         assert_eq!(node2["username"], "bob");
         assert_eq!(node2["password"], "qp");
     }

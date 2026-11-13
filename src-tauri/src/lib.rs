@@ -4,12 +4,12 @@ pub mod platform;
 pub mod plugins;
 
 #[cfg(desktop)]
+use tauri::WindowEvent;
+#[cfg(desktop)]
 use tauri::menu::{Menu, MenuItem};
 #[cfg(desktop)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent};
-#[cfg(desktop)]
-use tauri::WindowEvent;
 use tracing_subscriber::EnvFilter;
 
 /// 显示并聚焦主窗口（托盘左键 / 菜单“显示主窗口”）
@@ -88,12 +88,19 @@ pub fn run() {
             // 数据目录：settings.json / subscriptions.json / kernel/（config.json 等）
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir).ok();
-            app.manage(core::state::AppState::new(data_dir.clone(), app.handle().clone()));
+            app.manage(core::state::AppState::new(
+                data_dir.clone(),
+                app.handle().clone(),
+            ));
             // APP6 任务1：全模块环形日志系统（内存 800 条 + 512KB 磁盘轮转）
             core::logger::init(&data_dir);
             core::logger::info(
                 core::logger::MOD_KERNEL,
-                &format!("Prism 启动，版本 {}（{}）", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+                &format!(
+                    "Prism 启动，版本 {}（{}）",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS
+                ),
             );
             // 【110.txt】时钟回拨检测：系统时间 < 上次记录 - 5 分钟 → 清授权
             if core::ed25519_verify::check_clock_rollback(&data_dir) {
@@ -125,9 +132,7 @@ pub fn run() {
                 let state = handle.state::<core::state::AppState>();
                 loop {
                     let settings = state.settings.read().clone();
-                    if let Some(next) =
-                        core::license::daily_sync(&data_dir, &settings).await
-                    {
+                    if let Some(next) = core::license::daily_sync(&data_dir, &settings).await {
                         tracing::info!("license synced: {}", next.status);
                         state.apply_entitlement(next);
                     } else if let Some(cache) = core::license::cached_entitlement_opt(&data_dir) {

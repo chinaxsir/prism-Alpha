@@ -277,15 +277,13 @@ fn hardware_fingerprint() -> String {
             .output()
             .ok()
             .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .find_map(|l| {
-                        if l.contains("IOPlatformUUID") {
-                            l.split('"').nth(3).map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
+                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
+                    if l.contains("IOPlatformUUID") {
+                        l.split('"').nth(3).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
             })
             .unwrap_or_else(|| "macos-unknown-uuid".into());
         let host = hostname_fallback();
@@ -304,14 +302,12 @@ fn hardware_fingerprint() -> String {
             .output()
             .ok()
             .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .find_map(|l| {
-                        let mut p = l.split_whitespace();
-                        let _ = p.next()?; // "MachineGuid"
-                        let _ = p.next()?; // "REG_SZ"
-                        Some(p.collect::<Vec<_>>().join(" "))
-                    })
+                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
+                    let mut p = l.split_whitespace();
+                    let _ = p.next()?; // "MachineGuid"
+                    let _ = p.next()?; // "REG_SZ"
+                    Some(p.collect::<Vec<_>>().join(" "))
+                })
             })
             .unwrap_or_else(|| "windows-unknown".into());
         let host = hostname_fallback();
@@ -800,7 +796,10 @@ pub(crate) async fn send_with_v4_fallback(
             }
         }
     }
-    bail!("{}", last.unwrap_or_else(|| "网络连接失败，请检查网络设置后重试".to_string()))
+    bail!(
+        "{}",
+        last.unwrap_or_else(|| "网络连接失败，请检查网络设置后重试".to_string())
+    )
 }
 
 /// POST JSON 带兜底重试
@@ -998,7 +997,11 @@ async fn retry_after_secs(resp: reqwest::Response) -> i64 {
 }
 
 /// GET /api/license/status：200 返回状态体，其余按 StatusError 分类
-async fn fetch_status(base: &str, license_key: &str, data_dir: &Path) -> std::result::Result<StatusResponse, StatusError> {
+async fn fetch_status(
+    base: &str,
+    license_key: &str,
+    data_dir: &Path,
+) -> std::result::Result<StatusResponse, StatusError> {
     let resp = get_with_fallback(
         &format!("{base}{}", crate::obf!("/api/license/status")),
         license_key,
@@ -1021,10 +1024,11 @@ async fn fetch_status(base: &str, license_key: &str, data_dir: &Path) -> std::re
         .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
     // 【110.txt】GET /api/license/status 响应验签
     if let Some(signed) = status.signed.as_ref() {
-        let env: crate::core::ed25519_verify::SignedEnvelope = serde_json::from_value(signed.clone())
-            .map_err(|e| StatusError::Transient(format!("signed envelope json: {e}")))?;
-        let device_id_str = device_id(data_dir)
-            .map_err(|e| StatusError::Transient(format!("device_id: {e}")))?;
+        let env: crate::core::ed25519_verify::SignedEnvelope =
+            serde_json::from_value(signed.clone())
+                .map_err(|e| StatusError::Transient(format!("signed envelope json: {e}")))?;
+        let device_id_str =
+            device_id(data_dir).map_err(|e| StatusError::Transient(format!("device_id: {e}")))?;
         let now = crate::core::ed25519_verify::unix_now();
         crate::core::ed25519_verify::verify(
             &env,
@@ -1070,7 +1074,14 @@ fn map_entitlement(
         status: status.into(),
         // 【APP48】Alpha 内测授权虽是 plan=pro，但绝不能被渲染成「买断/永久」；
         // 统一按 subscription + 到期时间展示。
-        kind: Some(if plan == "team" && !alpha { "lifetime" } else { "subscription" }.into()),
+        kind: Some(
+            if plan == "team" && !alpha {
+                "lifetime"
+            } else {
+                "subscription"
+            }
+            .into(),
+        ),
         expires_at,
         source: Some("code".into()),
         last_verified_at: now_secs(),
@@ -1199,7 +1210,11 @@ pub async fn activate(
             crate::core::logger::MOD_PRO,
             &format!(
                 "激活请求被拒绝：HTTP {http}，错误码 {machine}{}",
-                if server_msg.is_empty() { String::new() } else { format!("，服务端描述：{server_msg}") }
+                if server_msg.is_empty() {
+                    String::new()
+                } else {
+                    format!("，服务端描述：{server_msg}")
+                }
             ),
         );
         if let Some(mapped) = map_activation_error(http, &machine, &server_msg) {
@@ -1389,10 +1404,7 @@ pub async fn verify_remote_forced(
 /// - 否则（跨天 / 上次同步失败留有 offline）→ 联网校验：
 ///   成功 → 更新缓存并应用新状态；失败 → 应用 offline 锁定（不更新 synced_on，
 ///   恢复联网后下一轮自动重试）
-pub async fn daily_sync(
-    data_dir: &Path,
-    settings: &UserSettings,
-) -> Option<EntitlementStatus> {
+pub async fn daily_sync(data_dir: &Path, settings: &UserSettings) -> Option<EntitlementStatus> {
     let cache = load_cache(data_dir)?;
     let today = today_utc();
 
@@ -1477,7 +1489,10 @@ impl ReleaseBinding {
         match result {
             Ok(resp) => {
                 let ok = resp.status().is_success();
-                tracing::info!("license deactivate notify: http={} ok={ok}", resp.status().as_u16());
+                tracing::info!(
+                    "license deactivate notify: http={} ok={ok}",
+                    resp.status().as_u16()
+                );
                 ok
             }
             Err(e) => {
@@ -1510,8 +1525,7 @@ pub fn get_saved_license_key(data_dir: &Path) -> Option<String> {
 pub fn cached_credentials(data_dir: &Path) -> Option<(String, String)> {
     load_cache(data_dir).and_then(|c| {
         let email = c.email.trim().to_lowercase();
-        (!c.license.is_empty() && !email.is_empty())
-            .then(|| (c.license, email))
+        (!c.license.is_empty() && !email.is_empty()).then(|| (c.license, email))
     })
 }
 

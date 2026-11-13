@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 明文特征：命中任一即认为已经是可解析的明文，无需 base64 解码
 const PLAINTEXT_MARKERS: &[&str] = &[
@@ -104,11 +104,7 @@ const CLASH_TYPES: &[&str] = &[
 /// - 仅当「不含任何明文特征」或「整段只由 base64 字符集组成」时才尝试解码；
 /// - 每层解码结果必须是可识别结构，否则视为误判并保留上一层文本。
 pub fn auto_decrypt_base64_payload(raw: &str) -> String {
-    let text = raw
-        .trim()
-        .trim_start_matches('\u{feff}')
-        .trim()
-        .to_string();
+    let text = raw.trim().trim_start_matches('\u{feff}').trim().to_string();
 
     // HTML 错误页（机场被墙 / 套餐失效时常返回）：不做破坏性处理
     let lower = text.to_ascii_lowercase();
@@ -321,10 +317,7 @@ fn looks_like_conf_node_line(line: &str) -> bool {
 /// 故通过 `yaml_to_json` 递归转换。name 缺失时用 `server:port` 补齐，
 /// 并剔除 server 为空 / port 非法的项。
 fn parse_clash_and_meta_yaml(text: &str) -> Result<Vec<Value>, String> {
-    if !text
-        .lines()
-        .any(|l| l.trim_start().starts_with("proxies:"))
-    {
+    if !text.lines().any(|l| l.trim_start().starts_with("proxies:")) {
         return Ok(Vec::new());
     }
     let doc: serde_yaml::Value =
@@ -503,11 +496,22 @@ fn parse_conf_line(line: &str) -> Option<Value> {
     //   allow-insecure: true / 1
     //   verify: false / no / 0
     let cert_insecure = {
-        let truthy = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-        let falsy = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
-        ["skip-cert-verify", "insecure", "allow-insecure", "allow_insecure"]
-            .iter()
-            .any(|k| kv.get(*k).is_some_and(|v| truthy(v)))
+        let truthy =
+            |v: &str| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        let falsy = |v: &str| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        };
+        [
+            "skip-cert-verify",
+            "insecure",
+            "allow-insecure",
+            "allow_insecure",
+        ]
+        .iter()
+        .any(|k| kv.get(*k).is_some_and(|v| truthy(v)))
             || kv.get("verify").is_some_and(|v| falsy(v))
     };
     if cert_insecure {
@@ -1155,7 +1159,11 @@ fn parse_qx_line(line: &str) -> Option<Value> {
             }
         }
         "vmess" => {
-            node["cipher"] = json!(if method.is_empty() { "auto" } else { method.as_str() });
+            node["cipher"] = json!(if method.is_empty() {
+                "auto"
+            } else {
+                method.as_str()
+            });
             if !password.is_empty() {
                 node["uuid"] = json!(password);
             }
@@ -1486,7 +1494,8 @@ vless = 4.4.4.4:443, method=none, password=uuid-2, obfs=ws, obfs-host=cdn.exampl
 
     #[test]
     fn parses_uri_mixed_list() {
-        let text = "vless://uuid-1@1.2.3.4:443?security=tls&sni=a.com#V1\ntrojan://pwd@5.6.7.8:443#T1";
+        let text =
+            "vless://uuid-1@1.2.3.4:443?security=tls&sni=a.com#V1\ntrojan://pwd@5.6.7.8:443#T1";
         let (nodes, errors) = parse_subscription_content(text);
         assert_eq!(nodes.len(), 2, "URI 列表应解析 2 个节点：{errors:?}");
         assert_eq!(find(&nodes, "V1")["type"], "vless");

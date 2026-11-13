@@ -252,10 +252,7 @@ pub fn init(data_dir: &std::path::Path) {
     for module in [
         MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_GO_AIM, MOD_GO_LAN, MOD_GO_CUS, MOD_SUB,
     ] {
-        buckets.insert(
-            module,
-            VecDeque::with_capacity(bucket_capacity(module)),
-        );
+        buckets.insert(module, VecDeque::with_capacity(bucket_capacity(module)));
     }
     let _ = STATE.set(Mutex::new(LogState {
         seq: AtomicU64::new(1),
@@ -266,9 +263,11 @@ pub fn init(data_dir: &std::path::Path) {
     // 【APP71 任务1.1】250ms 防抖刷盘线程：只服务 GoAIM 结构化日志，
     // 与既有同步写入路径完全隔离，不影响其他模块。
     let _ = AIM_WRITER_STARTED.get_or_init(|| {
-        std::thread::spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_millis(AIM_FLUSH_DEBOUNCE_MS));
-            flush_aim_pending();
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(AIM_FLUSH_DEBOUNCE_MS));
+                flush_aim_pending();
+            }
         });
     });
 }
@@ -277,9 +276,8 @@ pub fn init(data_dir: &std::path::Path) {
 /// 四端统一：无论系统处于哪个时区，日志时间戳一律为北京时间。
 pub fn beijing_now_string() -> String {
     use time::macros::format_description;
-    let fmt = format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
-    );
+    let fmt =
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
     let bj = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
     time::OffsetDateTime::now_utc()
         .to_offset(bj)
@@ -354,7 +352,11 @@ fn push_entry(level: &str, module: &str, message: &str) {
         })
         .to_string();
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = f.write_all(line.as_bytes());
             let _ = f.write_all(b"\n");
         }
@@ -363,7 +365,9 @@ fn push_entry(level: &str, module: &str, message: &str) {
 
 /// 超过 512 KB：截断保留最新一半（按行）
 fn truncate_log_file(path: &std::path::Path) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
     let lines: Vec<&str> = text.lines().collect();
     let keep_from = lines.len() / 2;
     let kept: String = lines[keep_from..].join("\n");
@@ -379,9 +383,9 @@ pub fn sanitize_aim_log_message(raw: &str) -> String {
     use regex::Regex;
     let mut out = raw.to_string();
     // 1) UUID（节点 uuid / 订阅标识）
-    if let Ok(re) = Regex::new(
-        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-    ) {
+    if let Ok(re) =
+        Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+    {
         out = re
             .replace_all(&out, |caps: &regex::Captures| {
                 let s = caps.get(0).map(|m| m.as_str()).unwrap_or("");
@@ -390,9 +394,7 @@ pub fn sanitize_aim_log_message(raw: &str) -> String {
             .into_owned();
     }
     // 2) Authorization / Cookie 头
-    if let Ok(re) =
-        Regex::new(r"(?i)\b(authorization|cookie)\b(\s*[:=]\s*)[^\r\n,;]+")
-    {
+    if let Ok(re) = Regex::new(r"(?i)\b(authorization|cookie)\b(\s*[:=]\s*)[^\r\n,;]+") {
         out = re
             .replace_all(&out, |caps: &regex::Captures| {
                 format!(
@@ -532,7 +534,9 @@ pub fn log_aim(level: &str, meta: &AimLogMeta, message: &str) {
 /// 将待落盘的 AIM 日志批量追加到 `logs_v2.jsonl`，并做文件容量轮转检查。
 pub fn flush_aim_pending() {
     let lines: Vec<String> = {
-        let Ok(mut pending) = aim_pending().lock() else { return };
+        let Ok(mut pending) = aim_pending().lock() else {
+            return;
+        };
         if pending.is_empty() {
             return;
         }
@@ -540,7 +544,9 @@ pub fn flush_aim_pending() {
     };
     let Some(mutex) = state() else { return };
     let Ok(mut st) = mutex.lock() else { return };
-    let Some(path) = st.file_path.clone() else { return };
+    let Some(path) = st.file_path.clone() else {
+        return;
+    };
     st.writes_since_check += lines.len() as u32;
     let need_truncate = st.writes_since_check >= 20
         && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_FILE_BYTES;
@@ -581,7 +587,11 @@ pub fn flush_aim_pending() {
 /// 【APP71】当前分类桶实际条数（用于有界队列回归测试与内存诊断）。
 pub fn bucket_len(module: &str) -> usize {
     state()
-        .and_then(|m| m.lock().ok().map(|st| st.buckets.get(module).map_or(0, |b| b.len())))
+        .and_then(|m| {
+            m.lock()
+                .ok()
+                .map(|st| st.buckets.get(module).map_or(0, |b| b.len()))
+        })
         .unwrap_or(0)
 }
 
@@ -641,9 +651,7 @@ fn strip_log_prefix(line: &str) -> String {
     }
     s = strip_leading_datetime(s);
     // 级别词
-    for level in [
-        "ERROR", "WARN", "INFO", "DEBUG", "FATAL", "TRACE",
-    ] {
+    for level in ["ERROR", "WARN", "INFO", "DEBUG", "FATAL", "TRACE"] {
         if let Some(rest) = s.strip_prefix(level)
             && (rest.starts_with(' ') || rest.starts_with('['))
         {
@@ -656,9 +664,7 @@ fn strip_log_prefix(line: &str) -> String {
         && let Some(end) = rest.find(']')
     {
         let inside = &rest[..end];
-        if inside.contains("ms")
-            && inside.chars().next().is_some_and(|c| c.is_ascii_digit())
-        {
+        if inside.contains("ms") && inside.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             s = rest[end + 1..].trim_start();
         }
     }
@@ -701,7 +707,9 @@ fn should_suppress_repeated(level: &str, module: &str, message: &str) -> bool {
         "{level}|{module}|{}",
         normalized.chars().take(80).collect::<String>()
     );
-    let Ok(mut map) = map.lock() else { return false };
+    let Ok(mut map) = map.lock() else {
+        return false;
+    };
     if map.len() > 512 {
         map.clear();
     }
@@ -755,16 +763,14 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
                     .map(|k| i + k)
                     .unwrap_or(n);
                 let raw = &line[i..end];
-                if let Ok(dt) = time::OffsetDateTime::parse(
-                    raw,
-                    &time::format_description::well_known::Rfc3339,
-                ) {
+                if let Ok(dt) =
+                    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                {
                     use time::macros::format_description;
                     let fmt = format_description!(
                         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
                     );
-                    let bj =
-                        time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
+                    let bj = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
                     if let Ok(s) = dt.to_offset(bj).format(&fmt) {
                         return Some(s);
                     }
@@ -796,7 +802,11 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
                 {
                     let hh: i32 = p[1..3].parse().ok()?;
                     let mm: i32 = p[3..5].parse().ok()?;
-                    Some(if pb[0] == b'-' { -(hh * 60 + mm) } else { hh * 60 + mm })
+                    Some(if pb[0] == b'-' {
+                        -(hh * 60 + mm)
+                    } else {
+                        hh * 60 + mm
+                    })
                 } else {
                     None
                 }
@@ -812,11 +822,10 @@ fn parse_kernel_timestamp(line: &str) -> Option<String> {
                 let minute: u8 = line[i + 14..i + 16].parse().ok()?;
                 let second: u8 = line[i + 17..i + 19].parse().ok()?;
                 let millis: i32 = ms.parse().unwrap_or(0);
-                let date = Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()?;
-                let time_of_day =
-                    Time::from_hms_milli(hour, minute, second, millis as u16).ok()?;
-                let source_offset =
-                    UtcOffset::from_whole_seconds(minutes * 60).ok()?;
+                let date =
+                    Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()?;
+                let time_of_day = Time::from_hms_milli(hour, minute, second, millis as u16).ok()?;
+                let source_offset = UtcOffset::from_whole_seconds(minutes * 60).ok()?;
                 let beijing = UtcOffset::from_hms(8, 0, 0).unwrap_or(UtcOffset::UTC);
                 let local = PrimitiveDateTime::new(date, time_of_day)
                     .assume_offset(source_offset)
@@ -878,10 +887,7 @@ fn strip_leading_datetime(line: &str) -> &str {
     }
     if end < b.len() && (b[end] == b'Z' || b[end] == b'z') {
         end += 1;
-    } else if end + 5 < b.len()
-        && (b[end] == b'+' || b[end] == b'-')
-        && b[end + 3] == b':'
-    {
+    } else if end + 5 < b.len() && (b[end] == b'+' || b[end] == b'-') && b[end + 3] == b':' {
         end += 6;
     }
     line[end..].trim_start()
@@ -977,7 +983,12 @@ fn is_benign_close_line(line: &str) -> bool {
     BENIGN.iter().any(|p| l.contains(p))
 }
 
-fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU64, max_lines: usize) {
+fn merge_external_text(
+    lines_text: &str,
+    out: &mut Vec<LogEntry>,
+    seq: &AtomicU64,
+    max_lines: usize,
+) {
     let mut count = 0usize;
     let mut last_key: Option<String> = None;
     for line in lines_text.lines() {
@@ -998,7 +1009,8 @@ fn merge_external_text(lines_text: &str, out: &mut Vec<LogEntry>, seq: &AtomicU6
         // 【APP56 任务4】再经强制分类器兜底，保证唯一分类
         let module = enforce_strict_log_category(raw_module, &classified);
         let lower = line.to_lowercase();
-        let level = if lower.contains("error") || lower.contains("fatal") || lower.contains("失败") {
+        let level = if lower.contains("error") || lower.contains("fatal") || lower.contains("失败")
+        {
             "ERROR"
         } else if lower.contains("warn") {
             "WARN"
@@ -1158,8 +1170,7 @@ fn sync_kernel_and_extension_logs(data_dir: &std::path::Path) {
 pub fn get_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> LogsPayload {
     // 【APP58 任务5】筛选条件也强制归一化为 7 类合法值之一，非法/未知 → Kernel，
     // 与列表、徽章使用同一投影结果
-    let filter: Option<&'static str> =
-        module_filter.map(|f| enforce_strict_log_category(f, ""));
+    let filter: Option<&'static str> = module_filter.map(|f| enforce_strict_log_category(f, ""));
     let mut mem_entries: Vec<LogEntry> = Vec::new();
     let mut file_bytes = 0usize;
     if let Some(mutex) = state()
@@ -1242,11 +1253,7 @@ pub fn get_logs_categorized(data_dir: &std::path::Path) -> CategorizedLogsPayloa
             .filter(|e| e.module == module)
             .cloned()
             .collect();
-        rows.sort_by(|a, b| {
-            a.timestamp
-                .cmp(&b.timestamp)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         let start = logs.len();
         let count = rows.len();
         logs.extend(rows);
@@ -1344,7 +1351,11 @@ fn mask_wg_key(token: &str) -> Option<String> {
     if bytes[..43].iter().filter(|b| **b == b'=').count() != 0 {
         return None;
     }
-    Some(format!("{}****[密钥已脱敏]****{}", &token[..6], &token[40..]))
+    Some(format!(
+        "{}****[密钥已脱敏]****{}",
+        &token[..6],
+        &token[40..]
+    ))
 }
 
 /// License Key 脱敏：保留前 4 位与后 4 位，中间打星
@@ -1391,8 +1402,7 @@ pub fn sanitize_sensitive(text: &str) -> String {
                 let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let sep = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                 let key = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-                let masked = mask_license_key(key)
-                    .unwrap_or_else(|| "*".repeat(key.len().min(44)));
+                let masked = mask_license_key(key).unwrap_or_else(|| "*".repeat(key.len().min(44)));
                 format!("{prefix}{sep}{masked}")
             })
             .into_owned();
@@ -1432,10 +1442,7 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     ));
-    out.push_str(&format!(
-        "导出时间: {}\n",
-        now_timestamp()
-    ));
+    out.push_str(&format!("导出时间: {}\n", now_timestamp()));
     if let Some(f) = module_filter {
         out.push_str(&format!("模块筛选: {f}\n"));
     }
@@ -1470,7 +1477,10 @@ pub fn export_logs(data_dir: &std::path::Path, module_filter: Option<&str>) -> S
         for e in rows {
             out.push_str(&format!(
                 "[{}][{}][{}] {}\n",
-                e.timestamp, e.level, e.module, sanitize_sensitive(&e.message)
+                e.timestamp,
+                e.level,
+                e.module,
+                sanitize_sensitive(&e.message)
             ));
         }
         out.push('\n');
@@ -1534,7 +1544,9 @@ pub fn export_diagnostic_text_filtered(
                     e.node_name.as_deref().unwrap_or("-"),
                     e.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
                     e.service.as_deref().unwrap_or("-"),
-                    e.elapsed_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    e.elapsed_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".into()),
                     msg
                 ));
             } else {
@@ -1552,27 +1564,50 @@ pub fn export_diagnostic_text_filtered(
 #[cfg(test)]
 mod tests {
     use super::{
-        beijing_now_string, classify_external_log_line, enforce_strict_log_category,
-        is_benign_close_line, is_noise_eperm_line, parse_kernel_timestamp, safe_truncate_str,
-        should_suppress_repeated, strip_leading_datetime, strip_log_prefix,
-        MOD_GO_AIM, MOD_GO_CUS,
-        MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_SUB, PHASE_CONNECTED, PHASE_FORWARDING,
-        PHASE_HANDSHAKE, PHASE_NODE_IDENT,
+        MOD_GO_AIM, MOD_GO_CUS, MOD_GO_LAN, MOD_KERNEL, MOD_NODE, MOD_RULE, MOD_SUB,
+        PHASE_CONNECTED, PHASE_FORWARDING, PHASE_HANDSHAKE, PHASE_NODE_IDENT, beijing_now_string,
+        classify_external_log_line, enforce_strict_log_category, is_benign_close_line,
+        is_noise_eperm_line, parse_kernel_timestamp, safe_truncate_str, should_suppress_repeated,
+        strip_leading_datetime, strip_log_prefix,
     };
 
     /// 【APP69 任务4】同类型错误 60 秒内最多记录 3 条，INFO 永不抑制
     #[test]
     fn test_repeated_error_suppression() {
-        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for a.com"));
-        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for b.com"));
-        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for c.com"));
+        assert!(!should_suppress_repeated(
+            "ERROR",
+            "dedupe-test",
+            "dns: exchange failed for a.com"
+        ));
+        assert!(!should_suppress_repeated(
+            "ERROR",
+            "dedupe-test",
+            "dns: exchange failed for b.com"
+        ));
+        assert!(!should_suppress_repeated(
+            "ERROR",
+            "dedupe-test",
+            "dns: exchange failed for c.com"
+        ));
         // 第 4 条同类型（不同域名）必须被抑制
-        assert!(should_suppress_repeated("ERROR", "dedupe-test", "dns: exchange failed for d.com"));
+        assert!(should_suppress_repeated(
+            "ERROR",
+            "dedupe-test",
+            "dns: exchange failed for d.com"
+        ));
         // 不同类型不受影响
-        assert!(!should_suppress_repeated("ERROR", "dedupe-test", "dial tcp: connection refused"));
+        assert!(!should_suppress_repeated(
+            "ERROR",
+            "dedupe-test",
+            "dial tcp: connection refused"
+        ));
         // INFO 永不抑制
         for _ in 0..10 {
-            assert!(!should_suppress_repeated("INFO", "dedupe-test", "节点已切换"));
+            assert!(!should_suppress_repeated(
+                "INFO",
+                "dedupe-test",
+                "节点已切换"
+            ));
         }
         assert_eq!(
             strip_log_prefix("1794452721 INFO 🌐 内核已切换至 pdp_ip0"),
@@ -1587,8 +1622,8 @@ mod tests {
             .expect("must parse");
         assert_eq!(ts, "2026-11-12 11:05:21.000");
         // 已是 +0800 的日志保持原时分
-        let ts = parse_kernel_timestamp("+0800 2026-11-12 11:05:21 INFO started")
-            .expect("must parse");
+        let ts =
+            parse_kernel_timestamp("+0800 2026-11-12 11:05:21 INFO started").expect("must parse");
         assert_eq!(ts, "2026-11-12 11:05:21.000");
     }
 
@@ -1604,8 +1639,7 @@ mod tests {
             "自主握手已触发"
         );
         assert_eq!(
-            classify_external_log_line("+0000 2026-11-12 03:05:21 INFO [GoLan-Ext] 握手")
-                .1,
+            classify_external_log_line("+0000 2026-11-12 03:05:21 INFO [GoLan-Ext] 握手").1,
             "握手"
         );
     }
@@ -1616,14 +1650,30 @@ mod tests {
     #[test]
     fn test_enforce_strict_log_category_isolated() {
         let cases: [(&str, &str, &str); 18] = [
-            ("Kernel", "[测速] 节点测速完成，自动选择最低延迟节点", MOD_KERNEL),
-            ("Kernel", "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY", MOD_KERNEL),
+            (
+                "Kernel",
+                "[测速] 节点测速完成，自动选择最低延迟节点",
+                MOD_KERNEL,
+            ),
+            (
+                "Kernel",
+                "[规则] 命中 DOMAIN-SUFFIX,google.com,PROXY",
+                MOD_KERNEL,
+            ),
             ("Kernel", "[GoAIM] probe gpt unlocked", MOD_KERNEL),
             ("Kernel", "[GoLan] 隧道握手完成 go-lan-home", MOD_KERNEL),
             ("Kernel", "[GoCus] 去广告模板已加载", MOD_KERNEL),
             ("Kernel", "[Sub] 订阅更新完成 18/20", MOD_KERNEL),
-            ("Kernel", "dns: exchange failed: timeout for hk1.company-example.com", MOD_KERNEL),
-            ("Kernel", "start inbound/tun[tun-in]: create tun", MOD_KERNEL),
+            (
+                "Kernel",
+                "dns: exchange failed: timeout for hk1.company-example.com",
+                MOD_KERNEL,
+            ),
+            (
+                "Kernel",
+                "start inbound/tun[tun-in]: create tun",
+                MOD_KERNEL,
+            ),
             ("Go Lan", "任意内容", MOD_GO_LAN),
             ("Go AIM", "任意内容", MOD_GO_AIM),
             ("Go Cus", "任意内容", MOD_GO_CUS),
@@ -1659,7 +1709,10 @@ mod tests {
     #[test]
     fn test_classify_external_log_line_categories() {
         let cases = [
-            ("[GoLan-Ext] 内网直连探测 10.10.10.253:8001 可达", MOD_GO_LAN),
+            (
+                "[GoLan-Ext] 内网直连探测 10.10.10.253:8001 可达",
+                MOD_GO_LAN,
+            ),
             ("[GoLan] profile home bypass on local lan", MOD_GO_LAN),
             ("outbound/wireguard[home]: handshake complete", MOD_GO_LAN),
             ("[GoAIM] probe gpt unlocked", MOD_KERNEL),
@@ -1744,7 +1797,10 @@ mod tests {
                    sub=https://sub.example.com/api/v1/client/subscribe?token=abcdef1234567890 \
                    Authorization: Bearer abc.def.ghi Cookie: sid=xyz987";
         let out = super::sanitize_aim_log_message(raw);
-        assert!(!out.contains("123e4567-e89b-12d3-a456-426614174000"), "{out}");
+        assert!(
+            !out.contains("123e4567-e89b-12d3-a456-426614174000"),
+            "{out}"
+        );
         assert!(!out.contains("secret123"), "{out}");
         assert!(!out.contains("abcdef1234567890"), "{out}");
         assert!(!out.contains("Bearer"), "{out}");
@@ -1761,13 +1817,21 @@ mod tests {
         let cap = super::bucket_capacity(super::MOD_GO_AIM);
         assert_eq!(cap, super::AIM_BUCKET_MAX);
         assert_eq!(cap, 400);
-        assert_eq!(super::bucket_capacity(super::MOD_KERNEL), super::PER_CATEGORY_MAX);
-        let mut q: std::collections::VecDeque<super::LogEntry> =
-            std::collections::VecDeque::new();
+        assert_eq!(
+            super::bucket_capacity(super::MOD_KERNEL),
+            super::PER_CATEGORY_MAX
+        );
+        let mut q: std::collections::VecDeque<super::LogEntry> = std::collections::VecDeque::new();
         for i in 0..1000u64 {
             super::push_bounded(
                 &mut q,
-                super::LogEntry::plain(i, "2026-11-12 00:00:00.000".into(), "INFO", super::MOD_GO_AIM, format!("line {i}")),
+                super::LogEntry::plain(
+                    i,
+                    "2026-11-12 00:00:00.000".into(),
+                    "INFO",
+                    super::MOD_GO_AIM,
+                    format!("line {i}"),
+                ),
                 cap,
             );
         }
@@ -1807,9 +1871,8 @@ mod tests {
         assert_eq!(&s[16..17], ":");
         assert_eq!(&s[19..20], ".");
         // 固定 UTC+8：与 UTC 时间相差 8 小时（按分钟对比，规避秒级抖动）
-        let bj = time::OffsetDateTime::now_utc().to_offset(
-            time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC),
-        );
+        let bj = time::OffsetDateTime::now_utc()
+            .to_offset(time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC));
         let expect = format!(
             "{:04}-{:02}-{:02} {:02}:{:02}",
             bj.year(),

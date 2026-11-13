@@ -18,20 +18,23 @@
 //! 探测绝不动 GLOBAL/主选择器以外的组。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
+use futures_util::StreamExt;
+
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP67】当前 Go AIM 检测引擎版本号：升级后旧版"假解锁"缓存
+/// 【APP73】当前 Go AIM 检测引擎版本号：升级后旧版缓存
 /// 因 probe_version 不符而被自动淘汰，直到用新引擎重测后才持久保留。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 3;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 3;
+/// v4：全代理槽位强制 `Proxy::all`、五级证据模型、七平台独立检测器。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 4;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 4;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -43,7 +46,6 @@ pub const AIM_RECENT_EVENTS: usize = 30;
 const SCREEN_EMIT_NODES: usize = 2;
 const SCREEN_EMIT_INTERVAL_MS: u64 = 120;
 
-
 /// 探测槽位数（与 config_builder 注入的探针入站/选择组数量严格一致）
 pub const PROBE_SLOTS: usize = 4;
 /// 探针入站端口基址（config_builder 注入 2083..=2086）
@@ -54,8 +56,14 @@ const BASELINE_URL: &str = "http://cp.cloudflare.com/generate_204";
 const BASELINE_TIMEOUT_MS: u64 = 1500;
 /// 参与探测的节点基线延迟上限（仅探测存活节点）
 const PROBE_MAX_DELAY_MS: u64 = 2500;
-/// 【APP51 任务1】单个平台探测请求超时（毫秒，严格 1200ms 快速出结果）
+/// 【APP51 任务1】单个平台探测请求超时（毫秒，严格 2800ms 快速出结果）
 const PROBE_TIMEOUT_MS: u64 = 2800;
+/// 【APP73 任务2.1】单次 HTTP 请求连接超时（3 秒）
+const PROBE_CONNECT_TIMEOUT_MS: u64 = 3000;
+/// 【APP73 任务2.1】单次 HTTP 请求总超时（8 秒）
+const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
+/// 【APP73 任务2.1】单个平台完整探测硬超时（10 秒，含 1 次补测）
+const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 10;
 /// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
 const SCREEN_BATCH_SIZE: usize = 32;
 /// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
@@ -66,9 +74,15 @@ const SCREEN_FALLBACK_URL: &str = "http://cp.cloudflare.com/generate_204";
 
 /// 【APP72 任务1.3】阶段1 延迟裁决：首测 → 备用地址重测 → 历史真实缓存（>0ms）。
 /// 任一环节拿到合法延迟即视为存活，全部不可用才判死。
-fn resolve_screen_delay(first: Option<u64>, retry: Option<u64>, cached: Option<u64>) -> Option<u64> {
+fn resolve_screen_delay(
+    first: Option<u64>,
+    retry: Option<u64>,
+    cached: Option<u64>,
+) -> Option<u64> {
     let valid = |d: Option<u64>| d.filter(|v| *v > 0 && *v < PROBE_MAX_DELAY_MS);
-    valid(first).or_else(|| valid(retry)).or_else(|| valid(cached))
+    valid(first)
+        .or_else(|| valid(retry))
+        .or_else(|| valid(cached))
 }
 /// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
 /// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
@@ -373,7 +387,8 @@ impl AdaptiveSlotController {
         let avg_node_ms = elapsed / 8;
         let active = self.active_slots();
         if timeout_rate > 0.40 || avg_node_ms > 4500 {
-            self.active.store(active.saturating_sub(1).max(1), Ordering::Release);
+            self.active
+                .store(active.saturating_sub(1).max(1), Ordering::Release);
         } else if timeout_rate < 0.15 && avg_node_ms < 1800 && active < self.max_slots {
             self.active.store(active + 1, Ordering::Release);
         }
@@ -404,13 +419,41 @@ struct Probe {
 
 #[allow(dead_code)]
 const PROBES: &[Probe] = &[
-    Probe { tag: "GPT", url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1", media: false },
-    Probe { tag: "Claude", url: "https://claude.ai/login", media: false },
-    Probe { tag: "Gemini", url: "https://gemini.google.com/app", media: false },
-    Probe { tag: "NF", url: "https://www.netflix.com/title/81280792", media: true },
-    Probe { tag: "YT", url: "https://www.youtube.com/premium", media: true },
-    Probe { tag: "Disney+", url: "https://www.disneyplus.com/", media: true },
-    Probe { tag: "TK", url: "https://www.tiktok.com/explore", media: true },
+    Probe {
+        tag: "GPT",
+        url: "https://ios.chat.openai.com/public-api/mobile/server_status/v1",
+        media: false,
+    },
+    Probe {
+        tag: "Claude",
+        url: "https://claude.ai/login",
+        media: false,
+    },
+    Probe {
+        tag: "Gemini",
+        url: "https://gemini.google.com/app",
+        media: false,
+    },
+    Probe {
+        tag: "NF",
+        url: "https://www.netflix.com/title/81280792",
+        media: true,
+    },
+    Probe {
+        tag: "YT",
+        url: "https://www.youtube.com/premium",
+        media: true,
+    },
+    Probe {
+        tag: "Disney+",
+        url: "https://www.disneyplus.com/",
+        media: true,
+    },
+    Probe {
+        tag: "TK",
+        url: "https://www.tiktok.com/explore",
+        media: true,
+    },
 ];
 
 // ---------------------------------------------------------------- 数据模型
@@ -471,6 +514,104 @@ pub enum AimProbeMode {
     Selected,
 }
 
+/// 【APP73 任务2.2】统一 14 类探测错误分类。
+/// 只有 `Unknown` / `Blocked` 结论才可能携带错误分类，`Verified` 恒为 None。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AimErrorKind {
+    #[serde(rename = "DNS_ERROR")]
+    DnsError,
+    #[serde(rename = "CONNECT_TIMEOUT")]
+    ConnectTimeout,
+    #[serde(rename = "TLS_ERROR")]
+    TlsError,
+    #[serde(rename = "PROXY_ERROR")]
+    ProxyError,
+    #[serde(rename = "HTTP_403")]
+    Http403,
+    #[serde(rename = "HTTP_429")]
+    Http429,
+    #[serde(rename = "HTTP_5XX")]
+    Http5xx,
+    #[serde(rename = "REDIRECT_ERROR")]
+    RedirectError,
+    #[serde(rename = "EMPTY_RESPONSE")]
+    EmptyResponse,
+    #[serde(rename = "CHALLENGE_PAGE")]
+    ChallengePage,
+    #[serde(rename = "REGION_RESTRICTED")]
+    RegionRestricted,
+    #[serde(rename = "BODY_PARSE_ERROR")]
+    BodyParseError,
+    #[serde(rename = "TASK_TIMEOUT")]
+    TaskTimeout,
+    #[serde(rename = "UNKNOWN_ERROR")]
+    UnknownError,
+}
+
+impl AimErrorKind {
+    fn label(self) -> &'static str {
+        match self {
+            AimErrorKind::DnsError => "DNS_ERROR",
+            AimErrorKind::ConnectTimeout => "CONNECT_TIMEOUT",
+            AimErrorKind::TlsError => "TLS_ERROR",
+            AimErrorKind::ProxyError => "PROXY_ERROR",
+            AimErrorKind::Http403 => "HTTP_403",
+            AimErrorKind::Http429 => "HTTP_429",
+            AimErrorKind::Http5xx => "HTTP_5XX",
+            AimErrorKind::RedirectError => "REDIRECT_ERROR",
+            AimErrorKind::EmptyResponse => "EMPTY_RESPONSE",
+            AimErrorKind::ChallengePage => "CHALLENGE_PAGE",
+            AimErrorKind::RegionRestricted => "REGION_RESTRICTED",
+            AimErrorKind::BodyParseError => "BODY_PARSE_ERROR",
+            AimErrorKind::TaskTimeout => "TASK_TIMEOUT",
+            AimErrorKind::UnknownError => "UNKNOWN_ERROR",
+        }
+    }
+}
+
+/// 【APP73 任务2.2】把 reqwest 传输错误归类到标准错误分类。
+fn classify_reqwest_error(err: &reqwest::Error) -> AimErrorKind {
+    if err.is_timeout() {
+        return AimErrorKind::ConnectTimeout;
+    }
+    let mut chain = String::new();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        chain.push_str(&cause.to_string().to_lowercase());
+        chain.push(' ');
+        source = cause.source();
+    }
+    if chain.contains("dns")
+        || chain.contains("name or service")
+        || chain.contains("failed to lookup")
+        || chain.contains("no such host")
+    {
+        return AimErrorKind::DnsError;
+    }
+    if chain.contains("tls")
+        || chain.contains("certificate")
+        || chain.contains("handshake")
+        || chain.contains("ssl")
+    {
+        return AimErrorKind::TlsError;
+    }
+    if chain.contains("proxy") || chain.contains("tunnel") || chain.contains("connect") {
+        return AimErrorKind::ProxyError;
+    }
+    AimErrorKind::UnknownError
+}
+
+/// 【APP73 任务2.2】HTTP 状态码 → 标准错误分类（无明确地区证据时）。
+fn classify_status(status: u16) -> AimErrorKind {
+    match status {
+        403 => AimErrorKind::Http403,
+        429 => AimErrorKind::Http429,
+        s if (300..400).contains(&s) => AimErrorKind::RedirectError,
+        s if (500..600).contains(&s) => AimErrorKind::Http5xx,
+        _ => AimErrorKind::UnknownError,
+    }
+}
+
 /// 【APP67 P1】单平台探测详情（正向特征码、状态码、证据、失败原因）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -483,6 +624,9 @@ pub struct ServiceProbeResult {
     pub evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// 【APP73 任务2.2】标准错误分类（成功为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<AimErrorKind>,
     // ---- 【APP71 任务4】证据级详情字段（旧缓存缺失时自动补默认值）----
     /// 单平台请求实际耗时（含重试）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,7 +781,9 @@ impl Drop for ProbeRunGuard {
             drop(progress);
             let _ = self.app.emit("aim://progress", &snapshot);
         }
-        let _ = self.app.emit(AIM_EVENT, serde_json::json!({ "finished": true }));
+        let _ = self
+            .app
+            .emit(AIM_EVENT, serde_json::json!({ "finished": true }));
     }
 }
 
@@ -712,7 +858,8 @@ pub fn snapshot_dto(state: &AppState) -> serde_json::Value {
     })
 }
 
-fn aim_mode_label(mode: Option<AimProbeMode>) -> &'static str {    match mode {
+fn aim_mode_label(mode: Option<AimProbeMode>) -> &'static str {
+    match mode {
         Some(AimProbeMode::Fast) => "FAST",
         Some(AimProbeMode::Full) => "FULL",
         Some(AimProbeMode::Selected) => "SELECTED",
@@ -760,14 +907,7 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
             empty_meta.clone(),
             "检测任务结束: status=ERROR（功能未启用）",
         );
-        let _ = run.emit(
-            &app,
-            "ERROR",
-            &empty_meta,
-            Some("DISABLED"),
-            msg,
-            None,
-        );
+        let _ = run.emit(&app, "ERROR", &empty_meta, Some("DISABLED"), msg, None);
         return;
     }
     // [AIM-04] 在途任务 / 代数
@@ -849,7 +989,11 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
                 // [AIM-18] 缓存持久化
                 let (cache_hits, updated, version) = {
                     let p = state.aim_progress.lock();
-                    (p.cache_hits, state.aim_results.read().len(), CURRENT_AIM_PROBE_VERSION)
+                    (
+                        p.cache_hits,
+                        state.aim_results.read().len(),
+                        CURRENT_AIM_PROBE_VERSION,
+                    )
                 };
                 run.log(
                     18,
@@ -925,13 +1069,23 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
                         AimLogMeta::default(),
                         "检测任务结束: status=ERROR（0 存活节点）",
                     );
-                    let _ = run.emit(&app, "ERROR", &AimLogMeta::default(), Some("NO_ALIVE_NODES"), msg, None);
+                    let _ = run.emit(
+                        &app,
+                        "ERROR",
+                        &AimLogMeta::default(),
+                        Some("NO_ALIVE_NODES"),
+                        msg,
+                        None,
+                    );
                 } else {
                     run.log(
                         21,
                         "INFO",
                         AimLogMeta::default(),
-                        format!("检测任务结束: status=FINISHED, rated={count}, elapsed={}ms", run.elapsed_ms()),
+                        format!(
+                            "检测任务结束: status=FINISHED, rated={count}, elapsed={}ms",
+                            run.elapsed_ms()
+                        ),
                     );
                     let _ = run.emit(
                         &app,
@@ -953,14 +1107,7 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
                     AimLogMeta::default(),
                     format!("检测任务结束: status={phase}, reason={e}"),
                 );
-                let _ = run.emit(
-                    &app,
-                    phase,
-                    &AimLogMeta::default(),
-                    Some(phase),
-                    e,
-                    None,
-                );
+                let _ = run.emit(&app, phase, &AimLogMeta::default(), Some(phase), e, None);
             }
         }
         guard.mark_terminal();
@@ -972,11 +1119,22 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
 /// 严禁跳过未测速节点——返回全部节点，由探测循环逐一覆盖。
 fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
     const GROUP_TYPES: [&str; 10] = [
-        "Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject", "Compatible",
-        "Pass", "RejectDrop", "Global",
+        "Selector",
+        "URLTest",
+        "Fallback",
+        "LoadBalance",
+        "Direct",
+        "Reject",
+        "Compatible",
+        "Pass",
+        "RejectDrop",
+        "Global",
     ];
     let mut nodes = Vec::new();
-    let Some(map) = proxies.get("proxies").and_then(serde_json::Value::as_object) else {
+    let Some(map) = proxies
+        .get("proxies")
+        .and_then(serde_json::Value::as_object)
+    else {
         return nodes;
     };
     for (name, p) in map {
@@ -985,7 +1143,10 @@ fn collect_nodes(proxies: &serde_json::Value) -> Vec<(String, Option<u64>)> {
         if crate::core::config_builder::is_builtin_non_proxy_tag(name) {
             continue;
         }
-        let type_ = p.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+        let type_ = p
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if GROUP_TYPES.contains(&type_) {
             continue;
         }
@@ -1035,8 +1196,7 @@ async fn probe_all(
         let settings = state.settings.read();
         (
             settings.selected_node.clone(),
-            settings.user_manually_selected_node
-                || *state.user_manually_selected_node.read(),
+            settings.user_manually_selected_node || *state.user_manually_selected_node.read(),
             state.node_metrics.read().aim_best_node.clone(),
         )
     };
@@ -1044,59 +1204,61 @@ async fn probe_all(
     let api_after_stage1 = api.clone();
 
     // 1. 读取全量节点列表
-    let (nodes, offline_endpoints): (Vec<(String, Option<u64>)>, Option<Vec<(String, String, u16)>>) =
-        if preview_mode {
-            // 【APP53 任务2.3】预览模式：内核未运行时从订阅缓存读取节点，
-            // 同时记录每个节点的 server/port 用于离线 TCP 测速基线。
-            let subs = crate::core::store::load_subscriptions(&state.data_dir);
-            let mut names: Vec<(String, Option<u64>)> = Vec::new();
-            let mut eps: Vec<(String, String, u16)> = Vec::new();
-            for r in subs {
-                if !r.enabled {
+    let (nodes, offline_endpoints): (
+        Vec<(String, Option<u64>)>,
+        Option<Vec<(String, String, u16)>>,
+    ) = if preview_mode {
+        // 【APP53 任务2.3】预览模式：内核未运行时从订阅缓存读取节点，
+        // 同时记录每个节点的 server/port 用于离线 TCP 测速基线。
+        let subs = crate::core::store::load_subscriptions(&state.data_dir);
+        let mut names: Vec<(String, Option<u64>)> = Vec::new();
+        let mut eps: Vec<(String, String, u16)> = Vec::new();
+        for r in subs {
+            if !r.enabled {
+                continue;
+            }
+            let path = crate::core::store::profile_path(&state.data_dir, &r.url);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+                continue;
+            };
+            let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) else {
+                continue;
+            };
+            for p in proxies {
+                let Some(name) = p.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(server) = p.get("server").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                if name.is_empty() || server.is_empty() || port == 0 {
                     continue;
                 }
-                let path = crate::core::store::profile_path(&state.data_dir, &r.url);
-                let Ok(text) = std::fs::read_to_string(&path) else {
+                if crate::core::config_builder::is_builtin_non_proxy_tag(name) {
                     continue;
-                };
-                let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
-                    continue;
-                };
-                let Some(proxies) = value.get("proxies").and_then(|v| v.as_sequence()) else {
-                    continue;
-                };
-                for p in proxies {
-                    let Some(name) = p.get("name").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let Some(server) = p.get("server").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-                    if name.is_empty() || server.is_empty() || port == 0 {
-                        continue;
-                    }
-                    if crate::core::config_builder::is_builtin_non_proxy_tag(name) {
-                        continue;
-                    }
-                    if crate::core::config_builder::is_info_or_ad_node_name(name) {
-                        continue;
-                    }
-                    names.push((name.to_string(), None));
-                    eps.push((name.to_string(), server.to_string(), port));
                 }
+                if crate::core::config_builder::is_info_or_ad_node_name(name) {
+                    continue;
+                }
+                names.push((name.to_string(), None));
+                eps.push((name.to_string(), server.to_string(), port));
             }
-            if names.is_empty() {
-                return Err("节点列表为空，请先刷新订阅".into());
-            }
-            (names, Some(eps))
-        } else {
-            let proxies = api
-                .get_proxies()
-                .await
-                .map_err(|e| format!("读取节点列表失败: {e}"))?;
-            (collect_nodes(&proxies), None)
-        };
+        }
+        if names.is_empty() {
+            return Err("节点列表为空，请先刷新订阅".into());
+        }
+        (names, Some(eps))
+    } else {
+        let proxies = api
+            .get_proxies()
+            .await
+            .map_err(|e| format!("读取节点列表失败: {e}"))?;
+        (collect_nodes(&proxies), None)
+    };
     if nodes.is_empty() {
         return Err("节点列表为空，无可探测节点".into());
     }
@@ -1108,7 +1270,11 @@ async fn probe_all(
         format!(
             "节点列表加载完成: count={}, source={}",
             nodes.len(),
-            if preview_mode { "subscription_cache" } else { "clash_api" }
+            if preview_mode {
+                "subscription_cache"
+            } else {
+                "clash_api"
+            }
         ),
     );
     run.log(
@@ -1150,7 +1316,10 @@ async fn probe_all(
         7,
         "INFO",
         AimLogMeta::default(),
-        format!("阶段一快筛开始: concurrency={SCREEN_BATCH_SIZE}, total={}", nodes.len()),
+        format!(
+            "阶段一快筛开始: concurrency={SCREEN_BATCH_SIZE}, total={}",
+            nodes.len()
+        ),
     );
     let _ = run.emit(
         app,
@@ -1211,8 +1380,9 @@ async fn probe_all(
                         .await
                     } else {
                         // 内核运行：真实隧道 HTTP 测速；首次失败立即用备用地址重试一次
-                        let first =
-                            api.test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32).await;
+                        let first = api
+                            .test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32)
+                            .await;
                         if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
                             first
                         } else {
@@ -1269,7 +1439,10 @@ async fn probe_all(
                         mode: Some(AimProbeMode::Fast),
                         ..Default::default()
                     };
-                    state.aim_results.write().insert(name.clone(), placeholder.clone());
+                    state
+                        .aim_results
+                        .write()
+                        .insert(name.clone(), placeholder.clone());
                     let _ = app.emit(
                         AIM_EVENT,
                         serde_json::json!({ "name": name, "result": placeholder }),
@@ -1366,7 +1539,10 @@ async fn probe_all(
                 mode: Some(AimProbeMode::Fast),
                 ..Default::default()
             };
-            state.aim_results.write().insert(name.clone(), result.clone());
+            state
+                .aim_results
+                .write()
+                .insert(name.clone(), result.clone());
             let _ = app.emit(
                 AIM_EVENT,
                 serde_json::json!({ "name": name, "result": result }),
@@ -1422,7 +1598,10 @@ async fn probe_all(
                 mode: Some(AimProbeMode::Fast),
                 ..Default::default()
             };
-            state.aim_results.write().insert(name.clone(), result.clone());
+            state
+                .aim_results
+                .write()
+                .insert(name.clone(), result.clone());
             let _ = app.emit(
                 AIM_EVENT,
                 serde_json::json!({ "name": name.clone(), "result": result.clone() }),
@@ -1528,7 +1707,7 @@ async fn probe_all(
         "INFO",
         AimLogMeta::default(),
         format!(
-            "探测客户端初始化完成: clients={}, timeout={PROBE_TIMEOUT_MS}ms",
+            "探测客户端初始化完成: clients={}, proxy=all, connect_timeout={PROBE_CONNECT_TIMEOUT_MS}ms, request_timeout={PROBE_REQUEST_TIMEOUT_MS}ms",
             slot_clients.len()
         ),
     );
@@ -1560,7 +1739,10 @@ async fn probe_all(
         "DEEP_PROBE",
         &AimLogMeta::default(),
         Some("DEEP_PROBE"),
-        format!("阶段二深度探测开始，存活节点 {alive_count} 个，并发槽位 {}", slot_clients.len()),
+        format!(
+            "阶段二深度探测开始，存活节点 {alive_count} 个，并发槽位 {}",
+            slot_clients.len()
+        ),
         None,
     );
 
@@ -1732,7 +1914,10 @@ async fn probe_all(
                     let (unlocked, verified, unknown) = {
                         let results = app_state.aim_results.read();
                         (
-                            results.values().filter(|r| r.probed && r.ai_unlocked).count(),
+                            // 【APP73 任务3.4】解锁统计口径改为“至少一个平台
+                            // 达到 ACCESSIBLE（8 分）”，避免新版五级模型下
+                            // 无 VERIFIED 时统计恒为 0 的假死锁。
+                            results.values().filter(|r| r.probed && r.score >= 8).count(),
                             results
                                 .values()
                                 .filter(|r| r.probed && !r.unlocked_tags.is_empty())
@@ -1840,8 +2025,16 @@ fn build_probe_client(slot: usize) -> Result<reqwest::Client, String> {
         reqwest::header::HeaderValue::from_static("close"),
     );
     reqwest::Client::builder()
-        .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
-        .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
+        // 【APP73 任务1.1】必须使用 Proxy::all：Proxy::http 只代理明文 HTTP，
+        // 会导致 Gemini/TikTok/GPT/Claude/Netflix/YouTube/Disney+ 等 HTTPS
+        // 探测请求绕过 AIM 探针槽位直连系统网络，出口证据完全失真。
+        .proxy(
+            reqwest::Proxy::all(&probe_proxy_url(slot))
+                .map_err(|e| format!("PROXY_ERROR: invalid probe proxy: {e}"))?,
+        )
+        // 【APP73 任务2.1】连接 3s / 总请求 8s，杜绝单请求拖到几十秒。
+        .connect_timeout(std::time::Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS))
+        .timeout(std::time::Duration::from_millis(PROBE_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::limited(5))
         // 【APP67 BUG-03】彻底根除跨节点连接池复用污染：
         // pool_max_idle_per_host(0) + Connection: close 双保险，
@@ -1874,8 +2067,13 @@ fn build_probe_client_no_redirect(slot: usize) -> Result<reqwest::Client, String
         reqwest::header::HeaderValue::from_static("close"),
     );
     reqwest::Client::builder()
-        .proxy(reqwest::Proxy::http(&probe_proxy_url(slot)).map_err(|e| e.to_string())?)
-        .timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
+        // 【APP73 任务1.1】与 build_probe_client 保持一致：HTTPS 也必须走槽位代理。
+        .proxy(
+            reqwest::Proxy::all(&probe_proxy_url(slot))
+                .map_err(|e| format!("PROXY_ERROR: invalid probe proxy: {e}"))?,
+        )
+        .connect_timeout(std::time::Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS))
+        .timeout(std::time::Duration::from_millis(PROBE_REQUEST_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none())
         // 【APP67 BUG-03】同 build_probe_client：禁用空闲连接池复用 + Connection: close
         .pool_max_idle_per_host(0)
@@ -1899,6 +2097,7 @@ fn svc_verified(service: &str, status: u16, evidence: &str) -> ServiceProbeResul
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        error_kind: None,
         ..Default::default()
     }
 }
@@ -1910,6 +2109,7 @@ fn svc_accessible(service: &str, status: u16, evidence: &str) -> ServiceProbeRes
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        error_kind: None,
         ..Default::default()
     }
 }
@@ -1921,30 +2121,55 @@ fn svc_partial(service: &str, status: u16, evidence: &str) -> ServiceProbeResult
         status_code: Some(status),
         evidence: evidence.to_string(),
         failure_reason: None,
+        error_kind: None,
         ..Default::default()
     }
 }
 
-fn svc_blocked(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+/// 【APP73 任务2.2】保留真实 HTTP 状态码的 BLOCKED 结果。
+fn svc_blocked_status(
+    service: &str,
+    status: Option<u16>,
+    reason: impl Into<String>,
+    kind: AimErrorKind,
+) -> ServiceProbeResult {
     ServiceProbeResult {
         service: service.to_string(),
         verdict: ProbeVerdict::Blocked,
-        status_code: None,
+        status_code: status,
         evidence: String::new(),
         failure_reason: Some(reason.into()),
+        error_kind: Some(kind),
         ..Default::default()
     }
 }
 
-fn svc_unknown(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+/// 【APP73 任务2.2】保留真实 HTTP 状态码的 UNKNOWN 结果。
+fn svc_unknown_status(
+    service: &str,
+    status: Option<u16>,
+    reason: impl Into<String>,
+    kind: AimErrorKind,
+) -> ServiceProbeResult {
     ServiceProbeResult {
         service: service.to_string(),
         verdict: ProbeVerdict::Unknown,
-        status_code: None,
+        status_code: status,
         evidence: String::new(),
         failure_reason: Some(reason.into()),
+        error_kind: Some(kind),
         ..Default::default()
     }
+}
+
+#[allow(dead_code)]
+fn svc_blocked(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+    svc_blocked_status(service, None, reason, AimErrorKind::UnknownError)
+}
+
+#[allow(dead_code)]
+fn svc_unknown(service: &str, reason: impl Into<String>) -> ServiceProbeResult {
+    svc_unknown_status(service, None, reason, AimErrorKind::UnknownError)
 }
 
 /// 【APP67 BUG-02】纯函数：判定响应正文是否为 Cloudflare 质询/拦截页。
@@ -1961,6 +2186,7 @@ fn is_cf_challenge_body(body: &str) -> bool {
 /// - 传输失败 / 正文过短（< min_len）→ `Err(ProbeVerdict::Unknown)`
 /// - Cloudflare 质询拦截页 / 通用网关错误 → `Err(ProbeVerdict::Blocked)`
 /// - 正常 → `Ok((status_code, headers, body))`
+#[allow(dead_code)]
 async fn read_verified_body(
     resp: reqwest::Response,
     min_len: usize,
@@ -1998,68 +2224,208 @@ fn location_lc(headers: &reqwest::header::HeaderMap) -> String {
 // ===== 【APP67 P1】7 大平台独立正特征检测器 =====
 // 每个检测器返回 ServiceProbeResult，只有 Verified 可进入 unlocked_tags。
 
-/// GPT：ios.chat.openai.com server_status + chatgpt.com 双端点正特征
+/// 【APP73 任务3】正文地区限制证据（仅用于 403/451 或明确拒绝页，绝不单独作为封锁依据）。
+fn body_region_evidence(lc: &str) -> bool {
+    lc.contains("not available in your country")
+        || lc.contains("unavailable in your region")
+        || lc.contains("not available in your region")
+        || lc.contains("isn't currently supported")
+        || lc.contains("is not currently supported")
+        || lc.contains("unsupported_country")
+        || lc.contains("app-unavailable-in-region")
+        || lc.contains("this content is not available in your location")
+}
+
+/// 精简拒绝页：地区封锁页通常只有极少量 HTML（无完整应用骨架）。
+fn is_compact_body(body: &str) -> bool {
+    body.len() < 20_000
+}
+
+/// 读取响应状态码、响应头与正文；正文读取失败统一归为 BODY_PARSE_ERROR。
+async fn read_body(
+    resp: reqwest::Response,
+    service: &str,
+) -> Result<(u16, reqwest::header::HeaderMap, String), ServiceProbeResult> {
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    match resp.text().await {
+        Ok(body) => Ok((status, headers, body)),
+        Err(e) => Err(svc_unknown_status(
+            service,
+            Some(status),
+            format!("响应正文读取失败: {e}"),
+            AimErrorKind::BodyParseError,
+        )),
+    }
+}
+
+/// GPT：ios.chat.openai.com server_status + chatgpt.com 双端点。
+/// 【APP73】无合法授权账号对话验证时最高只给 PARTIAL，不虚构 VERIFIED。
 async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
     const SVC: &str = "GPT";
     if region_blocked(exit_country, AI_BLOCKLIST) {
-        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
+        return svc_blocked_status(
+            SVC,
+            None,
+            format!(
+                "出口地区 {} 命中 AI 受限名单",
+                exit_country.unwrap_or("未知")
+            ),
+            AimErrorKind::RegionRestricted,
+        );
     }
-    // 端点1：server_status
-    let ss = client
+    let ss = match client
         .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
         .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
         .send()
-        .await;
-    let Ok(ss_resp) = ss else {
-        return svc_unknown(SVC, "server_status 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("server_status 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let ss_status = ss_resp.status().as_u16();
-    if ss_status == 403 {
-        return svc_blocked(SVC, "server_status 返回 403 风控");
-    }
-    if ss_status == 429 {
-        return svc_unknown(SVC, "server_status 返回 429，稍后重测");
-    }
-    let ss_body = match ss_resp.text().await {
-        Ok(b) => b,
-        Err(_) => return svc_unknown(SVC, "server_status 读取失败"),
+    let (ss_status, _, ss_body) = match read_body(ss, SVC).await {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-    if ss_body.trim().is_empty() {
-        return svc_unknown(SVC, "server_status 空响应");
-    }
     let ss_lc = ss_body.to_lowercase();
     if ss_lc.contains("unsupported_country") || ss_lc.contains("vpn_detected") {
-        return svc_blocked(SVC, "server_status 含地区限制特征");
+        return svc_blocked_status(
+            SVC,
+            Some(ss_status),
+            "server_status 含明确地区限制特征",
+            AimErrorKind::RegionRestricted,
+        );
     }
-    let ss_normal = ss_lc.contains("\"status\":\"normal\"") || ss_lc.contains("\"status\": \"normal\"");
+    if ss_status == 403 {
+        return svc_unknown_status(
+            SVC,
+            Some(ss_status),
+            "server_status 返回 403（无明确地区证据）",
+            AimErrorKind::Http403,
+        );
+    }
+    if ss_status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(ss_status),
+            "server_status 返回 429，稍后重测",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&ss_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(ss_status),
+            format!("server_status 返回 {ss_status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
+    if !(200..300).contains(&ss_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(ss_status),
+            format!("server_status 返回 {ss_status}"),
+            classify_status(ss_status),
+        );
+    }
+    let ss_normal =
+        ss_lc.contains("\"status\":\"normal\"") || ss_lc.contains("\"status\": \"normal\"");
 
-    // 端点2：chatgpt.com
-    let hp = client
+    let hp = match client
         .get("https://chatgpt.com/")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(hp_resp) = hp else {
-        return svc_unknown(SVC, "chatgpt.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("chatgpt.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let (hp_status, _, hp_body) = match read_verified_body(hp_resp, 500).await {
+    let (hp_status, _, hp_body) = match read_body(hp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "chatgpt.com 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "chatgpt.com 响应过短或读取失败"),
+        Err(r) => return r,
     };
     let hp_lc = hp_body.to_lowercase();
-    if hp_lc.contains("unsupported_country") || hp_lc.contains("attention required") {
-        return svc_blocked(SVC, "chatgpt.com 含地区限制/CF 质询");
+    if hp_status == 403 {
+        if body_region_evidence(&hp_lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(hp_status),
+                "chatgpt.com 403 含明确地区限制证据",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "chatgpt.com 返回普通 403（无明确地区证据）",
+            AimErrorKind::Http403,
+        );
     }
-    let has_brand = hp_lc.contains("chatgpt") || hp_lc.contains("oai");
-
-    if ss_status == 200 && ss_normal && hp_status == 200 && has_brand {
-        svc_verified(SVC, hp_status, "server_status=normal + chatgpt.com 品牌正特征")
-    } else if ss_status == 200 || hp_status == 200 {
-        svc_accessible(SVC, hp_status, "单一接口连通但缺少完整正特征")
+    if hp_status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "chatgpt.com 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&hp_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            format!("chatgpt.com 返回 {hp_status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
+    if !(200..300).contains(&hp_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            format!("chatgpt.com 返回 {hp_status}"),
+            classify_status(hp_status),
+        );
+    }
+    if is_cf_challenge_body(&hp_body) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "chatgpt.com 返回 Cloudflare 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
+    if body_region_evidence(&hp_lc) {
+        return svc_blocked_status(
+            SVC,
+            Some(hp_status),
+            "chatgpt.com 含明确地区限制证据",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    let has_brand = hp_lc.contains("chatgpt") || hp_lc.contains("openai");
+    if ss_normal && has_brand {
+        svc_partial(
+            SVC,
+            hp_status,
+            "server_status=normal + 品牌正特征（未验证实际对话）",
+        )
+    } else if has_brand {
+        svc_accessible(SVC, hp_status, "入口/登录页正常，缺少业务正特征")
     } else {
-        svc_blocked(SVC, format!("ss={ss_status} hp={hp_status} 均未通过"))
+        svc_accessible(SVC, hp_status, "入口连通但缺少品牌正特征")
     }
 }
 
@@ -2071,74 +2437,189 @@ async fn probe_claude(
 ) -> ServiceProbeResult {
     const SVC: &str = "Claude";
     if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
-        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
+        return svc_blocked_status(
+            SVC,
+            None,
+            format!(
+                "出口地区 {} 命中 AI 受限名单",
+                exit_country.unwrap_or("未知")
+            ),
+            AimErrorKind::RegionRestricted,
+        );
     }
-    // 先看首跳 Location 是否指向不可用页
-    let first = nr_client
+    let first = match nr_client
         .get("https://claude.ai/login")
         .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
         .send()
-        .await;
-    let Ok(first_resp) = first else {
-        return svc_unknown(SVC, "claude.ai/login 首跳请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("claude.ai/login 首跳请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let first_status = first_resp.status().as_u16();
-    let first_loc = location_lc(first_resp.headers());
+    let first_status = first.status().as_u16();
+    let first_loc = location_lc(first.headers());
     if first_loc.contains("unavailable")
         || first_loc.contains("unsupported")
         || first_loc.contains("app-unavailable-in-region")
     {
-        return svc_blocked(SVC, format!("首跳 Location 指向地区不可用页: {first_loc}"));
+        return svc_blocked_status(
+            SVC,
+            Some(first_status),
+            format!("首跳 Location 指向地区不可用页: {first_loc}"),
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if first_status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(first_status),
+            "claude.ai/login 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&first_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(first_status),
+            format!("claude.ai/login 返回 {first_status}"),
+            AimErrorKind::Http5xx,
+        );
     }
     if first_status == 403 {
-        return svc_blocked(SVC, "claude.ai/login 返回 403");
+        let (_, _, body) = match read_body(first, SVC).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        if body_region_evidence(&body.to_lowercase()) {
+            return svc_blocked_status(
+                SVC,
+                Some(403),
+                "claude.ai/login 403 含明确地区证据",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(403),
+            "claude.ai/login 普通 403（无明确地区证据）",
+            AimErrorKind::Http403,
+        );
     }
-    // 跟随重定向读正文
-    let hp = client
+
+    let hp = match client
         .get("https://claude.ai/login")
         .header("Accept-Language", "en-US,en;q=0.9")
-        .timeout(std::time::Duration::from_millis(1800))
         .send()
-        .await;
-    let Ok(hp_resp) = hp else {
-        return svc_unknown(SVC, "claude.ai/login 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("claude.ai/login 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let (hp_status, _, hp_body) = match read_verified_body(hp_resp, 200).await {
+    let (hp_status, _, hp_body) = match read_body(hp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "claude.ai 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "claude.ai 响应过短或读取失败"),
+        Err(r) => return r,
     };
     let hp_lc = hp_body.to_lowercase();
-    if hp_lc.contains("not available in your country")
-        || hp_lc.contains("unavailable in your region")
-        || hp_lc.contains("just a moment")
-    {
-        return svc_blocked(SVC, "claude.ai 正文含地区不可用/CF 质询");
+    if hp_status == 403 {
+        if body_region_evidence(&hp_lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(hp_status),
+                "claude.ai 403 含明确地区证据",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "claude.ai 普通 403（无明确地区证据）",
+            AimErrorKind::Http403,
+        );
+    }
+    if hp_status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "claude.ai 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&hp_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            format!("claude.ai 返回 {hp_status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
+    if !(200..400).contains(&hp_status) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            format!("claude.ai 返回 {hp_status}"),
+            classify_status(hp_status),
+        );
+    }
+    if is_cf_challenge_body(&hp_body) {
+        return svc_unknown_status(
+            SVC,
+            Some(hp_status),
+            "claude.ai 返回 Cloudflare 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
+    if body_region_evidence(&hp_lc) {
+        return svc_blocked_status(
+            SVC,
+            Some(hp_status),
+            "claude.ai 正文含明确地区不可用证据",
+            AimErrorKind::RegionRestricted,
+        );
     }
     let has_brand = hp_lc.contains("claude") || hp_lc.contains("anthropic");
-    if hp_status == 200 && has_brand {
-        svc_verified(SVC, hp_status, "claude.ai 200 + 品牌正特征")
-    } else if (200..400).contains(&hp_status) {
-        svc_accessible(SVC, hp_status, "连通但缺少品牌正特征")
+    if has_brand {
+        svc_partial(SVC, hp_status, "登录页正常且含品牌正特征（未验证实际对话）")
     } else {
-        svc_blocked(SVC, format!("claude.ai 返回 {hp_status}"))
+        svc_accessible(SVC, hp_status, "连通但缺少品牌正特征")
     }
 }
 
-/// Gemini：gemini.google.com/app（无重定向看首跳 Location）
-async fn probe_gemini(nr_client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+/// Gemini：gemini.google.com/app（无重定向看首跳 Location）。
+/// 【APP73】严禁在整段 HTML/JS 中扫到地区提示串就判 BLOCKED。
+async fn probe_gemini(
+    nr_client: &reqwest::Client,
+    _exit_country: Option<&str>,
+) -> ServiceProbeResult {
     const SVC: &str = "Gemini";
-    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
-        return svc_blocked(SVC, format!("出口地区 {} 命中 AI 受限名单", exit_country.unwrap_or("未知")));
-    }
-    let resp = nr_client
+    let resp = match nr_client
         .get("https://gemini.google.com/app")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(resp) = resp else {
-        return svc_unknown(SVC, "gemini.google.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("gemini.google.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
     let status = resp.status().as_u16();
     let loc = location_lc(resp.headers());
@@ -2148,180 +2629,495 @@ async fn probe_gemini(nr_client: &reqwest::Client, exit_country: Option<&str>) -
             || loc.contains("unsupported")
             || loc.contains("notavailable")
         {
-            return svc_blocked(SVC, format!("首跳重定向至地区限制页: {loc}"));
+            return svc_blocked_status(
+                SVC,
+                Some(status),
+                format!("首跳重定向至地区限制页: {loc}"),
+                AimErrorKind::RegionRestricted,
+            );
         }
-        // 跳登录/首页等正常 3xx → 视为可达但未验证业务特征
-        return svc_accessible(SVC, status, "首跳正常重定向但未验证业务正特征");
+        return svc_accessible(SVC, status, "首跳正常重定向（登录/首页），未验证业务正特征");
     }
+    let (status, _, body) = match read_body(resp, SVC).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     if status == 403 {
-        return svc_blocked(SVC, "gemini.google.com 返回 403");
+        if is_cf_challenge_body(&body) {
+            return svc_unknown_status(
+                SVC,
+                Some(status),
+                "Gemini 返回 Cloudflare/Google 质询页",
+                AimErrorKind::ChallengePage,
+            );
+        }
+        let lc = body.to_lowercase();
+        // 只有「明确地区拒绝页」才判封锁；普通 403 一律 UNKNOWN。
+        // 用精简页结构作为护栏，避免把整段 JS 中偶然出现的文案当成证据。
+        if is_compact_body(&body) && body_region_evidence(&lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(status),
+                "403 精简地区拒绝页含明确不支持标题",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "普通 403（无明确地区证据）",
+            AimErrorKind::Http403,
+        );
+    }
+    if status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "gemini.google.com 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("gemini.google.com 返回 {status}"),
+            AimErrorKind::Http5xx,
+        );
     }
     if status != 200 {
-        return svc_blocked(SVC, format!("gemini.google.com 返回 {status}"));
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("gemini.google.com 返回 {status}"),
+            classify_status(status),
+        );
     }
-    // 200：必须正文 > 1000 且含正特征码
-    let (_, _, body) = match read_verified_body(resp, 1000).await {
-        Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "gemini 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "gemini 响应过短或读取失败"),
-    };
+    if body.trim().len() < 1000 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "gemini 响应正文过短/为空",
+            AimErrorKind::EmptyResponse,
+        );
+    }
+    if is_cf_challenge_body(&body) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "gemini 返回 Cloudflare/Google 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
     let lc = body.to_lowercase();
-    if lc.contains("isn't currently supported")
-        || lc.contains("not available in your country")
-        || lc.contains("currently not available")
-    {
-        return svc_blocked(SVC, "gemini 正文含地区不支持提示");
+    let has_login = lc.contains("accounts.google.com/servicelogin")
+        || lc.contains("serviceLogin".to_lowercase().as_str())
+        || (lc.contains("sign in") && lc.contains("google"));
+    let has_workspace =
+        lc.contains("wiz_global_data") && (lc.contains("gemini") || lc.contains("bard"));
+    if has_workspace {
+        return svc_verified(SVC, status, "gemini 工作区初始化数据正特征");
     }
-    let has_fp = lc.contains("bard") || lc.contains("gemini") || lc.contains("wiz_global_data");
-    if has_fp {
-        svc_verified(SVC, 200, "gemini 200 + 业务正特征码")
-    } else {
-        svc_accessible(SVC, 200, "200 但缺少业务正特征码")
+    if has_login {
+        return svc_accessible(SVC, status, "正常返回 Google 登录页，未验证 AI 会话");
     }
+    // 地区拒绝主标题 + 精简拒绝页且无工作区/登录入口 → 封锁
+    if body_region_evidence(&lc) && is_compact_body(&body) {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "页面仅展示地区拒绝主标题且无工作区/登录入口",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    svc_accessible(SVC, status, "首页可打开但缺少 AI 工作区正特征")
 }
 
-/// NF：netflix.com/title/81280792（非自制剧区域锁片源）
+/// NF：netflix.com/title/81280792（非自制剧区域锁片源）。
+/// 【APP73】状态码不再直接判解锁，真实播放无法免登录验证时最高 PARTIAL。
 async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "NF";
-    let resp = client
+    let resp = match client
         .get("https://www.netflix.com/title/81280792")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(resp) = resp else {
-        return svc_unknown(SVC, "netflix.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("netflix.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let status = resp.status().as_u16();
-    if status == 403 || status == 404 {
-        return svc_blocked(SVC, format!("netflix 返回 {status}"));
-    }
-    let (_, _, body) = match read_verified_body(resp, 200).await {
+    let (status, _, body) = match read_body(resp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "netflix 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "netflix 响应过短或读取失败"),
+        Err(r) => return r,
     };
+    if status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "netflix 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("netflix 返回 {status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
+    if status == 403 || status == 404 || status == 451 {
+        let lc = body.to_lowercase();
+        // 【APP73 任务3】403/404 只有在带明确地区不可用证据时才判 BLOCKED，
+        // 否则一律 UNKNOWN，避免把片源下架误判成地区封锁。
+        if body_region_evidence(&lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(status),
+                "netflix 返回明确地区拒绝页",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("netflix 返回 {status}（无明确地区证据）"),
+            classify_status(status),
+        );
+    }
+    if !(200..300).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("netflix 返回 {status}"),
+            classify_status(status),
+        );
+    }
+    if body.trim().len() < 200 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "netflix 响应正文过短/为空",
+            AimErrorKind::EmptyResponse,
+        );
+    }
+    if is_cf_challenge_body(&body) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "netflix 返回 Cloudflare 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
     let lc = body.to_lowercase();
-    if lc.contains("nses-404") || lc.contains("oh no!") || lc.contains("this title is not available") {
-        return svc_partial(SVC, status, "片源未解锁（可能仅自制剧）");
+    if lc.contains("nses-404") || lc.contains("this title is not available") {
+        return svc_partial(SVC, status, "片源不可用（可能仅自制剧目录）");
     }
     let has_title = body.contains("81280792");
     let has_brand = lc.contains("netflix");
     if has_title && has_brand {
-        svc_verified(SVC, status, "netflix 片源 81280792 正特征")
-    } else if (200..400).contains(&status) {
-        svc_accessible(SVC, status, "连通但缺少片源正特征")
+        svc_partial(SVC, status, "片源页面可访问，未验证真实播放")
+    } else if has_brand {
+        svc_accessible(SVC, status, "官网/目录可访问，未命中目标片源")
     } else {
-        svc_blocked(SVC, format!("netflix 返回 {status}"))
+        svc_accessible(SVC, status, "连通但缺少品牌正特征")
     }
 }
 
-/// YT：youtube.com/premium
+/// YT：youtube.com/premium。
+/// 【APP73】不能仅凭首页 200 或包含 "youtube" 字符串判 VERIFIED。
 async fn probe_youtube(client: &reqwest::Client) -> ServiceProbeResult {
     const SVC: &str = "YT";
-    let resp = client
+    let resp = match client
         .get("https://www.youtube.com/premium")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(resp) = resp else {
-        return svc_unknown(SVC, "youtube.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("youtube.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let status = resp.status().as_u16();
-    if status == 403 {
-        return svc_blocked(SVC, "youtube 返回 403");
-    }
-    let (_, _, body) = match read_verified_body(resp, 2000).await {
+    let (status, _, body) = match read_body(resp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "youtube 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "youtube 响应过短或读取失败"),
+        Err(r) => return r,
     };
+    if status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "youtube 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("youtube 返回 {status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
     let lc = body.to_lowercase();
-    if lc.contains("youtube premium is not available in your country") {
-        return svc_blocked(SVC, "YouTube Premium 地区不可用");
+    if matches!(status, 403 | 451) && body_region_evidence(&lc) {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "youtube 返回明确地区限制页",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if !(200..300).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("youtube 返回 {status}"),
+            classify_status(status),
+        );
+    }
+    if body.trim().len() < 2000 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "youtube 响应正文过短/为空",
+            AimErrorKind::EmptyResponse,
+        );
+    }
+    if is_cf_challenge_body(&body) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "youtube 返回 Cloudflare 质询页",
+            AimErrorKind::ChallengePage,
+        );
     }
     let has_init = lc.contains("ytinitialdata");
-    let has_premium = lc.contains("youtube premium") || lc.contains("offer");
-    if status == 200 && has_init && has_premium {
-        svc_verified(SVC, status, "youtube premium + ytInitialData 正特征")
-    } else if status == 200 {
-        svc_accessible(SVC, status, "200 但缺少播放器初始化正特征")
+    let has_premium = lc.contains("youtube premium") || lc.contains("premium");
+    if has_init && has_premium {
+        svc_partial(SVC, status, "Premium 页面与元数据可获取，未验证实际播放")
+    } else if has_init {
+        svc_accessible(SVC, status, "首页/元数据可访问，未命中 Premium 业务特征")
     } else {
-        svc_blocked(SVC, format!("youtube 返回 {status}"))
+        svc_accessible(SVC, status, "200 但缺少播放器初始化正特征")
     }
 }
 
-/// Disney+：disneyplus.com/
+/// Disney+：disneyplus.com/。
+/// 【APP73】品牌词单独不足以 VERIFIED；真实播放不可免登录验证。
 async fn probe_disney(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
     const SVC: &str = "Disney+";
     if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
-        return svc_blocked(SVC, format!("出口地区 {} 命中受限名单", exit_country.unwrap_or("未知")));
+        return svc_blocked_status(
+            SVC,
+            None,
+            format!("出口地区 {} 命中受限名单", exit_country.unwrap_or("未知")),
+            AimErrorKind::RegionRestricted,
+        );
     }
-    let resp = client
+    let resp = match client
         .get("https://www.disneyplus.com/")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(resp) = resp else {
-        return svc_unknown(SVC, "disneyplus.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("disneyplus.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let status = resp.status().as_u16();
     let final_url = resp.url().as_str().to_lowercase();
-    if status == 403 || final_url.contains("unavailable") || final_url.contains("preview") {
-        return svc_blocked(SVC, format!("disney+ 跳转不可用/预览页: {final_url}"));
+    if final_url.contains("/unavailable") || final_url.contains("unavailable-in-region") {
+        return svc_blocked_status(
+            SVC,
+            Some(resp.status().as_u16()),
+            format!("disney+ 跳转不可用/预览页: {final_url}"),
+            AimErrorKind::RegionRestricted,
+        );
     }
-    let (_, _, body) = match read_verified_body(resp, 200).await {
+    let (status, _, body) = match read_body(resp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "disney+ 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "disney+ 响应过短或读取失败"),
+        Err(r) => return r,
     };
+    if status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "disney+ 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("disney+ 返回 {status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
     let lc = body.to_lowercase();
-    if lc.contains("not available in your region") || lc.contains("unavailable") {
-        return svc_blocked(SVC, "disney+ 正文含地区不可用");
+    if matches!(status, 403 | 451) && body_region_evidence(&lc) {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "disney+ 返回明确地区不可用",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if !(200..300).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("disney+ 返回 {status}"),
+            classify_status(status),
+        );
+    }
+    if body.trim().len() < 200 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "disney+ 响应正文过短/为空",
+            AimErrorKind::EmptyResponse,
+        );
+    }
+    if is_cf_challenge_body(&body) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "disney+ 返回 Cloudflare 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
+    if lc.contains("not available in your region") {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "disney+ 正文含明确地区不可用",
+            AimErrorKind::RegionRestricted,
+        );
     }
     if lc.contains("disneyplus") {
-        svc_verified(SVC, status, "disneyplus 品牌正特征")
-    } else if (200..400).contains(&status) {
-        svc_accessible(SVC, status, "连通但缺少品牌正特征")
+        svc_partial(SVC, status, "品牌入口可访问，未验证真实播放")
     } else {
-        svc_blocked(SVC, format!("disney+ 返回 {status}"))
+        svc_accessible(SVC, status, "连通但缺少品牌正特征")
     }
 }
 
-/// TK：tiktok.com/explore
+/// TK：tiktok.com/explore。
+/// 【APP73】严禁静态标记 SIGI_STATE 直接 VERIFIED，也严禁脚本含
+/// `access denied` 文本就 BLOCKED。
 async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
     const SVC: &str = "TK";
-    if region_blocked(exit_country, TIKTOK_BLOCKLIST) {
-        return svc_blocked(SVC, format!("出口地区 {} 命中 TikTok 受限名单", exit_country.unwrap_or("未知")));
-    }
-    let resp = client
+    let resp = match client
         .get("https://www.tiktok.com/explore")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .await;
-    let Ok(resp) = resp else {
-        return svc_unknown(SVC, "tiktok.com 请求失败");
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return svc_unknown_status(
+                SVC,
+                None,
+                format!("tiktok.com 请求失败: {e}"),
+                classify_reqwest_error(&e),
+            );
+        }
     };
-    let status = resp.status().as_u16();
-    if status == 403 {
-        return svc_blocked(SVC, "tiktok 返回 403");
-    }
-    let (_, _, body) = match read_verified_body(resp, 1000).await {
+    let (status, _, body) = match read_body(resp, SVC).await {
         Ok(v) => v,
-        Err(ProbeVerdict::Blocked) => return svc_blocked(SVC, "tiktok 返回 CF 质询/拦截页"),
-        Err(_) => return svc_unknown(SVC, "tiktok 响应过短或读取失败"),
+        Err(r) => return r,
     };
+    if status == 429 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "tiktok 返回 429 频率限制",
+            AimErrorKind::Http429,
+        );
+    }
+    if (500..600).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("tiktok 返回 {status}"),
+            AimErrorKind::Http5xx,
+        );
+    }
+    if is_cf_challenge_body(&body) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "tiktok 返回 Cloudflare/WAF 质询页",
+            AimErrorKind::ChallengePage,
+        );
+    }
     let lc = body.to_lowercase();
-    if lc.contains("access denied") || lc.contains("not available") {
-        return svc_blocked(SVC, "tiktok 正文含拒绝访问");
+    if matches!(status, 403 | 451) {
+        if is_compact_body(&body) && body_region_evidence(&lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(status),
+                "tiktok 精简地区封锁拒绝页",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        if region_blocked(exit_country, TIKTOK_BLOCKLIST) && is_compact_body(&body) {
+            return svc_blocked_status(
+                SVC,
+                Some(status),
+                "tiktok 拒绝页且出口地区命中封禁区",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("tiktok 普通 {status}（无明确地区证据）"),
+            AimErrorKind::Http403,
+        );
     }
-    let has_fp = lc.contains("__universal_data_for_rehydration__") || lc.contains("sigi_state");
-    if status == 200 && has_fp {
-        svc_verified(SVC, status, "tiktok 视频流初始化数据正特征")
-    } else if status == 200 {
-        svc_accessible(SVC, status, "200 但缺少视频流初始化正特征")
-    } else {
-        svc_blocked(SVC, format!("tiktok 返回 {status}"))
+    if !(200..300).contains(&status) {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("tiktok 返回 {status}"),
+            classify_status(status),
+        );
     }
+    if body.trim().len() < 1000 {
+        return svc_unknown_status(
+            SVC,
+            Some(status),
+            "tiktok 响应正文过短/为空",
+            AimErrorKind::EmptyResponse,
+        );
+    }
+    let has_play_meta = lc.contains("playaddr")
+        || lc.contains("\"vid\"")
+        || lc.contains("videometadata")
+        || lc.contains("__universal_data_for_rehydration__");
+    if has_play_meta {
+        return svc_partial(SVC, status, "视频流元数据可获取，未验证实际播放");
+    }
+    svc_accessible(SVC, status, "首页/登录页正常可访问")
 }
 
 /// 【APP71 任务2.4】槽位实时状态守卫：节点开始时登记，结束/取消/panic 时清空，
@@ -2387,7 +3183,7 @@ async fn probe_node(
         app,
         slot,
         name,
-        format!("#{slot}: {name} · GPT/Claude/Gemini/NF/YT/Disney+/TK"),
+        format!("#{slot}: {name} · 7 平台并发 [HTTPS_REQUEST]"),
     );
     let stamp = |mut result: AimNodeResult| {
         result.node_id = node_id.to_string();
@@ -2398,7 +3194,10 @@ async fn probe_node(
     // 1. 基线延迟
     let base_delay = match prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS) {
         Some(d) => d,
-        None => match api.test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32).await {
+        None => match api
+            .test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32)
+            .await
+        {
             Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => d,
             _ => return NodeProbeOutcome::new(stamp(dead_result(name)), false, started),
         },
@@ -2409,9 +3208,58 @@ async fn probe_node(
         tracing::warn!("[go-aim] 槽位 {slot} 切换探针到「{name}」失败: {e}");
         return NodeProbeOutcome::new(stamp(dead_result(name)), false, started);
     }
+    // [AIM-12] 8 阶段追踪：PROXY_SELECTED
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_AIM,
+        format!(
+            "[AIM][{name}][-] [阶段] PROXY_SELECTED selector={} target={name}",
+            probe_selector(slot)
+        ),
+    );
+
+    // 2.1 【APP73 任务1.2】PROXY_VERIFIED：选择器实际 now 必须是目标节点。
+    // 若 Clash API 返回的 now 与目标不一致，说明设置尚未生效/被其他任务抢占，
+    // 本节点所有平台一律回退 UNKNOWN，严禁继续判定任何 VERIFIED。
+    let selected_now = api.get_proxies().await.ok().and_then(|v| {
+        v.get("proxies")
+            .and_then(|p| p.get(probe_selector(slot)))
+            .and_then(|g| g.get("now"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+    });
+    if selected_now.as_deref() != Some(name) {
+        let actual = selected_now.unwrap_or_else(|| "<unknown>".to_string());
+        crate::core::logger::warn(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "[AIM][{name}][-] [阶段] PROXY_ERROR 选择器未生效: 期望={name} 实际={actual}，全部平台回退 UNKNOWN"
+            ),
+        );
+        let result = all_unknown_result(
+            name,
+            base_delay,
+            format!("PROXY_ERROR: 探针选择器实际指向 {actual}，选择未生效"),
+            AimErrorKind::ProxyError,
+        );
+        return NodeProbeOutcome::new(stamp(result), false, started);
+    }
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_AIM,
+        format!("[AIM][{name}][-] [阶段] PROXY_VERIFIED 选择器 now={name}"),
+    );
 
     // 3. 每个节点都先做一次轻量出口预检（仅采集证据，失败也继续 7 平台探测）。
+    // [AIM-13] EGRESS_CHECK：出口 IP/地区仅作证据，不参与短路。
     let egress = fetch_egress(client).await;
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_AIM,
+        format!(
+            "[AIM][{name}][-] [阶段] EGRESS_CHECK ip={} country={} asn={}",
+            egress.ip.as_deref().unwrap_or("unknown"),
+            egress.country.as_deref().unwrap_or("unknown"),
+            egress.asn.as_deref().unwrap_or("unknown"),
+        ),
+    );
     if egress.ip.is_none() || egress.country.is_none() {
         tracing::debug!(
             "[go-aim] 节点「{name}」cdn-cgi/trace 未取到完整出口信息，继续执行 7 平台实测"
@@ -2420,9 +3268,9 @@ async fn probe_node(
 
     // 4. 配置指纹 + 双版本 + 出口 IP 全一致：0 平台请求直接复用。
     let current_ip = egress.ip.as_deref().unwrap_or_default();
-    if let Some(cached) = cached.filter(|cached| {
-        cache_reusable(cached, node_id, current_ip, force_full)
-    }) {
+    if let Some(cached) =
+        cached.filter(|cached| cache_reusable(cached, node_id, current_ip, force_full))
+    {
         let mut result = cached.clone();
         result.node_name = name.to_string();
         result.delay_ms = base_delay;
@@ -2442,18 +3290,56 @@ async fn probe_node(
         AimLogMeta::default().node(name).slot(slot),
         "发起 7 平台并发真实探测（GPT/Claude/Gemini/NF/YT/Disney+/TK）",
     );
-    let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>> = vec![
-        Box::pin(probe_with_retry(|| probe_gpt(client, ec))),
-        Box::pin(probe_with_retry(|| probe_claude(client, nr_client, ec))),
-        Box::pin(probe_with_retry(|| probe_gemini(nr_client, ec))),
-        Box::pin(probe_with_retry(|| probe_netflix(client))),
-        Box::pin(probe_with_retry(|| probe_youtube(client))),
-        Box::pin(probe_with_retry(|| probe_disney(client, ec))),
-        Box::pin(probe_with_retry(|| probe_tiktok(client, ec))),
-    ];
-    let results = futures_util::future::join_all(futs).await;
-    // [AIM-15] 单平台探测结果；[AIM-16] 异常 / 重试
-    for r in &results {
+    let mut futs: futures_util::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>,
+    > = futures_util::stream::FuturesUnordered::new();
+    futs.push(Box::pin(probe_platform("GPT", || probe_gpt(client, ec))));
+    futs.push(Box::pin(probe_platform("Claude", || {
+        probe_claude(client, nr_client, ec)
+    })));
+    futs.push(Box::pin(probe_platform("Gemini", || {
+        probe_gemini(nr_client, ec)
+    })));
+    futs.push(Box::pin(probe_platform("NF", || probe_netflix(client))));
+    futs.push(Box::pin(probe_platform("YT", || probe_youtube(client))));
+    futs.push(Box::pin(probe_platform("Disney+", || {
+        probe_disney(client, ec)
+    })));
+    futs.push(Box::pin(probe_platform("TK", || probe_tiktok(client, ec))));
+    // [AIM-14] 8 阶段追踪：DNS_CONNECT + HTTPS_REQUEST（7 平台并发）
+    for service in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "[AIM][{name}][{service}] [阶段] DNS_CONNECT proxy={} target={}",
+                probe_proxy_url(slot),
+                service_domain(service)
+            ),
+        );
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "[AIM][{name}][{service}] [阶段] HTTPS_REQUEST method=GET domain={}",
+                service_domain(service)
+            ),
+        );
+    }
+    let mut results: Vec<ServiceProbeResult> = Vec::with_capacity(7);
+    // [AIM-15] 单平台探测结果 + 8 阶段中的 RESPONSE/BODY/RESULT 追踪；
+    // 使用 FuturesUnordered 逐平台完成即刷新 UI，满足实时平台/阶段展示。
+    // [AIM-16] 异常 / 重试
+    while let Some(r) = futs.next().await {
+        // 前端实时进度：当前节点 + 平台 + 阶段（RESULT 已完成）
+        set_slot_state(
+            app,
+            slot,
+            name,
+            format!(
+                "#{slot}: {name} · {} [RESULT: {}]",
+                r.service,
+                r.verdict.label()
+            ),
+        );
         run.log(
             15,
             "INFO",
@@ -2463,18 +3349,75 @@ async fn probe_node(
                 .service(&r.service)
                 .elapsed(r.elapsed_ms.unwrap_or(0)),
             format!(
-                "平台探测结果: verdict={}, status={:?}, basis={}, elapsed={}ms",
+                "平台探测结果: verdict={}, status={:?}, kind={:?}, basis={}, elapsed={}ms",
                 r.verdict.label(),
                 r.status_code,
+                r.error_kind.map(|k| k.label()),
                 r.verdict_basis,
                 r.elapsed_ms.unwrap_or(0)
             ),
         );
+        let prefix = format!("[AIM][{name}][{}]", r.service);
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "{prefix} [阶段] RESPONSE_RECEIVED status={} protocol=HTTPS",
+                r.status_code
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        );
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "{prefix} [阶段] BODY_ANALYSIS evidence={}",
+                if r.evidence.is_empty() {
+                    r.failure_reason.as_deref().unwrap_or("无")
+                } else {
+                    &r.evidence
+                }
+            ),
+        );
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "{prefix} [阶段] RESULT verdict={} elapsed={}ms",
+                r.verdict.label(),
+                r.elapsed_ms.unwrap_or(0)
+            ),
+        );
+        if !r.verdict.is_verified() {
+            crate::core::logger::info(
+                crate::core::logger::MOD_GO_AIM,
+                format!(
+                    "[AIM][诊断] 平台={} | 节点={name} | 目标域名={} | 代理槽位=#{} | 出口IP={} | 出口地区={} | HTTP状态码={} | 耗时={}ms | 失败阶段=RESULT | 错误分类={} | 最终状态={} | 判定依据={}",
+                    r.service,
+                    service_domain(&r.service),
+                    slot,
+                    egress.ip.as_deref().unwrap_or("unknown"),
+                    egress.country.as_deref().unwrap_or("unknown"),
+                    r.status_code
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    r.elapsed_ms.unwrap_or(0),
+                    r.error_kind.map(|k| k.label()).unwrap_or("NONE"),
+                    r.verdict.label(),
+                    if r.verdict_basis.is_empty() {
+                        r.failure_reason.as_deref().unwrap_or("无")
+                    } else {
+                        &r.verdict_basis
+                    }
+                ),
+            );
+        }
         if r.retry_count > 0 {
             run.log(
                 16,
                 "WARN",
-                AimLogMeta::default().node(name).slot(slot).service(&r.service),
+                AimLogMeta::default()
+                    .node(name)
+                    .slot(slot)
+                    .service(&r.service),
                 format!(
                     "平台探测异常触发补测 {} 次: {}",
                     r.retry_count,
@@ -2482,9 +3425,12 @@ async fn probe_node(
                 ),
             );
         }
+        results.push(r);
     }
+    // 释放 futures 对 egress.country 的借用，后续才能把 egress 字段移入结果。
+    drop(futs);
 
-    // 6. 汇总：只有 Verified 进入 unlocked_tags。
+    // 6. 汇总：只有 Verified 进入 unlocked_tags；评分按五级权重累计。
     let mut services: HashMap<String, ServiceProbeResult> = HashMap::with_capacity(results.len());
     let mut evidence = HashMap::new();
     let mut failure_reasons = HashMap::new();
@@ -2509,7 +3455,7 @@ async fn probe_node(
         }
         services.insert(r.service.clone(), r);
     }
-    let score = tags.len() as u32;
+    let score: u32 = services.values().map(|r| verdict_score(r.verdict)).sum();
     let result = AimNodeResult {
         node_name: name.to_string(),
         node_id: node_id.to_string(),
@@ -2591,6 +3537,97 @@ fn egress_unknown_result(
         egress_country,
         services,
         ..Default::default()
+    }
+}
+
+/// 【APP73 任务3.4】五级评分权重：只有 UNKNOWN/BLOCKED 记 0 分。
+fn verdict_score(verdict: ProbeVerdict) -> u32 {
+    match verdict {
+        ProbeVerdict::Verified => 20,
+        ProbeVerdict::Partial => 12,
+        ProbeVerdict::Accessible => 8,
+        ProbeVerdict::Unknown | ProbeVerdict::Blocked => 0,
+    }
+}
+
+/// 平台 → 诊断日志使用的目标域名。
+fn service_domain(service: &str) -> &'static str {
+    match service {
+        "GPT" => "chatgpt.com",
+        "Claude" => "claude.ai",
+        "Gemini" => "gemini.google.com",
+        "NF" => "netflix.com",
+        "YT" => "youtube.com",
+        "Disney+" => "disneyplus.com",
+        "TK" => "tiktok.com",
+        _ => "-",
+    }
+}
+
+/// 【APP73 任务1.2】选择器核验失败时的统一结果：7 平台全部 UNKNOWN。
+fn all_unknown_result(name: &str, delay: u64, reason: String, kind: AimErrorKind) -> AimNodeResult {
+    let mut services: HashMap<String, ServiceProbeResult> = HashMap::new();
+    let mut failure_reasons = HashMap::new();
+    for s in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
+        services.insert(
+            s.to_string(),
+            svc_unknown_status(s, None, reason.clone(), kind),
+        );
+        failure_reasons.insert(s.to_string(), reason.clone());
+    }
+    AimNodeResult {
+        node_name: name.to_string(),
+        unlocked_tags: vec![],
+        ai_unlocked: false,
+        media_unlocked: false,
+        score: 0,
+        delay_ms: delay,
+        updated_at: now_secs(),
+        detected_at: now_secs(),
+        probed: true,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        services,
+        failure_reasons,
+        ..Default::default()
+    }
+}
+
+/// 【APP73 任务3.3】平台级 10 秒硬超时包裹（含 Unknown 补测 1 次）。
+async fn probe_platform<F, Fut>(service: &'static str, f: F) -> ServiceProbeResult
+where
+    F: Fn() -> Fut + Send,
+    Fut: std::future::Future<Output = ServiceProbeResult> + Send,
+{
+    probe_platform_timeout(service, PROBE_PLATFORM_HARD_TIMEOUT_SECS, f).await
+}
+
+async fn probe_platform_timeout<F, Fut>(
+    service: &'static str,
+    timeout_secs: u64,
+    f: F,
+) -> ServiceProbeResult
+where
+    F: Fn() -> Fut + Send,
+    Fut: std::future::Future<Output = ServiceProbeResult> + Send,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        probe_with_retry(f),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let mut result = svc_unknown_status(
+                service,
+                None,
+                format!("平台探测硬超时({timeout_secs}s)"),
+                AimErrorKind::TaskTimeout,
+            );
+            result.verdict_basis = "TASK_TIMEOUT: 超过平台级硬超时上限".to_string();
+            result
+        }
     }
 }
 
@@ -2955,13 +3992,18 @@ fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> 
     if alive.is_empty() {
         return None;
     }
-    // 低延迟解锁节点优先（300ms 上限，超出视为「虽解锁但线路太差」）
-    let unlocked_fast: Vec<&AimNodeResult> = alive
+    // 【APP73 任务3.4】低延迟优质节点优先：score >= 8（ACCESSIBLE 及以上）
+    // 且延迟 < 300ms；没有时再回退全部可达节点，避免全 0 分节点导致无法选优。
+    let good_fast: Vec<&AimNodeResult> = alive
         .iter()
         .copied()
-        .filter(|r| !r.unlocked_tags.is_empty() && r.delay_ms < 300)
+        .filter(|r| r.score >= 8 && r.delay_ms < 300)
         .collect();
-    let pool = if unlocked_fast.is_empty() { alive } else { unlocked_fast };
+    let pool = if good_fast.is_empty() {
+        alive
+    } else {
+        good_fast
+    };
     pool.into_iter().min_by_key(|r| r.delay_ms).cloned()
 }
 
@@ -2983,7 +4025,9 @@ pub fn spawn_monitor(app: AppHandle) {
             if !is_running(&state) || !state.settings.read().go_aim_enabled {
                 continue;
             }
-            let Some(locked) = state.aim_locked_node.read().clone() else { continue };
+            let Some(locked) = state.aim_locked_node.read().clone() else {
+                continue;
+            };
             let api = state.kernel_api();
             let alive = api
                 .test_delay(&locked, BASELINE_URL, 4000)
@@ -3030,8 +4074,12 @@ mod tests {
             })
             .collect();
         AimNodeResult {
-            ai_unlocked: tags.iter().any(|t| t == "GPT" || t == "Claude" || t == "Gemini"),
-            media_unlocked: tags.iter().any(|t| t == "NF" || t == "YT" || t == "Disney+" || t == "TK"),
+            ai_unlocked: tags
+                .iter()
+                .any(|t| t == "GPT" || t == "Claude" || t == "Gemini"),
+            media_unlocked: tags
+                .iter()
+                .any(|t| t == "NF" || t == "YT" || t == "Disney+" || t == "TK"),
             node_name: name.to_string(),
             unlocked_tags: tags,
             score: 0,
@@ -3079,10 +4127,17 @@ mod tests {
         m.insert("a".into(), node("a", 80, &["GPT", "NF", "YT"]));
         m.insert(
             "b".into(),
-            node("b", 900, &["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"]),
+            node(
+                "b",
+                900,
+                &["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"],
+            ),
         );
         let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "a", "低延迟解锁节点应优先于高延迟全解锁节点");
+        assert_eq!(
+            best.node_name, "a",
+            "低延迟解锁节点应优先于高延迟全解锁节点"
+        );
     }
 
     #[test]
@@ -3109,10 +4164,16 @@ mod tests {
     fn test_pick_best_all_unlocked_slow_falls_back_to_fastest_alive() {
         // 无「<300ms 解锁节点」时，直接从全部可达节点取最低延迟
         let mut m = HashMap::new();
-        m.insert("slow_unlocked".into(), node("slow_unlocked", 520, &["GPT", "NF"]));
+        m.insert(
+            "slow_unlocked".into(),
+            node("slow_unlocked", 520, &["GPT", "NF"]),
+        );
         m.insert("fast_plain".into(), node("fast_plain", 40, &[]));
         let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "fast_plain", "无低延迟解锁节点时取全体最低延迟");
+        assert_eq!(
+            best.node_name, "fast_plain",
+            "无低延迟解锁节点时取全体最低延迟"
+        );
     }
 
     #[test]
@@ -3133,7 +4194,11 @@ mod tests {
     fn test_probe_matrix_urls() {
         assert_eq!(PROBES.len(), 7, "探测矩阵必须覆盖 7 个平台");
         for p in PROBES {
-            assert!(p.url.starts_with("https://"), "探测 URL 必须为 https: {}", p.url);
+            assert!(
+                p.url.starts_with("https://"),
+                "探测 URL 必须为 https: {}",
+                p.url
+            );
             assert!(!p.tag.is_empty());
         }
         assert!(PROBES.iter().any(|p| !p.media), "必须包含 AI 平台");
@@ -3202,7 +4267,11 @@ mod tests {
     fn test_parse_trace_loc() {
         let trace = "fl=123f\nh=chatgpt.com\nip=1.2.3.4\nts=1\nvisit_scheme=https\nuag=Chrome\nloc=SG\ntls=TLSv1.3\n";
         assert_eq!(parse_trace_loc(trace), Some("SG".to_string()));
-        assert_eq!(parse_trace_loc("loc=jp\n"), Some("JP".to_string()), "必须转大写");
+        assert_eq!(
+            parse_trace_loc("loc=jp\n"),
+            Some("JP".to_string()),
+            "必须转大写"
+        );
         assert_eq!(parse_trace_loc("no loc here"), None);
         assert_eq!(parse_trace_loc("loc=\n"), None, "空 loc 视为未知");
     }
@@ -3211,6 +4280,99 @@ mod tests {
     fn test_probe_score_matches_tag_count() {
         let r = node("n", 100, &["GPT", "Claude"]);
         assert_eq!(r.unlocked_tags.len(), 2);
+    }
+
+    /// 【APP73 任务1.1】回归：两个探测客户端都必须使用 Proxy::all，
+    /// 严禁再出现只代理明文 HTTP 的 Proxy::http（HTTPS 会绕过探针槽位）。
+    #[test]
+    fn test_probe_clients_use_proxy_all() {
+        let src = include_str!("go_aim.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(concat!("Proxy::", "http(")),
+            "禁止使用 Proxy::http：HTTPS 探测会绕过槽位代理"
+        );
+        assert!(
+            code.matches("Proxy::all(").count() >= 2,
+            "build_probe_client / build_probe_client_no_redirect 都必须使用 Proxy::all"
+        );
+        assert!(code.contains("connect_timeout"));
+        assert!(code.contains("PROBE_REQUEST_TIMEOUT_MS"));
+    }
+
+    /// 【APP73 任务3.4】五级评分权重：20 / 12 / 8 / 0 / 0。
+    #[test]
+    fn test_verdict_score_weights() {
+        assert_eq!(verdict_score(ProbeVerdict::Verified), 20);
+        assert_eq!(verdict_score(ProbeVerdict::Partial), 12);
+        assert_eq!(verdict_score(ProbeVerdict::Accessible), 8);
+        assert_eq!(verdict_score(ProbeVerdict::Unknown), 0);
+        assert_eq!(verdict_score(ProbeVerdict::Blocked), 0);
+        let total = [
+            ProbeVerdict::Verified,
+            ProbeVerdict::Partial,
+            ProbeVerdict::Accessible,
+            ProbeVerdict::Blocked,
+        ]
+        .into_iter()
+        .map(verdict_score)
+        .sum::<u32>();
+        assert_eq!(total, 40);
+    }
+
+    /// 【APP73 任务3.1】Gemini：整段长 HTML/JS 中命中地区提示串不得直接判 BLOCKED，
+    /// 只有“精简拒绝页 + 受限出口地区”组合才允许封锁。
+    #[test]
+    fn test_gemini_long_script_region_text_not_blocked() {
+        let big = format!(
+            "<html><script>{}</script></html>",
+            "var x='not available in your country';".repeat(2000)
+        );
+        let lc = big.to_lowercase();
+        assert!(body_region_evidence(&lc));
+        assert!(!is_compact_body(&big), "完整应用骨架不是精简拒绝页");
+        let blocked = is_compact_body(&big)
+            && body_region_evidence(&lc)
+            && region_blocked(Some("CN"), AI_BLOCKLIST_NO_VE);
+        assert!(
+            region_blocked(Some("CN"), AI_BLOCKLIST_NO_VE),
+            "测试前提：CN 必须在受限名单内"
+        );
+        assert!(!blocked, "长脚本中的地区字符串绝不能单独构成封锁证据");
+    }
+
+    /// 【APP73 任务3.3】TikTok：静态标记 SIGI_STATE 不再直接 VERIFIED，
+    /// 无播放验证时最高 PARTIAL。
+    #[test]
+    fn test_tiktok_never_verified_without_playback() {
+        let src = include_str!("go_aim.rs");
+        let start = src
+            .find("async fn probe_tiktok")
+            .expect("probe_tiktok 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").map(|i| start + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains("svc_verified"),
+            "TikTok 不得在无播放验证时返回 VERIFIED"
+        );
+        assert!(!body.to_lowercase().contains("sigi_state"));
+    }
+
+    /// 【APP73 任务2.1】平台级硬超时必须返回 UNKNOWN + TASK_TIMEOUT，并落真实 status=None。
+    #[tokio::test]
+    async fn test_platform_hard_timeout_returns_task_timeout() {
+        let result = probe_platform_timeout("X", 0, || async {
+            std::future::pending::<ServiceProbeResult>().await
+        })
+        .await;
+        assert_eq!(result.verdict, ProbeVerdict::Unknown);
+        assert_eq!(result.error_kind, Some(AimErrorKind::TaskTimeout));
+        assert_eq!(result.status_code, None);
     }
 
     /// 【APP66 任务1】防复发：Go AIM 解锁判定必须 100% 真实网络验证，
@@ -3272,7 +4434,9 @@ mod tests {
         assert!(is_cf_challenge_body("cf-chl-bypass"));
         assert!(is_cf_challenge_body("cf-error-details"));
         // 普通 HTML 不含质询标记
-        assert!(!is_cf_challenge_body("<html><body>Hello World</body></html>"));
+        assert!(!is_cf_challenge_body(
+            "<html><body>Hello World</body></html>"
+        ));
         assert!(!is_cf_challenge_body("chatgpt oai normal page"));
     }
 
@@ -3280,7 +4444,8 @@ mod tests {
     fn test_no_positive_fingerprint_not_verified() {
         // 无正向业务特征码的普通 HTML 不得判 Verified
         let body = "<html><head><title>Some Page</title></head><body>welcome</body></html>";
-        let has_brand = body.to_lowercase().contains("chatgpt") || body.to_lowercase().contains("oai");
+        let has_brand =
+            body.to_lowercase().contains("chatgpt") || body.to_lowercase().contains("oai");
         let has_init = body.to_lowercase().contains("ytinitialdata");
         assert!(!has_brand, "普通 HTML 不应含 GPT 品牌特征");
         assert!(!has_init, "普通 HTML 不应含 YT 初始化特征");
@@ -3383,7 +4548,10 @@ mod tests {
             "Gemini 为 Blocked 严禁进入 unlocked_tags（禁止跨平台兜底猜测）"
         );
         assert!(!tags.contains(&"Claude".to_string()));
-        assert!(!tags.contains(&"NF".to_string()), "Accessible 不得进入解锁标签");
+        assert!(
+            !tags.contains(&"NF".to_string()),
+            "Accessible 不得进入解锁标签"
+        );
     }
 
     #[test]
@@ -3400,20 +4568,16 @@ mod tests {
                 verdict: v,
                 ..Default::default()
             };
-            assert!(
-                !r.verdict.is_verified(),
-                "{:?} 不得进入 unlocked_tags",
-                v
-            );
+            assert!(!r.verdict.is_verified(), "{:?} 不得进入 unlocked_tags", v);
         }
     }
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 3);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 3);
-        assert!(2 < CURRENT_AIM_PROBE_VERSION, "v2 及更早缓存应被淘汰");
-        assert!(3 >= CURRENT_AIM_PROBE_VERSION, "v3 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 4);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 4);
+        assert!(3 < CURRENT_AIM_PROBE_VERSION, "v3 及更早缓存应被淘汰");
+        assert!(4 >= CURRENT_AIM_PROBE_VERSION, "v4 真实缓存应保留");
     }
 
     #[test]
@@ -3474,27 +4638,58 @@ mod tests {
         cached.node_id = "0123456789abcdef".into();
         cached.egress_ip = Some("203.0.113.8".into());
         cached.mode = Some(AimProbeMode::Full);
-        assert!(cache_reusable(&cached, &cached.node_id, "203.0.113.8", false));
-        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.9", false));
-        assert!(!cache_reusable(&cached, "fedcba9876543210", "203.0.113.8", false));
-        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.8", true));
+        assert!(cache_reusable(
+            &cached,
+            &cached.node_id,
+            "203.0.113.8",
+            false
+        ));
+        assert!(!cache_reusable(
+            &cached,
+            &cached.node_id,
+            "203.0.113.9",
+            false
+        ));
+        assert!(!cache_reusable(
+            &cached,
+            "fedcba9876543210",
+            "203.0.113.8",
+            false
+        ));
+        assert!(!cache_reusable(
+            &cached,
+            &cached.node_id,
+            "203.0.113.8",
+            true
+        ));
         let mut old_rule = cached.clone();
         old_rule.rule_version -= 1;
-        assert!(!cache_reusable(&old_rule, &old_rule.node_id, "203.0.113.8", false));
+        assert!(!cache_reusable(
+            &old_rule,
+            &old_rule.node_id,
+            "203.0.113.8",
+            false
+        ));
         let mut fast = cached.clone();
         fast.mode = Some(AimProbeMode::Fast);
         assert!(!cache_reusable(&fast, &fast.node_id, "203.0.113.8", false));
-        let mut precheck = egress_unknown_result(
-            "n",
-            100,
-            Some("203.0.113.8".into()),
-            Some("XX".into()),
-        );
+        let mut precheck =
+            egress_unknown_result("n", 100, Some("203.0.113.8".into()), Some("XX".into()));
         precheck.node_id = cached.node_id.clone();
         precheck.mode = Some(AimProbeMode::Full);
-        assert!(!cache_reusable(&precheck, &precheck.node_id, "203.0.113.8", false));
+        assert!(!cache_reusable(
+            &precheck,
+            &precheck.node_id,
+            "203.0.113.8",
+            false
+        ));
         cached.probed = false;
-        assert!(!cache_reusable(&cached, &cached.node_id, "203.0.113.8", false));
+        assert!(!cache_reusable(
+            &cached,
+            &cached.node_id,
+            "203.0.113.8",
+            false
+        ));
     }
 
     #[test]
@@ -3572,7 +4767,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_aim_large_scale_benchmark() {
         use futures_util::StreamExt as _;
-        println!("\n| nodes | total_ms | avg_node_ms | p95_node_ms | max_inflight_requests | peak_mem_kb(est.) | timeout_rate | cache_hit_rate | cancel_latency_ms |");
+        println!(
+            "\n| nodes | total_ms | avg_node_ms | p95_node_ms | max_inflight_requests | peak_mem_kb(est.) | timeout_rate | cache_hit_rate | cancel_latency_ms |"
+        );
         println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for size in [20usize, 50, 100, 148, 200, 300] {
             let total_started = std::time::Instant::now();
@@ -3676,8 +4873,8 @@ mod tests {
             let total_ms = total_started.elapsed().as_millis() as u64;
             let avg_node_ms = stats.elapsed_ms.iter().sum::<u64>() / stats.processed.max(1) as u64;
             stats.elapsed_ms.sort_unstable();
-            let p95_index = ((stats.elapsed_ms.len() * 95) / 100)
-                .min(stats.elapsed_ms.len().saturating_sub(1));
+            let p95_index =
+                ((stats.elapsed_ms.len() * 95) / 100).min(stats.elapsed_ms.len().saturating_sub(1));
             let p95_node_ms = stats.elapsed_ms.get(p95_index).copied().unwrap_or(0);
             let peak = max_inflight.load(Ordering::Acquire);
             let peak_mem_kb = 2048 + peak * 96;
@@ -3717,7 +4914,11 @@ mod tests {
             ProbeVerdict::Blocked,
             ProbeVerdict::Unknown,
         ] {
-            assert!(!verdict.is_verified(), "{} 不得进入解锁标签", verdict.label());
+            assert!(
+                !verdict.is_verified(),
+                "{} 不得进入解锁标签",
+                verdict.label()
+            );
         }
     }
 

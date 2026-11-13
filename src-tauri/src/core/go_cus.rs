@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::Manager;
 
 /// 边车出站 tag（sing-box 配置中引用）
@@ -374,8 +374,10 @@ fn parse_rewrite_line(line: &str) -> Option<(Option<CusRewriteRule>, Option<CusS
         return Some((
             Some(CusRewriteRule {
                 pattern,
-                action: if action_raw == "reject-200" || action_raw == "reject-img"
-                    || action_raw == "reject-dict" || action_raw == "reject-array"
+                action: if action_raw == "reject-200"
+                    || action_raw == "reject-img"
+                    || action_raw == "reject-dict"
+                    || action_raw == "reject-array"
                 {
                     "reject200".into()
                 } else {
@@ -429,7 +431,11 @@ fn quanx_action(
         Some(CusRewriteRule {
             pattern: pattern.to_string(),
             action: action.into(),
-            target: if target.is_empty() { None } else { Some(target.to_string()) },
+            target: if target.is_empty() {
+                None
+            } else {
+                Some(target.to_string())
+            },
             enabled: true,
         }),
         None,
@@ -572,7 +578,8 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
             "IP-CIDR" | "IP-CIDR6" => "ip_cidr",
             "GEOIP" => "geoip",
             other => {
-                out.warnings.push(format!("Go Cus 规则类型 {other} 暂不支持，已忽略"));
+                out.warnings
+                    .push(format!("Go Cus 规则类型 {other} 暂不支持，已忽略"));
                 return;
             }
         };
@@ -581,7 +588,8 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
             "direct" => "direct",
             _ => proxy_tag,
         };
-        out.rules.push(json!({ matcher: targets, "outbound": policy_out }));
+        out.rules
+            .push(json!({ matcher: targets, "outbound": policy_out }));
     };
 
     for module in &settings.modules {
@@ -592,11 +600,13 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
         // 模块规则
         for (kind, target, policy) in &parsed.rules {
             if kind == "FINAL" {
-                out.warnings.push("Go Cus 模块 FINAL 规则暂不支持，已忽略".into());
+                out.warnings
+                    .push("Go Cus 模块 FINAL 规则暂不支持，已忽略".into());
                 continue;
             }
             if kind == "URL-REGEX" {
-                out.warnings.push("Go Cus 模块 URL-REGEX 规则暂不支持（已按域名提取尝试）".into());
+                out.warnings
+                    .push("Go Cus 模块 URL-REGEX 规则暂不支持（已按域名提取尝试）".into());
                 for d in extract_domains_from_pattern(target) {
                     block_domains.push(d);
                 }
@@ -618,7 +628,8 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
                     block_domains.extend(extract_domains_from_pattern(&rw.pattern));
                 }
                 "redirect302" | "redirect307" | "header" => {
-                    out.sidecar_domains.extend(extract_domains_from_pattern(&rw.pattern));
+                    out.sidecar_domains
+                        .extend(extract_domains_from_pattern(&rw.pattern));
                 }
                 _ => {}
             }
@@ -701,7 +712,8 @@ pub(crate) fn compile(settings: &GoCusSettings, proxy_tag: &str) -> CusCompiled 
     }
     if !out.sidecar_domains.is_empty() {
         out.sidecar_needed = true;
-        out.rules.push(json!({ "domain_suffix": out.sidecar_domains.clone(), "outbound": SIDECAR_TAG }));
+        out.rules
+            .push(json!({ "domain_suffix": out.sidecar_domains.clone(), "outbound": SIDECAR_TAG }));
     }
     // 静态 Host 映射降级说明（内核 1.11 无 DNS 静态记录）
     if !out.dns_local_domains.is_empty() {
@@ -749,7 +761,9 @@ async fn run_sidecar(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("绑定 127.0.0.1:{SIDECAR_PORT} 失败: {e}"))?;
     tracing::info!("[go-cus] 边车已启动 127.0.0.1:{SIDECAR_PORT}");
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let _ = handle_sidecar_conn(app, stream).await;
@@ -812,7 +826,11 @@ async fn handle_sidecar_conn(
         if settings.enabled {
             if let Some(action) = match_rewrite(&settings, &probe_url) {
                 if action == "reject" {
-                    let _ = write_all(&mut stream, b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let _ = write_all(
+                        &mut stream,
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
                     return Ok(());
                 }
                 // redirect/header 对 CONNECT 无法注入，按隧道透传处理
@@ -835,7 +853,11 @@ async fn handle_sidecar_conn(
         let host = headers.get("host").cloned().unwrap_or_default();
         format!("http://{host}{target}")
     };
-    let action = if settings.enabled { match_rewrite(&settings, &url) } else { None };
+    let action = if settings.enabled {
+        match_rewrite(&settings, &url)
+    } else {
+        None
+    };
     let Some(action) = action else {
         // 未命中改写：透传（直连转发）
         return forward_plain(&mut stream, &request_line, &headers, &url).await;
@@ -857,7 +879,11 @@ async fn handle_sidecar_conn(
         }
         a if a == "redirect302" || a == "redirect307" => {
             let target_url = find_rewrite_target(&settings, &url).unwrap_or_default();
-            let status = if a == "redirect302" { "302 Found" } else { "307 Temporary Redirect" };
+            let status = if a == "redirect302" {
+                "302 Found"
+            } else {
+                "307 Temporary Redirect"
+            };
             let resp = format!(
                 "HTTP/1.1 {status}\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -865,7 +891,8 @@ async fn handle_sidecar_conn(
         }
         "header" => {
             // header 改写后转发（Alpha：支持 $(remove-NAME) 删除头）
-            forward_plain_with_header_ops(&mut stream, &request_line, &headers, &url, &settings).await?;
+            forward_plain_with_header_ops(&mut stream, &request_line, &headers, &url, &settings)
+                .await?;
         }
         _ => {
             forward_plain(&mut stream, &request_line, &headers, &url).await?;
@@ -993,7 +1020,15 @@ async fn forward_plain_with_header_ops(
             }
         }
     }
-    forward_plain_inner(stream, request_line, headers, url, spec.as_deref(), Some(settings)).await
+    forward_plain_inner(
+        stream,
+        request_line,
+        headers,
+        url,
+        spec.as_deref(),
+        Some(settings),
+    )
+    .await
 }
 
 async fn forward_plain_inner(
@@ -1091,13 +1126,15 @@ pub fn generate_or_get_ca(
 
 /// rcgen 自签名 CA（ECDSA P-256，10 年有效期）
 fn generate_self_signed_ca() -> Result<(String, String), String> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    };
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
     let key = KeyPair::generate().map_err(|e| e.to_string())?;
     let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
-    params.distinguished_name.push(DnType::CommonName, "Prism Root CA");
-    params.distinguished_name.push(DnType::OrganizationName, "Prism");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Prism Root CA");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "Prism");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -1213,7 +1250,9 @@ fn ensure_ca_service(_app: tauri::AppHandle, crt_pem: String) {
         };
         tracing::info!("[go-cus] CA 分发服务已启动 127.0.0.1:{CA_PORT}");
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { continue };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
             let body = mobileconfig.clone();
             tauri::async_runtime::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1254,7 +1293,9 @@ pub async fn fetch_module_text(source: &str) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("模块下载失败: HTTP {}", resp.status()));
     }
-    resp.text().await.map_err(|e| format!("模块内容读取失败: {e}"))
+    resp.text()
+        .await
+        .map_err(|e| format!("模块内容读取失败: {e}"))
 }
 
 /// 解析并写入/更新模块（按 source 去重）
@@ -1355,8 +1396,14 @@ tracker.bad.com = 0.0.0.0
         let parsed = parse_universal_module(SGMODULE);
         assert_eq!(parsed.name.as_deref(), Some("测试模块"));
         assert_eq!(parsed.rules.len(), 3);
-        assert_eq!(parsed.rules[0], ("DOMAIN-SUFFIX".into(), "example.com".into(), "block".into()));
-        assert_eq!(parsed.rules[1], ("DOMAIN".into(), "api.foo.com".into(), "direct".into()));
+        assert_eq!(
+            parsed.rules[0],
+            ("DOMAIN-SUFFIX".into(), "example.com".into(), "block".into())
+        );
+        assert_eq!(
+            parsed.rules[1],
+            ("DOMAIN".into(), "api.foo.com".into(), "direct".into())
+        );
         assert_eq!(parsed.rules[2].2, "direct");
         // 改写：3 条（含 surge reject）
         assert_eq!(parsed.rewrites.len(), 3);
@@ -1364,13 +1411,19 @@ tracker.bad.com = 0.0.0.0
         assert_eq!(parsed.rewrites[1].action, "redirect302");
         assert_eq!(parsed.rewrites[2].action, "reject");
         // MitM
-        assert_eq!(parsed.mitm_hosts, vec!["api.example.com".to_string(), "ssl.foo.com".to_string()]);
+        assert_eq!(
+            parsed.mitm_hosts,
+            vec!["api.example.com".to_string(), "ssl.foo.com".to_string()]
+        );
         // 脚本
         assert_eq!(parsed.scripts.len(), 1);
         assert_eq!(parsed.scripts[0].kind, "http-response");
         assert!(parsed.scripts[0].requires_body);
         // DNS / Host
-        assert_eq!(parsed.dns_servers.first().map(String::as_str), Some("1.1.1.1"));
+        assert_eq!(
+            parsed.dns_servers.first().map(String::as_str),
+            Some("1.1.1.1")
+        );
         assert_eq!(parsed.hosts.len(), 2);
     }
 
@@ -1481,15 +1534,27 @@ tracker.bad.com = 0.0.0.0
 
     #[test]
     fn test_split_authority() {
-        assert_eq!(split_authority("a.com:8443", 443).unwrap(), ("a.com".into(), 8443));
-        assert_eq!(split_authority("a.com", 443).unwrap(), ("a.com".into(), 443));
-        assert_eq!(split_authority("[::1]:9090", 80).unwrap(), ("::1".into(), 9090));
+        assert_eq!(
+            split_authority("a.com:8443", 443).unwrap(),
+            ("a.com".into(), 8443)
+        );
+        assert_eq!(
+            split_authority("a.com", 443).unwrap(),
+            ("a.com".into(), 443)
+        );
+        assert_eq!(
+            split_authority("[::1]:9090", 80).unwrap(),
+            ("::1".into(), 9090)
+        );
     }
 
     #[test]
     fn test_split_url() {
         let (scheme, host, port, path) = split_url("http://a.com:8080/x/y?z=1").unwrap();
-        assert_eq!((scheme.as_str(), host.as_str(), port, path.as_str()), ("http", "a.com", 8080, "/x/y?z=1"));
+        assert_eq!(
+            (scheme.as_str(), host.as_str(), port, path.as_str()),
+            ("http", "a.com", 8080, "/x/y?z=1")
+        );
     }
 
     #[test]
@@ -1518,8 +1583,18 @@ tracker.bad.com = 0.0.0.0
                 "doubleclick.net",
                 "block",
             ),
-            ("ai", "DOMAIN-SUFFIX,openai.com,PROXY", "openai.com", "PROXY"),
-            ("media", "DOMAIN-SUFFIX,netflix.com,PROXY", "netflix.com", "PROXY"),
+            (
+                "ai",
+                "DOMAIN-SUFFIX,openai.com,PROXY",
+                "openai.com",
+                "PROXY",
+            ),
+            (
+                "media",
+                "DOMAIN-SUFFIX,netflix.com,PROXY",
+                "netflix.com",
+                "PROXY",
+            ),
             (
                 "cnDirect",
                 "DOMAIN-SUFFIX,taobao.com,DIRECT",
@@ -1548,8 +1623,7 @@ tracker.bad.com = 0.0.0.0
             let compiled = compile(&settings, "PROXY");
             let hit = compiled.rules.iter().any(|r| {
                 r.get("outbound").and_then(Value::as_str) == Some(expect_outbound)
-                    && r
-                        .get("domain_suffix")
+                    && r.get("domain_suffix")
                         .and_then(Value::as_array)
                         .map(|a| a.iter().any(|d| d.as_str() == Some(expect_domain)))
                         .unwrap_or(false)

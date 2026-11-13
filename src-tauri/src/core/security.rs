@@ -50,11 +50,7 @@ fn session_secret() -> &'static [u8; 16] {
 
 /// 授权状态签名：绑定 status / expires_at / last_verified_at 与会话密钥。
 /// 内存修改器改 status 后签名不再匹配，`is_pro_active()` 随即返回 false。
-pub fn entitlement_signature(
-    status: &str,
-    expires_at: Option<i64>,
-    last_verified_at: i64,
-) -> u64 {
+pub fn entitlement_signature(status: &str, expires_at: Option<i64>, last_verified_at: i64) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in session_secret().iter().chain(status.as_bytes()) {
         h ^= *b as u64;

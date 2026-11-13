@@ -24,7 +24,9 @@ pub fn get_system_proxy() -> io::Result<ProxyBackup> {
     let output = Command::new("gsettings")
         .args(["get", "org.gnome.system.proxy", "mode"])
         .output()?;
-    let mode = String::from_utf8_lossy(&output.stdout).trim().replace("'", "");
+    let mode = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .replace("'", "");
     if mode != "manual" {
         return Ok(ProxyBackup::default());
     }
@@ -39,9 +41,7 @@ pub fn get_system_proxy() -> io::Result<ProxyBackup> {
     let port_out = Command::new("gsettings")
         .args(["get", "org.gnome.system.proxy.http", "port"])
         .output()?;
-    let port = String::from_utf8_lossy(&port_out.stdout)
-        .trim()
-        .to_string();
+    let port = String::from_utf8_lossy(&port_out.stdout).trim().to_string();
 
     if host.is_empty() || port.is_empty() || port == "0" {
         return Ok(ProxyBackup::default());

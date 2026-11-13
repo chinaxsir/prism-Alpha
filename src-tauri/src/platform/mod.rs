@@ -6,16 +6,16 @@
 //! - 开机自启动注册
 //! - 代理独占：备份并恢复原有系统代理设置，确保只有当前 APP 的代理生效
 
-#[cfg(target_os = "windows")]
-pub mod windows;
-#[cfg(target_os = "macos")]
-pub mod macos;
-#[cfg(target_os = "linux")]
-pub mod linux;
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "ios")]
 pub mod ios;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// 移动端平台初始化（Tauri setup 调用；桌面端 no-op）：
 /// Android 注册 JNI/libbox 回调；iOS 无需在此初始化（Swift 侧自管理）
@@ -101,7 +101,11 @@ pub fn restore_system_proxy(backup: &ProxyBackup) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     linux::restore_system_proxy(backup)?;
 
-    tracing::info!("system proxy restored -> enabled={}, server={:?}", backup.enabled, backup.server);
+    tracing::info!(
+        "system proxy restored -> enabled={}, server={:?}",
+        backup.enabled,
+        backup.server
+    );
     Ok(())
 }
 

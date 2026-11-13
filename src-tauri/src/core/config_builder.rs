@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::state::{OutboundMode, RunMode, UserSettings};
 
@@ -68,13 +68,47 @@ pub(crate) fn is_info_or_ad_node_name(name: &str) -> bool {
         return true;
     }
     const KEYWORDS: &[&str] = &[
-        "剩余", "流量", "到期", "过期", "重置", "套餐", "有效期",
-        "官网", "网址", "发布页", "地址发布", "最新地址", "备用地址", "防失联",
-        "群组", "官方群", "电报群", "tg群", "频道", "客服", "工单",
-        "公告", "通知", "使用说明", "使用必读", "教程", "必看",
-        "优惠", "折扣", "续费", "购买", "邀请好友", "返利", "推广",
-        "请更新", "更新订阅", "节点故障", "维护中",
-        "http://", "https://", "t.me/",
+        "剩余",
+        "流量",
+        "到期",
+        "过期",
+        "重置",
+        "套餐",
+        "有效期",
+        "官网",
+        "网址",
+        "发布页",
+        "地址发布",
+        "最新地址",
+        "备用地址",
+        "防失联",
+        "群组",
+        "官方群",
+        "电报群",
+        "tg群",
+        "频道",
+        "客服",
+        "工单",
+        "公告",
+        "通知",
+        "使用说明",
+        "使用必读",
+        "教程",
+        "必看",
+        "优惠",
+        "折扣",
+        "续费",
+        "购买",
+        "邀请好友",
+        "返利",
+        "推广",
+        "请更新",
+        "更新订阅",
+        "节点故障",
+        "维护中",
+        "http://",
+        "https://",
+        "t.me/",
     ];
     KEYWORDS.iter().any(|k| n.contains(k))
 }
@@ -92,12 +126,7 @@ pub(crate) fn is_valid_usable_proxy_node(node: &ClashNode) -> bool {
         return false;
     }
     let server = node.server.trim();
-    if server.is_empty()
-        || matches!(
-            server,
-            "127.0.0.1" | "0.0.0.0" | "localhost" | "::1"
-        )
-    {
+    if server.is_empty() || matches!(server, "127.0.0.1" | "0.0.0.0" | "localhost" | "::1") {
         return false;
     }
     if node.port <= 1 {
@@ -124,72 +153,231 @@ pub(crate) fn auto_detect_interface_enabled() -> bool {
 /// `gw.alicdn.com -> dial tcp 172.64.229.88:443: network is unreachable`。
 /// 该清单在 Rust 与 PacketTunnelProvider.swift 中必须保持 100% 同步。
 pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
-    "cn", "xn--fiqs8s", "xn--55qx5d", "xn--io0a7i",
-    "baidu.com", "bdstatic.com", "baidupcs.com",
-    "qq.com", "weixin.qq.com", "weixinbridge.com", "wechat.com", "tenpay.com",
-    "gtimg.cn", "gtimg.com", "qpic.cn", "qlogo.cn", "myqcloud.com", "tencent.com",
+    "cn",
+    "xn--fiqs8s",
+    "xn--55qx5d",
+    "xn--io0a7i",
+    "baidu.com",
+    "bdstatic.com",
+    "baidupcs.com",
+    "qq.com",
+    "weixin.qq.com",
+    "weixinbridge.com",
+    "wechat.com",
+    "tenpay.com",
+    "gtimg.cn",
+    "gtimg.com",
+    "qpic.cn",
+    "qlogo.cn",
+    "myqcloud.com",
+    "tencent.com",
     "tencent-cloud.net",
-    "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
-    "alipay.com", "alipayobjects.com", "alibaba.com", "alibaba-inc.com",
-    "dingtalk.com", "goofish.com", "tbcache.com", "mmstat.com", "youku.com",
-    "ucweb.com", "amap.com",
-    "jd.com", "360buyimg.com", "jdcloud.com",
-    "bilibili.com", "hdslb.com", "biliapi.net", "biliapi.com", "bilivideo.com",
-    "douyin.com", "douyincdn.com", "byteimg.com", "bytedance.com", "toutiao.com",
-    "snssdk.com", "pstatp.com", "volces.com", "feishu.cn",
-    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "yximgs.com",
-    "163.com", "126.com", "126.net", "127.net", "netease.com",
-    "sina.com.cn", "weibo.com", "weibocdn.com", "sinaimg.cn",
-    "meituan.com", "meituan.net", "dianping.com", "dpfile.com",
-    "pinduoduo.com", "yangkeduo.com", "pddugc.com",
-    "xiaomi.com", "mi.com", "miui.com", "huawei.com", "vmall.com", "hicloud.com",
+    "taobao.com",
+    "tmall.com",
+    "alicdn.com",
+    "aliyun.com",
+    "aliyuncs.com",
+    "alipay.com",
+    "alipayobjects.com",
+    "alibaba.com",
+    "alibaba-inc.com",
+    "dingtalk.com",
+    "goofish.com",
+    "tbcache.com",
+    "mmstat.com",
+    "youku.com",
+    "ucweb.com",
+    "amap.com",
+    "jd.com",
+    "360buyimg.com",
+    "jdcloud.com",
+    "bilibili.com",
+    "hdslb.com",
+    "biliapi.net",
+    "biliapi.com",
+    "bilivideo.com",
+    "douyin.com",
+    "douyincdn.com",
+    "byteimg.com",
+    "bytedance.com",
+    "toutiao.com",
+    "snssdk.com",
+    "pstatp.com",
+    "volces.com",
+    "feishu.cn",
+    "xiaohongshu.com",
+    "xhscdn.com",
+    "kuaishou.com",
+    "yximgs.com",
+    "163.com",
+    "126.com",
+    "126.net",
+    "127.net",
+    "netease.com",
+    "sina.com.cn",
+    "weibo.com",
+    "weibocdn.com",
+    "sinaimg.cn",
+    "meituan.com",
+    "meituan.net",
+    "dianping.com",
+    "dpfile.com",
+    "pinduoduo.com",
+    "yangkeduo.com",
+    "pddugc.com",
+    "xiaomi.com",
+    "mi.com",
+    "miui.com",
+    "huawei.com",
+    "vmall.com",
+    "hicloud.com",
     "dbankcdn.com",
-    "zhihu.com", "zhimg.com", "csdn.net", "juejin.cn", "gitee.com", "oschina.net",
-    "ctrip.com", "12306.cn", "didiglobal.com", "didichuxing.com",
-    "apple.com", "icloud.com", "icloud.com.cn", "icloud-content.com", "mzstatic.com",
-    "cdn-apple.com", "aaplimg.com",
+    "zhihu.com",
+    "zhimg.com",
+    "csdn.net",
+    "juejin.cn",
+    "gitee.com",
+    "oschina.net",
+    "ctrip.com",
+    "12306.cn",
+    "didiglobal.com",
+    "didichuxing.com",
+    "apple.com",
+    "icloud.com",
+    "icloud.com.cn",
+    "icloud-content.com",
+    "mzstatic.com",
+    "cdn-apple.com",
+    "aaplimg.com",
     // 【APP71 任务7】扩充：主流非 .cn 后缀的大陆服务 / CDN / 云厂商域名。
     // iOS 扩展剥离 geosite.db 后，未命中该名单的大陆站点会掉进策略组，
     // 经海外节点回源导致首包数秒延迟；补齐后域名级直接判定 → direct，
     // 零额外解析、零额外探测。本清单与 PacketTunnelProvider.swift 中
     // cnDirectDomainSuffixes 必须保持 100% 同步（顺序也需一致）。
     // 百度生态
-    "baiducontent.com", "bdimg.com", "bdurl.net", "baidustatic.com",
-    "bcebos.com", "yunjiasu-cdn.net", "baifubao.com",
+    "baiducontent.com",
+    "bdimg.com",
+    "bdurl.net",
+    "baidustatic.com",
+    "bcebos.com",
+    "yunjiasu-cdn.net",
+    "baifubao.com",
     // 腾讯生态扩展
-    "weixin.com", "foxmail.com", "tencent.cn", "tencent-cloud.com",
-    "qcloud.com", "qcloudimg.com", "tencentcloudapi.com",
-    "tencentmusic.com", "qqmusic.com", "kugou.com", "kuwo.cn", "weiyun.com",
-    "dnspod.cn", "dnspod.com",
+    "weixin.com",
+    "foxmail.com",
+    "tencent.cn",
+    "tencent-cloud.com",
+    "qcloud.com",
+    "qcloudimg.com",
+    "tencentcloudapi.com",
+    "tencentmusic.com",
+    "qqmusic.com",
+    "kugou.com",
+    "kuwo.cn",
+    "weiyun.com",
+    "dnspod.cn",
+    "dnspod.com",
     // 阿里生态扩展
-    "alibabacloud.com", "aliyuncdn.com", "aliuser.com", "cnzz.com", "umeng.com",
+    "alibabacloud.com",
+    "aliyuncdn.com",
+    "aliuser.com",
+    "cnzz.com",
+    "umeng.com",
     "alipay-eco.com",
     // 字节生态扩展
-    "ixigua.com", "douyinvod.com", "douyinstatic.com", "amemv.com", "feishucdn.com",
+    "ixigua.com",
+    "douyinvod.com",
+    "douyinstatic.com",
+    "amemv.com",
+    "feishucdn.com",
     // 网易生态扩展
-    "netease.im", "youdao.com", "163yun.com", "neteasegames.com", "lofter.com",
+    "netease.im",
+    "youdao.com",
+    "163yun.com",
+    "neteasegames.com",
+    "lofter.com",
     // 门户 / 视频 / 音乐
-    "sina.cn", "sina.com", "sohu.com", "ifeng.com",
-    "iqiyi.com", "qiyi.com", "qy.net", "mgtv.com", "pptv.com", "letv.com", "le.com",
+    "sina.cn",
+    "sina.com",
+    "sohu.com",
+    "ifeng.com",
+    "iqiyi.com",
+    "qiyi.com",
+    "qy.net",
+    "mgtv.com",
+    "pptv.com",
+    "letv.com",
+    "le.com",
     // 社区 / 生活 / 出行 / 招聘 / 电商扩展
-    "douban.com", "doubanio.com", "58.com", "anjuke.com", "lianjia.com", "ke.com",
-    "zhaopin.com", "51job.com", "zhipin.com", "bosszhipin.com", "lagou.com",
-    "ele.me", "elemecdn.com", "smzdm.com", "hupu.com",
-    "qunar.com", "ly.com", "tuniu.com", "autonavi.com",
-    "sf-express.com", "unionpay.com", "unionpaysecure.com", "21cn.com",
+    "douban.com",
+    "doubanio.com",
+    "58.com",
+    "anjuke.com",
+    "lianjia.com",
+    "ke.com",
+    "zhaopin.com",
+    "51job.com",
+    "zhipin.com",
+    "bosszhipin.com",
+    "lagou.com",
+    "ele.me",
+    "elemecdn.com",
+    "smzdm.com",
+    "hupu.com",
+    "qunar.com",
+    "ly.com",
+    "tuniu.com",
+    "autonavi.com",
+    "sf-express.com",
+    "unionpay.com",
+    "unionpaysecure.com",
+    "21cn.com",
     // 对象存储 / 云 CDN
-    "qiniu.com", "qiniucdn.com", "qnssl.com", "clouddn.com", "upyun.com",
+    "qiniu.com",
+    "qiniucdn.com",
+    "qnssl.com",
+    "clouddn.com",
+    "upyun.com",
     // 开发 / 工具
-    "cnblogs.com", "51cto.com", "chinaz.com", "runoob.com",
+    "cnblogs.com",
+    "51cto.com",
+    "chinaz.com",
+    "runoob.com",
     // 【APP72 任务3.2】补齐：微信生态 / 电商 / 短视频 / 手机厂商 /
     // 金融 / 内容社区等高频大陆域名（仍不含任何海外通用后缀）。
-    "1688.com", "servicewechat.com", "douyinpic.com", "volcengine.com",
-    "zjcdn.com", "gifshow.com", "jcloudcs.com", "jdpay.com", "pddpic.com",
-    "sankuai.com", "xiaomi.net", "honor.com", "oppo.com", "vivo.com",
-    "coloros.com", "acgvideo.com", "bilivideo.cn", "71.am", "cainiao.com",
-    "fliggy.com", "nga.cn", "v2ex.com", "music.163.com", "ydstatic.com",
-    "ccb.com", "abchina.com", "cmbchina.com", "bankcomm.com", "psbc.com",
-    "95516.com", "apple-cloudkit.com", "local", "lan",
+    "1688.com",
+    "servicewechat.com",
+    "douyinpic.com",
+    "volcengine.com",
+    "zjcdn.com",
+    "gifshow.com",
+    "jcloudcs.com",
+    "jdpay.com",
+    "pddpic.com",
+    "sankuai.com",
+    "xiaomi.net",
+    "honor.com",
+    "oppo.com",
+    "vivo.com",
+    "coloros.com",
+    "acgvideo.com",
+    "bilivideo.cn",
+    "71.am",
+    "cainiao.com",
+    "fliggy.com",
+    "nga.cn",
+    "v2ex.com",
+    "music.163.com",
+    "ydstatic.com",
+    "ccb.com",
+    "abchina.com",
+    "cmbchina.com",
+    "bankcomm.com",
+    "psbc.com",
+    "95516.com",
+    "apple-cloudkit.com",
+    "local",
+    "lan",
 ];
 
 /// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段。
@@ -198,26 +386,58 @@ pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
 /// 大陆目标 → direct。仅包含大陆云厂商与运营商公网段，不含私网段。
 pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     // 阿里云 / 阿里系 CDN
-    "8.129.0.0/16", "47.92.0.0/14", "47.96.0.0/11", "47.100.0.0/14",
-    "59.110.0.0/16", "101.37.0.0/16", "106.11.0.0/16", "112.124.0.0/14",
-    "116.62.0.0/16", "118.31.0.0/16", "120.24.0.0/13", "121.40.0.0/14",
-    "123.56.0.0/15", "139.129.0.0/16", "182.92.0.0/16", "203.107.0.0/16",
+    "8.129.0.0/16",
+    "47.92.0.0/14",
+    "47.96.0.0/11",
+    "47.100.0.0/14",
+    "59.110.0.0/16",
+    "101.37.0.0/16",
+    "106.11.0.0/16",
+    "112.124.0.0/14",
+    "116.62.0.0/16",
+    "118.31.0.0/16",
+    "120.24.0.0/13",
+    "121.40.0.0/14",
+    "123.56.0.0/15",
+    "139.129.0.0/16",
+    "182.92.0.0/16",
+    "203.107.0.0/16",
     // 腾讯云 / 腾讯系
-    "49.51.0.0/16", "106.52.0.0/14", "119.29.0.0/16", "129.28.0.0/16",
-    "132.232.0.0/16", "134.175.0.0/16", "162.62.0.0/16", "175.24.0.0/14",
+    "49.51.0.0/16",
+    "106.52.0.0/14",
+    "119.29.0.0/16",
+    "129.28.0.0/16",
+    "132.232.0.0/16",
+    "134.175.0.0/16",
+    "162.62.0.0/16",
+    "175.24.0.0/14",
     "193.112.0.0/16",
     // 百度 / 百度智能云
-    "61.135.0.0/16", "180.76.0.0/16", "182.61.0.0/16", "220.181.0.0/16",
+    "61.135.0.0/16",
+    "180.76.0.0/16",
+    "182.61.0.0/16",
+    "220.181.0.0/16",
     // 华为云 / 移动 / 联通 / 电信高频段
-    "114.115.0.0/16", "121.36.0.0/16", "122.112.0.0/16", "139.9.0.0/16",
-    "111.13.0.0/16", "119.3.0.0/16", "180.101.0.0/16", "210.22.0.0/16",
-    "58.216.0.0/16", "221.204.0.0/16",
+    "114.115.0.0/16",
+    "121.36.0.0/16",
+    "122.112.0.0/16",
+    "139.9.0.0/16",
+    "111.13.0.0/16",
+    "119.3.0.0/16",
+    "180.101.0.0/16",
+    "210.22.0.0/16",
+    "58.216.0.0/16",
+    "221.204.0.0/16",
     // 【APP71 任务7】补充：大陆公有云确定归属网段（不含海外区域与私网段）。
     // 仅用于 geosite/geoip 规则缺失时按目标 IP 兜底直连，收敛大陆站点
     // 首包绕行海外节点的延迟；与 Swift cnDirectCIDRs 100% 同步。
     // 阿里云北京 / 杭州 / 青岛
-    "39.96.0.0/13", "101.200.0.0/16", "118.178.0.0/16",
-    "120.55.0.0/16", "121.43.0.0/16", "123.57.0.0/16",
+    "39.96.0.0/13",
+    "101.200.0.0/16",
+    "118.178.0.0/16",
+    "120.55.0.0/16",
+    "121.43.0.0/16",
+    "123.57.0.0/16",
     // 腾讯云华南 / 华东
     "81.68.0.0/14",
     // 百度云北京
@@ -227,11 +447,23 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     // 【APP72 任务3.2】大陆运营商/宽带大网段：覆盖家庭宽带与移动网络的
     // CDN 回源地址（仅 China 注册段，不含海外段），让「域名未命中但 IP
     // 属于大陆」的请求也能直连而不是绕行海外节点。
-    "14.112.0.0/12", "58.144.0.0/16", "203.209.0.0/16",
-    "110.0.0.0/7", "112.0.0.0/6", "116.0.0.0/6", "120.0.0.0/6",
-    "124.0.0.0/7", "182.0.0.0/8", "183.0.0.0/8",
-    "202.96.0.0/12", "210.21.0.0/16", "211.136.0.0/13",
-    "218.0.0.0/7", "219.128.0.0/11", "221.0.0.0/8", "222.0.0.0/8",
+    "14.112.0.0/12",
+    "58.144.0.0/16",
+    "203.209.0.0/16",
+    "110.0.0.0/7",
+    "112.0.0.0/6",
+    "116.0.0.0/6",
+    "120.0.0.0/6",
+    "124.0.0.0/7",
+    "182.0.0.0/8",
+    "183.0.0.0/8",
+    "202.96.0.0/12",
+    "210.21.0.0/16",
+    "211.136.0.0/13",
+    "218.0.0.0/7",
+    "219.128.0.0/11",
+    "221.0.0.0/8",
+    "222.0.0.0/8",
     "223.64.0.0/11",
 ];
 
@@ -240,23 +472,64 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
 /// 靠前的 CN 后缀 / geosite 规则命中 dns-direct，不受影响。
 /// 与 PacketTunnelProvider.swift 中 proxyDomainSuffixes 保持 100% 同步。
 pub(crate) const PROXY_DOMAIN_SUFFIXES: &[&str] = &[
-    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
-    "anthropic.com", "claude.ai", "gemini.google.com",
-    "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
-    "youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com",
-    "netflix.com", "nflxvideo.net", "nflximg.net", "nflxext.com", "nflxso.net",
-    "disneyplus.com", "disney-plus.net", "bamgrid.com", "dssott.com",
-    "tiktok.com", "tiktokv.com", "byteoversea.com", "ibytedtos.com",
-    "twitter.com", "x.com", "twimg.com", "facebook.com", "instagram.com",
-    "whatsapp.net", "telegram.org", "t.me", "github.com", "githubusercontent.com",
-    "figma.com", "notion.so", "dropbox.com", "spotify.com", "soundcloud.com",
-    "twitch.tv", "reddit.com", "wikipedia.org",
+    "openai.com",
+    "chatgpt.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "anthropic.com",
+    "claude.ai",
+    "gemini.google.com",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "youtube.com",
+    "googlevideo.com",
+    "ytimg.com",
+    "ggpht.com",
+    "netflix.com",
+    "nflxvideo.net",
+    "nflximg.net",
+    "nflxext.com",
+    "nflxso.net",
+    "disneyplus.com",
+    "disney-plus.net",
+    "bamgrid.com",
+    "dssott.com",
+    "tiktok.com",
+    "tiktokv.com",
+    "byteoversea.com",
+    "ibytedtos.com",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "facebook.com",
+    "instagram.com",
+    "whatsapp.net",
+    "telegram.org",
+    "t.me",
+    "github.com",
+    "githubusercontent.com",
+    "figma.com",
+    "notion.so",
+    "dropbox.com",
+    "spotify.com",
+    "soundcloud.com",
+    "twitch.tv",
+    "reddit.com",
+    "wikipedia.org",
 ];
 
 /// 【APP72 任务3.2】海外站点关键词（后缀未覆盖时的兜底），仅用于 DNS 走远端。
 pub(crate) const PROXY_DOMAIN_KEYWORDS: &[&str] = &[
-    "openai", "anthropic", "claude", "gemini", "netflix", "disney",
-    "tiktok", "telegram",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "netflix",
+    "disney",
+    "tiktok",
+    "telegram",
 ];
 
 pub struct BuiltConfig {
@@ -408,8 +681,7 @@ fn extract_flow_style_nodes(text: &str) -> Vec<ClashNode> {
 /// 导致启动时报「未解析到任何节点或策略组」。
 pub fn validate_subscription_text(text: &str) -> Result<(), String> {
     // 【APP15 任务3.1】走自愈解析器：尾部被截断的订阅不再整份拒绝
-    let profile: ClashProfile =
-        parse_clash_profile_resilient(text).map_err(|e| format!("{e}"))?;
+    let profile: ClashProfile = parse_clash_profile_resilient(text).map_err(|e| format!("{e}"))?;
 
     // 检查 proxies：不仅要有节点，且节点必须通过合法性校验（剔除
     // 「剩余流量/到期时间」等信息展示类假节点与 127.x 环回占位节点）。
@@ -423,9 +695,7 @@ pub fn validate_subscription_text(text: &str) -> Result<(), String> {
 
     // 有可用节点 或 有 proxy-providers（启动时会下载）即视为有效
     if real_nodes.is_empty() && profile.proxy_providers.is_empty() {
-        return Err(
-            "订阅内容未包含可用节点（可能是机场限流/到期提示页），已保留原订阅".into(),
-        );
+        return Err("订阅内容未包含可用节点（可能是机场限流/到期提示页），已保留原订阅".into());
     }
     // 只有策略组没有节点：策略组成员为空，同样无法启动
     if real_nodes.is_empty()
@@ -649,8 +919,8 @@ pub fn build(
     // 单条 sing-box JSON：原样透传，但自定义规则仍可前置合并（见 merge_json_custom）
     if profiles.len() == 1 && profiles[0].2.trim().starts_with('{') {
         let trimmed = profiles[0].2.trim();
-        let mut config: Value = serde_json::from_str(trimmed)
-            .context("profile looks like JSON but failed to parse")?;
+        let mut config: Value =
+            serde_json::from_str(trimmed).context("profile looks like JSON but failed to parse")?;
         let mut warnings = vec!["内核 JSON 配置原样透传，未做模式/端口合并".into()];
         merge_json_custom(&mut config, custom_rules, &mut warnings);
         let final_group = config
@@ -669,11 +939,15 @@ pub fn build(
     let mut warnings = Vec::new();
     // 发射判重：emit_node/group 用 insert 返回值判断首次发射，
     // 只能在发射阶段写入（预解析写这里会把全部名字误判为重复）
-    let mut known_tags: HashSet<String> =
-        ["direct", "block", "dns-out"].map(str::to_string).into_iter().collect();
+    let mut known_tags: HashSet<String> = ["direct", "block", "dns-out"]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
     // 跨订阅改名追踪：预解析阶段登记全部订阅的标签，供后续订阅冲突改名
-    let mut seen_tags: HashSet<String> =
-        ["direct", "block", "dns-out"].map(str::to_string).into_iter().collect();
+    let mut seen_tags: HashSet<String> = ["direct", "block", "dns-out"]
+        .map(str::to_string)
+        .into_iter()
+        .collect();
 
     // 【APP-11B 任务2】未开启 IPv6 时 direct 出站强制 ipv4_only：
     // iOS 扩展沙盒中 Go 的 net.ListenPacket("udp", ":0") 默认创建 AF_INET6
@@ -715,8 +989,9 @@ pub fn build(
 
     for (url, sub_name, text) in profiles {
         // 【APP15 任务3.1】自愈解析：尾部截断/畸形 YAML 也能恢复可用节点
-        let mut profile: ClashProfile = parse_clash_profile_resilient(text)
-            .with_context(|| format!("无法解析订阅「{sub_name}」为 Clash YAML（请检查订阅格式）"))?;
+        let mut profile: ClashProfile = parse_clash_profile_resilient(text).with_context(|| {
+            format!("无法解析订阅「{sub_name}」为 Clash YAML（请检查订阅格式）")
+        })?;
 
         // 【APP32 任务1.1】订阅解析入口过滤：剔除「剩余流量/到期时间/官网
         // 广告」等信息展示类假节点与非法参数节点，绝不让其进入 outbounds。
@@ -742,7 +1017,8 @@ pub fn build(
             let path = crate::core::store::provider_path(data_dir, url, pname);
             match std::fs::read_to_string(&path) {
                 Ok(payload) => {
-                    let parsed: ProviderPayload = serde_yaml::from_str(&payload).unwrap_or_default();
+                    let parsed: ProviderPayload =
+                        serde_yaml::from_str(&payload).unwrap_or_default();
                     // 【APP32 任务1.1】provider 磁盘缓存节点同样过滤假节点
                     let mut proxies = parsed.proxies;
                     let before = proxies.len();
@@ -902,9 +1178,7 @@ pub fn build(
     // 把应走节点的流量改道直连，导致「选了节点却上不了网」。
     // 广告拦截 / 局域网主机名 / 国内域名直连统一改由下方「route.rules 黄金
     // 顺序装配」第 8 条落位（clash_mode: global 之后、geoip 之前）。
-    warnings.push(
-        "已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into(),
-    );
+    warnings.push("已内置常见分流规则：广告域名拦截、局域网与国内域名直连".into());
 
     // 【APP50 任务2】节点域名批量预解析（主进程 DoH，重启用 APP47 移除的能力）：
     // log11 实证——iOS 扩展内节点域名（*.the-best-airport.com）UDP DNS 解析
@@ -959,7 +1233,15 @@ pub fn build(
 
         // 订阅自身节点
         for node in &profile.proxies {
-            if let Some(t) = emit_node(&mut outbounds, &mut known_tags, &mut warnings, node, &apply, &mut total_nodes, &node_ip_map) {
+            if let Some(t) = emit_node(
+                &mut outbounds,
+                &mut known_tags,
+                &mut warnings,
+                node,
+                &apply,
+                &mut total_nodes,
+                &node_ip_map,
+            ) {
                 node_tags.push(t);
             }
         }
@@ -1152,8 +1434,7 @@ pub fn build(
     // 【APP47 任务3.3】Prism 标准主选择器 tag：所有订阅节点 100% 汇入
     let mut prism_proxy_tag: Option<String> = None;
     {
-        let lookup =
-            |tag: &str| outbounds.iter().find(|o| o["tag"].as_str() == Some(tag));
+        let lookup = |tag: &str| outbounds.iter().find(|o| o["tag"].as_str() == Some(tag));
         let mut current = final_tag.clone();
         let mut visited: HashSet<String> = HashSet::new();
         loop {
@@ -1257,7 +1538,8 @@ pub fn build(
     // 时可用。主 App 被系统冻结、边车崩溃或用户后台运行时，直接指向边车的
     // 规则会整条断网。把边车出站包进一个 urltest 组（边车优先、主组兜底），
     // 边车不可达时内核自动回落到主组，网络不中断。
-    if !proxy_target.is_empty() && proxy_target != crate::core::go_cus::SIDECAR_TAG
+    if !proxy_target.is_empty()
+        && proxy_target != crate::core::go_cus::SIDECAR_TAG
         && outbounds
             .iter()
             .any(|o| o["tag"].as_str() == Some(crate::core::go_cus::SIDECAR_TAG))
@@ -1283,8 +1565,9 @@ pub fn build(
 
     match attach_group_tag {
         Some(ref main_tag) => {
-            if let Some(group) =
-                outbounds.iter_mut().find(|o| o["tag"].as_str() == Some(main_tag.as_str()))
+            if let Some(group) = outbounds
+                .iter_mut()
+                .find(|o| o["tag"].as_str() == Some(main_tag.as_str()))
             {
                 let existing: Vec<String> = group
                     .get("outbounds")
@@ -1330,7 +1613,8 @@ pub fn build(
             }
         }
         None => warnings.push(
-            "订阅中存在不属于任何策略组的节点，但未找到可挂接的主选择组，这些节点无法在节点页选择".into(),
+            "订阅中存在不属于任何策略组的节点，但未找到可挂接的主选择组，这些节点无法在节点页选择"
+                .into(),
         ),
     }
 
@@ -1433,7 +1717,14 @@ pub fn build(
     // 解析器解析——它们是面向国内的入口域名，且整条解析链路不得依赖境外可达性。
     // DNS 规则的 outbound 匹配器专门用于匹配「正在拨号的出站 tag」。
     const RESOLVABLE_NODE_TYPES: [&str; 8] = [
-        "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria", "hysteria2", "wireguard",
+        "shadowsocks",
+        "vmess",
+        "vless",
+        "trojan",
+        "tuic",
+        "hysteria",
+        "hysteria2",
+        "wireguard",
     ];
     let is_ip_literal = |s: &str| {
         s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
@@ -1720,7 +2011,9 @@ pub fn build(
     final_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
     // 【APP70 任务2.2】主代理出口：第三方策略组已被归一化为 Prism 标准
     // 主选择器 Proxy，此处必须同步沿用，严禁再写回第三方组 tag
-    let main_proxy_target = prism_proxy_tag.clone().unwrap_or_else(|| rule_final.clone());
+    let main_proxy_target = prism_proxy_tag
+        .clone()
+        .unwrap_or_else(|| rule_final.clone());
     // 非大陆域名 → 策略组：域名级判定，零解析开销，必须先于 geoip，
     // 否则被墙域名的污染 IP 会命中 geoip cn 被改道直连
     if main_proxy_target != "direct" {
@@ -1940,10 +2233,7 @@ pub(crate) fn is_valid_public_server_ipv4(ip: std::net::Ipv4Addr) -> bool {
 ///
 /// ip_map 来自 build() 开头的批量 DoH 预解析（命中 300s 缓存时 0ms 返回）。
 /// 未命中的域名返回 None，调用方保留原域名由内核 dns-direct 兜底解析。
-fn resolve_node_server_ipv4(
-    server: &str,
-    ip_map: &HashMap<String, String>,
-) -> Option<String> {
+fn resolve_node_server_ipv4(server: &str, ip_map: &HashMap<String, String>) -> Option<String> {
     let key = server.trim().to_ascii_lowercase();
     if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
         return None;
@@ -2054,10 +2344,7 @@ fn merge_json_custom(config: &mut Value, custom_rules: &[String], warnings: &mut
     let added = extra.len();
     let merged: Vec<Value> = extra.into_iter().chain(existing).collect();
     route["rules"] = json!(merged);
-    warnings.push(format!(
-        "已在 JSON 配置前置合并 {} 条自定义规则",
-        added
-    ));
+    warnings.push(format!("已在 JSON 配置前置合并 {} 条自定义规则", added));
 }
 
 // ---------------- 规则行解析 ----------------
@@ -2112,8 +2399,12 @@ fn parse_rule_line(
         "PROCESS-NAME" => Some(json!({ "process_name": [payload], "outbound": outbound })),
         "PROCESS-PATH" => Some(json!({ "process_path": [payload], "outbound": outbound })),
         "SRC-IP-CIDR" => Some(json!({ "source_ip_cidr": [payload], "outbound": outbound })),
-        "SRC-PORT" => Some(json!({ "source_port": [payload.parse::<u32>().unwrap_or(0)], "outbound": outbound })),
-        "DST-PORT" => Some(json!({ "port": [payload.parse::<u32>().unwrap_or(0)], "outbound": outbound })),
+        "SRC-PORT" => Some(
+            json!({ "source_port": [payload.parse::<u32>().unwrap_or(0)], "outbound": outbound }),
+        ),
+        "DST-PORT" => {
+            Some(json!({ "port": [payload.parse::<u32>().unwrap_or(0)], "outbound": outbound }))
+        }
         "NETWORK" => Some(json!({ "network": payload, "outbound": outbound })),
         // RULE-SET 依赖 rule-providers 元信息，无法从纯 Clash 配置无损转换
         "RULE-SET" => {
@@ -2314,12 +2605,13 @@ pub(crate) fn sanitize_outbound_dependencies(
                 .unwrap_or_default();
             let cur = ob.get("default").and_then(|d| d.as_str()).unwrap_or("");
             if cur.is_empty() || !list.contains(cur) || is_info_or_ad_node_name(cur) {
-                ob["default"] = json!(ob
-                    .get("outbounds")
-                    .and_then(Value::as_array)
-                    .and_then(|l| l.first())
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&fallback));
+                ob["default"] = json!(
+                    ob.get("outbounds")
+                        .and_then(Value::as_array)
+                        .and_then(|l| l.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&fallback)
+                );
             }
         } else if let Some(obj) = ob.as_object_mut() {
             // urltest 不支持 default 字段
@@ -2541,7 +2833,10 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
         "wireguard" => {
             // mihomo 裸 IP（10.0.0.2）→ sing-box local_address 需带前缀长度
             let mut local_address: Vec<String> = Vec::new();
-            for raw in [node.ip.as_deref(), node.ipv6.as_deref()].into_iter().flatten() {
+            for raw in [node.ip.as_deref(), node.ipv6.as_deref()]
+                .into_iter()
+                .flatten()
+            {
                 for part in raw.split(',') {
                     let part = part.trim();
                     if part.is_empty() {
@@ -2568,8 +2863,7 @@ pub(crate) fn node_to_outbound(node: &ClashNode) -> Option<(Value, Option<String
                 .public_key
                 .as_deref()
                 .and_then(crate::core::go_lan::normalize_wg_key);
-            let (Some(private_key), Some(peer_public_key)) = (private_key, peer_public_key)
-            else {
+            let (Some(private_key), Some(peer_public_key)) = (private_key, peer_public_key) else {
                 return None;
             };
 
@@ -2811,10 +3105,13 @@ fn build_transport(node: &ClashNode) -> (Option<Value>, Option<String>) {
             }
             (Some(transport), None)
         }
-        Some("grpc") => (Some(json!({
-            "type": "grpc",
-            "service_name": node.grpc_opts.as_ref().and_then(|g| g.service_name.clone()).unwrap_or_default()
-        })), None),
+        Some("grpc") => (
+            Some(json!({
+                "type": "grpc",
+                "service_name": node.grpc_opts.as_ref().and_then(|g| g.service_name.clone()).unwrap_or_default()
+            })),
+            None,
+        ),
         Some("http") => {
             let mut transport = json!({ "type": "http" });
             if let Some(opts) = &node.http_opts {
@@ -2896,9 +3193,10 @@ fn group_to_outbound(
             obj.insert("type".into(), json!("selector"));
             obj.insert("tag".into(), json!(group.name));
             obj.insert("outbounds".into(), Value::Array(ordered.clone()));
-            if let Some(default) = ordered.iter().find(|r| {
-                !matches!(r.as_str(), Some("direct") | Some("block"))
-            }) {
+            if let Some(default) = ordered
+                .iter()
+                .find(|r| !matches!(r.as_str(), Some("direct") | Some("block")))
+            {
                 obj.insert("default".into(), default.clone());
             }
             Value::Object(obj)
@@ -3101,18 +3399,22 @@ rules:
             &crate::core::go_cus::GoCusSettings::default(),
         )
         .expect("build must succeed");
-        assert!(built.config["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|o| o["type"] != "hysteria"));
+        assert!(
+            built.config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o["type"] != "hysteria")
+        );
         // 【APP32 任务1.1】缺凭证节点如今在上游被 is_valid_usable_proxy_node
         // 直接过滤（"非正常节点"警告）；旧路径的"缺少 auth-str/password"
         // 警告同样视为合法剔除原因。
-        assert!(built
-            .warnings
-            .iter()
-            .any(|w| w.contains("缺少 auth-str/password") || w.contains("非正常节点")));
+        assert!(
+            built
+                .warnings
+                .iter()
+                .any(|w| w.contains("缺少 auth-str/password") || w.contains("非正常节点"))
+        );
     }
 
     /// 回归（内置分流规则）：域名类内置规则在自定义之后、订阅规则之前；
@@ -3172,7 +3474,11 @@ rules:
             None
         };
         let sigs: Vec<String> = rules.iter().filter_map(sig).collect();
-        let find = |k: &str| sigs.iter().position(|s| s == k).unwrap_or_else(|| panic!("{k} missing: {sigs:?}"));
+        let find = |k: &str| {
+            sigs.iter()
+                .position(|s| s == k)
+                .unwrap_or_else(|| panic!("{k} missing: {sigs:?}"))
+        };
         let (custom, ads, gpriv, cn) = (
             find("custom"),
             find("builtin-ads"),
@@ -3189,9 +3495,15 @@ rules:
         // → 订阅规则 → clash_mode: global → 大陆直连 → geoip 兜底
         let direct_mode = find("clash_mode-direct");
         let global_mode = find("clash_mode-global");
-        assert!(direct_mode < custom, "clash_mode: direct 必须早于自定义规则: {sigs:?}");
+        assert!(
+            direct_mode < custom,
+            "clash_mode: direct 必须早于自定义规则: {sigs:?}"
+        );
         assert!(custom < subrule, "自定义规则必须先于订阅规则: {sigs:?}");
-        assert!(subrule < global_mode, "clash_mode: global 必须在订阅规则之后: {sigs:?}");
+        assert!(
+            subrule < global_mode,
+            "clash_mode: global 必须在订阅规则之后: {sigs:?}"
+        );
         assert!(
             global_mode < ads && ads < gpriv && gpriv < cn,
             "域名类内置规则必须在全局规则之后: {sigs:?}"
@@ -3306,9 +3618,18 @@ rules:
             .iter()
             .filter_map(|o| o["tag"].as_str())
             .collect();
-        assert!(tags.contains(&"HK-01"), "node HK-01 must be emitted, got {tags:?}");
-        assert!(tags.contains(&"US-01"), "node US-01 must be emitted, got {tags:?}");
-        assert!(tags.contains(&"节点选择"), "group must be emitted, got {tags:?}");
+        assert!(
+            tags.contains(&"HK-01"),
+            "node HK-01 must be emitted, got {tags:?}"
+        );
+        assert!(
+            tags.contains(&"US-01"),
+            "node US-01 must be emitted, got {tags:?}"
+        );
+        assert!(
+            tags.contains(&"节点选择"),
+            "group must be emitted, got {tags:?}"
+        );
     }
 
     /// 回归（51 节点只见 10 个）：策略组只引用一个节点时，
@@ -3351,9 +3672,18 @@ rules:
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(members.contains(&"IN-01"), "original member kept: {members:?}");
-        assert!(members.contains(&"IN-02"), "uncovered node attached: {members:?}");
-        assert!(members.contains(&"IN-03"), "uncovered node attached: {members:?}");
+        assert!(
+            members.contains(&"IN-01"),
+            "original member kept: {members:?}"
+        );
+        assert!(
+            members.contains(&"IN-02"),
+            "uncovered node attached: {members:?}"
+        );
+        assert!(
+            members.contains(&"IN-03"),
+            "uncovered node attached: {members:?}"
+        );
     }
 
     /// 回归（测速全部超时）：服务器为域名的节点必须出现在 DNS outbound 规则中
@@ -3411,8 +3741,14 @@ rules:
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(tags.contains(&"DOM-NODE"), "domain-server node routed to dns-local: {tags:?}");
-        assert!(!tags.contains(&"IP-NODE"), "IP node must not be listed: {tags:?}");
+        assert!(
+            tags.contains(&"DOM-NODE"),
+            "domain-server node routed to dns-local: {tags:?}"
+        );
+        assert!(
+            !tags.contains(&"IP-NODE"),
+            "IP node must not be listed: {tags:?}"
+        );
         assert_eq!(outbound_rule["server"].as_str(), Some("dns-local"));
     }
 
@@ -3450,12 +3786,22 @@ rules:
         .unwrap();
 
         const NODE_TYPES: [&str; 7] = [
-            "shadowsocks", "vmess", "vless", "trojan", "tuic", "hysteria", "hysteria2",
+            "shadowsocks",
+            "vmess",
+            "vless",
+            "trojan",
+            "tuic",
+            "hysteria",
+            "hysteria2",
         ];
         let outbounds = built.config["outbounds"].as_array().unwrap();
         let node_tags: Vec<&str> = outbounds
             .iter()
-            .filter(|o| o.get("type").and_then(|t| t.as_str()).is_some_and(|t| NODE_TYPES.contains(&t)))
+            .filter(|o| {
+                o.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| NODE_TYPES.contains(&t))
+            })
             .filter_map(|o| o["tag"].as_str())
             .collect();
 
@@ -3469,8 +3815,14 @@ rules:
                 }
             }
         }
-        let unreferenced: Vec<&&str> = node_tags.iter().filter(|t| !referenced.contains(**t)).collect();
-        assert!(unreferenced.is_empty(), "nodes still invisible: {unreferenced:?}");
+        let unreferenced: Vec<&&str> = node_tags
+            .iter()
+            .filter(|t| !referenced.contains(**t))
+            .collect();
+        assert!(
+            unreferenced.is_empty(),
+            "nodes still invisible: {unreferenced:?}"
+        );
 
         let is_ip = |s: &str| {
             s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
@@ -3479,8 +3831,13 @@ rules:
             .iter()
             .copied()
             .filter(|t| {
-                let o = outbounds.iter().find(|x| x["tag"].as_str() == Some(*t)).unwrap();
-                o.get("server").and_then(|s| s.as_str()).is_some_and(|s| !is_ip(s))
+                let o = outbounds
+                    .iter()
+                    .find(|x| x["tag"].as_str() == Some(*t))
+                    .unwrap();
+                o.get("server")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !is_ip(s))
             })
             .collect();
 
@@ -3489,13 +3846,27 @@ rules:
             .unwrap()
             .iter()
             .filter(|r| r.get("outbound").is_some())
-            .flat_map(|r| r["outbound"].as_array().unwrap().iter().filter_map(|v| v.as_str()))
+            .flat_map(|r| {
+                r["outbound"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|v| v.as_str())
+            })
             .collect();
-        let missing_dns: Vec<&str> = domain_nodes.iter().copied().filter(|t| !dns_rule_tags.contains(t)).collect();
-        assert!(missing_dns.is_empty(), "domain nodes missing DNS rule: {missing_dns:?}");
+        let missing_dns: Vec<&str> = domain_nodes
+            .iter()
+            .copied()
+            .filter(|t| !dns_rule_tags.contains(t))
+            .collect();
+        assert!(
+            missing_dns.is_empty(),
+            "domain nodes missing DNS rule: {missing_dns:?}"
+        );
         eprintln!(
             "OK: {} nodes all referenced, {} domain-server nodes covered by dns-local rule",
-            node_tags.len(), domain_nodes.len()
+            node_tags.len(),
+            domain_nodes.len()
         );
     }
 
@@ -3507,8 +3878,11 @@ rules:
         // PSK 写入前会被规范化重编码
         let k = |seed: u8| {
             use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD
-                .encode((0..32u8).map(|i| i.wrapping_mul(31).wrapping_add(seed) | 1).collect::<Vec<u8>>())
+            base64::engine::general_purpose::STANDARD.encode(
+                (0..32u8)
+                    .map(|i| i.wrapping_mul(31).wrapping_add(seed) | 1)
+                    .collect::<Vec<u8>>(),
+            )
         };
         let priv_key = k(1);
         let peer_key = k(2);
@@ -3583,8 +3957,14 @@ rules:
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(addrs.contains(&"10.0.0.2/32"), "bare v4 normalized: {addrs:?}");
-        assert!(addrs.contains(&"fdfe:dcba:9876::2/128"), "bare v6 normalized: {addrs:?}");
+        assert!(
+            addrs.contains(&"10.0.0.2/32"),
+            "bare v4 normalized: {addrs:?}"
+        );
+        assert!(
+            addrs.contains(&"fdfe:dcba:9876::2/128"),
+            "bare v6 normalized: {addrs:?}"
+        );
         assert_eq!(wg["mtu"].as_u64(), Some(1280));
         assert_eq!(wg["reserved"][0].as_u64(), Some(1));
         // APP-6：PSK 已被规范化重编码为标准 44 位 Base64
@@ -3603,7 +3983,10 @@ rules:
 
         let https = find("HTTPS-01");
         assert_eq!(https["type"].as_str(), Some("http"));
-        assert!(https.get("tls").is_some(), "https node must carry tls block");
+        assert!(
+            https.get("tls").is_some(),
+            "https node must carry tls block"
+        );
     }
 
     // ============================== Go 引擎集成 ==============================
@@ -3662,9 +4045,8 @@ rules:
             "必须注入 {home_tag} 出站"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
-        let pos = |pred: &dyn Fn(&Value) -> bool| -> Option<usize> {
-            rules.iter().position(|r| pred(r))
-        };
+        let pos =
+            |pred: &dyn Fn(&Value) -> bool| -> Option<usize> { rules.iter().position(|r| pred(r)) };
         let lan_ip = pos(&|r| {
             r.get("outbound").and_then(Value::as_str) == Some(home_tag.as_str())
                 && r.get("ip_cidr").is_some()
@@ -3680,12 +4062,20 @@ rules:
         assert!(lan_ip.is_some(), "缺少回家 ip_cidr 规则");
         assert!(private_geosite.is_some(), "缺少内置 geosite: private 规则");
         assert!(private_ip.is_some(), "缺少 ip_is_private 直连规则");
-        assert!(lan_ip.unwrap() < private_geosite.unwrap(), "回家规则必须先于 geosite: private");
-        assert!(lan_ip.unwrap() < private_ip.unwrap(), "回家规则必须先于 ip_is_private 直连");
+        assert!(
+            lan_ip.unwrap() < private_geosite.unwrap(),
+            "回家规则必须先于 geosite: private"
+        );
+        assert!(
+            lan_ip.unwrap() < private_ip.unwrap(),
+            "回家规则必须先于 ip_is_private 直连"
+        );
         // dns-home 已并入 DNS 配置
         let dns_servers = built.config["dns"]["servers"].as_array().unwrap();
         assert!(
-            dns_servers.iter().any(|s| s["tag"].as_str() == Some("dns-home")),
+            dns_servers
+                .iter()
+                .any(|s| s["tag"].as_str() == Some("dns-home")),
             "lan_domains 需经家庭 DNS 解析，必须注入 dns-home"
         );
     }
@@ -3741,31 +4131,41 @@ rules:
 
         let outbounds = built.config["outbounds"].as_array().unwrap();
         assert!(
-            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-cus-sidecar")),
+            outbounds
+                .iter()
+                .any(|o| o["tag"].as_str() == Some("go-cus-sidecar")),
             "MitM 域名需要边车出站"
         );
         let rules = built.config["route"]["rules"].as_array().unwrap();
         // 阻断规则存在
         assert!(
-            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("block")
-                && r["domain_suffix"]
-                    .as_array()
-                    .map(|a| a.iter().any(|v| v.as_str() == Some("ads.example.com")))
-                    .unwrap_or(false)),
+            rules.iter().any(
+                |r| r.get("outbound").and_then(Value::as_str) == Some("block")
+                    && r["domain_suffix"]
+                        .as_array()
+                        .map(|a| a.iter().any(|v| v.as_str() == Some("ads.example.com")))
+                        .unwrap_or(false)
+            ),
             "模块 REJECT 规则应编译为 block"
         );
         // MitM 域名路由到边车容错组（边车不可达时回落主组），且不残留 PROXY 占位
         assert!(
-            outbounds.iter().any(|o| o["tag"].as_str() == Some("go-cus-fallback")
-                && o["type"].as_str() == Some("urltest")),
+            outbounds
+                .iter()
+                .any(|o| o["tag"].as_str() == Some("go-cus-fallback")
+                    && o["type"].as_str() == Some("urltest")),
             "边车必须包进 urltest 容错组"
         );
         assert!(
-            rules.iter().any(|r| r.get("outbound").and_then(Value::as_str) == Some("go-cus-fallback")),
+            rules
+                .iter()
+                .any(|r| r.get("outbound").and_then(Value::as_str) == Some("go-cus-fallback")),
             "MitM 域名必须路由到边车容错组"
         );
         assert!(
-            rules.iter().all(|r| r.get("outbound").and_then(Value::as_str) != Some("PROXY")),
+            rules
+                .iter()
+                .all(|r| r.get("outbound").and_then(Value::as_str) != Some("PROXY")),
             "PROXY 占位符必须全部解析为真实组 tag"
         );
     }
@@ -3888,8 +4288,16 @@ rules:
             dns_pos, 7,
             "aim-probe + 直连DNS旁路 + WG豁免 + go-lan隧道 之后才是 protocol dns"
         );
-        assert_eq!(rules[dns_pos + 1]["port"].as_u64(), Some(53), "缺 port 53 劫持");
-        assert_eq!(rules[dns_pos + 2]["port"].as_u64(), Some(853), "缺 853 拦截");
+        assert_eq!(
+            rules[dns_pos + 1]["port"].as_u64(),
+            Some(53),
+            "缺 port 53 劫持"
+        );
+        assert_eq!(
+            rules[dns_pos + 2]["port"].as_u64(),
+            Some(853),
+            "缺 853 拦截"
+        );
         let wg_pos = rules
             .iter()
             .position(|r| {
@@ -3931,8 +4339,14 @@ rules:
             .flatten()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
-        assert!(cidrs.contains(&"192.168.1.0/24".to_string()), "网段需归一化: {cidrs:?}");
-        assert!(cidrs.contains(&"10.8.0.0/24".to_string()), "需并入虚拟子网: {cidrs:?}");
+        assert!(
+            cidrs.contains(&"192.168.1.0/24".to_string()),
+            "网段需归一化: {cidrs:?}"
+        );
+        assert!(
+            cidrs.contains(&"10.8.0.0/24".to_string()),
+            "需并入虚拟子网: {cidrs:?}"
+        );
     }
 
     /// 【APP32 任务1.1】「剩余流量/到期时间/重置时间/官网广告」等机场
@@ -3953,7 +4367,11 @@ rules:
   - MATCH,节点选择
 "#;
         let built = build(
-            &[("https://sub.example".into(), "订阅1".into(), yaml.to_string())],
+            &[(
+                "https://sub.example".into(),
+                "订阅1".into(),
+                yaml.to_string(),
+            )],
             &[],
             RunMode::SystemProxy,
             &UserSettings::default(),
@@ -3971,7 +4389,12 @@ rules:
             .iter()
             .filter_map(|o| o["tag"].as_str())
             .collect();
-        for bad in ["剩余流量：99GB", "到期时间：2026-12-01", "距离下次重置：10天", "官网：https://xxx.com"] {
+        for bad in [
+            "剩余流量：99GB",
+            "到期时间：2026-12-01",
+            "距离下次重置：10天",
+            "官网：https://xxx.com",
+        ] {
             assert!(
                 !tags.iter().any(|t| t.contains(bad) || bad.contains(t)),
                 "假节点「{bad}」绝不能进入 outbounds: {tags:?}"
@@ -4014,7 +4437,11 @@ rules:
   - MATCH,节点选择
 "#;
         let built = build(
-            &[("https://sub.example".into(), "订阅1".into(), yaml.to_string())],
+            &[(
+                "https://sub.example".into(),
+                "订阅1".into(),
+                yaml.to_string(),
+            )],
             &[],
             RunMode::SystemProxy,
             &UserSettings::default(),
@@ -4033,9 +4460,16 @@ rules:
             .filter_map(|o| o["tag"].as_str())
             .collect();
         let unique: std::collections::HashSet<&&str> = tags.iter().collect();
-        assert_eq!(tags.len(), unique.len(), "全部 outbound tag 必须唯一: {tags:?}");
+        assert_eq!(
+            tags.len(),
+            unique.len(),
+            "全部 outbound tag 必须唯一: {tags:?}"
+        );
         assert!(tags.contains(&"HK"), "首个同名节点保留原名: {tags:?}");
-        assert!(tags.contains(&"HK (2)"), "第二个同名节点自动加序号: {tags:?}");
+        assert!(
+            tags.contains(&"HK (2)"),
+            "第二个同名节点自动加序号: {tags:?}"
+        );
     }
 
     /// 【APP39 任务2.1/3】Tun 模式下 tun-in 必须使用纯用户态 gvisor 协议栈
@@ -4083,7 +4517,11 @@ rules:
             Some("30ms"),
             "【APP72 任务3.2】tun-in 嗅探超时已压缩为 30ms（原 50ms）"
         );
-        assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启被动嗅探");
+        assert_eq!(
+            tun["sniff"].as_bool(),
+            Some(true),
+            "tun-in 必须开启被动嗅探"
+        );
         assert_eq!(
             tun["sniff_override_destination"].as_bool(),
             Some(false),
@@ -4097,7 +4535,11 @@ rules:
             .iter()
             .find(|i| i["tag"] == MIXED_TAG)
             .expect("mixed-in 入站必须存在");
-        assert_eq!(mixed["sniff"].as_bool(), Some(true), "mixed-in 必须开启被动嗅探");
+        assert_eq!(
+            mixed["sniff"].as_bool(),
+            Some(true),
+            "mixed-in 必须开启被动嗅探"
+        );
         assert_eq!(
             mixed["sniff_override_destination"].as_bool(),
             Some(false),
@@ -4166,7 +4608,10 @@ rules:
             "假节点引用必须被剔除: {list:?}"
         );
         // 真实节点保留
-        assert!(list.contains(&"美国凤凰城|高速下载"), "真实节点必须保留: {list:?}");
+        assert!(
+            list.contains(&"美国凤凰城|高速下载"),
+            "真实节点必须保留: {list:?}"
+        );
         assert!(list.contains(&"日本东京"), "真实节点必须保留: {list:?}");
         // urltest 严禁 default 字段
         assert!(
@@ -4236,17 +4681,18 @@ rules:
         ];
         let real_tags2 = vec!["香港 01".to_string()];
         sanitize_outbound_dependencies(&mut outbounds2, &real_tags2);
-        let sel2 = outbounds2
-            .iter()
-            .find(|o| o["tag"] == "Proxy")
-            .unwrap();
+        let sel2 = outbounds2.iter().find(|o| o["tag"] == "Proxy").unwrap();
         let list2: Vec<&str> = sel2["outbounds"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(list2, vec!["香港 01"], "空组必须回填 real_proxy_tags: {list2:?}");
+        assert_eq!(
+            list2,
+            vec!["香港 01"],
+            "空组必须回填 real_proxy_tags: {list2:?}"
+        );
     }
 
     /// 【APP33 任务2.1】策略组自引用（outbounds 含自身 tag）必须剔除，
@@ -4275,10 +4721,7 @@ rules:
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(
-            !list.contains(&"Proxy"),
-            "策略组自引用必须被剔除: {list:?}"
-        );
+        assert!(!list.contains(&"Proxy"), "策略组自引用必须被剔除: {list:?}");
         assert!(list.contains(&"日本东京"));
     }
 
@@ -4446,9 +4889,7 @@ rules:
             .expect("直连 DNS 旁路规则缺失");
         let hijack = rules
             .iter()
-            .position(|rule| {
-                rule["port"] == 53 || rule["protocol"] == "dns"
-            })
+            .position(|rule| rule["port"] == 53 || rule["protocol"] == "dns")
             .expect("DNS 劫持规则缺失");
         assert!(
             bypass < hijack,
@@ -4570,8 +5011,15 @@ rules:
         // 真实链路：URI 列表 → uri_parser → 节点 JSON → 合成 Clash YAML → build
         let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
         assert!(errors.is_empty(), "真实 18 行必须全部解析成功: {errors:?}");
-        assert!(notice.is_some(), "server=0.0.0.0 的假节点必须被识别为机场提示");
-        assert_eq!(nodes.len(), 18, "假节点被过滤后：14 vless + 4 trojan = 18 行");
+        assert!(
+            notice.is_some(),
+            "server=0.0.0.0 的假节点必须被识别为机场提示"
+        );
+        assert_eq!(
+            nodes.len(),
+            18,
+            "假节点被过滤后：14 vless + 4 trojan = 18 行"
+        );
         let doc = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
             .expect("合成 Clash YAML");
         let built = build(
@@ -4591,7 +5039,11 @@ rules:
         let vless: Vec<_> = outbounds.iter().filter(|o| o["type"] == "vless").collect();
         let trojan: Vec<_> = outbounds.iter().filter(|o| o["type"] == "trojan").collect();
         assert_eq!(vless.len(), 14, "14 个 vless 必须全部发射");
-        assert_eq!(trojan.len(), 4, "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan");
+        assert_eq!(
+            trojan.len(),
+            4,
+            "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan"
+        );
         // 假节点严禁出现在任何出站中
         assert!(
             !outbounds
@@ -4602,7 +5054,10 @@ rules:
 
         let v0 = vless[0];
         assert_eq!(v0["tls"]["enabled"], true);
-        assert_eq!(v0["tls"]["insecure"], true, "allowInsecure=1 → tls.insecure");
+        assert_eq!(
+            v0["tls"]["insecure"], true,
+            "allowInsecure=1 → tls.insecure"
+        );
         assert_eq!(v0["tls"]["server_name"], "baidu.com");
         assert_eq!(v0["tls"]["utls"]["fingerprint"], "chrome");
         assert_eq!(v0["flow"], "xtls-rprx-vision");
@@ -4646,8 +5101,15 @@ rules:
         let text = lines.join("\n");
         let (nodes, errors, notice) = crate::core::uri_parser::parse_lines(&text);
         assert!(errors.is_empty(), "真实 18 行必须全部解析成功: {errors:?}");
-        assert!(notice.is_some(), "server=0.0.0.0 假节点必须被识别为机场提示");
-        assert_eq!(nodes.len(), 18, "假节点被过滤后：14 vless + 4 trojan = 18 行");
+        assert!(
+            notice.is_some(),
+            "server=0.0.0.0 假节点必须被识别为机场提示"
+        );
+        assert_eq!(
+            nodes.len(),
+            18,
+            "假节点被过滤后：14 vless + 4 trojan = 18 行"
+        );
         let doc_a = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
             .expect("合成 Clash YAML");
 
@@ -4686,7 +5148,11 @@ rules:
         let vless: Vec<_> = outbounds.iter().filter(|o| o["type"] == "vless").collect();
         let trojan: Vec<_> = outbounds.iter().filter(|o| o["type"] == "trojan").collect();
         assert_eq!(vless.len(), 14, "14 个 vless 必须全部发射");
-        assert_eq!(trojan.len(), 4, "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan");
+        assert_eq!(
+            trojan.len(),
+            4,
+            "0.0.0.0 假节点必须被过滤，只剩 4 个 trojan"
+        );
         assert!(
             !outbounds
                 .iter()
@@ -4713,7 +5179,10 @@ rules:
         for o in &trojan {
             assert_eq!(o["tls"]["insecure"], true);
             assert_eq!(o["tls"]["server_name"], "update.microsoft.com");
-            assert_eq!(o["tls"]["utls"]["enabled"], true, "trojan 必须默认 uTLS: {o}");
+            assert_eq!(
+                o["tls"]["utls"]["enabled"], true,
+                "trojan 必须默认 uTLS: {o}"
+            );
             assert_eq!(o["tls"]["utls"]["fingerprint"], "chrome");
         }
 
@@ -4815,7 +5284,9 @@ rules:
             "4 个 Trojan"
         );
         assert!(
-            nodes.iter().all(|n| n["server"].as_str() != Some("0.0.0.0")),
+            nodes
+                .iter()
+                .all(|n| n["server"].as_str() != Some("0.0.0.0")),
             "0.0.0.0 伪节点绝不允许进入节点列表"
         );
 
@@ -4886,8 +5357,7 @@ rules:
         assert!(
             servers
                 .iter()
-                .any(|s| s["tag"] == "dns-direct-backup"
-                    && s["address"] == "udp://119.29.29.29"),
+                .any(|s| s["tag"] == "dns-direct-backup" && s["address"] == "udp://119.29.29.29"),
             "119.29.29.29 备用 DNS 缺失: {servers:?}"
         );
     }
@@ -4923,13 +5393,15 @@ rules:
                 .to_string(),
         );
         // 额外：trojan://...&security=tls 默认开 TLS —— 验证默认 tls=true
-        lines.push(
-            "trojan://pw@default.example.com:443?type=tcp#DEFAULT-TROJAN".to_string(),
-        );
+        lines.push("trojan://pw@default.example.com:443?type=tcp#DEFAULT-TROJAN".to_string());
         let text = lines.join("\n");
         let (nodes, errors, _) = crate::core::uri_parser::parse_lines(&text);
         assert!(errors.is_empty());
-        assert_eq!(nodes.len(), 20, "14 vless + 4 trojan + 1 plain + 1 default = 20");
+        assert_eq!(
+            nodes.len(),
+            20,
+            "14 vless + 4 trojan + 1 plain + 1 default = 20"
+        );
         let doc = serde_yaml::to_string(&serde_json::json!({ "proxies": nodes }))
             .expect("合成 Clash YAML");
         let base = std::env::temp_dir().join("prism-cb-test-app64");
@@ -5014,9 +5486,13 @@ rules:
         }
 
         // —— 严禁给 tcp 节点写多余 transport 字段 ——
-        for o in outbounds.iter().filter(|o| o["type"].as_str() == Some("vless")) {
+        for o in outbounds
+            .iter()
+            .filter(|o| o["type"].as_str() == Some("vless"))
+        {
             assert!(
-                o.get("transport").is_none() && o.get("ws-opts").is_none()
+                o.get("transport").is_none()
+                    && o.get("ws-opts").is_none()
                     && o.get("grpc-opts").is_none(),
                 "tcp 类型节点严禁写 transport / ws-opts / grpc-opts: {o}"
             );
@@ -5040,13 +5516,17 @@ rules:
             "必须存在 outbound:any → dns-direct"
         );
         assert!(
-            rules.iter().any(|r| r["clash_mode"].as_str() == Some("direct")
-                && r["server"].as_str() == Some("dns-direct")),
+            rules
+                .iter()
+                .any(|r| r["clash_mode"].as_str() == Some("direct")
+                    && r["server"].as_str() == Some("dns-direct")),
             "必须存在 clash_mode: direct → dns-direct"
         );
         assert!(
-            rules.iter().any(|r| r["clash_mode"].as_str() == Some("global")
-                && r["server"].as_str() == Some("dns-remote")),
+            rules
+                .iter()
+                .any(|r| r["clash_mode"].as_str() == Some("global")
+                    && r["server"].as_str() == Some("dns-remote")),
             "必须存在 clash_mode: global → dns-remote"
         );
     }
@@ -5339,7 +5819,10 @@ rules:
             .iter()
             .position(|r| r.get("clash_mode").and_then(Value::as_str) == Some("global"))
             .expect("dns.rules 缺少 clash_mode: global");
-        assert!(cn < svcb && svcb < global, "SVCB 拦截必须位于 cn 直连之后、global 之前");
+        assert!(
+            cn < svcb && svcb < global,
+            "SVCB 拦截必须位于 cn 直连之后、global 之前"
+        );
     }
 
     /// APP70 测试4：Rule / Global / Direct × Go Lan 开/关 组合矩阵。
@@ -5404,9 +5887,15 @@ rules:
                         r.get("domain_suffix")
                             .and_then(Value::as_array)
                             .is_some_and(|a| {
-                                ["taobao.com", "alicdn.com", "weixin.qq.com", "bilibili.com", "icloud.com.cn"]
-                                    .iter()
-                                    .all(|d| a.iter().any(|x| x.as_str() == Some(d)))
+                                [
+                                    "taobao.com",
+                                    "alicdn.com",
+                                    "weixin.qq.com",
+                                    "bilibili.com",
+                                    "icloud.com.cn",
+                                ]
+                                .iter()
+                                .all(|d| a.iter().any(|x| x.as_str() == Some(d)))
                             })
                     })
                     .expect("dns.rules 缺少内置大陆域名后缀");
@@ -5508,9 +5997,12 @@ rules:
         // 5) 内置大陆网段清单不含私网段（不得侵占 Go Lan 网段）
         for cidr in CN_DIRECT_CIDRS {
             assert!(
-                !cidr.starts_with("10.") && !cidr.starts_with("192.168.")
-                    && !(cidr.starts_with("172.16.") || cidr.starts_with("172.17.")
-                        || cidr.starts_with("172.18.") || cidr.starts_with("172.19.")
+                !cidr.starts_with("10.")
+                    && !cidr.starts_with("192.168.")
+                    && !(cidr.starts_with("172.16.")
+                        || cidr.starts_with("172.17.")
+                        || cidr.starts_with("172.18.")
+                        || cidr.starts_with("172.19.")
                         || cidr.starts_with("172.2")),
                 "内置大陆网段严禁包含私网段: {cidr}"
             );
@@ -5656,10 +6148,7 @@ rules:
                         .is_some_and(|a| a.iter().any(|x| x == "58.144.0.0/16"))
             })
             .expect("大陆 ip_cidr 直连规则缺失");
-        if let Some(foreign) = rules
-            .iter()
-            .position(|r| r["geosite"] == "geolocation-!cn")
-        {
+        if let Some(foreign) = rules.iter().position(|r| r["geosite"] == "geolocation-!cn") {
             assert!(
                 cn_domain < foreign && cn_cidr < foreign,
                 "大陆直连规则必须早于海外域名代理规则"

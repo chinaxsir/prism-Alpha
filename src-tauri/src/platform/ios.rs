@@ -97,18 +97,15 @@ pub fn start_tunnel(config_content: &str) -> Result<()> {
     } else {
         // Swift 侧把 NSError 完整描述写入 NSTemporaryDirectory()/
         // prism_vpn_start_error.txt（iOS 沙盒 tmp，与 std::env::temp_dir 一致）
-        let detail = std::fs::read_to_string(
-            std::env::temp_dir().join("prism_vpn_start_error.txt")
-        )
-        .unwrap_or_default();
+        let detail =
+            std::fs::read_to_string(std::env::temp_dir().join("prism_vpn_start_error.txt"))
+                .unwrap_or_default();
         if detail.is_empty() {
             Err(anyhow!(
                 "NETunnelProviderManager 启动失败（代码 {rc}）：请检查系统 VPN 授权与扩展安装"
             ))
         } else {
-            Err(anyhow!(
-                "VPN 启动失败（代码 {rc}）：{detail}"
-            ))
+            Err(anyhow!("VPN 启动失败（代码 {rc}）：{detail}"))
         }
     }
 }
@@ -192,5 +189,3 @@ pub fn share_text_file(filename: &str, content: &str) -> bool {
     };
     unsafe { sys::prism_ios_share_text_file(name.as_ptr(), body.as_ptr()) }
 }
-
-

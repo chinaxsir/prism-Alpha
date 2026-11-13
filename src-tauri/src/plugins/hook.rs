@@ -15,10 +15,20 @@ pub enum HookEvent {
         network: String,
     },
     /// HTTP 请求/响应改写（去广告等）
-    HttpRequest { url: String, headers: Vec<(String, String)> },
-    HttpResponse { url: String, status: u16, body: Vec<u8> },
+    HttpRequest {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+    HttpResponse {
+        url: String,
+        status: u16,
+        body: Vec<u8>,
+    },
     /// 规则匹配后：插件可覆盖匹配结果
-    PostRuleMatch { matched_rule: String, outbound: String },
+    PostRuleMatch {
+        matched_rule: String,
+        outbound: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

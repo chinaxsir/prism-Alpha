@@ -354,8 +354,7 @@ impl ProbeProgress {
             self.total = self.full_total;
             // 【APP72 任务1.3】processed = 阶段1 已淘汰 + 阶段2 已处理（含缓存命中）：
             // 只有全部候选节点都处理完（如 34/34）时进度才允许到 100%。
-            self.done = (self.full_done + self.cache_hits + self.failed_count)
-                .min(self.full_total);
+            self.done = (self.full_done + self.cache_hits + self.failed_count).min(self.full_total);
             self.pending_count = self.full_total.saturating_sub(self.done);
             let computed = 20 + (self.done * 79) / self.full_total.max(1);
             self.percent = if matches!(phase.as_str(), "ERROR" | "CANCELLED") {
@@ -652,8 +651,7 @@ impl AppState {
             )
         };
         let sign = *self.entitlement_sign.read();
-        let expect =
-            super::security::entitlement_signature(&status, expires_at, last_verified_at);
+        let expect = super::security::entitlement_signature(&status, expires_at, last_verified_at);
         if sign != expect {
             super::security::mark_compromised("entitlement signature mismatch");
             return false;
@@ -731,10 +729,7 @@ impl AppState {
 
         // 60s 流量队列（按时间先后；最新一次同时作为当前速率）
         let history = self.traffic_history.read();
-        let (up_speed, down_speed) = history
-            .back()
-            .map(|s| (s.up, s.down))
-            .unwrap_or((0, 0));
+        let (up_speed, down_speed) = history.back().map(|s| (s.up, s.down)).unwrap_or((0, 0));
         let traffic_history: Vec<serde_json::Value> = history
             .iter()
             .map(|s| serde_json::json!({ "time": s.time, "up": s.up, "down": s.down }))
@@ -977,9 +972,7 @@ pub fn load_node_metrics(data_dir: &std::path::Path) -> PersistedNodeMetrics {
         return PersistedNodeMetrics::default();
     };
     let mut metrics: PersistedNodeMetrics = serde_json::from_str(&text).unwrap_or_default();
-    metrics
-        .delays
-        .retain(|_, d| *d == 0 || *d >= 5);
+    metrics.delays.retain(|_, d| *d == 0 || *d >= 5);
     for d in metrics.delays.values_mut() {
         *d = sanitize_fake_delay(*d);
     }
@@ -1179,7 +1172,9 @@ mod app52_tests {
     /// 只有当前引擎版本的真实结果才保留，彻底清除遗留假解锁标签。
     #[test]
     fn test_old_aim_cache_evicted_on_load() {
-        use crate::core::go_aim::{CURRENT_AIM_PROBE_VERSION, CURRENT_AIM_RULE_VERSION, AimNodeResult};
+        use crate::core::go_aim::{
+            AimNodeResult, CURRENT_AIM_PROBE_VERSION, CURRENT_AIM_RULE_VERSION,
+        };
         let dir = std::env::temp_dir().join(format!(
             "prism_app67_aim_cache_{}",
             std::time::SystemTime::now()

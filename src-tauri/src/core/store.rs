@@ -142,7 +142,9 @@ pub struct TrafficStats {
 impl Default for TrafficStats {
     fn default() -> Self {
         let now = std::time::SystemTime::now();
-        let epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let epoch = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         let days = (epoch.as_secs() / 86400) as i64;
         // 简化日期计算：用 chrono 太重，这里用 naive 算法
         // 对于统计用途，只需区分日/周/月即可
@@ -196,7 +198,9 @@ pub fn save_traffic_stats(data_dir: &Path, stats: &TrafficStats) -> anyhow::Resu
 pub fn add_traffic(data_dir: &Path, up: u64, down: u64) -> anyhow::Result<TrafficStats> {
     let mut stats = load_traffic_stats(data_dir);
     let now = std::time::SystemTime::now();
-    let epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let days = (epoch.as_secs() / 86400) as i64;
     let current_date = format!("day-{}", days);
     let current_week = (days / 7) as u32;
@@ -440,11 +444,7 @@ pub fn upsert_subscription_pending(data_dir: &Path, url: &str) -> anyhow::Result
 }
 
 /// 设置订阅启用状态；返回是否存在该记录
-pub fn set_subscription_enabled(
-    data_dir: &Path,
-    url: &str,
-    enabled: bool,
-) -> anyhow::Result<bool> {
+pub fn set_subscription_enabled(data_dir: &Path, url: &str, enabled: bool) -> anyhow::Result<bool> {
     let mut records = load_subscriptions(data_dir);
     let Some(record) = records.iter_mut().find(|r| r.url == url) else {
         return Ok(false);

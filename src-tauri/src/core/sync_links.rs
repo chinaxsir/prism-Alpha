@@ -303,7 +303,10 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
             continue;
         }
         if has_record {
-            tracing::info!("订阅同步：本地为空壳（缓存缺失或 0 节点），重新拉取 {}", link.url);
+            tracing::info!(
+                "订阅同步：本地为空壳（缓存缺失或 0 节点），重新拉取 {}",
+                link.url
+            );
         } else {
             tracing::info!("订阅同步：从云端拉取 {}", link.url);
         }
@@ -344,11 +347,7 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
         if local_name.is_none() && cloud_name.is_some() {
             set_local_name(&data_dir, &link.url, cloud_name.clone());
         } else if local_name != cloud_name {
-            tracing::info!(
-                "订阅同步：本地上行重命名 {} -> {:?}",
-                link.url,
-                local_name
-            );
+            tracing::info!("订阅同步：本地上行重命名 {} -> {:?}", link.url, local_name);
             match api_put_link(&base, &key, &email, &link.url, local_name.as_deref()).await {
                 Ok(updated) => {
                     cloud[idx] = updated;
@@ -395,7 +394,10 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
             continue;
         }
         if cloud.len() >= LINK_LIMIT {
-            tracing::warn!("订阅同步：云端已达 {LINK_LIMIT} 条上限，未上传 {}", record.url);
+            tracing::warn!(
+                "订阅同步：云端已达 {LINK_LIMIT} 条上限，未上传 {}",
+                record.url
+            );
             continue;
         }
         tracing::info!("订阅同步：上传本地订阅 {}", record.url);

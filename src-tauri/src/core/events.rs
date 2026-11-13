@@ -22,11 +22,11 @@ use futures_util::StreamExt;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
-use tokio_tungstenite::tungstenite::Message;
 
-use super::state::{AppState, AggStat, ConnSnapshot, OutboundMode, TrafficSample};
+use super::state::{AggStat, AppState, ConnSnapshot, OutboundMode, TrafficSample};
 
 /// 60 秒实时流量环形队列容量
 const TRAFFIC_HISTORY_CAP: usize = 60;
@@ -65,14 +65,22 @@ fn should_reset_session(prev_total: u64, cur_total: u64, cooldown_ok: bool) -> b
 /// 【APP69 任务3】进程级单实例：每次 spawn_all 先 abort 上一轮订阅，
 /// 杜绝 reattach / 热重启后两条 /connections 流并存导致的分析重复统计、
 /// 日志双写（日志里 `.145` 与 `.254` 两条相同重置记录即由此产生）。
-pub fn spawn_all(
-    api_addr: &str,
-    api_secret: &str,
-    app: AppHandle,
-) -> Vec<JoinHandle<()>> {
+pub fn spawn_all(api_addr: &str, api_secret: &str, app: AppHandle) -> Vec<JoinHandle<()>> {
     let handles = vec![
-        spawn_stream(api_addr, api_secret, "/traffic", "traffic://tick", app.clone()),
-        spawn_stream(api_addr, api_secret, "/connections", "connections://tick", app.clone()),
+        spawn_stream(
+            api_addr,
+            api_secret,
+            "/traffic",
+            "traffic://tick",
+            app.clone(),
+        ),
+        spawn_stream(
+            api_addr,
+            api_secret,
+            "/connections",
+            "connections://tick",
+            app.clone(),
+        ),
         spawn_stream(api_addr, api_secret, "/memory", "memory://tick", app),
     ];
     static STREAMS: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
@@ -311,9 +319,7 @@ pub(crate) fn apply_connections_update(
             // 防止用户/第三方从「连接」「分析 Top 主机」反推授权服务并恶意阻断。
             if super::license::is_stealth_protected_host_or_ip(&host)
                 || super::license::is_stealth_protected_host_or_ip(&destination_ip)
-                || super::license::is_stealth_protected_host_or_ip(&meta_str(
-                    "rulePayload",
-                ))
+                || super::license::is_stealth_protected_host_or_ip(&meta_str("rulePayload"))
             {
                 continue;
             }
@@ -497,7 +503,8 @@ pub(crate) fn apply_connections_update(
             .saturating_sub(agg.last_total_down)
             .saturating_add(upload_total.saturating_sub(agg.last_total_up));
         let untracked = total_inc.saturating_sub(tagged);
-        let (to_proxy, to_direct) = allocate_untracked(&state.settings.read().outbound_mode, untracked);
+        let (to_proxy, to_direct) =
+            allocate_untracked(&state.settings.read().outbound_mode, untracked);
         proxy_inc = proxy_inc.saturating_add(to_proxy);
         direct_inc = direct_inc.saturating_add(to_direct);
         agg.proxy_bytes = agg.proxy_bytes.saturating_add(proxy_inc);
@@ -519,7 +526,8 @@ pub(crate) fn apply_connections_update(
 
         agg.last_seen.retain(|id, _| incoming.contains_key(id));
         for (id, conn) in &incoming {
-            agg.last_seen.insert(id.clone(), (conn.upload, conn.download));
+            agg.last_seen
+                .insert(id.clone(), (conn.upload, conn.download));
         }
     }
 
@@ -655,8 +663,8 @@ fn local_hhmmss() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_untracked, builtin_ip_domain, is_ip_literal, looks_like_domain_suffix,
-        resolve_domain, route_category, should_reset_session, OutboundMode, RouteCategory,
+        OutboundMode, RouteCategory, allocate_untracked, builtin_ip_domain, is_ip_literal,
+        looks_like_domain_suffix, resolve_domain, route_category, should_reset_session,
     };
     use std::collections::HashMap;
 
@@ -726,18 +734,12 @@ mod tests {
             route_category(&chains(&["go-lan-home", "节点选择"])),
             RouteCategory::Lan
         );
-        assert_eq!(
-            route_category(&chains(&["DIRECT"])),
-            RouteCategory::Direct
-        );
+        assert_eq!(route_category(&chains(&["DIRECT"])), RouteCategory::Direct);
         assert_eq!(
             route_category(&chains(&["节点", "dns-direct"])),
             RouteCategory::Direct
         );
-        assert_eq!(
-            route_category(&chains(&["REJECT"])),
-            RouteCategory::Block
-        );
+        assert_eq!(route_category(&chains(&["REJECT"])), RouteCategory::Block);
         // 普通代理链：首个出站即节点名，未命中以上规则 → proxy
         assert_eq!(
             route_category(&chains(&["香港01", "节点选择"])),
