@@ -889,10 +889,13 @@ export default function Proxies() {
                   >
                     {node.name}
                   </span>
-                  {/* 【APP74 任务5.2】PROXY_FAILED 红色小标 */}
+                  {/* 【APP75 任务3.3】PROXY_FAILED 显示「代理不可用」红标 */}
                   {proxyFailed && (
-                    <span className="shrink-0 px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/30 text-[10px] font-mono uppercase tracking-wide">
-                      PROXY_FAILED
+                    <span
+                      title="PROXY_FAILED"
+                      className="shrink-0 px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/30 text-[10px] tracking-wide"
+                    >
+                      代理不可用
                     </span>
                   )}
                   {/* 无 AIM 平台徽章时保持紧凑单行：协议标签内联显示 */}

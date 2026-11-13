@@ -1920,14 +1920,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     inbounds[i]["address"] = ["172.19.0.1/30"]
                     inbounds[i]["mtu"] = 1280
                     inbounds[i]["stack"] = "gvisor"
-                    // 【APP66 任务2.2C】sniff_override_destination 必须为 false：
-                    // sniff=true 仍能从 TLS ClientHello / HTTP Host 识别真实域名并
-                    // 命中域名分流规则，但数据包目标地址永远保持原始 IP —— 访问
-                    // 多网卡内网 `https://192.168.10.253:8001` 或自定义 Host 时
-                    // 100% 命中顶部 ip_cidr → go-lan-* 规则，绝不被改写漏进代理。
+                    // 【APP75 任务1.1】tun-in 嗅探强改写，与 Rust config_builder 同步：
+                    // Safari/App 的 HTTPS 请求进入 utun 后，从 TLS ClientHello 提取真实
+                    // SNI 域名并覆写目标地址，交给 VLESS/Trojan 出站按域名直连真实
+                    // 服务器，彻底绕开本地 DNS 污染返回的脏 IP（对标 Karing）。
+                    // 内网 ip_cidr → go-lan-* 规则先按原始 IP 匹配，命中后不受影响。
                     inbounds[i]["sniff"] = true
-                    inbounds[i]["sniff_override_destination"] = false
-                    inbounds[i]["sniff_timeout"] = "30ms"
+                    inbounds[i]["sniff_override_destination"] = true
+                    inbounds[i]["sniff_timeout"] = "100ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }

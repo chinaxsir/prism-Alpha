@@ -30,10 +30,10 @@ use futures_util::StreamExt;
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP74】当前 Go AIM 检测引擎版本号：统一递增至 6，启动时自动淘汰
-/// `< 6` 的错误缓存（含出口名单提前短路、PROXY_FAILED 伪装 probed=true 等脏结果）。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 6;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 6;
+/// 【APP75】当前 Go AIM 检测引擎版本号：统一递增至 7，启动时自动淘汰
+/// `< 7` 的旧缓存（含无 3 目标 HTTPS 门槛、NF/Disney+/TK 一律 PARTIAL 等旧结论）。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 7;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 7;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -63,6 +63,9 @@ const PROBE_CONNECT_TIMEOUT_MS: u64 = 3000;
 const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
 /// 【APP73 任务2.1】单个平台完整探测硬超时（10 秒，含 1 次补测）
 const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 10;
+/// 【APP75 任务3.2】单节点内部 7 平台并发上限：同一时刻最多 3 个平台
+/// 同时发起 HTTPS 握手，避免瞬时 7 路突发被中转服务器限流重置。
+const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
 /// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
 const SCREEN_BATCH_SIZE: usize = 32;
 /// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
@@ -115,9 +118,12 @@ fn probe_port_reachable(port: u16) -> bool {
 /// AI 平台受限地区（cdn-trace loc=）：命中任一即判定该平台对该出口封锁。
 /// 【APP67】GPT 增加 VE（委内瑞拉）；其余 AI 平台使用不含 VE 的子集时
 /// 在各自探测器中另行校验。
+/// 【APP75】生产代码已删除出口名单提前短路，仅保留给回归测试断言名单内容。
+#[cfg(test)]
 const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY", "VE"];
 
 /// 不含 VE 的 AI 平台受限名单（Claude / Gemini / Disney+ 使用）
+#[cfg(test)]
 const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
@@ -1456,15 +1462,9 @@ async fn probe_all(
                 .collect()
         })
         .unwrap_or_default();
-    // 【APP72 任务1.3】阶段1 引入重试与缓存回退：单次超时不再直接判死，
-    // 避免大批可用节点（如 34 个中 19 个）被误淘汰导致阶段2 样本过少。
-    let cached_delays: std::collections::HashMap<String, u64> = state
-        .aim_results
-        .read()
-        .iter()
-        .filter(|(_, r)| r.delay_ms > 0)
-        .map(|(name, r)| (name.clone(), r.delay_ms))
-        .collect();
+    // 【APP75 任务3.1】阶段1 严禁历史缓存延迟冒充本轮存活：
+    // 只有本轮实时测速成功（delay > 0）才允许进入深度检测队列。此处不再
+    // 读取 aim_results 的历史延迟，主备两次实时测速均失败即 ScreenedDead。
     {
         use futures_util::StreamExt as _;
         let sem = Arc::new(tokio::sync::Semaphore::new(SCREEN_BATCH_SIZE));
@@ -2701,6 +2701,7 @@ async fn probe_claude(
 /// Gemini：gemini.google.com/app（无重定向看首跳 Location）。
 /// 【APP73】严禁在整段 HTML/JS 中扫到地区提示串就判 BLOCKED。
 async fn probe_gemini(
+    client: &reqwest::Client,
     nr_client: &reqwest::Client,
     _exit_country: Option<&str>,
 ) -> ServiceProbeResult {
@@ -2735,6 +2736,67 @@ async fn probe_gemini(
                 format!("首跳重定向至地区限制页: {loc}"),
                 AimErrorKind::RegionRestricted,
             );
+        }
+        // 【APP75 任务3.2】同域重定向必须跟随 1~2 跳，核验最终落地页：
+        // 香港节点首跳 302 曾被误判 ACCESSIBLE，实际落地 /faq 不支持页。
+        let next = if loc.starts_with("http") {
+            loc.clone()
+        } else if loc.starts_with('/') {
+            format!("https://gemini.google.com{loc}")
+        } else {
+            String::new()
+        };
+        if next.contains("gemini.google.com") {
+            match client
+                .get(&next)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let final_url = resp.url().as_str().to_lowercase();
+                    if final_url.contains("/faq") || final_url.contains("unsupported") {
+                        return svc_blocked_status(
+                            SVC,
+                            Some(resp.status().as_u16()),
+                            format!("跟随重定向后落地地区限制页: {final_url}"),
+                            AimErrorKind::RegionRestricted,
+                        );
+                    }
+                    match read_body(resp, SVC).await {
+                        Ok((st, _, body)) => {
+                            let blc = body.to_lowercase();
+                            if body_region_evidence(&blc) && is_compact_body(&body) {
+                                return svc_blocked_status(
+                                    SVC,
+                                    Some(st),
+                                    "跟随重定向后落地精简地区拒绝页",
+                                    AimErrorKind::RegionRestricted,
+                                );
+                            }
+                            if blc.contains("wiz_global_data") {
+                                return svc_verified(
+                                    SVC,
+                                    st,
+                                    "跟随重定向后命中 gemini 工作区正特征",
+                                );
+                            }
+                            if blc.contains("accounts.google.com/servicelogin") {
+                                return svc_accessible(SVC, st, "正常重定向至 Google 登录页");
+                            }
+                        }
+                        Err(r) => return r,
+                    }
+                }
+                Err(e) => {
+                    return svc_unknown_status(
+                        SVC,
+                        Some(status),
+                        format!("跟随重定向失败: {e}"),
+                        classify_reqwest_error(&e),
+                    );
+                }
+            }
         }
         return svc_accessible(SVC, status, "首跳正常重定向（登录/首页），未验证业务正特征");
     }
@@ -2833,6 +2895,27 @@ async fn probe_gemini(
     svc_accessible(SVC, status, "首页可打开但缺少 AI 工作区正特征")
 }
 
+/// 【APP75 任务3.1】3 目标 HTTPS 门槛判定：至少 2 个目标真实握手成功才算
+/// ProxyOk；0~1 个成功一律 ProxyFailed（纯 IP 可通、普通 HTTPS 全挂的节点）。
+fn proxy_health_from_ok_count(ok: u32) -> ProxyHealthStatus {
+    if ok >= 2 {
+        ProxyHealthStatus::ProxyOk
+    } else {
+        ProxyHealthStatus::ProxyFailed
+    }
+}
+
+/// 轻量状态码探测（不读正文），用于片源 / 地区兜底判断。
+async fn fetch_status(client: &reqwest::Client, url: &str) -> Option<u16> {
+    client
+        .get(url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16())
+}
+
 /// NF：netflix.com/title/81280792（非自制剧区域锁片源）。
 /// 【APP73】状态码不再直接判解锁，真实播放无法免登录验证时最高 PARTIAL。
 async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
@@ -2875,8 +2958,7 @@ async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
     }
     if status == 403 || status == 404 || status == 451 {
         let lc = body.to_lowercase();
-        // 【APP73 任务3】403/404 只有在带明确地区不可用证据时才判 BLOCKED，
-        // 否则一律 UNKNOWN，避免把片源下架误判成地区封锁。
+        // 【APP73 任务3】403/404 只有在带明确地区不可用证据时才判 BLOCKED。
         if body_region_evidence(&lc) {
             return svc_blocked_status(
                 SVC,
@@ -2885,11 +2967,16 @@ async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
                 AimErrorKind::RegionRestricted,
             );
         }
-        return svc_unknown_status(
+        // 【APP75 任务3.2】非自制剧片源不可用 → 回退自制剧探测：
+        // 自制剧可访问 → PARTIAL（仅自制剧）；两者均不可用 → BLOCKED。
+        if fetch_status(client, "https://www.netflix.com/title/80018499").await == Some(200) {
+            return svc_partial(SVC, status, "非自制剧片源不可用，仅自制剧可访问");
+        }
+        return svc_blocked_status(
             SVC,
             Some(status),
-            format!("netflix 返回 {status}（无明确地区证据）"),
-            classify_status(status),
+            "非自制剧与自制剧片源均不可用",
+            AimErrorKind::RegionRestricted,
         );
     }
     if !(200..300).contains(&status) {
@@ -2917,14 +3004,21 @@ async fn probe_netflix(client: &reqwest::Client) -> ServiceProbeResult {
         );
     }
     let lc = body.to_lowercase();
-    if lc.contains("nses-404") || lc.contains("this title is not available") {
-        return svc_partial(SVC, status, "片源不可用（可能仅自制剧目录）");
-    }
+    let title_gone = lc.contains("nses-404")
+        || lc.contains("this title is not available")
+        || lc.contains("not available")
+        || lc.contains("oh no");
     let has_title = body.contains("81280792");
     let has_brand = lc.contains("netflix");
+    // 【APP75 任务3.2】恢复 NF 正向判定：非自制剧片源页 + 品牌正特征且无
+    // 不可用提示 → VERIFIED（不再一律降级 PARTIAL）。
+    if has_title && has_brand && !title_gone {
+        return svc_verified(SVC, status, "非自制剧片源页可访问（81280792 + 品牌正特征）");
+    }
     if has_title && has_brand {
-        svc_partial(SVC, status, "片源页面可访问，未验证真实播放")
-    } else if has_brand {
+        return svc_partial(SVC, status, "片源页含不可用提示（可能仅自制剧目录）");
+    }
+    if has_brand {
         svc_accessible(SVC, status, "官网/目录可访问，未命中目标片源")
     } else {
         svc_accessible(SVC, status, "连通但缺少品牌正特征")
@@ -3108,8 +3202,19 @@ async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> 
             AimErrorKind::RegionRestricted,
         );
     }
-    if lc.contains("disneyplus") {
-        svc_partial(SVC, status, "品牌入口可访问，未验证真实播放")
+    let has_brand = lc.contains("disneyplus") || lc.contains("disney+");
+    // 【APP75 任务3.2】重定向落到有效地区路径（/ja-jp、/en-us、/zh-hk、
+    // /en-sg 等）并返回品牌正特征 → VERIFIED；仅基础品牌页 → PARTIAL。
+    const REGION_PATHS: [&str; 12] = [
+        "/ja-jp", "/en-us", "/zh-hk", "/en-sg", "/en-gb", "/de-de", "/fr-fr", "/es-es", "/it-it",
+        "/pt-br", "/ko-kr", "/zh-tw",
+    ];
+    let region_landed = REGION_PATHS.iter().any(|p| final_url.contains(p));
+    if has_brand && region_landed {
+        return svc_verified(SVC, status, "落地有效地区路径 + 品牌正特征");
+    }
+    if has_brand {
+        svc_partial(SVC, status, "品牌入口可访问，未落地有效地区路径")
     } else {
         svc_accessible(SVC, status, "连通但缺少品牌正特征")
     }
@@ -3205,12 +3310,36 @@ async fn probe_tiktok(client: &reqwest::Client, exit_country: Option<&str>) -> S
             AimErrorKind::EmptyResponse,
         );
     }
-    let has_play_meta = lc.contains("playaddr")
+    let has_playaddr = lc.contains("playaddr")
         || lc.contains("\"vid\"")
         || lc.contains("videometadata")
         || lc.contains("__universal_data_for_rehydration__");
-    if has_play_meta {
-        return svc_partial(SVC, status, "视频流元数据可获取，未验证实际播放");
+    // 【APP75 任务3.2】动态视频流列表正特征（真实 feed 数据）→ VERIFIED。
+    let has_feed = has_playaddr
+        && (lc.contains("itemlist")
+            || lc.contains("diggcount")
+            || lc.contains("collectcount")
+            || lc.contains("challengeinfo"));
+    if has_feed {
+        return svc_verified(
+            SVC,
+            status,
+            "探索页返回真实视频流数据（itemList + playAddr）",
+        );
+    }
+    if has_playaddr {
+        return svc_partial(SVC, status, "视频流元数据可获取，缺少完整 feed 数据");
+    }
+    if region_blocked(exit_country, TIKTOK_BLOCKLIST) {
+        return svc_blocked_status(
+            SVC,
+            Some(status),
+            "出口地区命中 TK 停服名单且无有效视频流数据",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if lc.contains("sigi_state") {
+        return svc_partial(SVC, status, "仅静态 SIGI_STATE 框架，无视频流数据");
     }
     svc_accessible(SVC, status, "首页/登录页正常可访问")
 }
@@ -3343,6 +3472,27 @@ async fn probe_node(
         format!("[AIM][{name}][-] [阶段] PROXY_VERIFIED 选择器 now={name}"),
     );
 
+    // 2.2 【APP75 任务3.1】第二道铁闸：3 路独立 HTTPS 基础代理健康检测。
+    // 只有至少 2/3 目标真实握手成功，才允许继续 7 平台解锁检测；否则立即
+    // 判定 PROXY_FAILED（probed=false / score=0 / 不生成任何解锁标签），
+    // 杜绝「只有纯 IP 的 Telegram 能通，普通 HTTPS 网页全挂」的节点被误判解锁。
+    let (proxy_health, _health_hits) = verify_basic_https_proxy_health(client, slot, name).await;
+    if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
+        let mut detail = String::from("基础 HTTPS 代理不可用: ");
+        for (label, status, elapsed, kind) in &_health_hits {
+            detail.push_str(&format!("{label}={status}/{elapsed}ms/{} ", kind.label()));
+        }
+        crate::core::logger::warn(
+            crate::core::logger::MOD_GO_AIM,
+            format!("[AIM][{name}][-] [阶段] PROXY_FAILED {detail}，终止 7 平台检测"),
+        );
+        return NodeProbeOutcome::new(
+            stamp(proxy_failed_result(name, base_delay, detail)),
+            false,
+            started,
+        );
+    }
+
     // 3. 每个节点都先做一次轻量出口预检（仅采集证据，失败也继续 7 平台探测）。
     // [AIM-13] EGRESS_CHECK：出口 IP/地区仅作证据，不参与短路。
     let egress = fetch_egress(client).await;
@@ -3388,19 +3538,60 @@ async fn probe_node(
     let mut futs: futures_util::stream::FuturesUnordered<
         std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>,
     > = futures_util::stream::FuturesUnordered::new();
-    futs.push(Box::pin(probe_platform("GPT", || probe_gpt(client, ec))));
-    futs.push(Box::pin(probe_platform("Claude", || {
-        probe_claude(client, nr_client, ec)
-    })));
-    futs.push(Box::pin(probe_platform("Gemini", || {
-        probe_gemini(nr_client, ec)
-    })));
-    futs.push(Box::pin(probe_platform("NF", || probe_netflix(client))));
-    futs.push(Box::pin(probe_platform("YT", || probe_youtube(client))));
-    futs.push(Box::pin(probe_platform("Disney+", || {
-        probe_disney(client, ec)
-    })));
-    futs.push(Box::pin(probe_platform("TK", || probe_tiktok(client, ec))));
+    // 【APP75 任务3.2】单节点内部并发闸门：同一节点同一时刻最多 3 个平台
+    // 同时发起 HTTPS 请求，避免 7 路同一毫秒突发握手被中转服务器限流重置
+    // （diagnostic log 中 Claude/Gemini 报 error sending request 的根因）。
+    let platform_sem =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(PER_NODE_PLATFORM_CONCURRENCY));
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("GPT", || probe_gpt(client, ec)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("Claude", || probe_claude(client, nr_client, ec)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("Gemini", || probe_gemini(client, nr_client, ec)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("NF", || probe_netflix(client)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("YT", || probe_youtube(client)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("Disney+", || probe_disney(client, ec)).await
+        }));
+    }
+    {
+        let sem = platform_sem.clone();
+        futs.push(Box::pin(async move {
+            let _permit = sem.acquire().await;
+            probe_platform("TK", || probe_tiktok(client, ec)).await
+        }));
+    }
     // [AIM-14] 8 阶段追踪：DNS_CONNECT + HTTPS_REQUEST（7 平台并发）
     for service in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
         crate::core::logger::info(
@@ -3551,8 +3742,16 @@ async fn probe_node(
         services.insert(r.service.clone(), r);
     }
     let score: u32 = services.values().map(|r| verdict_score(r.verdict)).sum();
-    let proxy_health = ProxyHealthStatus::ProxyOk; // 后续由 verify_basic_https_proxy_health 真实填写
     let overall_status = compute_overall_status(proxy_health, &services);
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_AIM,
+        format!(
+            "[AIM][{name}][-] [阶段] RESULT_SUMMARY proxy_health={} overall={} score={score} unlocked={}",
+            proxy_health.label(),
+            overall_status.label(),
+            tags.len()
+        ),
+    );
     let result = AimNodeResult {
         node_name: name.to_string(),
         node_id: node_id.to_string(),
@@ -3603,6 +3802,35 @@ impl NodeProbeOutcome {
             elapsed_ms: started.elapsed().as_millis() as u64,
             timed_out,
         }
+    }
+}
+
+/// 【APP75 任务3.1】3 目标 HTTPS 基础代理健康检测未通过（< 2/3）→
+/// PROXY_FAILED 占位结果：不发起 7 平台探测，绝不生成任何解锁标签，
+/// probed=false、score=0、probe_stage/overall_status 均为 ProxyFailed。
+fn proxy_failed_result(name: &str, delay: u64, reason: String) -> AimNodeResult {
+    let mut services: HashMap<String, ServiceProbeResult> = HashMap::new();
+    for s in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
+        let mut r = svc_unknown_status(s, None, reason.clone(), AimErrorKind::ProxyError);
+        r.verdict_basis = "PROXY_FAILED: 3 目标 HTTPS 基础代理门槛未通过".to_string();
+        services.insert(s.to_string(), r);
+    }
+    AimNodeResult {
+        node_name: name.to_string(),
+        unlocked_tags: vec![],
+        ai_unlocked: false,
+        media_unlocked: false,
+        score: 0,
+        delay_ms: delay,
+        updated_at: now_secs(),
+        probed: false,
+        proxy_health: ProxyHealthStatus::ProxyFailed,
+        probe_stage: AimProbeStage::ProxyFailed,
+        overall_status: AimNodeOverallStatus::ProxyFailed,
+        probe_version: CURRENT_AIM_PROBE_VERSION,
+        rule_version: CURRENT_AIM_RULE_VERSION,
+        services,
+        ..Default::default()
     }
 }
 
@@ -3851,11 +4079,7 @@ async fn verify_basic_https_proxy_health(
             }
         }
     }
-    let status = if ok >= 2 {
-        ProxyHealthStatus::ProxyOk
-    } else {
-        ProxyHealthStatus::ProxyFailed
-    };
+    let status = proxy_health_from_ok_count(ok);
     crate::core::logger::info(
         crate::core::logger::MOD_GO_AIM,
         format!(
@@ -4540,10 +4764,10 @@ mod tests {
         assert!(!blocked, "长脚本中的地区字符串绝不能单独构成封锁证据");
     }
 
-    /// 【APP73 任务3.3】TikTok：静态标记 SIGI_STATE 不再直接 VERIFIED，
-    /// 无播放验证时最高 PARTIAL。
+    /// 【APP75 任务3.2】TikTok：只有真实视频流 feed 数据（playAddr + itemList
+    /// 等）才允许 VERIFIED；仅静态 SIGI_STATE 框架一律 PARTIAL。
     #[test]
-    fn test_tiktok_never_verified_without_playback() {
+    fn test_tiktok_verified_requires_video_feed() {
         let src = include_str!("go_aim.rs");
         let start = src
             .find("async fn probe_tiktok")
@@ -4551,11 +4775,18 @@ mod tests {
         let rest = &src[start..];
         let end = rest.find("\n}\n").map(|i| start + i).unwrap_or(src.len());
         let body = &src[start..end];
+        let feed_at = body.find("has_feed").expect("必须存在视频流 feed 判定");
+        let verified_at = body
+            .find("svc_verified")
+            .expect("真实 feed 命中时应返回 VERIFIED");
         assert!(
-            !body.contains("svc_verified"),
-            "TikTok 不得在无播放验证时返回 VERIFIED"
+            feed_at < verified_at,
+            "TikTok VERIFIED 必须严格位于视频流 feed 判定之后"
         );
-        assert!(!body.to_lowercase().contains("sigi_state"));
+        assert!(
+            body.contains("仅静态 SIGI_STATE 框架，无视频流数据"),
+            "仅静态 SIGI_STATE 框架必须降级为 PARTIAL"
+        );
     }
 
     /// 【APP73 任务2.1】平台级硬超时必须返回 UNKNOWN + TASK_TIMEOUT，并落真实 status=None。
@@ -4769,16 +5000,37 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 6);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 6);
-        assert!(4 < CURRENT_AIM_PROBE_VERSION, "v4 及更早缓存应被淘汰");
-        assert!(6 >= CURRENT_AIM_PROBE_VERSION, "v6 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 7);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 7);
+        assert!(6 < CURRENT_AIM_PROBE_VERSION, "v6 及更早缓存应被淘汰");
+        assert!(7 >= CURRENT_AIM_PROBE_VERSION, "v7 真实缓存应保留");
     }
 
     #[test]
     fn test_egress_unknown_result_sets_version_fields() {
         // 出口预检失败结果也必须携带当前版本号，否则会被缓存加载器误淘汰
         let r = egress_unknown_result("n", 50, None, None);
+        assert_eq!(r.probe_version, CURRENT_AIM_PROBE_VERSION);
+        assert_eq!(r.rule_version, CURRENT_AIM_RULE_VERSION);
+    }
+
+    #[test]
+    fn test_proxy_failed_result_never_unlocks() {
+        // 【APP75 任务3.1】3 目标 HTTPS 门槛未过：必须 PROXY_FAILED、probed=false、
+        // score=0、无任何解锁标签，且 7 平台全部为 UNKNOWN。
+        let r = proxy_failed_result("n", 120, "基础 HTTPS 代理不可用".to_string());
+        assert_eq!(r.proxy_health, ProxyHealthStatus::ProxyFailed);
+        assert_eq!(r.probe_stage, AimProbeStage::ProxyFailed);
+        assert_eq!(r.overall_status, AimNodeOverallStatus::ProxyFailed);
+        assert!(!r.probed);
+        assert_eq!(r.score, 0);
+        assert!(r.unlocked_tags.is_empty());
+        assert_eq!(r.services.len(), 7);
+        assert!(
+            r.services
+                .values()
+                .all(|s| matches!(s.verdict, ProbeVerdict::Unknown))
+        );
         assert_eq!(r.probe_version, CURRENT_AIM_PROBE_VERSION);
         assert_eq!(r.rule_version, CURRENT_AIM_RULE_VERSION);
     }
@@ -5250,9 +5502,16 @@ mod tests {
     /// 【APP74 测试7】gstatic + cf + microsoft 三目标至少 2/3 成功才算 ProxyOk。
     #[tokio::test]
     async fn test_proxy_health_needs_two_of_three() {
-        // 用真实 reqwest mock 不容易；用一个极简的 client 行为断言：
-        // 让 3 个目标都超时 → ProxyFailed
-        let probe = ProxyHealthStatus::ProxyFailed;
-        assert_ne!(probe, ProxyHealthStatus::ProxyOk);
+        // 【APP75 任务3.1】0/1 个目标成功必须 ProxyFailed；2/3 个成功才 ProxyOk。
+        assert_eq!(
+            proxy_health_from_ok_count(0),
+            ProxyHealthStatus::ProxyFailed
+        );
+        assert_eq!(
+            proxy_health_from_ok_count(1),
+            ProxyHealthStatus::ProxyFailed
+        );
+        assert_eq!(proxy_health_from_ok_count(2), ProxyHealthStatus::ProxyOk);
+        assert_eq!(proxy_health_from_ok_count(3), ProxyHealthStatus::ProxyOk);
     }
 }
