@@ -59,8 +59,14 @@ const PROTOCOL_LABEL: Record<string, string> = {
 const isValidDelay = (d: unknown): d is number =>
   typeof d === "number" && d >= 5;
 
-/** 【APP73 任务3.1】节点当前支持的 AIM 平台集合（含五级状态） */
-const aimBadgesOf = (r?: AimNodeResult): string[] =>
+/** 【APP74 任务5.1】列表只允许 VERIFIED 平台渲染徽章；
+ * ACCESSIBLE / PARTIAL / BLOCKED / UNKNOWN 一律隐藏，避免"似解锁非解锁"的假暗示。 */
+const aimListBadgesOf = (r?: AimNodeResult): string[] =>
+  AIM_DETAIL_ORDER.filter(
+    (s) => r?.services?.[s]?.verdict === "VERIFIED",
+  );
+/** 详情面板展示全部 7 平台（不区分状态） */
+const aimDetailBadgesOf = (r?: AimNodeResult): string[] =>
   AIM_DETAIL_ORDER.filter((s) => r?.services?.[s]);
 /** 【APP73 任务3.4】综合评分 > 0 即视为 AIM 支持节点 */
 const aimScoreOf = (r?: AimNodeResult): number => r?.score ?? 0;
@@ -93,7 +99,7 @@ function AimNodeDetailModal({
 }) {
   const { t, resolved } = useTranslation();
   const services = result?.services ?? {};
-  const rows = AIM_DETAIL_ORDER.filter((s) => services[s]);
+  const rows = aimDetailBadgesOf(result);
 
   // 【APP73 任务4.2】单节点报告导出：中英双语标准节点报告。
   // 剪贴板 + 系统分享（iOS）/ Downloads（桌面）；失败只提示、不中断弹窗。
@@ -850,8 +856,9 @@ export default function Proxies() {
           const delay = lastDelay(node);
           const selected = current === node.name;
           const aimResult = aimResults[node.name];
-          /// 【APP73 任务3.1】列表与详情共用五级状态徽章，未激活授权不渲染
-          const aimPlatforms = proActive ? aimBadgesOf(aimResult) : [];
+          /// 【APP74 任务5.1】列表只给 VERIFIED 渲染徽章；PROXY_FAILED 加红标
+          const aimPlatforms = proActive ? aimListBadgesOf(aimResult) : [];
+          const proxyFailed = aimResult?.overallStatus === "PROXY_FAILED";
           return (
             <button
               key={node.name}
@@ -882,8 +889,14 @@ export default function Proxies() {
                   >
                     {node.name}
                   </span>
+                  {/* 【APP74 任务5.2】PROXY_FAILED 红色小标 */}
+                  {proxyFailed && (
+                    <span className="shrink-0 px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/30 text-[10px] font-mono uppercase tracking-wide">
+                      PROXY_FAILED
+                    </span>
+                  )}
                   {/* 无 AIM 平台徽章时保持紧凑单行：协议标签内联显示 */}
-                  {aimPlatforms.length === 0 && (
+                  {!proxyFailed && aimPlatforms.length === 0 && (
                     <span className="shrink-0 px-1.5 py-0.5 rounded text-[11px] font-mono uppercase tracking-wide bg-glass text-gray-400">
                       {protocolTag(node.type)}
                     </span>

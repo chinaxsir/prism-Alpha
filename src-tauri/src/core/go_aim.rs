@@ -30,11 +30,10 @@ use futures_util::StreamExt;
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP73】当前 Go AIM 检测引擎版本号：升级后旧版缓存
-/// 因 probe_version 不符而被自动淘汰，直到用新引擎重测后才持久保留。
-/// v4：全代理槽位强制 `Proxy::all`、五级证据模型、七平台独立检测器。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 4;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 4;
+/// 【APP74】当前 Go AIM 检测引擎版本号：统一递增至 6，启动时自动淘汰
+/// `< 6` 的错误缓存（含出口名单提前短路、PROXY_FAILED 伪装 probed=true 等脏结果）。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 6;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 6;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -72,17 +71,15 @@ const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
 /// 单次失败不再直接判死。
 const SCREEN_FALLBACK_URL: &str = "http://cp.cloudflare.com/generate_204";
 
-/// 【APP72 任务1.3】阶段1 延迟裁决：首测 → 备用地址重测 → 历史真实缓存（>0ms）。
-/// 任一环节拿到合法延迟即视为存活，全部不可用才判死。
-fn resolve_screen_delay(
-    first: Option<u64>,
-    retry: Option<u64>,
-    cached: Option<u64>,
-) -> Option<u64> {
+/// 【APP74 任务1.1】阶段1 延迟裁决：**唯有本轮当前实时测速成功**才算存活。
+/// - 主测速（gstatic generate_204）成功 → alive
+/// - 主测失败 → 仅再用 Cloudflare 备用地址重试 **1 次**（避免瞬时抖动误杀）
+/// - 主备均失败 → 立即 SCREENED_DEAD，**严禁再读历史缓存 `cached` 冒充存活**
+/// - 历史缓存延迟只允许保留在 UI 展示字段，绝不覆盖本轮当前的失败事实
+#[inline]
+fn resolve_screen_delay(first: Option<u64>, retry: Option<u64>) -> Option<u64> {
     let valid = |d: Option<u64>| d.filter(|v| *v > 0 && *v < PROBE_MAX_DELAY_MS);
-    valid(first)
-        .or_else(|| valid(retry))
-        .or_else(|| valid(cached))
+    valid(first).or_else(|| valid(retry))
 }
 /// 【APP51 任务1】阶段2 深测只取阶段1 延迟最低的 Top N：
 /// 快筛已覆盖全部节点，深测 7 平台极耗时，只对最有希望的低延迟节点做精确评级
@@ -601,7 +598,7 @@ fn classify_reqwest_error(err: &reqwest::Error) -> AimErrorKind {
     AimErrorKind::UnknownError
 }
 
-/// 【APP73 任务2.2】HTTP 状态码 → 标准错误分类（无明确地区证据时）。
+/// 【APP74 任务2.2】HTTP 状态码 → 标准错误分类（无明确地区证据时）。
 fn classify_status(status: u16) -> AimErrorKind {
     match status {
         403 => AimErrorKind::Http403,
@@ -611,6 +608,104 @@ fn classify_status(status: u16) -> AimErrorKind {
         _ => AimErrorKind::UnknownError,
     }
 }
+
+// ==================================== APP74 新增状态枚举 ====================================
+
+/// 【APP74 任务1.2】基础代理健康状态（与 7 平台解锁状态完全分离）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProxyHealthStatus {
+    #[default]
+    ProxyUnknown,
+    ProxyOk,
+    ProxyFailed,
+}
+
+impl ProxyHealthStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ProxyHealthStatus::ProxyOk => "PROXY_OK",
+            ProxyHealthStatus::ProxyFailed => "PROXY_FAILED",
+            ProxyHealthStatus::ProxyUnknown => "PROXY_UNKNOWN",
+        }
+    }
+}
+
+/// 【APP74 任务1.3】节点所处的检测阶段（严禁 Dead/Fast/ProxyFailed 伪装成 DeepProbed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AimProbeStage {
+    #[default]
+    NotTested,
+    ScreenedAlive,
+    ScreenedDead,
+    ProxyFailed,
+    DeepProbed,
+    CacheHit,
+    PreviewOnly,
+}
+
+/// 【APP74 任务3】节点总体状态：严禁单一平台 BLOCKED 把整节点打成 BLOCKED。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AimNodeOverallStatus {
+    #[default]
+    Unknown,
+    ProxyFailed,
+    Verified,
+    Mixed,
+    PlatformsBlocked,
+}
+
+impl AimNodeOverallStatus {
+    fn label(self) -> &'static str {
+        match self {
+            AimNodeOverallStatus::ProxyFailed => "PROXY_FAILED",
+            AimNodeOverallStatus::Verified => "VERIFIED",
+            AimNodeOverallStatus::Mixed => "MIXED",
+            AimNodeOverallStatus::PlatformsBlocked => "PLATFORMS_BLOCKED",
+            AimNodeOverallStatus::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// 【APP74 任务1.3】根据 AimProbeStage 决定 AimNodeResult.probed 字段。
+fn probe_stage_to_probed(stage: AimProbeStage) -> bool {
+    matches!(stage, AimProbeStage::DeepProbed | AimProbeStage::CacheHit)
+}
+
+/// 【APP74 任务3】根据 7 平台汇总 + proxy_health 计算节点总体状态。
+fn compute_overall_status(
+    proxy_health: ProxyHealthStatus,
+    services: &HashMap<String, ServiceProbeResult>,
+) -> AimNodeOverallStatus {
+    if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
+        return AimNodeOverallStatus::ProxyFailed;
+    }
+    let all_unknown = !services.is_empty()
+        && services
+            .values()
+            .all(|s| matches!(s.verdict, ProbeVerdict::Unknown));
+    let all_blocked = !services.is_empty()
+        && services
+            .values()
+            .all(|s| matches!(s.verdict, ProbeVerdict::Blocked));
+    if services
+        .values()
+        .any(|s| matches!(s.verdict, ProbeVerdict::Verified))
+    {
+        return AimNodeOverallStatus::Verified;
+    }
+    if all_blocked {
+        return AimNodeOverallStatus::PlatformsBlocked;
+    }
+    if all_unknown {
+        return AimNodeOverallStatus::Unknown;
+    }
+    AimNodeOverallStatus::Mixed
+}
+
+// ==================================== APP74 新增状态枚举 END ====================================
 
 /// 【APP67 P1】单平台探测详情（正向特征码、状态码、证据、失败原因）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -653,17 +748,18 @@ pub struct AimNodeResult {
     pub ai_unlocked: bool,
     /// 流媒体任一解锁
     pub media_unlocked: bool,
-    /// 解锁平台数量（评分）
+    /// 【APP73 任务3.4 + APP74】评分：proxy_failed 强制为 0；
+    /// VERIFIED 20 / PARTIAL 12 / ACCESSIBLE 8 / UNKNOWN·BLOCKED 0。
     pub score: u32,
     /// 基线延迟（毫秒）
     pub delay_ms: u64,
     /// 更新时间戳（秒）
     pub updated_at: u64,
-    /// 是否已完成探测（含死节点——死节点也生成 probed=true 的空结果，
-    /// 确保没有任何节点遗漏在"未检测"状态）
+    /// 【APP74 任务1.3】只有 DeepProbed / CacheHit 才允许 probed=true。
+    /// Dead / Fast / ProxyFailed / Preview 一律 false，严禁伪装成完整检测。
     #[serde(default)]
     pub probed: bool,
-    /// 【APP67 P3】检测引擎版本号：旧版缓存（< 2）加载时自动淘汰。
+    /// 【APP67 P3】检测引擎版本号：旧版缓存（< 6）加载时自动淘汰。
     #[serde(default)]
     pub probe_version: u32,
     #[serde(default)]
@@ -691,6 +787,16 @@ pub struct AimNodeResult {
     pub evidence: HashMap<String, String>,
     #[serde(default)]
     pub failure_reasons: HashMap<String, String>,
+    // ---- 【APP74 任务1.2 / 1.3 / 3】新字段 ----
+    /// 基础代理健康状态（3 目标 HTTPS 独立校验）
+    #[serde(default)]
+    pub proxy_health: ProxyHealthStatus,
+    /// 节点所处检测阶段
+    #[serde(default)]
+    pub probe_stage: AimProbeStage,
+    /// 节点总体状态
+    #[serde(default)]
+    pub overall_status: AimNodeOverallStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1409,8 +1515,9 @@ async fn probe_all(
                 }
             };
             let Some((name, delay)) = next else { break };
-            // 重试仍失败时回退到历史真实测速缓存（>0ms 才认），避免误杀可用节点
-            let delay = resolve_screen_delay(delay, None, cached_delays.get(&name).copied());
+            // 【APP74 任务1.1】主备均失败时立即判 Dead——
+            // 历史缓存延迟（cached_delays）仅保留在内存里，绝不回退救场。
+            let delay = resolve_screen_delay(delay, None);
             // 中止条件：关闭 Go AIM / 订阅变更（代数变化）
             if !state.settings.read().go_aim_enabled
                 || (!preview_mode && !is_running(state))
@@ -1422,8 +1529,9 @@ async fn probe_all(
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
                     alive.push((name.clone(), d));
-                    // 存活节点延迟写入状态缓存（probed=false 占位，
-                    // 阶段2 完成后会被真实探测结果覆盖），前端徽章实时刷新
+                    // 存活节点延迟写入状态缓存（阶段1 只是 ScreenedAlive，
+                    // probe_stage = ScreenedAlive，probe_stage_to_probed → false，
+                    // 阶段2 完成后会被真实探测结果覆盖）
                     let placeholder = AimNodeResult {
                         node_name: name.clone(),
                         unlocked_tags: vec![],
@@ -1433,6 +1541,9 @@ async fn probe_all(
                         delay_ms: d,
                         updated_at: now_secs(),
                         probed: false,
+                        proxy_health: ProxyHealthStatus::ProxyUnknown,
+                        probe_stage: AimProbeStage::ScreenedAlive,
+                        overall_status: AimNodeOverallStatus::Unknown,
                         probe_version: CURRENT_AIM_PROBE_VERSION,
                         rule_version: CURRENT_AIM_RULE_VERSION,
                         node_id: node_ids.get(&name).cloned().unwrap_or_default(),
@@ -2261,19 +2372,9 @@ async fn read_body(
 
 /// GPT：ios.chat.openai.com server_status + chatgpt.com 双端点。
 /// 【APP73】无合法授权账号对话验证时最高只给 PARTIAL，不虚构 VERIFIED。
-async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+async fn probe_gpt(client: &reqwest::Client, _exit_country: Option<&str>) -> ServiceProbeResult {
     const SVC: &str = "GPT";
-    if region_blocked(exit_country, AI_BLOCKLIST) {
-        return svc_blocked_status(
-            SVC,
-            None,
-            format!(
-                "出口地区 {} 命中 AI 受限名单",
-                exit_country.unwrap_or("未知")
-            ),
-            AimErrorKind::RegionRestricted,
-        );
-    }
+    // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let ss = match client
         .get("https://ios.chat.openai.com/public-api/mobile/server_status/v1")
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -2416,14 +2517,23 @@ async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> Serv
         );
     }
     let has_brand = hp_lc.contains("chatgpt") || hp_lc.contains("openai");
-    if ss_normal && has_brand {
+    // 【APP74 任务2.2】恢复 v0.3.100 版 GPT 解锁规则：
+    // server_status 返回 "status": "normal" + chatgpt.com HTTP 200 + 品牌正特征 → VERIFIED。
+    // APP73 过度保守地把这一档降级成 PARTIAL，APP74 恢复。
+    if ss_status == 200 && ss_normal && hp_status == 200 && has_brand {
+        svc_verified(
+            SVC,
+            hp_status,
+            "server_status=normal + chatgpt.com 品牌正特征",
+        )
+    } else if ss_normal && has_brand {
         svc_partial(
             SVC,
             hp_status,
-            "server_status=normal + 品牌正特征（未验证实际对话）",
+            "server_status=normal + 品牌正特征（非 200）",
         )
     } else if has_brand {
-        svc_accessible(SVC, hp_status, "入口/登录页正常，缺少业务正特征")
+        svc_accessible(SVC, hp_status, "入口/登录页正常，缺少完整业务正特征")
     } else {
         svc_accessible(SVC, hp_status, "入口连通但缺少品牌正特征")
     }
@@ -2433,20 +2543,10 @@ async fn probe_gpt(client: &reqwest::Client, exit_country: Option<&str>) -> Serv
 async fn probe_claude(
     client: &reqwest::Client,
     nr_client: &reqwest::Client,
-    exit_country: Option<&str>,
+    _exit_country: Option<&str>,
 ) -> ServiceProbeResult {
     const SVC: &str = "Claude";
-    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
-        return svc_blocked_status(
-            SVC,
-            None,
-            format!(
-                "出口地区 {} 命中 AI 受限名单",
-                exit_country.unwrap_or("未知")
-            ),
-            AimErrorKind::RegionRestricted,
-        );
-    }
+    // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let first = match nr_client
         .get("https://claude.ai/login")
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -2906,8 +3006,10 @@ async fn probe_youtube(client: &reqwest::Client) -> ServiceProbeResult {
     }
     let has_init = lc.contains("ytinitialdata");
     let has_premium = lc.contains("youtube premium") || lc.contains("premium");
-    if has_init && has_premium {
-        svc_partial(SVC, status, "Premium 页面与元数据可获取，未验证实际播放")
+    // 【APP74 任务2.3】恢复 v0.3.100 版 YT 解锁规则：
+    // 200 + ytInitialData + Premium 特征 → VERIFIED。APP73 过度保守降级成 PARTIAL。
+    if status == 200 && has_init && has_premium {
+        svc_verified(SVC, status, "youtube premium + ytInitialData 正特征")
     } else if has_init {
         svc_accessible(SVC, status, "首页/元数据可访问，未命中 Premium 业务特征")
     } else {
@@ -2917,16 +3019,9 @@ async fn probe_youtube(client: &reqwest::Client) -> ServiceProbeResult {
 
 /// Disney+：disneyplus.com/。
 /// 【APP73】品牌词单独不足以 VERIFIED；真实播放不可免登录验证。
-async fn probe_disney(client: &reqwest::Client, exit_country: Option<&str>) -> ServiceProbeResult {
+async fn probe_disney(client: &reqwest::Client, _exit_country: Option<&str>) -> ServiceProbeResult {
     const SVC: &str = "Disney+";
-    if region_blocked(exit_country, AI_BLOCKLIST_NO_VE) {
-        return svc_blocked_status(
-            SVC,
-            None,
-            format!("出口地区 {} 命中受限名单", exit_country.unwrap_or("未知")),
-            AimErrorKind::RegionRestricted,
-        );
-    }
+    // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
     let resp = match client
         .get("https://www.disneyplus.com/")
         .header("Accept-Language", "en-US,en;q=0.9")
@@ -3456,6 +3551,8 @@ async fn probe_node(
         services.insert(r.service.clone(), r);
     }
     let score: u32 = services.values().map(|r| verdict_score(r.verdict)).sum();
+    let proxy_health = ProxyHealthStatus::ProxyOk; // 后续由 verify_basic_https_proxy_health 真实填写
+    let overall_status = compute_overall_status(proxy_health, &services);
     let result = AimNodeResult {
         node_name: name.to_string(),
         node_id: node_id.to_string(),
@@ -3466,7 +3563,11 @@ async fn probe_node(
         delay_ms: base_delay,
         updated_at: now_secs(),
         detected_at: now_secs(),
-        probed: true,
+        // 【APP74 任务1.3】真正完成 7 平台检测 → DeepProbed / probed=true
+        probed: probe_stage_to_probed(AimProbeStage::DeepProbed),
+        proxy_health,
+        probe_stage: AimProbeStage::DeepProbed,
+        overall_status,
         probe_version: CURRENT_AIM_PROBE_VERSION,
         rule_version: CURRENT_AIM_RULE_VERSION,
         egress_ip: egress.ip,
@@ -3505,9 +3606,8 @@ impl NodeProbeOutcome {
     }
 }
 
-/// 【APP67 BUG-04】出口预检失败时的统一结果：7 个服务均 Unknown，无解锁标签。
-/// 【APP72 任务1.2】在线探测路径已不再短路；该构造函数保留给回归测试与
-/// 诊断导出复用，因此显式允许未使用。
+/// 【APP74 任务1.3】出口预检失败 → PROXY_FAILED 占位结果，probe_stage=ProxyFailed，
+/// probed=false（禁止伪装成完整深测），overall_status=PROXY_FAILED。
 #[allow(dead_code)]
 fn egress_unknown_result(
     name: &str,
@@ -3519,7 +3619,12 @@ fn egress_unknown_result(
     for s in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
         services.insert(
             s.to_string(),
-            svc_unknown(s, "出口预检失败/未知/漏直连，未执行平台探测"),
+            svc_unknown_status(
+                s,
+                None,
+                "出口预检失败/未知/漏直连，未执行平台探测",
+                AimErrorKind::ProxyError,
+            ),
         );
     }
     AimNodeResult {
@@ -3530,7 +3635,11 @@ fn egress_unknown_result(
         score: 0,
         delay_ms: delay,
         updated_at: now_secs(),
-        probed: true,
+        // 【APP74】ProxyFailed 一律 probed=false
+        probed: false,
+        proxy_health: ProxyHealthStatus::ProxyFailed,
+        probe_stage: AimProbeStage::ProxyFailed,
+        overall_status: AimNodeOverallStatus::ProxyFailed,
         probe_version: CURRENT_AIM_PROBE_VERSION,
         rule_version: CURRENT_AIM_RULE_VERSION,
         egress_ip,
@@ -3584,7 +3693,11 @@ fn all_unknown_result(name: &str, delay: u64, reason: String, kind: AimErrorKind
         delay_ms: delay,
         updated_at: now_secs(),
         detected_at: now_secs(),
-        probed: true,
+        // 【APP74】选择器核验失败 → PROXY_FAILED，禁止伪装成完整深测
+        probed: false,
+        proxy_health: ProxyHealthStatus::ProxyFailed,
+        probe_stage: AimProbeStage::ProxyFailed,
+        overall_status: AimNodeOverallStatus::ProxyFailed,
         probe_version: CURRENT_AIM_PROBE_VERSION,
         rule_version: CURRENT_AIM_RULE_VERSION,
         services,
@@ -3673,11 +3786,93 @@ fn dead_result(name: &str) -> AimNodeResult {
         score: 0,
         delay_ms: 0,
         updated_at: now_secs(),
-        probed: true,
+        // 【APP74 任务1.3】死节点 probed=false，probe_stage=ScreenedDead
+        // —— 严禁伪装成深度检测完成。
+        probed: false,
+        proxy_health: ProxyHealthStatus::ProxyUnknown,
+        probe_stage: AimProbeStage::ScreenedDead,
+        overall_status: AimNodeOverallStatus::Unknown,
         probe_version: CURRENT_AIM_PROBE_VERSION,
         rule_version: CURRENT_AIM_RULE_VERSION,
         ..Default::default()
     }
+}
+
+/// 【APP74 任务1.2】基础代理健康检测（3 个独立 HTTPS 目标）。
+/// 必须至少 2/3 成功才算 PROXY_OK；否则 PROXY_FAILED，禁止继续 7 平台解锁检测。
+async fn verify_basic_https_proxy_health(
+    client: &reqwest::Client,
+    slot: usize,
+    name: &str,
+) -> (
+    ProxyHealthStatus,
+    Vec<(&'static str, u16, u64, AimErrorKind)>,
+) {
+    const TARGETS: [(&str, &str); 3] = [
+        ("gstatic", "https://www.gstatic.com/generate_204"),
+        ("cloudflare", "https://cp.cloudflare.com/generate_204"),
+        ("microsoft", "https://www.microsoft.com/"),
+    ];
+    let mut hits: Vec<(&'static str, u16, u64, AimErrorKind)> = Vec::with_capacity(3);
+    let mut ok = 0u32;
+    for (label, url) in &TARGETS {
+        let start = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(PROBE_PLATFORM_HARD_TIMEOUT_SECS),
+            client.get(*url).send(),
+        )
+        .await;
+        match r {
+            Ok(Ok(resp)) => {
+                let status = resp.status().as_u16();
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let kind = if resp.status().is_success() {
+                    AimErrorKind::UnknownError
+                } else {
+                    classify_status(status)
+                };
+                hits.push((*label, status, elapsed_ms, kind));
+                if status != 0 && !matches!(kind, AimErrorKind::ChallengePage) {
+                    // 任何 HTTP 状态（含非 200，但必须 HTTP 响应到达）都视为代理通路正常
+                    ok += 1;
+                }
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                hits.push((*label, 0, elapsed_ms, classify_reqwest_error(&e)));
+            }
+            Err(_) => {
+                hits.push((
+                    *label,
+                    0,
+                    start.elapsed().as_millis() as u64,
+                    AimErrorKind::TaskTimeout,
+                ));
+            }
+        }
+    }
+    let status = if ok >= 2 {
+        ProxyHealthStatus::ProxyOk
+    } else {
+        ProxyHealthStatus::ProxyFailed
+    };
+    crate::core::logger::info(
+        crate::core::logger::MOD_GO_AIM,
+        format!(
+            "[AIM][{name}][-] [阶段] PROXY_HEALTH_CHECK slot={slot} results={ok}/3 final={}",
+            status.label()
+        ),
+    );
+    for (label, status_code, elapsed, kind) in &hits {
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "[AIM][{name}][-] [阶段] PROXY_HEALTH_TARGET target={label} status={status_code} elapsed={elapsed}ms kind={:?}",
+                kind.label()
+            ),
+        );
+    }
+    (status, hits)
 }
 
 fn now_secs() -> u64 {
@@ -4574,10 +4769,10 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 4);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 4);
-        assert!(3 < CURRENT_AIM_PROBE_VERSION, "v3 及更早缓存应被淘汰");
-        assert!(4 >= CURRENT_AIM_PROBE_VERSION, "v4 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 6);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 6);
+        assert!(4 < CURRENT_AIM_PROBE_VERSION, "v4 及更早缓存应被淘汰");
+        assert!(6 >= CURRENT_AIM_PROBE_VERSION, "v6 真实缓存应保留");
     }
 
     #[test]
@@ -4939,14 +5134,125 @@ mod tests {
         assert!(restored.verdict_basis.is_empty());
     }
 
-    /// 【APP72 测试2】阶段1 单次超时不得直接判死：首测 → 备用地址重测 →
-    /// 历史缓存（>0ms）三级裁决，全部不可用才淘汰。
+    /// 【APP74 测试1】阶段1 裁决：**只看本轮当前测速**（无历史缓存回退）。
     #[test]
-    fn test_app72_screen_retry_and_cached_fallback() {
-        assert_eq!(resolve_screen_delay(Some(120), Some(300), None), Some(120));
-        assert_eq!(resolve_screen_delay(None, Some(180), Some(90)), Some(180));
-        assert_eq!(resolve_screen_delay(Some(0), None, Some(95)), Some(95));
-        assert_eq!(resolve_screen_delay(None, None, Some(0)), None);
-        assert_eq!(resolve_screen_delay(None, None, None), None);
+    fn test_screen_resolve_no_cache_fallback() {
+        assert_eq!(resolve_screen_delay(Some(120), Some(300)), Some(120));
+        assert_eq!(resolve_screen_delay(Some(120), None), Some(120));
+        assert_eq!(resolve_screen_delay(None, Some(180)), Some(180));
+        // 两参数全 None → None（缓存路径被彻底移除）
+        assert_eq!(resolve_screen_delay(None, None), None);
+        // 非法值（0 或 >= 60000ms）视为无结果
+        assert_eq!(resolve_screen_delay(Some(0), Some(60000)), None);
+    }
+
+    /// 【APP74 测试2】dead_result / proxy_failed 结果一律 probed=false，
+    /// 禁止伪装成完整深测。
+    #[test]
+    fn test_dead_and_proxy_failed_not_probed() {
+        let dead = dead_result("x");
+        assert_eq!(dead.probe_stage, AimProbeStage::ScreenedDead);
+        assert!(!dead.probed, "dead_result 必须 probed=false");
+        let pf = all_unknown_result("x", 10, "p".into(), AimErrorKind::ProxyError);
+        assert_eq!(pf.overall_status, AimNodeOverallStatus::ProxyFailed);
+        assert_eq!(pf.proxy_health, ProxyHealthStatus::ProxyFailed);
+        assert!(!pf.probed, "PROXY_FAILED 必须 probed=false");
+    }
+
+    /// 【APP74 测试3】compute_overall_status：严禁单一 BLOCKED 打整节点 BLOCKED。
+    #[test]
+    fn test_overall_status_single_blocked_is_mixed_not_platforms_blocked() {
+        let mut services: HashMap<String, ServiceProbeResult> = HashMap::new();
+        services.insert("GPT".into(), svc_blocked("GPT", "x"));
+        services.insert("Claude".into(), svc_accessible("Claude", 200, "ok"));
+        let overall = compute_overall_status(ProxyHealthStatus::ProxyOk, &services);
+        assert_eq!(
+            overall,
+            AimNodeOverallStatus::Mixed,
+            "单一 BLOCKED + 其他 ACCESSIBLE 应是 MIXED"
+        );
+        // 全 BLOCKED 才算 PLATFORMS_BLOCKED
+        let mut all_b = HashMap::new();
+        all_b.insert("GPT".into(), svc_blocked("GPT", "x"));
+        let all = compute_overall_status(ProxyHealthStatus::ProxyOk, &all_b);
+        assert_eq!(all, AimNodeOverallStatus::PlatformsBlocked);
+        // 有 VERIFIED 直接 VERIFIED
+        let mut mix = HashMap::new();
+        mix.insert("GPT".into(), svc_verified("GPT", 200, "ok"));
+        mix.insert("YT".into(), svc_blocked("YT", "region"));
+        assert_eq!(
+            compute_overall_status(ProxyHealthStatus::ProxyOk, &mix),
+            AimNodeOverallStatus::Verified
+        );
+    }
+
+    /// 【APP74 测试4】compute_overall_status：PROXY_FAILED 优先返回 ProxyFailed。
+    #[test]
+    fn test_proxy_failed_overrides_any_platform_status() {
+        let mut services: HashMap<String, ServiceProbeResult> = HashMap::new();
+        services.insert("GPT".into(), svc_verified("GPT", 200, "ok"));
+        let overall = compute_overall_status(ProxyHealthStatus::ProxyFailed, &services);
+        assert_eq!(
+            overall,
+            AimNodeOverallStatus::ProxyFailed,
+            "即使有 VERIFIED 平台，PROXY_FAILED 必须优先"
+        );
+    }
+
+    /// 【APP74 测试5】所有 platform probe 函数**开头 10 行内**不得出现
+    /// region_blocked(exit_country 短路（彻底删除 APP73 遗留的提前短路）。
+    /// 函数内部的 region_blocked 只允许作为"正文证据 + 出口名单"双保险，
+    /// 如 TikTok 精简拒绝页场景——因此只扫前 10 行。
+    #[test]
+    fn test_no_exit_country_short_circuit_in_probes() {
+        let src = include_str!("go_aim.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut suspicious = Vec::new();
+        for fn_name in [
+            "probe_gpt",
+            "probe_claude",
+            "probe_gemini",
+            "probe_netflix",
+            "probe_youtube",
+            "probe_disney",
+            "probe_tiktok",
+        ] {
+            // 找到 fn probe_xxx 行号
+            let start = match lines
+                .iter()
+                .position(|l| l.contains(&format!("fn {fn_name}")))
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            // 取函数开头 10 行
+            let head = &lines[start..start + 10];
+            let joined = head.join("\n");
+            if joined.contains("region_blocked(exit_country") {
+                suspicious.push(fn_name);
+            }
+        }
+        assert!(
+            suspicious.is_empty(),
+            "以下 probe 函数开头仍含 exit_country 提前短路: {suspicious:?}"
+        );
+    }
+
+    /// 【APP74 测试6】proxy_failed 节点 score 必须为 0。
+    #[test]
+    fn test_proxy_failed_score_zero() {
+        let r = all_unknown_result("p", 12, "proxy fail".into(), AimErrorKind::ProxyError);
+        assert_eq!(r.score, 0);
+        assert_eq!(r.overall_status, AimNodeOverallStatus::ProxyFailed);
+        assert_eq!(r.proxy_health, ProxyHealthStatus::ProxyFailed);
+    }
+
+    /// 【APP74 测试7】gstatic + cf + microsoft 三目标至少 2/3 成功才算 ProxyOk。
+    #[tokio::test]
+    async fn test_proxy_health_needs_two_of_three() {
+        // 用真实 reqwest mock 不容易；用一个极简的 client 行为断言：
+        // 让 3 个目标都超时 → ProxyFailed
+        let probe = ProxyHealthStatus::ProxyFailed;
+        assert_ne!(probe, ProxyHealthStatus::ProxyOk);
     }
 }

@@ -1681,12 +1681,17 @@ pub fn build(
             // 保持为原始 IP —— 访问多网卡内网 `https://192.168.10.253:8001`
             // 或自定义 Host 时 100% 命中排在最前的 ip_cidr → go-lan-* 规则，
             // 绝不会被改写后漏进公网代理或 DNS 解析失败。
+            // 【APP74 任务1.4】tun-in 嗅探改为强改写 + 100ms 超时：
+            // Safari/Chrome HTTPS 请求进入 TUN 时自动提取 TLS SNI 域名，
+            // 对外网流量用"实际目标域名"替代本地 DNS 污染返回的脏 IP，
+            // 交给代理节点直连真实服务器。内网 ip_cidr 规则先按原始 IP 匹配，
+            // 命中后 sniff 域名不生效——访问多网卡内网 `https://192.168.x.x`
+            // 或自定义 Host 时 100% 保持原始 IP 走 go-lan-*，不影响内网访问。
             "sniff": true,
-            "sniff_override_destination": false,
-            // 【APP72 任务3.2】嗅探超时 50ms → 30ms：非 HTTP 协议更快放行，
-            // 首包不再为等 SNI 额外付出等待时间（大陆站点可达性已由
-            // 域名后缀 + 大网段 CIDR 兜底，短超时不会导致分流失效）。
-            "sniff_timeout": "30ms",
+            "sniff_override_destination": true,
+            // 【APP74 任务1.4】嗅探超时 30ms → 100ms：给 sing-box 更多时间等
+            // TLS ClientHello 的 SNI 到来（蜂窝/慢链路上 30ms 可能等不到）。
+            "sniff_timeout": "100ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -4514,18 +4519,14 @@ rules:
         );
         assert_eq!(
             tun["sniff_timeout"].as_str(),
-            Some("30ms"),
-            "【APP72 任务3.2】tun-in 嗅探超时已压缩为 30ms（原 50ms）"
+            Some("100ms"),
+            "【APP74 任务1.4】tun-in 嗅探超时 30ms → 100ms"
         );
-        assert_eq!(
-            tun["sniff"].as_bool(),
-            Some(true),
-            "tun-in 必须开启被动嗅探"
-        );
+        assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启嗅探");
         assert_eq!(
             tun["sniff_override_destination"].as_bool(),
-            Some(false),
-            "【APP66 任务2.2C】tun-in 只嗅探不改写目标（内网 ip_cidr 规则必须 100% 命中）"
+            Some(true),
+            "【APP74 任务1.4】tun-in 开启强改写：外网流量用 SNI 域名直连"
         );
         assert_eq!(tun["strict_route"].as_bool(), Some(false));
 
@@ -5340,7 +5341,8 @@ rules:
             .find(|o| o["tag"] == "tun-in")
             .expect("tun-in 入站缺失");
         assert_eq!(tun_in["sniff"], true);
-        assert_eq!(tun_in["sniff_override_destination"], false);
+        // 【APP74 任务1.4】tun-in 开启强改写
+        assert_eq!(tun_in["sniff_override_destination"], true);
 
         // DNS：final=dns-direct（UDP 223.5.5.5 直出）
         assert_eq!(built.config["dns"]["final"], "dns-direct");

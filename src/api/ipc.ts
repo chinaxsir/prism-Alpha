@@ -312,7 +312,7 @@ export interface AimNodeResult {
   score: number;
   delayMs: number;
   updatedAt: number;
-  /** 是否已完成完整探测；FAST 占位结果恒为 false */
+  /** 【APP74 任务1.3】DeepProbed/CacheHit 才为 true；Dead/Fast/ProxyFailed 一律 false */
   probed?: boolean;
   nodeId?: string;
   egressIp?: string;
@@ -325,6 +325,25 @@ export interface AimNodeResult {
   services?: Record<string, ServiceProbeResult>;
   evidence?: Record<string, string>;
   failureReasons?: Record<string, string>;
+  // ---- 【APP74 新增三字段 ----
+  /** 基础代理健康状态：PROXY_OK / PROXY_FAILED / PROXY_UNKNOWN */
+  proxyHealth?: "PROXY_OK" | "PROXY_FAILED" | "PROXY_UNKNOWN";
+  /** 节点所处检测阶段：NOT_TESTED / SCREENED_ALIVE / SCREENED_DEAD / PROXY_FAILED / DEEP_PROBED / CACHE_HIT / PREVIEW_ONLY */
+  probeStage?:
+    | "NOT_TESTED"
+    | "SCREENED_ALIVE"
+    | "SCREENED_DEAD"
+    | "PROXY_FAILED"
+    | "DEEP_PROBED"
+    | "CACHE_HIT"
+    | "PREVIEW_ONLY";
+  /** 节点总体状态：PROXY_FAILED / VERIFIED / MIXED / PLATFORMS_BLOCKED / UNKNOWN */
+  overallStatus?:
+    | "PROXY_FAILED"
+    | "VERIFIED"
+    | "MIXED"
+    | "PLATFORMS_BLOCKED"
+    | "UNKNOWN";
 }
 
 export interface GoAimStatus {
