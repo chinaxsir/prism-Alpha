@@ -30,11 +30,11 @@ use futures_util::StreamExt;
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP76】当前 Go AIM 检测引擎版本号：统一递增至 8，启动时自动淘汰
-/// `< 8` 的旧缓存（含地区名单参与解锁/封锁判定、补测条件过宽、
-/// 出口名单短路等旧结论）。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 8;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 8;
+/// 【APP77】当前 Go AIM 检测引擎版本号：统一递增至 9，启动时自动淘汰
+/// `< 9` 的旧缓存（Claude / Gemini 判定已改为纯客观证据 + 手动逐跳跟踪，
+/// 旧的「302 即 ACCESSIBLE」「地区名单短路」结论全部失效）。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 9;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 9;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -123,10 +123,6 @@ fn probe_port_reachable(port: u16) -> bool {
 /// 【APP75】生产代码已删除出口名单提前短路，仅保留给回归测试断言名单内容。
 #[cfg(test)]
 const AI_BLOCKLIST: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY", "VE"];
-
-/// 不含 VE 的 AI 平台受限名单（Claude / Gemini / Disney+ 使用）
-#[cfg(test)]
-const AI_BLOCKLIST_NO_VE: &[&str] = &["CN", "HK", "MO", "RU", "BY", "IR", "KP", "CU", "SY"];
 
 /// 【APP49 任务3】TikTok 受限地区（trace loc=）：命中任一即判未解锁
 /// TikTok 停服名单（仅用于回归测试，生产代码已彻底移除所有 exit_country
@@ -2321,6 +2317,159 @@ fn location_lc(headers: &reqwest::header::HeaderMap) -> String {
         .to_lowercase()
 }
 
+/// 【APP77 任务1/2】手动逐跳跟踪的最终页面快照（携带内存 Cookie）。
+struct ChainPage {
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    body: String,
+    final_url: String,
+    /// 每一跳的 Location（小写），按跳序记录
+    locations: Vec<String>,
+    /// 重定向链中是否出现 accounts.google.com（Google 登录流）
+    to_login: bool,
+}
+
+/// 【APP77 任务1/2】把响应头中的 Set-Cookie 合并进内存 Cookie 罐。
+/// 同一 key 后出现的值覆盖先前的值，避免重复累积。
+fn merge_set_cookies(jar: &mut Vec<(String, String)>, headers: &reqwest::header::HeaderMap) {
+    for value in headers.get_all(reqwest::header::SET_COOKIE).iter() {
+        let Ok(raw) = value.to_str() else { continue };
+        let Some(pair) = raw.split(';').next() else {
+            continue;
+        };
+        let pair = pair.trim();
+        let Some(eq) = pair.find('=') else { continue };
+        let name = pair[..eq].trim();
+        if name.is_empty() {
+            continue;
+        }
+        let val = pair[eq + 1..].trim().to_string();
+        if let Some(existing) = jar.iter_mut().find(|(k, _)| k == name) {
+            existing.1 = val;
+        } else {
+            jar.push((name.to_string(), val));
+        }
+    }
+}
+
+/// 【APP77 任务1/2】解析 Location：支持绝对 URL、以 `/` 开头的相对路径与普通相对路径。
+fn resolve_location(base: &str, loc: &str) -> String {
+    if loc.starts_with("https://") || loc.starts_with("http://") {
+        return loc.to_string();
+    }
+    if let Some(idx) = base.find("://") {
+        let rest = &base[idx + 3..];
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let origin = format!("{}://{}", &base[..idx], &rest[..host_end]);
+        if loc.starts_with('/') {
+            return format!("{origin}{loc}");
+        }
+        return format!("{origin}/{loc}");
+    }
+    loc.to_string()
+}
+
+/// 【APP77 任务1/2】带 Cookie 的手动重定向跟踪（最多 max_hops 跳）。
+///
+/// 关键在于绕开 reqwest 自动重定向：`/app` → `accounts.google.com` → `/app`
+/// 的无 Cookie 死循环会报 `error sending request`。这里手动跟随并回传
+/// `Set-Cookie`，网络瞬断（完全拿不到 HTTP 状态）时等待 300ms 重试 1 次。
+async fn fetch_chain_with_cookies(
+    client: &reqwest::Client,
+    start_url: &str,
+    jar: &mut Vec<(String, String)>,
+    max_hops: usize,
+) -> Result<ChainPage, String> {
+    let mut url = start_url.to_string();
+    let mut locations: Vec<String> = Vec::new();
+    let mut to_login = false;
+
+    for hop in 0..=max_hops {
+        let cookie = jar
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let build = |target: &str| {
+            let mut req = client
+                .get(target)
+                .header("Accept-Language", "en-US,en;q=0.9");
+            if !cookie.is_empty() {
+                req = req.header(reqwest::header::COOKIE, cookie.clone());
+            }
+            req
+        };
+        let resp = match build(&url).send().await {
+            Ok(r) => r,
+            Err(_) if hop == 0 => {
+                // 【APP77】首次请求网络瞬断（无任何 HTTP 状态）→ 300ms 后重试 1 次
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                build(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("首跳重试仍失败: {e}"))?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        merge_set_cookies(jar, &headers);
+        let resp_url = resp.url().as_str().to_string();
+
+        if (300..400).contains(&status) {
+            let loc = location_lc(&headers);
+            if loc.is_empty() {
+                return Ok(ChainPage {
+                    status,
+                    headers,
+                    body: String::new(),
+                    final_url: resp_url,
+                    locations,
+                    to_login,
+                });
+            }
+            if loc.contains("accounts.google.com") {
+                to_login = true;
+            }
+            locations.push(loc.clone());
+            let next = resolve_location(&resp_url, &loc);
+            if next.is_empty() || next == url {
+                return Ok(ChainPage {
+                    status,
+                    headers,
+                    body: String::new(),
+                    final_url: resp_url,
+                    locations,
+                    to_login,
+                });
+            }
+            url = next;
+            continue;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(ChainPage {
+            status,
+            headers,
+            body,
+            final_url: resp_url,
+            locations,
+            to_login,
+        });
+    }
+
+    // 超过最大跳数：返回空正文快照，由调用方按未知处理
+    Ok(ChainPage {
+        status: 0,
+        headers: reqwest::header::HeaderMap::new(),
+        body: String::new(),
+        final_url: url,
+        locations,
+        to_login,
+    })
+}
+
 // ===== 【APP67 P1】7 大平台独立正特征检测器 =====
 // 每个检测器返回 ServiceProbeResult，只有 Verified 可进入 unlocked_tags。
 
@@ -2334,11 +2483,6 @@ fn body_region_evidence(lc: &str) -> bool {
         || lc.contains("unsupported_country")
         || lc.contains("app-unavailable-in-region")
         || lc.contains("this content is not available in your location")
-}
-
-/// 精简拒绝页：地区封锁页通常只有极少量 HTML（无完整应用骨架）。
-fn is_compact_body(body: &str) -> bool {
-    body.len() < 20_000
 }
 
 /// 读取响应状态码、响应头与正文；正文读取失败统一归为 BODY_PARSE_ERROR。
@@ -2528,352 +2672,315 @@ async fn probe_gpt(client: &reqwest::Client) -> ServiceProbeResult {
     }
 }
 
-/// Claude：claude.ai/login（无重定向客户端看 Location，跟随客户端读正文）
-async fn probe_claude(client: &reqwest::Client, nr_client: &reqwest::Client) -> ServiceProbeResult {
+/// Claude：claude.ai/login（手动逐跳跟踪 + 携带 Cookie + Cloudflare 真人检测识别）。
+/// 【APP77 任务1】纯客观证据判定：零地区代码依赖（不读 exit_country / BLOCKLIST）。
+async fn probe_claude(
+    _client: &reqwest::Client,
+    nr_client: &reqwest::Client,
+) -> ServiceProbeResult {
     const SVC: &str = "Claude";
-    // 【APP74 任务2.1】彻底删除出口名单提前短路——必须真实请求 + HTTP 响应证据。
-    let first = match nr_client
-        .get("https://claude.ai/login")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            return svc_unknown_status(
-                SVC,
-                None,
-                format!("claude.ai/login 首跳请求失败: {e}"),
-                classify_reqwest_error(&e),
-            );
-        }
-    };
-    let first_status = first.status().as_u16();
-    let first_loc = location_lc(first.headers());
-    if first_loc.contains("unavailable")
-        || first_loc.contains("unsupported")
-        || first_loc.contains("app-unavailable-in-region")
-    {
+    let mut jar: Vec<(String, String)> = Vec::new();
+    let page =
+        match fetch_chain_with_cookies(nr_client, "https://claude.ai/login", &mut jar, 3).await {
+            Ok(p) => p,
+            Err(e) => {
+                return svc_unknown_status(
+                    SVC,
+                    None,
+                    format!("claude.ai/login 请求失败（含 300ms 重试）: {e}"),
+                    AimErrorKind::UnknownError,
+                );
+            }
+        };
+
+    let final_lc = page.final_url.to_lowercase();
+    let lc = page.body.to_lowercase();
+
+    // 任意一跳 Location 指向地区不可用页 → 客观 BLOCKED
+    if let Some(bad) = page.locations.iter().find(|l| {
+        l.contains("app-unavailable-in-region")
+            || l.contains("/unavailable")
+            || l.contains("unsupported")
+    }) {
         return svc_blocked_status(
             SVC,
-            Some(first_status),
-            format!("首跳 Location 指向地区不可用页: {first_loc}"),
+            Some(page.status),
+            format!("首跳重定向指向地区不可用页 (app-unavailable-in-region): {bad}"),
             AimErrorKind::RegionRestricted,
         );
     }
-    if first_status == 429 {
-        return svc_unknown_status(
+    // 最终落地 URL 或正文含地区不可用 / Error 1020 硬封禁 → BLOCKED
+    if final_lc.contains("app-unavailable-in-region")
+        || final_lc.contains("/unavailable")
+        || lc.contains("app-unavailable-in-region")
+        || lc.contains("unavailable in your region")
+        || lc.contains("not available in your country")
+        || lc.contains("claude is not available")
+        || lc.contains("error code: 1020")
+    {
+        return svc_blocked_status(
             SVC,
-            Some(first_status),
-            "claude.ai/login 返回 429 频率限制",
+            Some(page.status),
+            "Claude 明确地区不可用 / Error 1020 硬封禁证据",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+
+    // 只有仍落地在 claude 域才按常规准入判定
+    if !(final_lc.contains("claude.ai") || final_lc.contains("claude.com")) {
+        return svc_accessible(SVC, page.status, "重定向离开 claude 域，未验证业务正特征");
+    }
+
+    match page.status {
+        200 => {
+            if lc.contains("claude") || lc.contains("anthropic") {
+                svc_verified(SVC, 200, "Claude 登录与工作区入口验证通过 (HTTP 200)")
+            } else {
+                svc_accessible(SVC, 200, "claude.ai 返回 200 但缺少品牌正特征")
+            }
+        }
+        403 => {
+            let cf_header = page.headers.get("cf-mitigated").is_some()
+                || page
+                    .headers
+                    .get(reqwest::header::SERVER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_lowercase().contains("cloudflare"))
+                    .unwrap_or(false);
+            let turnstile = lc.contains("just a moment")
+                || lc.contains("_cf_chl_opt")
+                || lc.contains("challenge-platform")
+                || lc.contains("turnstile")
+                || lc.contains("enable javascript and cookies to continue")
+                || is_cf_challenge_body(&page.body);
+            // 【APP77】403 + Cloudflare Turnstile 挑战页 = 已通过 Anthropic 地区准入
+            if cf_header && turnstile {
+                svc_verified(
+                    SVC,
+                    403,
+                    "已通过 Claude 地区准入校验（触发常规真人检测，账号可正常使用）",
+                )
+            } else {
+                svc_unknown_status(
+                    SVC,
+                    Some(403),
+                    "claude.ai 403 但缺少 Cloudflare 真人检测特征",
+                    AimErrorKind::Http403,
+                )
+            }
+        }
+        429 => svc_unknown_status(
+            SVC,
+            Some(429),
+            "claude.ai 返回 429 频率限制",
             AimErrorKind::Http429,
-        );
-    }
-    if (500..600).contains(&first_status) {
-        return svc_unknown_status(
+        ),
+        500..=599 => svc_unknown_status(
             SVC,
-            Some(first_status),
-            format!("claude.ai/login 返回 {first_status}"),
+            Some(page.status),
+            format!("claude.ai 返回 {}", page.status),
             AimErrorKind::Http5xx,
+        ),
+        0 => svc_unknown_status(
+            SVC,
+            None,
+            "claude.ai 重定向链超过最大跳数",
+            AimErrorKind::RedirectError,
+        ),
+        other => svc_unknown_status(
+            SVC,
+            Some(other),
+            format!("claude.ai 返回 {other}"),
+            classify_status(other),
+        ),
+    }
+}
+
+/// Gemini 地区不支持文案（仅匹配明确、完整的提示句）。
+fn gemini_region_text(lc: &str) -> bool {
+    lc.contains("isn't currently supported in your country")
+        || lc.contains("is not currently supported in your country")
+        || lc.contains("not available in your country")
+        || lc.contains("目前不支持你所在的国家/地区")
+}
+
+/// 【APP77 任务2】Gemini 根入口交叉核验：
+/// `/app` 已进入 Google 登录流时，用同一 Cookie 罐请求根路径，确认是否
+/// 被地区准入重定向到 `/faq`，并据此给出 VERIFIED / BLOCKED。
+async fn gemini_root_check(
+    client: &reqwest::Client,
+    jar: &mut Vec<(String, String)>,
+    hop_status: u16,
+) -> ServiceProbeResult {
+    const SVC: &str = "Gemini";
+    let page = match fetch_chain_with_cookies(client, "https://gemini.google.com/", jar, 3).await {
+        Ok(p) => p,
+        Err(_) => {
+            return svc_accessible(
+                SVC,
+                hop_status,
+                "Gemini 登录认证流已进入，但根入口复检网络失败",
+            );
+        }
+    };
+    let final_lc = page.final_url.to_lowercase();
+    let lc = page.body.to_lowercase();
+    if let Some(bad) = page.locations.iter().find(|l| {
+        l.contains("/faq") || l.contains("support.google.com") || l.contains("unsupported")
+    }) {
+        return svc_blocked_status(
+            SVC,
+            Some(page.status),
+            format!("根入口重定向至 Gemini 地区不支持说明页: {bad}"),
+            AimErrorKind::RegionRestricted,
         );
     }
-    if first_status == 403 {
-        let (_, _, body) = match read_body(first, SVC).await {
-            Ok(v) => v,
-            Err(r) => return r,
+    if final_lc.contains("/faq")
+        || final_lc.contains("support.google.com")
+        || gemini_region_text(&lc)
+    {
+        return svc_blocked_status(
+            SVC,
+            Some(page.status),
+            "根入口页面明确提示当前地区不支持 Gemini",
+            AimErrorKind::RegionRestricted,
+        );
+    }
+    if page.status == 403 && (lc.contains("recaptcha") || lc.contains("unusual traffic")) {
+        return svc_verified(SVC, 403, "已通过 Gemini 准入（触发常规真人验证，账号可用）");
+    }
+    if (200..300).contains(&page.status) {
+        return svc_verified(SVC, page.status, "Gemini 登录认证流与准入校验通过");
+    }
+    svc_accessible(SVC, page.status, "根入口可访问但未命中 Gemini 正特征")
+}
+
+/// Gemini：gemini.google.com/app（手动逐跳 + Cookie 复用 + 根入口交叉核验）。
+/// 【APP77 任务2】纯客观证据判定：零地区代码依赖，根除 302 死循环与漏判。
+async fn probe_gemini(
+    _client: &reqwest::Client,
+    nr_client: &reqwest::Client,
+) -> ServiceProbeResult {
+    const SVC: &str = "Gemini";
+    // 初始 Cookie: CONSENT=YES+（与真实浏览器首访一致，抑制同意页跳转）
+    let mut jar: Vec<(String, String)> = vec![("CONSENT".to_string(), "YES+".to_string())];
+    let page =
+        match fetch_chain_with_cookies(nr_client, "https://gemini.google.com/app", &mut jar, 4)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return svc_unknown_status(
+                    SVC,
+                    None,
+                    format!("gemini.google.com/app 请求失败（含 300ms 重试）: {e}"),
+                    AimErrorKind::UnknownError,
+                );
+            }
         };
-        if body_region_evidence(&body.to_lowercase()) {
+
+    // 任意一跳 Location 指向地区不支持说明页 → 客观 BLOCKED
+    if let Some(bad) = page.locations.iter().find(|l| {
+        l.contains("/faq")
+            || l.contains("support.google.com")
+            || l.contains("unsupported")
+            || l.contains("region-not-supported")
+    }) {
+        return svc_blocked_status(
+            SVC,
+            Some(page.status),
+            format!("重定向指向 Gemini 地区不支持说明页 (/faq): {bad}"),
+            AimErrorKind::RegionRestricted,
+        );
+    }
+
+    let final_lc = page.final_url.to_lowercase();
+
+    // /app 进入 Google 账号登录流 → 根入口交叉核验（避免无 Cookie 死循环）
+    if page.to_login || final_lc.contains("accounts.google.com") {
+        return gemini_root_check(nr_client, &mut jar, page.status).await;
+    }
+
+    if page.status == 200 {
+        let lc = page.body.to_lowercase();
+        if final_lc.contains("/faq") || final_lc.contains("support.google.com") {
+            return svc_blocked_status(
+                SVC,
+                Some(200),
+                "最终落地 URL 为 Gemini 地区不支持说明页",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        if gemini_region_text(&lc) {
+            return svc_blocked_status(
+                SVC,
+                Some(200),
+                "页面明确提示当前地区不支持 Gemini",
+                AimErrorKind::RegionRestricted,
+            );
+        }
+        if lc.contains("wiz_global_data")
+            || lc.contains("snlm0e")
+            || lc.contains("bardchatui")
+            || lc.contains("gemini")
+        {
+            return svc_verified(SVC, 200, "Gemini 工作区与网页入口客观验证通过 (HTTP 200)");
+        }
+        return svc_accessible(SVC, 200, "页面可打开但缺少 Gemini 应用正特征");
+    }
+
+    if page.status == 403 {
+        let lc = page.body.to_lowercase();
+        if gemini_region_text(&lc) {
             return svc_blocked_status(
                 SVC,
                 Some(403),
-                "claude.ai/login 403 含明确地区证据",
+                "403 页面明确提示当前地区不支持 Gemini",
                 AimErrorKind::RegionRestricted,
             );
+        }
+        // 【APP77】403 + reCAPTCHA / unusual traffic = 已通过准入，账号可用
+        if lc.contains("recaptcha") || lc.contains("unusual traffic") {
+            return svc_verified(SVC, 403, "已通过 Gemini 准入（触发常规真人验证，账号可用）");
         }
         return svc_unknown_status(
             SVC,
             Some(403),
-            "claude.ai/login 普通 403（无明确地区证据）",
+            "Gemini 普通 403（无地区不支持 / 真人验证特征）",
             AimErrorKind::Http403,
         );
     }
 
-    let hp = match client
-        .get("https://claude.ai/login")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            return svc_unknown_status(
-                SVC,
-                None,
-                format!("claude.ai/login 请求失败: {e}"),
-                classify_reqwest_error(&e),
-            );
-        }
-    };
-    let (hp_status, _, hp_body) = match read_body(hp, SVC).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let hp_lc = hp_body.to_lowercase();
-    if hp_status == 403 {
-        if body_region_evidence(&hp_lc) {
-            return svc_blocked_status(
-                SVC,
-                Some(hp_status),
-                "claude.ai 403 含明确地区证据",
-                AimErrorKind::RegionRestricted,
-            );
-        }
+    if page.status == 429 {
         return svc_unknown_status(
             SVC,
-            Some(hp_status),
-            "claude.ai 普通 403（无明确地区证据）",
-            AimErrorKind::Http403,
-        );
-    }
-    if hp_status == 429 {
-        return svc_unknown_status(
-            SVC,
-            Some(hp_status),
-            "claude.ai 返回 429 频率限制",
-            AimErrorKind::Http429,
-        );
-    }
-    if (500..600).contains(&hp_status) {
-        return svc_unknown_status(
-            SVC,
-            Some(hp_status),
-            format!("claude.ai 返回 {hp_status}"),
-            AimErrorKind::Http5xx,
-        );
-    }
-    if !(200..400).contains(&hp_status) {
-        return svc_unknown_status(
-            SVC,
-            Some(hp_status),
-            format!("claude.ai 返回 {hp_status}"),
-            classify_status(hp_status),
-        );
-    }
-    if is_cf_challenge_body(&hp_body) {
-        return svc_unknown_status(
-            SVC,
-            Some(hp_status),
-            "claude.ai 返回 Cloudflare 质询页",
-            AimErrorKind::ChallengePage,
-        );
-    }
-    if body_region_evidence(&hp_lc) {
-        return svc_blocked_status(
-            SVC,
-            Some(hp_status),
-            "claude.ai 正文含明确地区不可用证据",
-            AimErrorKind::RegionRestricted,
-        );
-    }
-    let has_brand = hp_lc.contains("claude") || hp_lc.contains("anthropic");
-    if has_brand {
-        svc_partial(SVC, hp_status, "登录页正常且含品牌正特征（未验证实际对话）")
-    } else {
-        svc_accessible(SVC, hp_status, "连通但缺少品牌正特征")
-    }
-}
-
-/// Gemini：gemini.google.com/app（无重定向看首跳 Location）。
-/// 【APP73】严禁在整段 HTML/JS 中扫到地区提示串就判 BLOCKED。
-async fn probe_gemini(client: &reqwest::Client, nr_client: &reqwest::Client) -> ServiceProbeResult {
-    const SVC: &str = "Gemini";
-    let resp = match nr_client
-        .get("https://gemini.google.com/app")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            return svc_unknown_status(
-                SVC,
-                None,
-                format!("gemini.google.com 请求失败: {e}"),
-                classify_reqwest_error(&e),
-            );
-        }
-    };
-    let status = resp.status().as_u16();
-    let loc = location_lc(resp.headers());
-    if (300..400).contains(&status) {
-        if loc.contains("support.google.com")
-            || loc.contains("/faq")
-            || loc.contains("unsupported")
-            || loc.contains("notavailable")
-        {
-            return svc_blocked_status(
-                SVC,
-                Some(status),
-                format!("首跳重定向至地区限制页: {loc}"),
-                AimErrorKind::RegionRestricted,
-            );
-        }
-        // 【APP75 任务3.2】同域重定向必须跟随 1~2 跳，核验最终落地页：
-        // 香港节点首跳 302 曾被误判 ACCESSIBLE，实际落地 /faq 不支持页。
-        let next = if loc.starts_with("http") {
-            loc.clone()
-        } else if loc.starts_with('/') {
-            format!("https://gemini.google.com{loc}")
-        } else {
-            String::new()
-        };
-        if next.contains("gemini.google.com") {
-            match client
-                .get(&next)
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let final_url = resp.url().as_str().to_lowercase();
-                    if final_url.contains("/faq") || final_url.contains("unsupported") {
-                        return svc_blocked_status(
-                            SVC,
-                            Some(resp.status().as_u16()),
-                            format!("跟随重定向后落地地区限制页: {final_url}"),
-                            AimErrorKind::RegionRestricted,
-                        );
-                    }
-                    match read_body(resp, SVC).await {
-                        Ok((st, _, body)) => {
-                            let blc = body.to_lowercase();
-                            if body_region_evidence(&blc) && is_compact_body(&body) {
-                                return svc_blocked_status(
-                                    SVC,
-                                    Some(st),
-                                    "跟随重定向后落地精简地区拒绝页",
-                                    AimErrorKind::RegionRestricted,
-                                );
-                            }
-                            if blc.contains("wiz_global_data") {
-                                return svc_verified(
-                                    SVC,
-                                    st,
-                                    "跟随重定向后命中 gemini 工作区正特征",
-                                );
-                            }
-                            if blc.contains("accounts.google.com/servicelogin") {
-                                return svc_accessible(SVC, st, "正常重定向至 Google 登录页");
-                            }
-                        }
-                        Err(r) => return r,
-                    }
-                }
-                Err(e) => {
-                    return svc_unknown_status(
-                        SVC,
-                        Some(status),
-                        format!("跟随重定向失败: {e}"),
-                        classify_reqwest_error(&e),
-                    );
-                }
-            }
-        }
-        return svc_accessible(SVC, status, "首跳正常重定向（登录/首页），未验证业务正特征");
-    }
-    let (status, _, body) = match read_body(resp, SVC).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    if status == 403 {
-        if is_cf_challenge_body(&body) {
-            return svc_unknown_status(
-                SVC,
-                Some(status),
-                "Gemini 返回 Cloudflare/Google 质询页",
-                AimErrorKind::ChallengePage,
-            );
-        }
-        let lc = body.to_lowercase();
-        // 只有「明确地区拒绝页」才判封锁；普通 403 一律 UNKNOWN。
-        // 用精简页结构作为护栏，避免把整段 JS 中偶然出现的文案当成证据。
-        if is_compact_body(&body) && body_region_evidence(&lc) {
-            return svc_blocked_status(
-                SVC,
-                Some(status),
-                "403 精简地区拒绝页含明确不支持标题",
-                AimErrorKind::RegionRestricted,
-            );
-        }
-        return svc_unknown_status(
-            SVC,
-            Some(status),
-            "普通 403（无明确地区证据）",
-            AimErrorKind::Http403,
-        );
-    }
-    if status == 429 {
-        return svc_unknown_status(
-            SVC,
-            Some(status),
+            Some(429),
             "gemini.google.com 返回 429 频率限制",
             AimErrorKind::Http429,
         );
     }
-    if (500..600).contains(&status) {
+    if (500..600).contains(&page.status) {
         return svc_unknown_status(
             SVC,
-            Some(status),
-            format!("gemini.google.com 返回 {status}"),
+            Some(page.status),
+            format!("gemini.google.com 返回 {}", page.status),
             AimErrorKind::Http5xx,
         );
     }
-    if status != 200 {
+    if page.status == 0 {
         return svc_unknown_status(
             SVC,
-            Some(status),
-            format!("gemini.google.com 返回 {status}"),
-            classify_status(status),
+            None,
+            "gemini 重定向链超过最大跳数",
+            AimErrorKind::RedirectError,
         );
     }
-    if body.trim().len() < 1000 {
-        return svc_unknown_status(
-            SVC,
-            Some(status),
-            "gemini 响应正文过短/为空",
-            AimErrorKind::EmptyResponse,
-        );
-    }
-    if is_cf_challenge_body(&body) {
-        return svc_unknown_status(
-            SVC,
-            Some(status),
-            "gemini 返回 Cloudflare/Google 质询页",
-            AimErrorKind::ChallengePage,
-        );
-    }
-    let lc = body.to_lowercase();
-    let has_login = lc.contains("accounts.google.com/servicelogin")
-        || lc.contains("serviceLogin".to_lowercase().as_str())
-        || (lc.contains("sign in") && lc.contains("google"));
-    let has_workspace =
-        lc.contains("wiz_global_data") && (lc.contains("gemini") || lc.contains("bard"));
-    if has_workspace {
-        return svc_verified(SVC, status, "gemini 工作区初始化数据正特征");
-    }
-    if has_login {
-        return svc_accessible(SVC, status, "正常返回 Google 登录页，未验证 AI 会话");
-    }
-    // 地区拒绝主标题 + 精简拒绝页且无工作区/登录入口 → 封锁
-    if body_region_evidence(&lc) && is_compact_body(&body) {
-        return svc_blocked_status(
-            SVC,
-            Some(status),
-            "页面仅展示地区拒绝主标题且无工作区/登录入口",
-            AimErrorKind::RegionRestricted,
-        );
-    }
-    svc_accessible(SVC, status, "首页可打开但缺少 AI 工作区正特征")
+    svc_unknown_status(
+        SVC,
+        Some(page.status),
+        format!("gemini.google.com 返回 {}", page.status),
+        classify_status(page.status),
+    )
 }
 
 /// 【APP75 任务3.1】3 目标 HTTPS 门槛判定：至少 2 个目标真实握手成功才算
@@ -4748,25 +4855,124 @@ mod tests {
         assert_eq!(total, 40);
     }
 
-    /// 【APP73 任务3.1】Gemini：整段长 HTML/JS 中命中地区提示串不得直接判 BLOCKED，
-    /// 只有“精简拒绝页 + 受限出口地区”组合才允许封锁。
+    /// 【APP77 任务1】Claude 纯客观判定回归：
+    /// - 重定向链任意一跳命中 app-unavailable-in-region / /unavailable / unsupported → BLOCKED
+    /// - 403 + Cloudflare Turnstile（响应头 + 正文双特征）→ VERIFIED
+    /// - 200 + claude / anthropic 品牌特征 → VERIFIED
+    /// - 彻底移除 exit_country / 地区名单
     #[test]
-    fn test_gemini_long_script_region_text_not_blocked() {
-        let big = format!(
-            "<html><script>{}</script></html>",
-            "var x='not available in your country';".repeat(2000)
-        );
-        let lc = big.to_lowercase();
-        assert!(body_region_evidence(&lc));
-        assert!(!is_compact_body(&big), "完整应用骨架不是精简拒绝页");
-        let blocked = is_compact_body(&big)
-            && body_region_evidence(&lc)
-            && region_blocked(Some("CN"), AI_BLOCKLIST_NO_VE);
+    fn test_claude_turnstile_403_and_200_are_verified_and_302_unavailable_is_blocked() {
+        let src = include_str!("go_aim.rs");
+        let start = src
+            .find("async fn probe_claude")
+            .expect("probe_claude 必须存在");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+
+        // 逐跳 Location 的三个地区不可用关键词必须全部参与判定
+        for key in ["app-unavailable-in-region", "/unavailable", "unsupported"] {
+            assert!(
+                body.contains(key),
+                "probe_claude 必须识别重定向 Location 中的 `{key}`"
+            );
+        }
+        // 403 必须同时要求 Cloudflare 响应头与挑战页正文特征
         assert!(
-            region_blocked(Some("CN"), AI_BLOCKLIST_NO_VE),
-            "测试前提：CN 必须在受限名单内"
+            body.contains("cf-mitigated") && body.contains("cloudflare"),
+            "403 判定必须校验 Cloudflare 响应头"
         );
-        assert!(!blocked, "长脚本中的地区字符串绝不能单独构成封锁证据");
+        for key in [
+            "just a moment",
+            "_cf_chl_opt",
+            "challenge-platform",
+            "turnstile",
+        ] {
+            assert!(body.contains(key), "403 挑战页正文必须识别 `{key}`");
+        }
+        assert!(
+            body.contains("cf_header && turnstile"),
+            "403 必须同时满足响应头与正文双特征才判 VERIFIED"
+        );
+        // 200 品牌特征 → VERIFIED
+        assert!(
+            body.contains("\"claude\"") || body.contains("lc.contains(\"claude\")"),
+            "200 判定必须校验 claude 品牌特征"
+        );
+        assert!(
+            body.contains("anthropic"),
+            "200 判定必须校验 anthropic 品牌特征"
+        );
+        // 零地区名单依赖
+        assert!(
+            !body.contains("region_blocked") && !body.contains("exit_country"),
+            "probe_claude 严禁使用出口地区名单参与判定"
+        );
+    }
+
+    /// 【APP77 任务2】Gemini 纯客观判定回归：
+    /// - 带 Cookie 手动逐跳（初始 CONSENT=YES+，最多 4 跳）
+    /// - 任意跳 Location 命中 /faq、support.google.com、unsupported、
+    ///   region-not-supported → BLOCKED
+    /// - /app 进入 accounts.google.com 登录流时用同一 Cookie 罐复检根路径
+    /// - 200 正特征、403 reCAPTCHA → VERIFIED；网络瞬断 300ms 重试 1 次
+    #[test]
+    fn test_gemini_redirect_chain_and_workspace_verified_vs_faq_blocked() {
+        let src = include_str!("go_aim.rs");
+        let start = src
+            .find("async fn probe_gemini")
+            .expect("probe_gemini 必须存在");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+
+        // 带 Cookie 手动逐跳，最多 4 跳 + 初始 CONSENT
+        assert!(
+            body.contains("fetch_chain_with_cookies"),
+            "probe_gemini 必须使用带 Cookie 的手动逐跳跟踪"
+        );
+        assert!(body.contains("CONSENT"), "必须携带初始 CONSENT=YES+ Cookie");
+        assert!(body.contains(", 4)"), "Gemini 重定向链最多跟踪 4 跳");
+        // 地区不支持说明页关键词
+        for key in [
+            "/faq",
+            "support.google.com",
+            "unsupported",
+            "region-not-supported",
+        ] {
+            assert!(
+                body.contains(key),
+                "probe_gemini 必须识别重定向中的 `{key}`"
+            );
+        }
+        // 登录流 → 根入口交叉核验
+        assert!(
+            body.contains("gemini_root_check") && body.contains("accounts.google.com"),
+            "进入 Google 登录流必须改用根入口交叉核验"
+        );
+        // 200 工作区正特征
+        for key in ["wiz_global_data", "snlm0e", "bardchatui", "gemini"] {
+            assert!(
+                body.contains(key),
+                "200 判定必须识别 Gemini 工作区特征 `{key}`"
+            );
+        }
+        // 403 真人验证 → VERIFIED
+        assert!(
+            body.contains("recaptcha") && body.contains("unusual traffic"),
+            "403 必须识别 reCAPTCHA / unusual traffic 真人验证特征"
+        );
+        // 零地区名单依赖
+        assert!(
+            !body.contains("region_blocked") && !body.contains("exit_country"),
+            "probe_gemini 严禁使用出口地区名单参与判定"
+        );
+
+        // 首跳网络瞬断 300ms 重试 1 次（在共享跟踪器中实现）
+        let retry_start = src
+            .find("async fn fetch_chain_with_cookies")
+            .expect("fetch_chain_with_cookies 必须存在");
+        let retry_body = &src[retry_start..retry_start + src[retry_start..].find("\n}\n").unwrap()];
+        assert!(
+            retry_body.contains("from_millis(300)"),
+            "首跳网络瞬断必须等待 300ms 后重试 1 次"
+        );
     }
 
     /// 【APP76 任务2.3】TikTok 纯客观证据：HTTP 200 + Web 应用数据容器 + 正常
@@ -5018,10 +5224,10 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 8);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 8);
-        assert!(7 < CURRENT_AIM_PROBE_VERSION, "v7 及更早缓存应被淘汰");
-        assert!(8 >= CURRENT_AIM_PROBE_VERSION, "v8 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 9);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 9);
+        assert!(8 < CURRENT_AIM_PROBE_VERSION, "v8 及更早缓存应被淘汰");
+        assert!(9 >= CURRENT_AIM_PROBE_VERSION, "v9 真实缓存应保留");
     }
 
     #[test]
