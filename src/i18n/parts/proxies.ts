@@ -24,6 +24,10 @@ const zh: Record<string, string> = {
   "proxies.err.testFailed": "测速失败：{error}",
   "proxies.err.coreNotRunningProbe": "内核未运行，无法探测",
   "proxies.goAim.probeStarted": "Go AIM 探测已启动，结果将实时更新",
+  "proxies.aimBanner.running": "Go AIM 正在检测中（{done}/{total}），结果实时更新…",
+  "proxies.aimBanner.runningSolo": "Go AIM 正在检测中，结果实时更新…",
+  "proxies.aimBanner.done": "Go AIM 检测已完成，已自动优选最佳节点：{name}",
+  "proxies.aimBanner.doneNoNode": "Go AIM 检测已完成，本轮未找到可用节点",
   "proxies.empty.noNodes": "暂无节点",
   "proxies.empty.noNodesDesc":
     "请导入订阅或更新已导入的订阅；启动内核后可在此测速、切换节点。",
@@ -254,6 +258,14 @@ const en: Record<string, string> = {
   "proxies.err.coreNotRunningProbe": "Core is not running, cannot probe",
   "proxies.goAim.probeStarted":
     "Go AIM probe started, results will update in real time",
+  "proxies.aimBanner.running":
+    "Go AIM is probing ({done}/{total}), results update in real time…",
+  "proxies.aimBanner.runningSolo":
+    "Go AIM is probing, results update in real time…",
+  "proxies.aimBanner.done":
+    "Go AIM finished — best node selected automatically: {name}",
+  "proxies.aimBanner.doneNoNode":
+    "Go AIM finished — no usable node found in this round",
   "proxies.empty.noNodes": "No nodes",
   "proxies.empty.noNodesDesc":
     "Import a subscription or update existing ones; once the core is running you can speed-test and switch nodes here.",

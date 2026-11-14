@@ -68,13 +68,23 @@ const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 8;
 /// 【APP75 任务3.2】单节点内部 7 平台并发上限：同一时刻最多 3 个平台
 /// 同时发起 HTTPS 握手，避免瞬时 7 路突发被中转服务器限流重置。
 const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
-/// 【APP51 任务1】阶段1 极速存活快筛：32 路并发（Semaphore 限流）
-const SCREEN_BATCH_SIZE: usize = 32;
+/// 【APP79 任务1.1】阶段1 平滑并发：32 → 8（iOS 6 路）。
+/// 32 路同时打 Clash API `/proxies/{tag}/delay` 会让 iOS 扩展内核瞬时拥塞，
+/// 28 个正常节点在队列里排队超时后被直接判死（实测「存活 6/34」）。
+/// 8/6 路既保持整体吞吐，又不给内核 DNS 与连接池造成突发压力。
+#[cfg(target_os = "ios")]
+const SCREEN_BATCH_SIZE: usize = 6;
+#[cfg(not(target_os = "ios"))]
+const SCREEN_BATCH_SIZE: usize = 8;
+/// 【APP79 任务1.1】阶段1 单次测速超时（2500ms，两级测速各一次）
+const SCREEN_TIMEOUT_MS: u64 = 2500;
 /// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
 const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
 /// 【APP72 任务1.3】阶段1 首次测速超时后的备用测速地址（Cloudflare 204），
 /// 单次失败不再直接判死。
 const SCREEN_FALLBACK_URL: &str = "http://cp.cloudflare.com/generate_204";
+/// 【APP79 任务1.1】阶段二探针槽位复测地址（HTTPS，绕开内核 delay 通道）
+const SCREEN_RETRY_URL: &str = "https://cp.cloudflare.com/generate_204";
 
 /// 【APP74 任务1.1】阶段1 延迟裁决：**唯有本轮当前实时测速成功**才算存活。
 /// - 主测速（gstatic generate_204）成功 → alive
@@ -1202,13 +1212,26 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
                             run.elapsed_ms()
                         ),
                     );
+                    // 【APP79 任务2.3】FINISHED 事件必须携带 bestNode：
+                    // 前端依赖它刷新「当前节点」高亮并展示优选结果横幅。
+                    let best_node = pick_best(&state.aim_results.read());
+                    let details = serde_json::json!({
+                        "bestNode": best_node.as_ref().map(|b| b.node_name.clone()),
+                        "bestDelay": best_node.as_ref().map(|b| b.delay_ms),
+                    });
                     let _ = run.emit(
                         &app,
                         "FINISHED",
                         &AimLogMeta::default(),
                         Some("FINISHED"),
-                        format!("检测完成，共 {count} 个节点参与评级"),
-                        None,
+                        match best_node.as_ref() {
+                            Some(b) => format!(
+                                "检测完成，共 {count} 个节点参与评级；最优节点「{}」{}ms",
+                                b.node_name, b.delay_ms
+                            ),
+                            None => format!("检测完成，共 {count} 个节点参与评级"),
+                        },
+                        Some(details),
                     );
                 }
             }
@@ -1456,6 +1479,10 @@ async fn probe_all(
     //（滚动消费，单节点慢不阻塞后续节点）。超时/失败 → dead_result 立即
     //入缓存并推前端；存活节点记录延迟，全部筛完后按延迟升序进入阶段2。
     let mut alive: Vec<(String, u64)> = Vec::with_capacity(nodes.len());
+    // 【APP79 任务1.1】阶段1 两级测速均失败的节点先记 0（前端显示红色「超时」，
+    // 绝不出现「未测速」），同时进入待复测队列——阶段二分配到探针槽位后
+    // 再用 HTTPS 实测一次，成功者提升为存活并正常参与 7 平台深测。
+    let mut unmeasured: Vec<String> = Vec::new();
     // preview_mode 下用 server/port 做离线 TCP 测速替代 api.test_delay
     let ep_map: std::collections::HashMap<String, (String, u16)> = offline_endpoints
         .as_ref()
@@ -1488,14 +1515,17 @@ async fn probe_all(
                         )
                         .await
                     } else {
-                        // 内核运行：真实隧道 HTTP 测速；首次失败立即用备用地址重试一次
+                        // 【APP79 任务1.1】两级回退保活：
+                        // 先 cp.cloudflare.com（2500ms），未响应再 gstatic
+                        // （2500ms）；仍失败者不在此判死，阶段二分配到探针
+                        // 槽位时再用 HTTPS 实测一次（见 probe_slot_retry）。
                         let first = api
-                            .test_delay(&name, SCREEN_URL, PROBE_TIMEOUT_MS as u32)
+                            .test_delay(&name, SCREEN_FALLBACK_URL, SCREEN_TIMEOUT_MS as u32)
                             .await;
                         if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
                             first
                         } else {
-                            api.test_delay(&name, SCREEN_FALLBACK_URL, PROBE_TIMEOUT_MS as u32)
+                            api.test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
                                 .await
                         }
                     };
@@ -1532,6 +1562,10 @@ async fn probe_all(
             match delay {
                 Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS => {
                     alive.push((name.clone(), d));
+                    // 【APP79 任务1.1】逐节点实时回写延迟：测完一个同步一个，
+                    // 前端列表不再整轮结束后才刷新。
+                    state.record_node_delays(std::iter::once((name.clone(), d as u32)));
+                    let _ = app.emit("delays://updated", serde_json::json!({ name.clone(): d }));
                     // 存活节点延迟写入状态缓存（阶段1 只是 ScreenedAlive，
                     // probe_stage = ScreenedAlive，probe_stage_to_probed → false，
                     // 阶段2 完成后会被真实探测结果覆盖）
@@ -1563,6 +1597,11 @@ async fn probe_all(
                     );
                 }
                 _ => {
+                    unmeasured.push(name.clone());
+                    // 【APP79 任务1.1】确认超时的节点：延迟立即记 0 并推送到前端，
+                    // UI 直接显示红色「超时」，不再停留在「未测速」。
+                    state.record_node_delays(std::iter::once((name.clone(), 0)));
+                    let _ = app.emit("delays://updated", serde_json::json!({ name.clone(): 0 }));
                     let mut dead = dead_result(&name);
                     dead.node_id = node_ids.get(&name).cloned().unwrap_or_default();
                     dead.mode = Some(AimProbeMode::Fast);
@@ -1789,6 +1828,99 @@ async fn probe_all(
         format!("探针槽位检查完成: available={slots:?}"),
     );
     tracing::info!("[go-aim] 可用探针槽位: {slots:?}");
+
+    // 【APP79 任务1.1】阶段1 两级 Clash delay 均失败的节点，改走探针槽位做
+    // 一次真实 HTTPS 204 实测（完全不同的传输路径，可绕开内核 delay 瞬时拥塞）。
+    // 成功者提升为存活并写入真实延迟，失败者保持红色「超时(0)」。
+    let mut alive = alive;
+    if !unmeasured.is_empty() {
+        let retry_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::from(unmeasured.clone())));
+        let mut retry_set = tokio::task::JoinSet::new();
+        for slot in slots.iter().copied() {
+            let client = match build_probe_client(slot) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let queue = retry_queue.clone();
+            let api = api_after_stage1.clone();
+            retry_set.spawn(async move {
+                let mut promoted: Vec<(String, u64)> = Vec::new();
+                loop {
+                    let next = { queue.lock().await.pop_front() };
+                    let Some(name) = next else { break };
+                    if api
+                        .select_proxy(&probe_selector(slot), &name)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let hit = tokio::time::timeout(
+                        std::time::Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS),
+                        client.get(SCREEN_RETRY_URL).send(),
+                    )
+                    .await;
+                    if let Ok(Ok(resp)) = hit {
+                        if resp.status().is_success() {
+                            promoted.push((name, started.elapsed().as_millis() as u64));
+                        }
+                    }
+                }
+                promoted
+            });
+        }
+        let mut promoted: Vec<(String, u64)> = Vec::new();
+        while let Some(joined) = retry_set.join_next().await {
+            if let Ok(list) = joined {
+                promoted.extend(list);
+            }
+        }
+        if !promoted.is_empty() {
+            for (name, d) in &promoted {
+                state.record_node_delays(std::iter::once((name.clone(), *d as u32)));
+                let _ = app.emit("delays://updated", serde_json::json!({ name.clone(): *d }));
+                let placeholder = AimNodeResult {
+                    node_name: name.clone(),
+                    delay_ms: *d,
+                    updated_at: now_secs(),
+                    probed: false,
+                    proxy_health: ProxyHealthStatus::ProxyUnknown,
+                    probe_stage: AimProbeStage::ScreenedAlive,
+                    overall_status: AimNodeOverallStatus::Unknown,
+                    probe_version: CURRENT_AIM_PROBE_VERSION,
+                    rule_version: CURRENT_AIM_RULE_VERSION,
+                    node_id: node_ids.get(name).cloned().unwrap_or_default(),
+                    mode: Some(AimProbeMode::Fast),
+                    ..Default::default()
+                };
+                state
+                    .aim_results
+                    .write()
+                    .insert(name.clone(), placeholder.clone());
+                let _ = app.emit(
+                    AIM_EVENT,
+                    serde_json::json!({ "name": name, "result": placeholder }),
+                );
+            }
+            {
+                let mut p = state.aim_progress.lock();
+                p.fast_alive += promoted.len();
+                p.failed_count = p.failed_count.saturating_sub(promoted.len());
+                p.recompute_aim();
+            }
+            alive.extend(promoted);
+            tracing::info!("[go-aim] 探针槽位复测提升 {} 个节点为存活", alive.len());
+        }
+    }
+    // 提升后重新按优先级排序并刷新存活计数
+    let alive = AimPriorityQueue::new(
+        alive,
+        selected_node.as_deref(),
+        manual_selected || mode == Some(AimProbeMode::Selected),
+        best_node.as_deref(),
+    );
+    let alive_count = alive.len();
 
     // 4. 【APP49 任务3】阶段2 开始前一次性预建全部槽位探针客户端
     //（普通客户端 + Gemini 无重定向客户端），连接池全程复用，
@@ -4629,14 +4761,40 @@ pub async fn lock_fastest_now(app: &AppHandle, state: &AppState) -> Option<Strin
     Some(name)
 }
 
+/// 【APP79 任务2.1】解锁得分：AI 权重 40、流媒体 20。
+/// 只依据检测器产出的客观解锁标签，不引入任何地区名单。
+fn unlock_score(r: &AimNodeResult) -> u32 {
+    let mut score = 0u32;
+    if r.ai_unlocked {
+        score += 40;
+    }
+    if r.media_unlocked {
+        score += 20;
+    }
+    score
+}
+
+/// 【APP79 任务2.2】延迟得分（0~40）：≤100ms 满分，按档递减。
+/// 交互频繁的 AI 网页对首包延迟极度敏感，100ms 内与 400ms 是两种体验。
+fn latency_score(delay_ms: u64) -> u32 {
+    match delay_ms {
+        0 => 0,
+        1..=100 => 40,
+        101..=200 => 30,
+        201..=350 => 20,
+        351..=600 => 10,
+        _ => 0,
+    }
+}
+
 /// 评级选优（纯函数，便于单元测试）。
 ///
-/// 【APP39 任务4】改为「延迟最低绝对优先」：
-/// - 候选池剔除内置假节点（剩余流量/到期等）与不可达节点（delay_ms == 0）；
-/// - 若存在「已解锁 AI/流媒体 且延迟 < 300ms」的节点，只在这些节点中
-///   选出延迟最低者（既保证解锁能力，又不让 300ms 的高延迟节点压过
-///   40ms 的亚洲节点）；
-/// - 否则直接从所有可达节点中选延迟最低者。
+/// 【APP79 任务2.1/2.2】分层选优：
+/// 1. 候选池剔除内置假节点与不可达节点（delay_ms == 0）；
+/// 2. 池内存在「AI + 流媒体双解锁」→ 只在这些节点里选；否则退回全部
+///    AI 解锁节点；再否则才在全部可达节点里选（绝不让无解锁能力的节点
+///    压过已解锁节点）；
+/// 3. 排序：先比 `latency_score` 分档，再比 `unlock_score`，最后比延迟。
 fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> {
     let alive: Vec<&AimNodeResult> = results
         .values()
@@ -4649,19 +4807,28 @@ fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> 
     if alive.is_empty() {
         return None;
     }
-    // 【APP73 任务3.4】低延迟优质节点优先：score >= 8（ACCESSIBLE 及以上）
-    // 且延迟 < 300ms；没有时再回退全部可达节点，避免全 0 分节点导致无法选优。
-    let good_fast: Vec<&AimNodeResult> = alive
-        .iter()
-        .copied()
-        .filter(|r| r.score >= 8 && r.delay_ms < 300)
-        .collect();
-    let pool = if good_fast.is_empty() {
+    let has_dual = alive.iter().any(|r| r.ai_unlocked && r.media_unlocked);
+    let has_ai = alive.iter().any(|r| r.ai_unlocked);
+    let pool: Vec<&AimNodeResult> = if has_dual {
         alive
+            .iter()
+            .copied()
+            .filter(|r| r.ai_unlocked && r.media_unlocked)
+            .collect()
+    } else if has_ai {
+        alive.iter().copied().filter(|r| r.ai_unlocked).collect()
     } else {
-        good_fast
+        alive
     };
-    pool.into_iter().min_by_key(|r| r.delay_ms).cloned()
+    pool.into_iter()
+        .max_by(|a, b| {
+            latency_score(a.delay_ms)
+                .cmp(&latency_score(b.delay_ms))
+                .then(unlock_score(a).cmp(&unlock_score(b)))
+                // max_by 取「最大」，延迟更低者需要排后面才算更大
+                .then(b.delay_ms.cmp(&a.delay_ms))
+        })
+        .cloned()
 }
 
 // ---------------------------------------------------------------- 故障转移监控
@@ -4798,14 +4965,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_best_unlocked_under_300_lowest_delay() {
-        // 300ms 以内的解锁节点池内取最低延迟；300ms 及以上不参与优先池
+    fn test_pick_best_dual_unlock_pool_preferred() {
+        // 【APP79 任务2.1】池中存在 AI+流媒体双解锁节点时，只在双解锁池内选，
+        // 单 AI 节点即使延迟更低也不参与。
         let mut m = HashMap::new();
         m.insert("a".into(), node("a", 120, &["GPT", "NF"]));
         m.insert("b".into(), node("b", 300, &["GPT", "NF", "YT"]));
         m.insert("c".into(), node("c", 90, &["GPT"]));
         let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "c", "300ms 内解锁节点取最低延迟");
+        assert_eq!(best.node_name, "a", "双解锁池内取延迟分档最高者");
     }
 
     #[test]
@@ -4818,8 +4986,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_best_all_unlocked_slow_falls_back_to_fastest_alive() {
-        // 无「<300ms 解锁节点」时，直接从全部可达节点取最低延迟
+    fn test_pick_best_unlocked_beats_plain_speed() {
+        // 【APP79 任务2.1】有 AI 解锁节点时，绝不让无解锁能力的快节点压过它
         let mut m = HashMap::new();
         m.insert(
             "slow_unlocked".into(),
@@ -4828,8 +4996,39 @@ mod tests {
         m.insert("fast_plain".into(), node("fast_plain", 40, &[]));
         let best = pick_best(&m).unwrap();
         assert_eq!(
-            best.node_name, "fast_plain",
-            "无低延迟解锁节点时取全体最低延迟"
+            best.node_name, "slow_unlocked",
+            "解锁能力优先于纯速度（无解锁节点时才回退全体最低延迟）"
+        );
+    }
+
+    #[test]
+    fn test_latency_score_tiers() {
+        // 【APP79 任务2.2】延迟分档：≤100 满分，逐档递减
+        assert_eq!(latency_score(0), 0);
+        assert_eq!(latency_score(1), 40);
+        assert_eq!(latency_score(100), 40);
+        assert_eq!(latency_score(101), 30);
+        assert_eq!(latency_score(200), 30);
+        assert_eq!(latency_score(201), 20);
+        assert_eq!(latency_score(350), 20);
+        assert_eq!(latency_score(351), 10);
+        assert_eq!(latency_score(600), 10);
+        assert_eq!(latency_score(601), 0);
+    }
+
+    #[test]
+    fn test_pick_best_latency_tier_beats_extra_media_tag() {
+        // 【APP79 任务2.2】同一解锁池内，先比延迟分档，再比解锁得分
+        let mut m = HashMap::new();
+        m.insert("fast_dual".into(), node("fast_dual", 80, &["GPT", "NF"]));
+        m.insert(
+            "slow_triple".into(),
+            node("slow_triple", 260, &["GPT", "NF", "YT"]),
+        );
+        let best = pick_best(&m).unwrap();
+        assert_eq!(
+            best.node_name, "fast_dual",
+            "≤100ms 分档优先于多一个流媒体标签"
         );
     }
 

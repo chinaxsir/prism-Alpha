@@ -223,6 +223,9 @@ export default function Proxies() {
   const aimProgress = useCoreStore((s) => s.aimProgress);
   // 【APP71 任务3/4】结构化事件失败原因与快照结果（节点详情弹窗数据源）
   const aimLastError = useCoreStore((s) => s.aimLastError);
+  // 【APP79 任务2.3】本轮优选结果与完成时刻（驱动顶部动态横幅）
+  const aimBestNode = useCoreStore((s) => s.aimBestNode);
+  const aimFinishedAt = useCoreStore((s) => s.aimFinishedAt);
   const storeAim = useCoreStore((s) => s.goAimStatus);
   const mergeNodeDelays = useCoreStore((s) => s.mergeNodeDelays);
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
@@ -540,8 +543,9 @@ export default function Proxies() {
       return;
     }
     try {
+      // 【APP79 任务2.3】不再用常驻 toast「探测已启动」——改由顶部动态横幅
+      // 展示真实进度，完成后 3.5s 自动淡出，避免提示一直残留不消失。
       await runGoAimProbe();
-      toast.info(t("proxies.goAim.probeStarted"));
     } catch (e) {
       // 含 "Pro" 的错误为门控/授权类错误，直接原样提示
       toast.error(String(e));
@@ -572,9 +576,7 @@ export default function Proxies() {
   const supportedAimCount = nodes.filter(
     (n) => aimScoreOf(aimResults[n.name]) > 0 && isValidDelay(lastDelay(n)),
   ).length;
-  const aimDone = aimProgress.running
-    ? aimProgress.done
-    : aimResultCount || testedCount;
+  const aimDone = aimProgress.running ? aimProgress.done : testedCount;
   const aimPct = aimRunning
     ? aimProgress.percent
     : totalCount > 0
@@ -598,6 +600,16 @@ export default function Proxies() {
               : t("proxies.aimBoard.start");
   const activeServiceLines = (aimProgress.currentServices ?? []).filter(Boolean);
   const aimBoardError = aimProgress.errorMessage || aimLastError;
+
+  // 【APP79 任务2.3】完成横幅只在 FINISHED 后展示 3.5s，随后自动淡出；
+  // 运行中则一直显示真实进度，绝不出现「已启动」这种静态残留提示。
+  const [showDoneBanner, setShowDoneBanner] = useState(false);
+  useEffect(() => {
+    if (!aimFinishedAt) return;
+    setShowDoneBanner(true);
+    const timer = setTimeout(() => setShowDoneBanner(false), 3500);
+    return () => clearTimeout(timer);
+  }, [aimFinishedAt]);
 
   // 【APP56 任务2.2】Pro + Go AIM 且尚无解锁标识时自动补一次全量探测
   const aimAutoProbeRef = useRef(false);
@@ -733,6 +745,32 @@ export default function Proxies() {
         </button>
       </div>
 
+      {/* 【APP79 任务2.3】动态状态横幅：运行中显示 done/total，完成后 3.5s 自动淡出 */}
+      {(aimRunning || showDoneBanner) && (
+        <div
+          className={clsx(
+            "flex items-center gap-2 rounded-xl border px-3 py-2 text-[12px] font-medium",
+            aimRunning
+              ? "border-[#007AFF]/30 bg-[#007AFF]/10 text-[#007AFF] dark:text-[#0A84FF]"
+              : "border-[#24B414]/30 bg-[#24B414]/10 text-[#24B414] dark:text-[#30D158]",
+          )}
+        >
+          <span aria-hidden className="shrink-0">{aimRunning ? "⏳" : "✅"}</span>
+          <span className="truncate">
+            {aimRunning
+              ? (aimProgress.total ?? 0) > 0
+                ? t("proxies.aimBanner.running", {
+                    done: aimProgress.done ?? 0,
+                    total: aimProgress.total ?? 0,
+                  })
+                : t("proxies.aimBanner.runningSolo")
+              : aimBestNode
+                ? t("proxies.aimBanner.done", { name: aimBestNode.name })
+                : t("proxies.aimBanner.doneNoNode")}
+          </span>
+        </div>
+      )}
+
       {/* 【APP56 任务1.2】蓝框 / 绿框：上下两行 + 实时进度条 */}
       <div className="flex flex-col gap-1.5 px-1 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 truncate text-[13px] font-semibold text-gray-400">
@@ -808,7 +846,7 @@ export default function Proxies() {
                 {(aimProgress.fullTotal ?? 0) > 0 && (
                   <span className="tabular-nums">
                     {t("proxies.aimBoard.deepProgress", {
-                      done: aimProgress.done ?? aimProgress.fullDone ?? 0,
+                      done: aimProgress.fullDone ?? 0,
                       total: aimProgress.fullTotal ?? 0,
                     })}
                   </span>

@@ -196,7 +196,6 @@ pub async fn auto_start_after_upgrade(app: AppHandle, state: &AppState) -> Resul
 
 /// 启动准备结果：校验通过但尚未停机/启动（restart 时先产出它再做静态校验）
 struct PreparedStart {
-    settings: UserSettings,
     work_dir: std::path::PathBuf,
     api_addr: String,
     api_secret: String,
@@ -377,7 +376,6 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     }
 
     Ok(PreparedStart {
-        settings,
         work_dir,
         api_addr,
         api_secret,
@@ -393,7 +391,6 @@ async fn apply_prepared(
     state: &AppState,
 ) -> Result<(), String> {
     let PreparedStart {
-        settings,
         work_dir,
         api_addr,
         api_secret,
@@ -412,7 +409,6 @@ async fn apply_prepared(
             crate::core::logger::PHASE_HANDSHAKE
         ),
     );
-    let handshake_started = std::time::Instant::now();
 
     let kernel_config = KernelConfig {
         binary_path: binary_path.clone(),
@@ -426,89 +422,97 @@ async fn apply_prepared(
         .await
         .map_err(|e| format!("内核启动失败: {}", sanitize_err(&e.to_string())))?;
 
-    // 探测并缓存版本号供设置页展示（失败不影响启动）
-    if let Some(version) = probe_version(&binary_path).await {
-        tracing::info!("kernel version: {version}");
-        *state.kernel_version.write() = Some(version);
-    }
-
     *state.kernel_handle.write() = Some(Arc::new(handle));
 
     // 内核启动成功：清空运行时统计（60s 队列 / 活跃连接 / 分析聚合），
     // 今日流量基数不动（事件流随后会重新填充）
     state.reset_runtime_stats();
 
-    // 解析主选择组：route.final 沿 selector 链走到最深的选择组。
-    // 节点页默认落在该组——GLOBAL 等虚拟组不在路由链路中，在其中选节点不会生效。
-    let api = state.kernel_api();
-    let main = resolve_main_selector(&api, &built.final_group).await;
-    if let Some(group) = &main {
-        tracing::info!(
-            "main selector group: {group} (final: {})",
-            built.final_group
-        );
-    } else {
-        tracing::warn!(
-            "no main selector resolved from final group '{}'",
-            built.final_group
-        );
-    }
-    *state.main_selector.write() = main.clone();
-    // 【APP52 任务4】[握手阶段] RTT 完成：内核 API 已应答并解析出主选择组
-    crate::core::logger::info(
-        crate::core::logger::MOD_NODE,
-        &format!(
-            "{} RTT 完成：{}ms，主选择组 {}",
-            crate::core::logger::PHASE_HANDSHAKE,
-            handshake_started.elapsed().as_millis(),
-            main.as_deref().unwrap_or("未解析")
-        ),
-    );
+    // 【APP79 任务3.1】启动关键路径到此为止：内核进程已起、handle 已登记，
+    // 立即返回让前端「启动」按钮解除 loading。随后的版本探测、主选择组
+    // 解析、模式同步、系统代理写入、边车与 AIM 全部转入后台任务，
+    // 不再让用户为 1~3s 的收尾流程空等。
+    let bg_app = app.clone();
+    let final_group = built.final_group.clone();
+    tauri::async_runtime::spawn(async move {
+        let st = bg_app.state::<AppState>();
+        let state: &AppState = st.inner();
+        let handshake_started = std::time::Instant::now();
 
-    // 出站模式同步（build 157）：内核启动后 Clash API 默认为 rule，用户
-    // 保存的全局/直连必须立即 PATCH 生效，否则显示与实际路由脱节
-    {
-        let mode_str = match state.settings.read().outbound_mode {
-            OutboundMode::Rule => "rule",
-            OutboundMode::Global => "global",
-            OutboundMode::Direct => "direct",
-        };
-        if mode_str != "rule" {
-            if let Err(e) = state.kernel_api().patch_mode(mode_str).await {
-                tracing::warn!("启动后同步出站模式失败: {e}");
+        // 探测并缓存版本号供设置页展示（失败不影响启动）
+        if let Some(version) = probe_version(&binary_path).await {
+            tracing::info!("kernel version: {version}");
+            *state.kernel_version.write() = Some(version);
+        }
+
+        // 解析主选择组：route.final 沿 selector 链走到最深的选择组。
+        // 节点页默认落在该组——GLOBAL 等虚拟组不在路由链路中，在其中选节点不会生效。
+        let api = state.kernel_api();
+        let main = resolve_main_selector(&api, &final_group).await;
+        if let Some(group) = &main {
+            tracing::info!("main selector group: {group} (final: {final_group})");
+        } else {
+            tracing::warn!("no main selector resolved from final group '{final_group}'");
+        }
+        *state.main_selector.write() = main.clone();
+        // 【APP52 任务4】[握手阶段] RTT 完成：内核 API 已应答并解析出主选择组
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!(
+                "{} RTT 完成：{}ms，主选择组 {}",
+                crate::core::logger::PHASE_HANDSHAKE,
+                handshake_started.elapsed().as_millis(),
+                main.as_deref().unwrap_or("未解析")
+            ),
+        );
+
+        // 出站模式同步（build 157）：内核启动后 Clash API 默认为 rule，用户
+        // 保存的全局/直连必须立即 PATCH 生效，否则显示与实际路由脱节
+        {
+            let mode_str = match state.settings.read().outbound_mode {
+                OutboundMode::Rule => "rule",
+                OutboundMode::Global => "global",
+                OutboundMode::Direct => "direct",
+            };
+            if mode_str != "rule" {
+                if let Err(e) = state.kernel_api().patch_mode(mode_str).await {
+                    tracing::warn!("启动后同步出站模式失败: {e}");
+                }
             }
         }
-    }
 
-    // TUN 模式下路由由内核 auto_route 接管；系统代理模式按用户设置写入系统代理
-    if *state.mode.read() == RunMode::SystemProxy && settings.system_proxy {
-        // 备份当前系统代理，确保停止时可恢复（代理独占：只有当前 APP 的设置生效）
-        if let Ok(backup) = crate::platform::get_system_proxy() {
-            *state.proxy_backup.write() = Some(backup);
-        }
-        crate::platform::set_system_proxy("127.0.0.1", settings.mixed_port)
-            .map_err(|e| sanitize_err(&e.to_string()))?;
-    }
-
-    // Go Cus 边车：授权激活且启用覆写时拉起本地处理服务（进程内单例）
-    {
-        let pro_unlocked = state.is_pro_active();
-        if pro_unlocked && state.go_cus.read().enabled {
-            crate::core::go_cus::ensure_sidecar(app.clone());
-        }
-    }
-
-    // Go AIM（Pro）：授权激活即后台探测评级；开关打开时自动锁定 + 故障转移监控
-    {
-        let pro_unlocked = state.is_pro_active();
-        if pro_unlocked {
-            let enabled = state.settings.read().go_aim_enabled;
-            if enabled {
-                crate::core::go_aim::spawn_monitor(app.clone());
+        // TUN 模式下路由由内核 auto_route 接管；系统代理模式按用户设置写入系统代理
+        if *state.mode.read() == RunMode::SystemProxy && state.settings.read().system_proxy {
+            // 备份当前系统代理，确保停止时可恢复（代理独占：只有当前 APP 的设置生效）
+            if let Ok(backup) = crate::platform::get_system_proxy() {
+                *state.proxy_backup.write() = Some(backup);
             }
-            crate::core::go_aim::start_probe(app.clone());
+            let port = state.settings.read().mixed_port;
+            if let Err(e) = crate::platform::set_system_proxy("127.0.0.1", port) {
+                tracing::warn!("写入系统代理失败: {}", sanitize_err(&e.to_string()));
+            }
         }
-    }
+
+        // Go Cus 边车：授权激活且启用覆写时拉起本地处理服务（进程内单例）
+        {
+            let pro_unlocked = state.is_pro_active();
+            if pro_unlocked && state.go_cus.read().enabled {
+                crate::core::go_cus::ensure_sidecar(bg_app.clone());
+            }
+        }
+
+        // Go AIM（Pro）：授权激活即后台探测评级；开关打开时自动锁定 + 故障转移监控
+        {
+            let pro_unlocked = state.is_pro_active();
+            if pro_unlocked {
+                let enabled = state.settings.read().go_aim_enabled;
+                if enabled {
+                    crate::core::go_aim::spawn_monitor(bg_app.clone());
+                }
+                crate::core::go_aim::start_probe(bg_app.clone());
+            }
+        }
+    });
 
     Ok(())
 }

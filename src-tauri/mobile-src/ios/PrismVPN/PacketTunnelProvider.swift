@@ -79,7 +79,34 @@ private let cnDirectDomainSuffixes: [String] = [
     "coloros.com", "acgvideo.com", "bilivideo.cn", "71.am", "cainiao.com",
     "fliggy.com", "nga.cn", "v2ex.com", "music.163.com", "ydstatic.com",
     "ccb.com", "abchina.com", "cmbchina.com", "bankcomm.com", "psbc.com",
-    "95516.com", "apple-cloudkit.com", "local", "lan"
+    "95516.com", "apple-cloudkit.com",
+    // 【APP79 任务3.3】补齐政务 / 教育 / 民生 / 银行高频后缀
+    //（与 Rust CN_DIRECT_DOMAIN_SUFFIXES 100% 同序同步）
+    "gov.cn", "edu.cn", "org.cn", "net.cn", "com.cn", "ac.cn",
+    "icbc.com.cn", "bankofchina.com", "boc.cn", "cebbank.com", "citicbank.com",
+    "pingan.com", "pingan.com.cn", "spdb.com.cn", "cib.com.cn", "cmbc.com.cn",
+    "hxbank.com.cn", "gf.com.cn", "eastmoney.com", "10jqka.com.cn",
+    "snowballfinance.com", "xueqiu.com",
+    // 音视频 / 直播 / 音乐 / 阅读
+    "douyu.com", "douyucdn.cn", "huya.com", "msstatic.com", "yy.com",
+    "miguvideo.com", "migu.cn", "ximalaya.com", "xmcdn.com",
+    "acfun.cn", "aixifan.com",
+    "jjwxc.net", "qidian.com", "yuewen.com", "zongheng.com",
+    // 电商 / 快递 / 出行 / 本地生活
+    "dewu.com", "poizon.com", "shizhuang-inc.com", "vip.com", "appsimg.com",
+    "suning.com", "suning.cn", "dangdang.com", "freshippo.com",
+    "luckincoffee.com", "heytea.com",
+    "sto.cn", "yto.net.cn", "zto.com", "jtexpress.com.cn",
+    "hellobike.com", "t3go.cn", "caocaokeji.cn", "12306.com",
+    "umetrip.com", "variflight.com",
+    // 办公 / 协同 / 游戏 / 手机生态 / CDN
+    "wps.cn", "wps.com", "kdocs.cn", "kingsoft.com", "ksyun.com", "ksyungslb.com",
+    "wemeet.tencent.com", "voovmeeting.com", "yuque.com", "nlark.com",
+    "dingtalkapps.com",
+    "mihoyo.com", "hoyoverse.com", "hypergryph.com", "tapimg.com", "taptap.cn",
+    "meizu.com", "flyme.cn", "oneplus.com", "realme.com", "lenovo.com.cn",
+    "chinacache.com", "chinacache.net", "wangsu.com", "wsglb0.com",
+    "local", "lan"
 ]
 
 /// 【APP70 任务2.2】中国大陆主流运营商 / 云厂商高频 ip_cidr 网段
@@ -1290,10 +1317,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP39 任务2.1】utun MTU 统一锁定 1280：与 tun-in["mtu"]=1280、
-        // go-lan-home["mtu"]=1280 三处完全一致，TCP MSS 由系统自动推算为
-        // 1240，彻底避免内网 HTTPS（自签名 :8001）大包被 iOS 拒绝。
-        let mtu: Int32 = 1280
+        // 【APP79 任务3.2】utun MTU 1280 → 1400：与 Rust config_builder.rs 的
+        // tun-in["mtu"]=1400 完全一致，TCP MSS 由系统推算为 1360，
+        // 内网 SMB/WebDAV/HTTPS 大包不再被切分为多段，吞吐恢复。
+        let mtu: Int32 = 1400
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -1918,8 +1945,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // - 移除旧字段 inet4_address 冲突（它是旧 sing-box 旧 API，新 sing-box 仅用 address）。
                     inbounds[i].removeValue(forKey: "inet4_address")
                     inbounds[i]["address"] = ["172.19.0.1/30"]
-                    inbounds[i]["mtu"] = 1280
-                    inbounds[i]["stack"] = "gvisor"
+                    inbounds[i]["mtu"] = 1400
+                    // 【APP79 任务3.2】栈 gvisor → mixed：与 Rust config_builder 一致。
+                    // 纯 gvisor 每个包都要经过用户态内存拷贝，大流量下 CPU 打满；
+                    // mixed 栈 TCP 短连接走系统栈，内网长连接仍由 gVisor 处理。
+                    inbounds[i]["stack"] = "mixed"
                     // 【APP75 任务1.1】tun-in 嗅探强改写，与 Rust config_builder 同步：
                     // Safari/App 的 HTTPS 请求进入 utun 后，从 TLS ClientHello 提取真实
                     // SNI 域名并覆写目标地址，交给 VLESS/Trojan 出站按域名直连真实
@@ -1927,7 +1957,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 内网 ip_cidr → go-lan-* 规则先按原始 IP 匹配，命中后不受影响。
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = true
-                    inbounds[i]["sniff_timeout"] = "100ms"
+                    inbounds[i]["sniff_timeout"] = "50ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }
@@ -2354,7 +2384,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 mixedInboundFound = true
                 mixedInbounds[i]["sniff"] = true
                 mixedInbounds[i]["sniff_override_destination"] = false
-                mixedInbounds[i]["sniff_timeout"] = "300ms"
+                mixedInbounds[i]["sniff_timeout"] = "50ms"
             }
         }
         if !mixedInboundFound {
@@ -2365,7 +2395,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "listen_port": prismMixedPort,
                 "sniff": true,
                 "sniff_override_destination": false,
-                "sniff_timeout": "300ms"
+                "sniff_timeout": "50ms"
             ])
         }
         root["inbounds"] = mixedInbounds

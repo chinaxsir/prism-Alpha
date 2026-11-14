@@ -376,6 +376,95 @@ pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
     "psbc.com",
     "95516.com",
     "apple-cloudkit.com",
+    // 【APP79 任务3.3】补齐政务 / 教育 / 民生 / 银行高频后缀。
+    // com.cn / net.cn / org.cn / gov.cn / edu.cn / ac.cn 为大陆专属二阶域，
+    // 命中即大陆目标；金融类逐条列出避免误伤境外同名域名。
+    "gov.cn",
+    "edu.cn",
+    "org.cn",
+    "net.cn",
+    "com.cn",
+    "ac.cn",
+    "icbc.com.cn",
+    "bankofchina.com",
+    "boc.cn",
+    "cebbank.com",
+    "citicbank.com",
+    "pingan.com",
+    "pingan.com.cn",
+    "spdb.com.cn",
+    "cib.com.cn",
+    "cmbc.com.cn",
+    "hxbank.com.cn",
+    "gf.com.cn",
+    "eastmoney.com",
+    "10jqka.com.cn",
+    "snowballfinance.com",
+    "xueqiu.com",
+    // 音视频 / 直播 / 音乐 / 阅读
+    "douyu.com",
+    "douyucdn.cn",
+    "huya.com",
+    "msstatic.com",
+    "yy.com",
+    "miguvideo.com",
+    "migu.cn",
+    "ximalaya.com",
+    "xmcdn.com",
+    "acfun.cn",
+    "aixifan.com",
+    "jjwxc.net",
+    "qidian.com",
+    "yuewen.com",
+    "zongheng.com",
+    // 电商 / 快递 / 出行 / 本地生活
+    "dewu.com",
+    "poizon.com",
+    "shizhuang-inc.com",
+    "vip.com",
+    "appsimg.com",
+    "suning.com",
+    "suning.cn",
+    "dangdang.com",
+    "freshippo.com",
+    "luckincoffee.com",
+    "heytea.com",
+    "sto.cn",
+    "yto.net.cn",
+    "zto.com",
+    "jtexpress.com.cn",
+    "hellobike.com",
+    "t3go.cn",
+    "caocaokeji.cn",
+    "12306.com",
+    "umetrip.com",
+    "variflight.com",
+    // 办公 / 协同 / 游戏 / 手机生态 / CDN
+    "wps.cn",
+    "wps.com",
+    "kdocs.cn",
+    "kingsoft.com",
+    "ksyun.com",
+    "ksyungslb.com",
+    "wemeet.tencent.com",
+    "voovmeeting.com",
+    "yuque.com",
+    "nlark.com",
+    "dingtalkapps.com",
+    "mihoyo.com",
+    "hoyoverse.com",
+    "hypergryph.com",
+    "tapimg.com",
+    "taptap.cn",
+    "meizu.com",
+    "flyme.cn",
+    "oneplus.com",
+    "realme.com",
+    "lenovo.com.cn",
+    "chinacache.com",
+    "chinacache.net",
+    "wangsu.com",
+    "wsglb0.com",
     "local",
     "lan",
 ];
@@ -1202,7 +1291,13 @@ pub fn build(
             }
         }
     }
-    let mut node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
+    // 【APP79 任务3.1】启动零网络阻塞：只读内存缓存，绝不在此发起 DoH。
+    // config_builder::build() 是「启动内核」按钮的同步关键路径，此前每次
+    // 都串行等待多轮 DoH（最长 2.6s）才吐出配置，用户体感为「按钮点了没反应」。
+    // 现在：命中 300s 缓存立即使用；未命中则先留原域名（内核 dns-direct 兜底），
+    // 同时拉起后台预热线程——下一次构建即命中，且不阻塞本次启动。
+    let mut node_ip_map = crate::core::go_lan::get_cached_node_hosts_ipv4(&node_hosts);
+    crate::core::go_lan::spawn_node_host_dns_warmup(node_hosts.clone());
     // 【APP65 任务2.1】只保留通过严格公网校验的解析结果（拒绝环回 / 私网 /
     // FakeIP 198.18/15 / CGNAT 100.64/10 / TUN 172.19/16 等污染地址）
     node_ip_map.retain(|_, ip| match ip.parse::<std::net::Ipv4Addr>() {
@@ -1689,9 +1784,10 @@ pub fn build(
             // 或自定义 Host 时 100% 保持原始 IP 走 go-lan-*，不影响内网访问。
             "sniff": true,
             "sniff_override_destination": true,
-            // 【APP74 任务1.4】嗅探超时 30ms → 100ms：给 sing-box 更多时间等
-            // TLS ClientHello 的 SNI 到来（蜂窝/慢链路上 30ms 可能等不到）。
-            "sniff_timeout": "100ms",
+            // 【APP79 任务3.2】嗅探超时 100ms → 50ms：TLS ClientHello 的 SNI
+            // 在真实网络下 10~20ms 内必到，缩短等待可显著降低首包延迟
+            //（页面打开前的每一毫秒都被用户体感放大）。
+            "sniff_timeout": "50ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -4536,8 +4632,8 @@ rules:
         );
         assert_eq!(
             tun["sniff_timeout"].as_str(),
-            Some("100ms"),
-            "【APP74 任务1.4】tun-in 嗅探超时 30ms → 100ms"
+            Some("50ms"),
+            "【APP79 任务3.2】tun-in 嗅探超时统一 50ms"
         );
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启嗅探");
         assert_eq!(

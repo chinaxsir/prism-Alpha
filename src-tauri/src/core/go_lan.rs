@@ -1615,6 +1615,47 @@ fn node_host_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// 【APP79 任务3.1】只读缓存查询（纯内存，O(1)，零网络零阻塞）。
+///
+/// `config_builder::build()` 位于「启动内核」的同步关键路径上，绝不能再
+/// 触发 DoH 等待；未命中的域名由调用方保留原样（内核 dns-direct 兜底），
+/// 同时由 `spawn_node_host_dns_warmup` 在后台线程预热，下次构建即命中。
+pub(crate) fn get_cached_node_hosts_ipv4(
+    hosts: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let Ok(mut cache) = node_host_cache().lock() else {
+        return out;
+    };
+    for h in hosts {
+        let key = h.trim().to_ascii_lowercase();
+        if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        match cache.get(&key) {
+            Some((ip, at)) if at.elapsed() < NODE_HOST_CACHE_TTL => {
+                out.insert(key, ip.clone());
+            }
+            Some(_) => {
+                cache.remove(&key);
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// 【APP79 任务3.1】后台预热节点域名 DoH 缓存（不阻塞调用方）。
+/// 已有未过期缓存的域名直接跳过，避免重复解析；线程内部仍有 2.6s 上限。
+pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
+    if hosts.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = doh_resolve_node_hosts_ipv4(&hosts);
+    });
+}
+
 /// 【APP45 任务2.2】并发 DoH 批量解析代理节点域名 → 真实公网 IPv4。
 ///
 /// 背景：`hk1.xxx.the-best-airport.com` 等多级动态域名在 iOS
@@ -3662,7 +3703,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = probe_intranet_ip(Some("10.1.8.2:8001"), "", "", true, true, &lan, None, &[]).await;
+        let r = probe_after_guard_free(Some("10.1.8.2:8001"), true, true, &lan).await;
         assert!(!r.reachable, "本机虚拟 IP 必须拒绝: {r:?}");
         assert!(
             r.message.contains("本机自身"),
@@ -3743,6 +3784,26 @@ mod tests {
         );
     }
 
+    /// 【APP79】`probe_intranet_ip` 内的 PROBE_IN_FLIGHT 是进程级单飞锁，
+    /// 并行测试同时发起探测时后到者会拿到「上一次检测尚未结束」的快速返回。
+    /// 测试里等待锁释放后重试，保证断言针对真实探测结果而非互斥提示。
+    async fn probe_after_guard_free(
+        target: Option<&str>,
+        is_running: bool,
+        go_lan_enabled: bool,
+        lan: &GoLanSettings,
+    ) -> GoLanProbeResult {
+        for _ in 0..40 {
+            let r =
+                probe_intranet_ip(target, "", "", is_running, go_lan_enabled, lan, None, &[]).await;
+            if !r.message.contains("尚未结束") {
+                return r;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("内网探测单飞锁长期被占用，测试无法继续");
+    }
+
     /// 【APP40 任务1 / APP50 任务3】未输入目标必须返回友好提示；
     /// 纯 IP 现在合法——默认探测 http:80 / https:443（最多 2 次延迟测试，
     /// 绝不盲目扫描其他端口），目标不可达时返回「未能通过」失败文案。
@@ -3763,7 +3824,7 @@ mod tests {
             ..Default::default()
         };
         // 未输入目标 → 友好提示
-        let r = probe_intranet_ip(None, "", "", true, true, &lan, None, &[]).await;
+        let r = probe_after_guard_free(None, true, true, &lan).await;
         assert!(!r.reachable, "无输入必须直接提示: {r:?}");
         assert!(
             r.message.contains("IP:端口"),
@@ -3774,8 +3835,7 @@ mod tests {
         // 可达性取决于测试环境（本机恰在同网段且目标在线时会真实连通成功），
         // 因此只断言文案结构：含目标 IP、绝无「请输入端口」拦截、
         // 绝无「延迟仅 1 ms」式误报
-        let r =
-            probe_intranet_ip(Some("192.168.10.253"), "", "", true, true, &lan, None, &[]).await;
+        let r = probe_after_guard_free(Some("192.168.10.253"), true, true, &lan).await;
         assert!(r.message.contains("192.168.10.253"), "{}", r.message);
         assert!(
             !r.message.contains("请输入"),
@@ -3788,17 +3848,7 @@ mod tests {
             r.message
         );
         // 显式 IP:端口 且内核未运行 → 提示启动
-        let r = probe_intranet_ip(
-            Some("192.168.10.253:8001"),
-            "",
-            "",
-            false,
-            true,
-            &lan,
-            None,
-            &[],
-        )
-        .await;
+        let r = probe_after_guard_free(Some("192.168.10.253:8001"), false, true, &lan).await;
         assert!(r.message.contains("VPN 尚未启动"), "{}", r.message);
     }
 

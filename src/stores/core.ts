@@ -303,6 +303,10 @@ interface CoreState {
   aimSequence: number;
   /** 【APP71】最近一次明确失败原因（0 存活 / 未启用 / 未激活） */
   aimLastError: string | null;
+  /** 【APP79 任务2.3】本轮检测评选出的最佳节点（FINISHED 事件携带） */
+  aimBestNode: { name: string; delayMs: number | null } | null;
+  /** 【APP79 任务2.3】检测完成时刻（毫秒时间戳），用于横幅 3.5s 自动淡出 */
+  aimFinishedAt: number | null;
   setGoAimStatus: (s: GoAimStatus | null) => void;
   setGoLanSettings: (s: GoLanSettings | null) => void;
   setGoCusSettings: (s: GoCusSettings | null) => void;
@@ -479,6 +483,8 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   aimRunId: null,
   aimSequence: 0,
   aimLastError: null,
+  aimBestNode: null,
+  aimFinishedAt: null,
   setGoAimStatus: (goAimStatus) => set({ goAimStatus }),
   setGoLanSettings: (goLanSettings) => set({ goLanSettings }),
   setGoCusSettings: (goCusSettings) => set({ goCusSettings }),
@@ -537,6 +543,20 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       patch.aimLastError = ev.message;
     } else if (ev.phase === "START") {
       patch.aimLastError = null;
+      // 【APP79 任务2.3】新一轮开始：清空上一轮的优选结果与完成时刻
+      patch.aimBestNode = null;
+      patch.aimFinishedAt = null;
+    } else if (ev.phase === "FINISHED") {
+      // 【APP79 任务2.3】后端在 FINISHED.details 中携带 bestNode，
+      // 前端据此刷新「当前节点」高亮并展示 3.5s 优选横幅。
+      const details = (ev.details ?? null) as {
+        bestNode?: string | null;
+        bestDelay?: number | null;
+      } | null;
+      patch.aimBestNode = details?.bestNode
+        ? { name: details.bestNode, delayMs: details.bestDelay ?? null }
+        : null;
+      patch.aimFinishedAt = Date.now();
     }
     // NODE_RESULT 携带单节点完整结果：直接合并到状态缓存，无需再拉全量
     if (ev.phase === "NODE_RESULT" && ev.details) {

@@ -351,12 +351,19 @@ impl ProbeProgress {
     pub fn recompute_aim(&mut self) {
         let phase = self.phase.clone();
         if self.full_total > 0 {
-            self.total = self.full_total;
-            // 【APP72 任务1.3】processed = 阶段1 已淘汰 + 阶段2 已处理（含缓存命中）：
-            // 只有全部候选节点都处理完（如 34/34）时进度才允许到 100%。
-            self.done = (self.full_done + self.cache_hits + self.failed_count).min(self.full_total);
-            self.pending_count = self.full_total.saturating_sub(self.done);
-            let computed = 20 + (self.done * 79) / self.full_total.max(1);
+            // 【APP79 任务1.4】阶段一 / 阶段二计数彻底分离：
+            // - full_total   = 阶段一筛出的存活节点数 M（定下后不再变化）
+            // - full_done    = 阶段二真正深测完成的节点数
+            // - failed_count = 阶段一确认死亡的节点数（N - M）
+            // 对用户展示的整体进度按 (full_done + 死亡) / 总节点数 N 计算，
+            // 进度条与「已完成/总数」文字始终一致，且只有全部节点处理完才 100%。
+            let total_nodes = self.fast_total.max(self.full_total + self.failed_count);
+            self.total = total_nodes;
+            self.done = (self.full_done + self.cache_hits + self.failed_count).min(total_nodes);
+            self.pending_count = self
+                .full_total
+                .saturating_sub(self.full_done + self.cache_hits);
+            let computed = 20 + (self.done * 79) / total_nodes.max(1);
             self.percent = if matches!(phase.as_str(), "ERROR" | "CANCELLED") {
                 computed.min(99) as u8
             } else if phase == "START" {
@@ -1299,6 +1306,37 @@ mod app52_tests {
         };
         start.recompute_aim();
         assert_eq!(start.percent, 1);
+    }
+
+    /// 【APP79 任务1.4】整体进度必须按「总节点数」结算，而不是存活数：
+    /// 34 个节点只有 6 个存活时，绝不能因为 28 个已淘汰就提前显示 100%。
+    #[test]
+    fn test_progress_uses_overall_total_not_alive_total() {
+        let mut p = ProbeProgress {
+            running: true,
+            phase: "DEEP_PROBE".into(),
+            fast_total: 34,
+            fast_done: 34,
+            full_total: 6,
+            full_done: 0,
+            failed_count: 28,
+            ..Default::default()
+        };
+        p.recompute_aim();
+        assert_eq!(p.total, 34, "总数必须是真实节点总数");
+        assert_eq!(p.done, 28, "已完成 = 深测完成 + 阶段一淘汰");
+        assert!(p.percent < 100, "仍有 6 个节点待深测，不得 100%");
+
+        p.full_done = 3;
+        p.recompute_aim();
+        assert_eq!(p.done, 31);
+        assert!(p.percent < 100);
+        assert_eq!(p.pending_count, 3, "深测待办只看存活节点");
+
+        p.full_done = 6;
+        p.recompute_aim();
+        assert_eq!(p.done, 34);
+        assert_eq!(p.percent, 100, "全部节点处理完毕才允许 100%");
     }
 
     /// 【APP71 任务6-2】ERROR / CANCELLED 终态永不超过 99%，且必须带明确原因。
