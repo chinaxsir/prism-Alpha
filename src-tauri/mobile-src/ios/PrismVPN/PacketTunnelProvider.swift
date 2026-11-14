@@ -106,6 +106,17 @@ private let cnDirectDomainSuffixes: [String] = [
     "mihoyo.com", "hoyoverse.com", "hypergryph.com", "tapimg.com", "taptap.cn",
     "meizu.com", "flyme.cn", "oneplus.com", "realme.com", "lenovo.com.cn",
     "chinacache.com", "chinacache.net", "wangsu.com", "wsglb0.com",
+    // 【APP80 任务2.3】导航 / 打车 / 航班 / 音乐长尾域名补全
+    //（与 Rust CN_DIRECT_DOMAIN_SUFFIXES 100% 同序同步）
+    "gaode.com", "amapauto.com", "a-map.cn", "baidumap.com", "daohang.qq.com",
+    "navinfo.com", "careland.com.cn", "ovital.com",
+    "udache.com", "xiaojukeji.com", "huaxiaozhu.com", "didapinche.com",
+    "saicmobility.com", "122.gov.cn",
+    "y.qq.com", "music.qq.com", "kugou.net", "kgimg.com", "koowo.com",
+    "wesingapp.com", "music.126.net", "qishui.com", "sodamusic.com",
+    "douyinmusic.com", "bodianmusic.com", "taihe.com", "91q.com",
+    "qianqian.com", "qingting.fm", "qtfm.cn", "lizhi.fm", "lizhicdn.com",
+    "missevan.com", "maoer.com", "lrts.me", "changba.com",
     "local", "lan"
 ]
 
@@ -1047,6 +1058,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 )
             )
         }
+        // 【APP80 任务1.2.2】致命修复：本函数此前只用 desired 重建
+        // excludedRoutes，把 openTun 里已配置的直连 DNS 与 WG 服务端 IP
+        // 整组抹掉 → 223.5.5.5:53 的查询被默认路由吸回 utun，触发
+        // `DNS query loopback in transport[dns-direct]`，全节点 0ms DEAD。
+        // 现在与 openTun 完全一致地追加永久直出项，任何时刻都不丢失。
+        for epIP in loadGoLanWgServerIPs() {
+            excluded.append(
+                NEIPv4Route(destinationAddress: epIP, subnetMask: "255.255.255.255")
+            )
+        }
+        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29"] {
+            excluded.append(
+                NEIPv4Route(destinationAddress: upstreamDNS, subnetMask: "255.255.255.255")
+            )
+        }
         ipv4.excludedRoutes = excluded
         let label = desired.isEmpty ? "🔒 恢复隧道" : "⚡ On-Demand 直连"
         setTunnelNetworkSettings(settings) { [weak self] error in
@@ -1317,10 +1343,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return -1
         }
 
-        // 【APP79 任务3.2】utun MTU 1280 → 1400：与 Rust config_builder.rs 的
-        // tun-in["mtu"]=1400 完全一致，TCP MSS 由系统推算为 1360，
-        // 内网 SMB/WebDAV/HTTPS 大包不再被切分为多段，吞吐恢复。
-        let mtu: Int32 = 1400
+        // 【APP80 任务1.2】utun MTU 恢复 1280（APP79 的 1400 实证在部分
+        // 运营商蜂窝网络下会导致大包分片丢失、连接随机卡死）。
+        // 1280 是 IPv6 最小 MTU，兼容性最好；MSS 1240 的吞吐损失远小于
+        // 分片丢包带来的重传风暴。
+        let mtu: Int32 = 1280
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         settings.mtu = NSNumber(value: mtu)
@@ -1945,11 +1972,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // - 移除旧字段 inet4_address 冲突（它是旧 sing-box 旧 API，新 sing-box 仅用 address）。
                     inbounds[i].removeValue(forKey: "inet4_address")
                     inbounds[i]["address"] = ["172.19.0.1/30"]
-                    inbounds[i]["mtu"] = 1400
-                    // 【APP79 任务3.2】栈 gvisor → mixed：与 Rust config_builder 一致。
-                    // 纯 gvisor 每个包都要经过用户态内存拷贝，大流量下 CPU 打满；
-                    // mixed 栈 TCP 短连接走系统栈，内网长连接仍由 gVisor 处理。
-                    inbounds[i]["stack"] = "mixed"
+                    inbounds[i]["mtu"] = 1280
+                    // 【APP80 任务1.2】栈 mixed → gvisor（恢复 v0.4.8 稳定参数）：
+                    // mixed 栈在 iOS 上会走系统网络栈，扩展进程与系统代理配置
+                    // 竞争时偶发 `endpoint not connected`；纯用户态 gvisor 稳定。
+                    inbounds[i]["stack"] = "gvisor"
                     // 【APP75 任务1.1】tun-in 嗅探强改写，与 Rust config_builder 同步：
                     // Safari/App 的 HTTPS 请求进入 utun 后，从 TLS ClientHello 提取真实
                     // SNI 域名并覆写目标地址，交给 VLESS/Trojan 出站按域名直连真实
@@ -1957,7 +1984,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 内网 ip_cidr → go-lan-* 规则先按原始 IP 匹配，命中后不受影响。
                     inbounds[i]["sniff"] = true
                     inbounds[i]["sniff_override_destination"] = true
-                    inbounds[i]["sniff_timeout"] = "50ms"
+                    inbounds[i]["sniff_timeout"] = "100ms"
                     inbounds[i]["udp_timeout"] = "5m"
                 }
             }

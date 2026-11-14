@@ -601,13 +601,13 @@ export default function Proxies() {
   const activeServiceLines = (aimProgress.currentServices ?? []).filter(Boolean);
   const aimBoardError = aimProgress.errorMessage || aimLastError;
 
-  // 【APP79 任务2.3】完成横幅只在 FINISHED 后展示 3.5s，随后自动淡出；
+  // 【APP80 任务2.1.4】完成横幅只在检测结束后展示 3s，随后自动隐藏；
   // 运行中则一直显示真实进度，绝不出现「已启动」这种静态残留提示。
   const [showDoneBanner, setShowDoneBanner] = useState(false);
   useEffect(() => {
     if (!aimFinishedAt) return;
     setShowDoneBanner(true);
-    const timer = setTimeout(() => setShowDoneBanner(false), 3500);
+    const timer = setTimeout(() => setShowDoneBanner(false), 3000);
     return () => clearTimeout(timer);
   }, [aimFinishedAt]);
 

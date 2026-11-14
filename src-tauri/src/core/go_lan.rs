@@ -1605,7 +1605,10 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 // 【APP50 任务2】config_builder 重新启用：log11 实证 iOS 扩展内节点域名
 // UDP DNS 被 utun 自拦截失败（0ms 超时），主进程构建期 DoH 预解析为
 // 公网 IPv4 写入 server（SNI/Host 保留原域名），内核 dns-direct 兜底。
-const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// 【APP80 任务1.1】节点域名 DoH 结果缓存 1800s（原 300s）。
+/// 节点服务器 IP 极少变动，5 分钟过期会让「启动 → 修改设置 → 再启动」反复
+/// 触发同步 DoH 等待；30 分钟既覆盖一次完整使用周期，又能感知 DNS 轮换。
+const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
 
 fn node_host_cache()
 -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
@@ -1615,37 +1618,9 @@ fn node_host_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 【APP79 任务3.1】只读缓存查询（纯内存，O(1)，零网络零阻塞）。
-///
-/// `config_builder::build()` 位于「启动内核」的同步关键路径上，绝不能再
-/// 触发 DoH 等待；未命中的域名由调用方保留原样（内核 dns-direct 兜底），
-/// 同时由 `spawn_node_host_dns_warmup` 在后台线程预热，下次构建即命中。
-pub(crate) fn get_cached_node_hosts_ipv4(
-    hosts: &[String],
-) -> std::collections::HashMap<String, String> {
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let Ok(mut cache) = node_host_cache().lock() else {
-        return out;
-    };
-    for h in hosts {
-        let key = h.trim().to_ascii_lowercase();
-        if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
-            continue;
-        }
-        match cache.get(&key) {
-            Some((ip, at)) if at.elapsed() < NODE_HOST_CACHE_TTL => {
-                out.insert(key, ip.clone());
-            }
-            Some(_) => {
-                cache.remove(&key);
-            }
-            None => {}
-        }
-    }
-    out
-}
-
 /// 【APP79 任务3.1】后台预热节点域名 DoH 缓存（不阻塞调用方）。
+/// 【APP80 任务1.1】App 启动 / 订阅更新落盘后立即调用，让随后构建配置时
+/// 的同步 DoH 100% 命中 1800s 缓存，实际耗时接近 0。
 /// 已有未过期缓存的域名直接跳过，避免重复解析；线程内部仍有 2.6s 上限。
 pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
     if hosts.is_empty() {
@@ -1667,7 +1642,7 @@ pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
 /// 绑定）兜底解析（保险 2）。
 ///
 /// 整体在独立工作线程 + current_thread runtime 内并发执行，调用方最多
-/// 阻塞 2600ms；命中 300s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
+/// 阻塞 2600ms；命中 1800s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
 /// 私网/fake-ip（198.18/15）等非法解析结果。
 pub(crate) fn doh_resolve_node_hosts_ipv4(
     hosts: &[String],
@@ -1679,7 +1654,7 @@ pub(crate) fn doh_resolve_node_hosts_ipv4(
         if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
             continue;
         }
-        // 300s 缓存命中直接用
+        // 1800s 缓存命中直接用
         if let Ok(mut c) = node_host_cache().lock() {
             if let Some((ip, at)) = c.get(&key) {
                 if at.elapsed() < NODE_HOST_CACHE_TTL {

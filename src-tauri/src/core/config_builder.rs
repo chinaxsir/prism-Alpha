@@ -465,6 +465,43 @@ pub(crate) const CN_DIRECT_DOMAIN_SUFFIXES: &[&str] = &[
     "chinacache.net",
     "wangsu.com",
     "wsglb0.com",
+    // 【APP80 任务2.3】导航 / 打车 / 航班 / 音乐长尾域名补全
+    "gaode.com",
+    "amapauto.com",
+    "a-map.cn",
+    "baidumap.com",
+    "daohang.qq.com",
+    "navinfo.com",
+    "careland.com.cn",
+    "ovital.com",
+    "udache.com",
+    "xiaojukeji.com",
+    "huaxiaozhu.com",
+    "didapinche.com",
+    "saicmobility.com",
+    "122.gov.cn",
+    "y.qq.com",
+    "music.qq.com",
+    "kugou.net",
+    "kgimg.com",
+    "koowo.com",
+    "wesingapp.com",
+    "music.126.net",
+    "qishui.com",
+    "sodamusic.com",
+    "douyinmusic.com",
+    "bodianmusic.com",
+    "taihe.com",
+    "91q.com",
+    "qianqian.com",
+    "qingting.fm",
+    "qtfm.cn",
+    "lizhi.fm",
+    "lizhicdn.com",
+    "missevan.com",
+    "maoer.com",
+    "lrts.me",
+    "changba.com",
     "local",
     "lan",
 ];
@@ -993,6 +1030,62 @@ struct ClashGroup {
 
 // ---------------- 入口 ----------------
 
+/// 【APP80 任务1.1】收集启用订阅（含 proxy-provider）的节点 server 域名。
+/// 只做解析与去重，不发网络请求；供 App 启动 / 订阅更新后后台 DoH 预热。
+pub(crate) fn collect_node_server_hosts(
+    profiles: &[(String, String, String)],
+    data_dir: &Path,
+) -> Vec<String> {
+    fn push_host(hosts: &mut Vec<String>, server: &str) {
+        let s = server.trim();
+        if s.is_empty() || s.parse::<std::net::IpAddr>().is_ok() || hosts.iter().any(|h| h == s) {
+            return;
+        }
+        hosts.push(s.to_string());
+    }
+
+    let mut hosts: Vec<String> = Vec::new();
+    for (url, _sub_name, text) in profiles {
+        let Ok(profile) = parse_clash_profile_resilient(text) else {
+            continue;
+        };
+        for node in &profile.proxies {
+            push_host(&mut hosts, &node.server);
+        }
+        for (pname, pdef) in &profile.proxy_providers {
+            if pdef.kind != "http" {
+                continue;
+            }
+            let path = crate::core::store::provider_path(data_dir, url, pname);
+            let Ok(payload) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let parsed: ProviderPayload = serde_yaml::from_str(&payload).unwrap_or_default();
+            for node in &parsed.proxies {
+                push_host(&mut hosts, &node.server);
+            }
+        }
+    }
+    hosts
+}
+
+/// 【APP80 任务1.1】App 启动 / 订阅更新后调用：读取全部启用订阅并后台预热
+/// 节点域名 DoH 缓存，保证下一次 `build()` 的同步 DoH 直接命中、零等待。
+/// 解析失败或文件缺失静默跳过，绝不阻塞调用方（真正解析在独立线程）。
+pub(crate) fn warm_node_host_cache(data_dir: &Path) {
+    let profiles: Vec<(String, String, String)> = crate::core::store::load_subscriptions(data_dir)
+        .into_iter()
+        .filter(|s| s.enabled)
+        .filter_map(|s| {
+            let text =
+                std::fs::read_to_string(crate::core::store::profile_path(data_dir, &s.url)).ok()?;
+            Some((s.url, s.name.unwrap_or_default(), text))
+        })
+        .collect();
+    let hosts = collect_node_server_hosts(&profiles, data_dir);
+    crate::core::go_lan::spawn_node_host_dns_warmup(hosts);
+}
+
 pub fn build(
     profiles: &[(String, String, String)],
     custom_rules: &[String],
@@ -1275,7 +1368,7 @@ pub fn build(
     // 阿里/腾讯 DoH 把节点 server 域名解析为真实公网 IPv4 写入配置
     // （tls.server_name / ws Host 已在 node_to_outbound 从独立字段写入，
     // SNI/Host 校验不受影响）；仅接受合法公网 IPv4（剔除 198.18/127/0.0.0.0/
-    // 私网），解析失败或超时（整体 ≤2.6s，结果 300s 缓存）的域名保留原样，
+    // 私网），解析失败或超时（整体 ≤2.6s，结果 1800s 缓存）的域名保留原样，
     // 由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡绑定）兜底。
     let mut node_hosts: Vec<String> = Vec::new();
     for parsed in &parsed_list {
@@ -1291,13 +1384,11 @@ pub fn build(
             }
         }
     }
-    // 【APP79 任务3.1】启动零网络阻塞：只读内存缓存，绝不在此发起 DoH。
-    // config_builder::build() 是「启动内核」按钮的同步关键路径，此前每次
-    // 都串行等待多轮 DoH（最长 2.6s）才吐出配置，用户体感为「按钮点了没反应」。
-    // 现在：命中 300s 缓存立即使用；未命中则先留原域名（内核 dns-direct 兜底），
-    // 同时拉起后台预热线程——下一次构建即命中，且不阻塞本次启动。
-    let mut node_ip_map = crate::core::go_lan::get_cached_node_hosts_ipv4(&node_hosts);
-    crate::core::go_lan::spawn_node_host_dns_warmup(node_hosts.clone());
+    // 【APP80 任务1.1】同步 DoH 预解析恢复（APP79 的纯缓存方案在冷启动时
+    // 会让节点域名直接交给内核 dns-direct 兜底，iOS 扩展上首包解析偶发超时）。
+    // 命中 1800s 缓存立即返回；未命中才发起 DoH（整体 ≤2.6s）。
+    // 配合 App 启动 / 订阅更新后的后台预热，绝大多数情况下这里是 0 网络等待。
+    let mut node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
     // 【APP65 任务2.1】只保留通过严格公网校验的解析结果（拒绝环回 / 私网 /
     // FakeIP 198.18/15 / CGNAT 100.64/10 / TUN 172.19/16 等污染地址）
     node_ip_map.retain(|_, ip| match ip.parse::<std::net::Ipv4Addr>() {
@@ -1784,10 +1875,10 @@ pub fn build(
             // 或自定义 Host 时 100% 保持原始 IP 走 go-lan-*，不影响内网访问。
             "sniff": true,
             "sniff_override_destination": true,
-            // 【APP79 任务3.2】嗅探超时 100ms → 50ms：TLS ClientHello 的 SNI
-            // 在真实网络下 10~20ms 内必到，缩短等待可显著降低首包延迟
-            //（页面打开前的每一毫秒都被用户体感放大）。
-            "sniff_timeout": "50ms",
+            // 【APP80 任务1.2】tun 嗅探超时恢复 100ms（与 iOS 扩展完全一致）：
+            // 50ms 在弱网/高丢包下会让 TLS ClientHello 未到达就被放行，
+            // 偶发「域名未嗅探 → 按脏 IP 直连」的连通性异常。
+            "sniff_timeout": "100ms",
             // UDP NAT 会话保持 5 分钟（默认值，显式声明避免频繁重建）
             "udp_timeout": "5m",
         });
@@ -4632,8 +4723,8 @@ rules:
         );
         assert_eq!(
             tun["sniff_timeout"].as_str(),
-            Some("50ms"),
-            "【APP79 任务3.2】tun-in 嗅探超时统一 50ms"
+            Some("100ms"),
+            "【APP80 任务1.2】tun-in 嗅探超时恢复 100ms，与 iOS 扩展一致"
         );
         assert_eq!(tun["sniff"].as_bool(), Some(true), "tun-in 必须开启嗅探");
         assert_eq!(

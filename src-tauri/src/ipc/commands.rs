@@ -1503,6 +1503,10 @@ pub(crate) async fn refresh_subscription(
     // 拉取订阅内声明的 http proxy-providers（失败只告警，不阻断订阅更新）
     refresh_providers(state, &url, &text).await;
 
+    // 【APP80 任务1.1】新节点落盘后立即后台预热 DoH 缓存，
+    // 随后的热重载 / 重启内核构建配置时同步 DoH 直接命中，零等待。
+    crate::core::config_builder::warm_node_host_cache(&state.data_dir);
+
     // 【APP51 任务1】订阅刷新后第一时间清理失效节点缓存并中止旧探测任务
     purge_disabled_or_deleted_subscription_nodes(state);
 

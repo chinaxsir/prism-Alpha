@@ -54,8 +54,10 @@ pub const PROBE_PORT_BASE: u16 = 2083;
 const BASELINE_URL: &str = "http://cp.cloudflare.com/generate_204";
 /// 【APP37 任务3.2】1.5s 极速连通性快筛超时（毫秒）
 const BASELINE_TIMEOUT_MS: u64 = 1500;
-/// 参与探测的节点基线延迟上限（仅探测存活节点）
-const PROBE_MAX_DELAY_MS: u64 = 2500;
+/// 【APP80 任务2.1.2】参与探测的节点基线延迟上限（仅探测存活节点）。
+/// 与阶段1 单次测速超时 3500ms 对齐：只要请求在超时前返回即视为存活，
+/// 避免 2.5s~3.5s 成功返回的慢节点被 `resolve_screen_delay` 二次判死。
+const PROBE_MAX_DELAY_MS: u64 = 3500;
 /// 【APP51 任务1】单个平台探测请求超时（毫秒，严格 2800ms 快速出结果）
 const PROBE_TIMEOUT_MS: u64 = 2800;
 /// 【APP73 任务2.1】单次 HTTP 请求连接超时（3 秒）
@@ -76,21 +78,21 @@ const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
 const SCREEN_BATCH_SIZE: usize = 6;
 #[cfg(not(target_os = "ios"))]
 const SCREEN_BATCH_SIZE: usize = 8;
-/// 【APP79 任务1.1】阶段1 单次测速超时（2500ms，两级测速各一次）
-const SCREEN_TIMEOUT_MS: u64 = 2500;
-/// 阶段1 快筛测速 URL（generate_204，任何出口都应 204）
-const SCREEN_URL: &str = "http://www.gstatic.com/generate_204";
-/// 【APP72 任务1.3】阶段1 首次测速超时后的备用测速地址（Cloudflare 204），
-/// 单次失败不再直接判死。
-const SCREEN_FALLBACK_URL: &str = "http://cp.cloudflare.com/generate_204";
+/// 【APP80 任务2.1.2】阶段1 单次测速超时（3500ms，与「⚡ 测速」按钮一致）
+const SCREEN_TIMEOUT_MS: u64 = 3500;
+/// 【APP80 任务2.1.2】阶段1 主测速 URL：与「⚡ 测速」按钮完全相同的
+/// Cloudflare generate_204（任何出口都应 204）
+const SCREEN_URL: &str = "http://cp.cloudflare.com/generate_204";
+/// 【APP80 任务2.1.2】主测速失败后的重试地址（gstatic 204），仅重试 1 次
+const SCREEN_RETRY_URL: &str = "http://www.gstatic.com/generate_204";
 /// 【APP79 任务1.1】阶段二探针槽位复测地址（HTTPS，绕开内核 delay 通道）
-const SCREEN_RETRY_URL: &str = "https://cp.cloudflare.com/generate_204";
+const SCREEN_PROBE_RETRY_URL: &str = "https://cp.cloudflare.com/generate_204";
 
-/// 【APP74 任务1.1】阶段1 延迟裁决：**唯有本轮当前实时测速成功**才算存活。
-/// - 主测速（gstatic generate_204）成功 → alive
-/// - 主测失败 → 仅再用 Cloudflare 备用地址重试 **1 次**（避免瞬时抖动误杀）
-/// - 主备均失败 → 立即 SCREENED_DEAD，**严禁再读历史缓存 `cached` 冒充存活**
-/// - 历史缓存延迟只允许保留在 UI 展示字段，绝不覆盖本轮当前的失败事实
+/// 【APP80 任务2.1.2】阶段1 延迟裁决：
+/// - 主测速（cp.cloudflare 204）成功 → alive
+/// - 主测失败 → 用 gstatic 204 重试 **1 次**（避免瞬时抖动误杀）
+/// - 主备均失败时，调用方还会回退到 `state.node_delays` 中的有效历史延迟，
+///   绝不因为一次快筛抖动把可用节点判死。
 #[inline]
 fn resolve_screen_delay(first: Option<u64>, retry: Option<u64>) -> Option<u64> {
     let valid = |d: Option<u64>| d.filter(|v| *v > 0 && *v < PROBE_MAX_DELAY_MS);
@@ -1080,9 +1082,18 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
     );
     drop(state);
 
+    // 【APP80 任务2.1.1】自动触发（App 启动 / 内核刚起）时先让内核稳定
+    let auto_trigger = trigger == "auto";
+
     tauri::async_runtime::spawn(async move {
         let guard = ProbeRunGuard::new(app.clone(), run.clone());
         let state = app.state::<AppState>();
+        // 【APP80 任务2.1.1】内核刚启动时 utun 路由表与 DNS 尚未就绪，
+        // 立即快筛会把全部节点打成 0ms DEAD（diagnostic-log 第 31 行）。
+        // 自动触发场景先等 1500ms，让扩展侧路由/栈完全稳定。
+        if auto_trigger {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
         let outcome = probe_all(&app, &state, mode, &run).await;
         match outcome {
             Ok(count) => {
@@ -1515,17 +1526,17 @@ async fn probe_all(
                         )
                         .await
                     } else {
-                        // 【APP79 任务1.1】两级回退保活：
-                        // 先 cp.cloudflare.com（2500ms），未响应再 gstatic
-                        // （2500ms）；仍失败者不在此判死，阶段二分配到探针
-                        // 槽位时再用 HTTPS 实测一次（见 probe_slot_retry）。
+                        // 【APP80 任务2.1.2】与「⚡ 测速」同源的稳健快筛：
+                        // 先 cp.cloudflare.com（3500ms），未响应再 gstatic
+                        // （3500ms）重试 1 次；仍失败者由下方调用方回退到
+                        // state.node_delays 的有效历史延迟，绝不轻易判死。
                         let first = api
-                            .test_delay(&name, SCREEN_FALLBACK_URL, SCREEN_TIMEOUT_MS as u32)
+                            .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
                             .await;
                         if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
                             first
                         } else {
-                            api.test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
+                            api.test_delay(&name, SCREEN_RETRY_URL, SCREEN_TIMEOUT_MS as u32)
                                 .await
                         }
                     };
@@ -1548,9 +1559,19 @@ async fn probe_all(
                 }
             };
             let Some((name, delay)) = next else { break };
-            // 【APP74 任务1.1】主备均失败时立即判 Dead——
-            // 历史缓存延迟（cached_delays）仅保留在内存里，绝不回退救场。
-            let delay = resolve_screen_delay(delay, None);
+            // 【APP80 任务2.1.2】主备均超时时不立即判死：若该节点在几秒前的
+            // 全量测速里已有有效延迟（state.node_delays > 0），说明通道本身
+            // 可用，本次只是并发抖动 → 沿用该延迟判为 ALIVE 送入阶段二。
+            let delay = resolve_screen_delay(delay, None).or_else(|| {
+                state
+                    .node_metrics
+                    .read()
+                    .delays
+                    .get(&name)
+                    .copied()
+                    .filter(|d| *d > 0 && (*d as u64) < PROBE_MAX_DELAY_MS)
+                    .map(|d| d as u64)
+            });
             // 中止条件：关闭 Go AIM / 订阅变更（代数变化）
             if !state.settings.read().go_aim_enabled
                 || (!preview_mode && !is_running(state))
@@ -1858,7 +1879,7 @@ async fn probe_all(
                     let started = std::time::Instant::now();
                     let hit = tokio::time::timeout(
                         std::time::Duration::from_millis(PROBE_CONNECT_TIMEOUT_MS),
-                        client.get(SCREEN_RETRY_URL).send(),
+                        client.get(SCREEN_PROBE_RETRY_URL).send(),
                     )
                     .await;
                     if let Ok(Ok(resp)) = hit {
@@ -3241,10 +3262,11 @@ async fn probe_gemini(slot: usize) -> ServiceProbeResult {
     )
 }
 
-/// 【APP75 任务3.1】3 目标 HTTPS 门槛判定：至少 2 个目标真实握手成功才算
-/// ProxyOk；0~1 个成功一律 ProxyFailed（纯 IP 可通、普通 HTTPS 全挂的节点）。
+/// 【APP80 任务2.1.3】3 目标 HTTPS 门槛判定：任意 1 个目标真实握手成功即
+/// 视为 ProxyOk（放宽前置门槛，确保所有可用节点都能跑完 7 平台检测）；
+/// 0 个成功时调用方还会用 EGRESS_CHECK 的出口 IP 做二次放行。
 fn proxy_health_from_ok_count(ok: u32) -> ProxyHealthStatus {
-    if ok >= 2 {
+    if ok >= 1 {
         ProxyHealthStatus::ProxyOk
     } else {
         ProxyHealthStatus::ProxyFailed
@@ -3837,13 +3859,24 @@ async fn probe_node(
         format!("[AIM][{name}][-] [阶段] PROXY_VERIFIED 选择器 now={name}"),
     );
 
-    // 2.2 【APP75 任务3.1】第二道铁闸：3 路独立 HTTPS 基础代理健康检测。
-    // 只有至少 2/3 目标真实握手成功，才允许继续 7 平台解锁检测；否则立即
-    // 判定 PROXY_FAILED（probed=false / score=0 / 不生成任何解锁标签），
-    // 杜绝「只有纯 IP 的 Telegram 能通，普通 HTTPS 网页全挂」的节点被误判解锁。
-    let (proxy_health, _health_hits) = verify_basic_https_proxy_health(client, slot, name).await;
+    // 2.2 【APP80 任务2.1.3】放宽前置门槛：3 路独立 HTTPS 健康检测中
+    // 任意 1 路成功即视为代理通道畅通；全部失败时，若 EGRESS_CHECK 仍能
+    // 拿到出口 IP，也视为畅通并继续 7 平台检测。只有「3 路全挂且出口不可达」
+    // 才判定 PROXY_FAILED，确保所有可用节点 100% 跑完 AIM 检测。
+    let (mut proxy_health, _health_hits) =
+        verify_basic_https_proxy_health(client, slot, name).await;
+    let egress = if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
+        // 3 路基础检测全失败 → 以出口预检结果作为最后一道放行依据
+        let probe = fetch_egress(client).await;
+        if probe.ip.is_some() {
+            proxy_health = ProxyHealthStatus::ProxyOk;
+        }
+        probe
+    } else {
+        fetch_egress(client).await
+    };
     if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
-        let mut detail = String::from("基础 HTTPS 代理不可用: ");
+        let mut detail = String::from("基础 HTTPS 代理不可用且出口不可达: ");
         for (label, status, elapsed, kind) in &_health_hits {
             detail.push_str(&format!("{label}={status}/{elapsed}ms/{} ", kind.label()));
         }
@@ -3857,10 +3890,6 @@ async fn probe_node(
             started,
         );
     }
-
-    // 3. 每个节点都先做一次轻量出口预检（仅采集证据，失败也继续 7 平台探测）。
-    // [AIM-13] EGRESS_CHECK：出口 IP/地区仅作证据，不参与短路。
-    let egress = fetch_egress(client).await;
     crate::core::logger::info(
         crate::core::logger::MOD_GO_AIM,
         format!(
@@ -4672,7 +4701,17 @@ async fn lock_node(
         best.delay_ms,
         best.unlocked_tags.join("/")
     );
+    // 【APP80 任务2.2】记录 AIM 最优节点并通知前端立即刷新「当前：xxx」
+    state.node_metrics.write().aim_best_node = Some(best.node_name.clone());
     let _ = app.emit("proxies://changed", ());
+    let _ = app.emit(
+        "aim://updated",
+        serde_json::json!({
+            "selectedNode": best.node_name,
+            "bestNode": best.node_name,
+            "delayMs": best.delay_ms,
+        }),
+    );
     let _ = app.emit(AIM_EVENT, serde_json::json!({ "locked": best.node_name }));
     Ok(best.node_name.clone())
 }
@@ -4761,40 +4800,40 @@ pub async fn lock_fastest_now(app: &AppHandle, state: &AppState) -> Option<Strin
     Some(name)
 }
 
-/// 【APP79 任务2.1】解锁得分：AI 权重 40、流媒体 20。
-/// 只依据检测器产出的客观解锁标签，不引入任何地区名单。
-fn unlock_score(r: &AimNodeResult) -> u32 {
-    let mut score = 0u32;
-    if r.ai_unlocked {
-        score += 40;
-    }
-    if r.media_unlocked {
-        score += 20;
-    }
-    score
-}
-
-/// 【APP79 任务2.2】延迟得分（0~40）：≤100ms 满分，按档递减。
-/// 交互频繁的 AI 网页对首包延迟极度敏感，100ms 内与 400ms 是两种体验。
-fn latency_score(delay_ms: u64) -> u32 {
+/// 【APP80 任务2.2】延迟加权（-30~40）：
+/// ≤200ms +40、201..=350ms +25、351..=500ms +10、>500ms 扣 -30。
+/// 最后一条用于防止「解锁更多但 600ms+」的慢节点压过 150ms 的快节点。
+fn latency_score(delay_ms: u64) -> i32 {
     match delay_ms {
         0 => 0,
-        1..=100 => 40,
-        101..=200 => 30,
-        201..=350 => 20,
-        351..=600 => 10,
-        _ => 0,
+        1..=200 => 40,
+        201..=350 => 25,
+        351..=500 => 10,
+        _ => -30,
     }
+}
+
+/// 【APP80 任务2.2】综合选点分：AI 平台 VERIFIED +25/项，流媒体 +18/项，
+/// 再叠加延迟加权。只依据检测器产出的客观解锁标签，不引入地区名单。
+fn candidate_score(r: &AimNodeResult) -> i32 {
+    let mut score = 0i32;
+    for tag in &r.unlocked_tags {
+        match tag.as_str() {
+            "GPT" | "Claude" | "Gemini" => score += 25,
+            "NF" | "YT" | "Disney+" | "TK" => score += 18,
+            _ => {}
+        }
+    }
+    score + latency_score(r.delay_ms)
 }
 
 /// 评级选优（纯函数，便于单元测试）。
 ///
-/// 【APP79 任务2.1/2.2】分层选优：
+/// 【APP80 任务2.2】综合评分选优：
 /// 1. 候选池剔除内置假节点与不可达节点（delay_ms == 0）；
-/// 2. 池内存在「AI + 流媒体双解锁」→ 只在这些节点里选；否则退回全部
-///    AI 解锁节点；再否则才在全部可达节点里选（绝不让无解锁能力的节点
-///    压过已解锁节点）；
-/// 3. 排序：先比 `latency_score` 分档，再比 `unlock_score`，最后比延迟。
+/// 2. 池内存在 `unlocked_tags` 非空的节点 → 只在这些节点里比 `candidate_score`；
+///    全部节点都没有解锁标签时才回退到最低延迟节点；
+/// 3. 同分时延迟更低者优先。
 fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> {
     let alive: Vec<&AimNodeResult> = results
         .values()
@@ -4807,24 +4846,22 @@ fn pick_best(results: &HashMap<String, AimNodeResult>) -> Option<AimNodeResult> 
     if alive.is_empty() {
         return None;
     }
-    let has_dual = alive.iter().any(|r| r.ai_unlocked && r.media_unlocked);
-    let has_ai = alive.iter().any(|r| r.ai_unlocked);
-    let pool: Vec<&AimNodeResult> = if has_dual {
-        alive
-            .iter()
-            .copied()
-            .filter(|r| r.ai_unlocked && r.media_unlocked)
-            .collect()
-    } else if has_ai {
-        alive.iter().copied().filter(|r| r.ai_unlocked).collect()
-    } else {
-        alive
-    };
-    pool.into_iter()
+    let unlocked: Vec<&AimNodeResult> = alive
+        .iter()
+        .copied()
+        .filter(|r| !r.unlocked_tags.is_empty())
+        .collect();
+    if unlocked.is_empty() {
+        return alive
+            .into_iter()
+            .min_by(|a, b| a.delay_ms.cmp(&b.delay_ms))
+            .cloned();
+    }
+    unlocked
+        .into_iter()
         .max_by(|a, b| {
-            latency_score(a.delay_ms)
-                .cmp(&latency_score(b.delay_ms))
-                .then(unlock_score(a).cmp(&unlock_score(b)))
+            candidate_score(a)
+                .cmp(&candidate_score(b))
                 // max_by 取「最大」，延迟更低者需要排后面才算更大
                 .then(b.delay_ms.cmp(&a.delay_ms))
         })
@@ -4944,92 +4981,75 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_best_lower_delay_beats_more_tags() {
-        // 【APP39 任务4】延迟最低绝对优先：80ms 节点即使解锁平台更少，
-        // 也必须压过 900ms 的全解锁节点（旧 Tier 评分会让高延迟节点胜出）。
+    fn test_pick_best_penalizes_slow_nodes() {
+        // 【APP80 任务2.2】>500ms 扣 30 分：608ms 全解锁节点不再压过
+        // 166ms 的「AI 双平台 + 流媒体」节点。
         let mut m = HashMap::new();
-        m.insert("a".into(), node("a", 80, &["GPT", "NF", "YT"]));
         m.insert(
-            "b".into(),
+            "fast".into(),
+            node("fast", 166, &["GPT", "Claude", "NF", "YT"]),
+        );
+        m.insert(
+            "slow".into(),
             node(
-                "b",
-                900,
+                "slow",
+                608,
                 &["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"],
             ),
         );
         let best = pick_best(&m).unwrap();
-        assert_eq!(
-            best.node_name, "a",
-            "低延迟解锁节点应优先于高延迟全解锁节点"
-        );
+        assert_eq!(best.node_name, "fast", ">500ms 惩罚应让慢节点落选");
     }
 
     #[test]
-    fn test_pick_best_dual_unlock_pool_preferred() {
-        // 【APP79 任务2.1】池中存在 AI+流媒体双解锁节点时，只在双解锁池内选，
-        // 单 AI 节点即使延迟更低也不参与。
+    fn test_pick_best_more_ai_unlocks_wins() {
+        // 【APP80 任务2.2】同一延迟档内 AI +25/项 高于流媒体 +18/项
         let mut m = HashMap::new();
-        m.insert("a".into(), node("a", 120, &["GPT", "NF"]));
-        m.insert("b".into(), node("b", 300, &["GPT", "NF", "YT"]));
-        m.insert("c".into(), node("c", 90, &["GPT"]));
-        let best = pick_best(&m).unwrap();
-        assert_eq!(best.node_name, "a", "双解锁池内取延迟分档最高者");
-    }
-
-    #[test]
-    fn test_pick_best_same_tier_prefers_lower_delay() {
-        let mut m = HashMap::new();
-        m.insert("a".into(), node("a", 120, &["GPT"]));
+        m.insert("a".into(), node("a", 120, &["GPT", "Claude", "NF"]));
         m.insert("b".into(), node("b", 90, &["GPT"]));
+        let best = pick_best(&m).unwrap();
+        assert_eq!(best.node_name, "a", "AI 平台解锁数量权重最高");
+    }
+
+    #[test]
+    fn test_pick_best_same_score_prefers_lower_delay() {
+        // 同分时延迟更低者优先
+        let mut m = HashMap::new();
+        m.insert("a".into(), node("a", 150, &["GPT", "Claude"]));
+        m.insert("b".into(), node("b", 100, &["GPT", "Claude"]));
         let best = pick_best(&m).unwrap();
         assert_eq!(best.node_name, "b");
     }
 
     #[test]
-    fn test_pick_best_unlocked_beats_plain_speed() {
-        // 【APP79 任务2.1】有 AI 解锁节点时，绝不让无解锁能力的快节点压过它
+    fn test_pick_best_falls_back_to_lowest_delay_without_unlocks() {
+        // 全部节点都没有解锁标签 → 回退到最低延迟节点
         let mut m = HashMap::new();
-        m.insert(
-            "slow_unlocked".into(),
-            node("slow_unlocked", 520, &["GPT", "NF"]),
-        );
-        m.insert("fast_plain".into(), node("fast_plain", 40, &[]));
+        m.insert("slow".into(), node("slow", 300, &[]));
+        m.insert("fast".into(), node("fast", 40, &[]));
         let best = pick_best(&m).unwrap();
-        assert_eq!(
-            best.node_name, "slow_unlocked",
-            "解锁能力优先于纯速度（无解锁节点时才回退全体最低延迟）"
-        );
+        assert_eq!(best.node_name, "fast");
+    }
+
+    #[test]
+    fn test_candidate_score_counts_ai_25_media_18() {
+        // 2 AI + 1 流媒体 + ≤200ms = 25+25+18+40 = 108
+        let r = node("n", 150, &["GPT", "Gemini", "NF"]);
+        assert_eq!(candidate_score(&r), 108);
     }
 
     #[test]
     fn test_latency_score_tiers() {
-        // 【APP79 任务2.2】延迟分档：≤100 满分，逐档递减
+        // 【APP80 任务2.2】延迟加权：≤200 +40 / ≤350 +25 / ≤500 +10 / >500 -30
         assert_eq!(latency_score(0), 0);
         assert_eq!(latency_score(1), 40);
-        assert_eq!(latency_score(100), 40);
-        assert_eq!(latency_score(101), 30);
-        assert_eq!(latency_score(200), 30);
-        assert_eq!(latency_score(201), 20);
-        assert_eq!(latency_score(350), 20);
+        assert_eq!(latency_score(200), 40);
+        assert_eq!(latency_score(201), 25);
+        assert_eq!(latency_score(350), 25);
         assert_eq!(latency_score(351), 10);
-        assert_eq!(latency_score(600), 10);
-        assert_eq!(latency_score(601), 0);
-    }
-
-    #[test]
-    fn test_pick_best_latency_tier_beats_extra_media_tag() {
-        // 【APP79 任务2.2】同一解锁池内，先比延迟分档，再比解锁得分
-        let mut m = HashMap::new();
-        m.insert("fast_dual".into(), node("fast_dual", 80, &["GPT", "NF"]));
-        m.insert(
-            "slow_triple".into(),
-            node("slow_triple", 260, &["GPT", "NF", "YT"]),
-        );
-        let best = pick_best(&m).unwrap();
-        assert_eq!(
-            best.node_name, "fast_dual",
-            "≤100ms 分档优先于多一个流媒体标签"
-        );
+        assert_eq!(latency_score(500), 10);
+        assert_eq!(latency_score(501), -30);
+        assert_eq!(latency_score(900), -30);
     }
 
     #[test]
@@ -6122,18 +6142,16 @@ mod tests {
         assert_eq!(r.proxy_health, ProxyHealthStatus::ProxyFailed);
     }
 
-    /// 【APP74 测试7】gstatic + cf + microsoft 三目标至少 2/3 成功才算 ProxyOk。
+    /// 【APP80 测试】gstatic + cf + microsoft 三目标任意 1 个成功即 ProxyOk。
     #[tokio::test]
-    async fn test_proxy_health_needs_two_of_three() {
-        // 【APP75 任务3.1】0/1 个目标成功必须 ProxyFailed；2/3 个成功才 ProxyOk。
+    async fn test_proxy_health_needs_any_one() {
+        // 【APP80 任务2.1.3】放宽前置门槛：1/3 成功即可继续 7 平台检测；
+        // 0/3 时由调用方再用 EGRESS_CHECK 出口 IP 做二次放行。
         assert_eq!(
             proxy_health_from_ok_count(0),
             ProxyHealthStatus::ProxyFailed
         );
-        assert_eq!(
-            proxy_health_from_ok_count(1),
-            ProxyHealthStatus::ProxyFailed
-        );
+        assert_eq!(proxy_health_from_ok_count(1), ProxyHealthStatus::ProxyOk);
         assert_eq!(proxy_health_from_ok_count(2), ProxyHealthStatus::ProxyOk);
         assert_eq!(proxy_health_from_ok_count(3), ProxyHealthStatus::ProxyOk);
     }
