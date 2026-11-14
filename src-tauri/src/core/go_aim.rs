@@ -30,11 +30,11 @@ use futures_util::StreamExt;
 use crate::core::logger::AimLogMeta;
 use crate::core::state::{AppState, CoreStatus};
 
-/// 【APP77】当前 Go AIM 检测引擎版本号：统一递增至 9，启动时自动淘汰
-/// `< 9` 的旧缓存（Claude / Gemini 判定已改为纯客观证据 + 手动逐跳跟踪，
-/// 旧的「302 即 ACCESSIBLE」「地区名单短路」结论全部失效）。
-pub const CURRENT_AIM_PROBE_VERSION: u32 = 9;
-pub const CURRENT_AIM_RULE_VERSION: u32 = 9;
+/// 【APP78】当前 Go AIM 检测引擎版本号：统一递增至 10，启动时自动淘汰
+/// `< 10` 的旧缓存（Gemini 已改用 HTTP/1.1 专用客户端 + 有界流式读取 +
+/// 剥离脚本后的可见文案判定，旧的 GFE HTTP/2 断连与字典误判结论全部失效）。
+pub const CURRENT_AIM_PROBE_VERSION: u32 = 10;
+pub const CURRENT_AIM_RULE_VERSION: u32 = 10;
 
 /// 前端事件：探测结果更新（payload 为单节点结果或全量刷新标记）
 pub const AIM_EVENT: &str = "go-aim://updated";
@@ -2325,8 +2325,6 @@ struct ChainPage {
     final_url: String,
     /// 每一跳的 Location（小写），按跳序记录
     locations: Vec<String>,
-    /// 重定向链中是否出现 accounts.google.com（Google 登录流）
-    to_login: bool,
 }
 
 /// 【APP77 任务1/2】把响应头中的 Set-Cookie 合并进内存 Cookie 罐。
@@ -2382,7 +2380,6 @@ async fn fetch_chain_with_cookies(
 ) -> Result<ChainPage, String> {
     let mut url = start_url.to_string();
     let mut locations: Vec<String> = Vec::new();
-    let mut to_login = false;
 
     for hop in 0..=max_hops {
         let cookie = jar
@@ -2426,11 +2423,7 @@ async fn fetch_chain_with_cookies(
                     body: String::new(),
                     final_url: resp_url,
                     locations,
-                    to_login,
                 });
-            }
-            if loc.contains("accounts.google.com") {
-                to_login = true;
             }
             locations.push(loc.clone());
             let next = resolve_location(&resp_url, &loc);
@@ -2441,7 +2434,6 @@ async fn fetch_chain_with_cookies(
                     body: String::new(),
                     final_url: resp_url,
                     locations,
-                    to_login,
                 });
             }
             url = next;
@@ -2455,7 +2447,6 @@ async fn fetch_chain_with_cookies(
             body,
             final_url: resp_url,
             locations,
-            to_login,
         });
     }
 
@@ -2466,7 +2457,6 @@ async fn fetch_chain_with_cookies(
         body: String::new(),
         final_url: url,
         locations,
-        to_login,
     })
 }
 
@@ -2796,190 +2786,326 @@ async fn probe_claude(
     }
 }
 
-/// Gemini 地区不支持文案（仅匹配明确、完整的提示句）。
-fn gemini_region_text(lc: &str) -> bool {
-    lc.contains("isn't currently supported in your country")
-        || lc.contains("is not currently supported in your country")
-        || lc.contains("not available in your country")
-        || lc.contains("目前不支持你所在的国家/地区")
+/// 【APP78 任务1.1】Gemini 专用 HTTP/1.1 零重定向客户端。
+/// Google Frontend (GFE) 在 HTTP/2 下会因连接头或大帧流控直接 RST_STREAM
+/// （PROTOCOL_ERROR 断连），显式 http1_only 根除该传输层失败。
+fn build_gemini_probe_client(slot: usize) -> Result<reqwest::Client, String> {
+    let proxy =
+        reqwest::Proxy::all(&probe_proxy_url(slot)).map_err(|e| format!("PROXY_ERROR: {e}"))?;
+    reqwest::Client::builder()
+        .proxy(proxy)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(7))
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        .build()
+        .map_err(|e| format!("CLIENT_BUILD_ERROR: {e}"))
 }
 
-/// 【APP77 任务2】Gemini 根入口交叉核验：
-/// `/app` 已进入 Google 登录流时，用同一 Cookie 罐请求根路径，确认是否
-/// 被地区准入重定向到 `/faq`，并据此给出 VERIFIED / BLOCKED。
-async fn gemini_root_check(
-    client: &reqwest::Client,
-    jar: &mut Vec<(String, String)>,
-    hop_status: u16,
-) -> ServiceProbeResult {
-    const SVC: &str = "Gemini";
-    let page = match fetch_chain_with_cookies(client, "https://gemini.google.com/", jar, 3).await {
-        Ok(p) => p,
-        Err(_) => {
-            return svc_accessible(
-                SVC,
-                hop_status,
-                "Gemini 登录认证流已进入，但根入口复检网络失败",
-            );
+/// 【APP78 任务1.2】流式读取响应前 max_bytes 字节即停止。
+/// /app 完整 HTML 含超过 1MB 内联 Closure JS，全量下载极易超时；
+/// <head>/<title>/WIZ_global_data/SNlM0e/BardChatUi 与地区提示横幅都在前 64KB。
+async fn read_bounded_html_prefix(mut resp: reqwest::Response, max_bytes: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < max_bytes {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
         }
-    };
-    let final_lc = page.final_url.to_lowercase();
-    let lc = page.body.to_lowercase();
-    if let Some(bad) = page.locations.iter().find(|l| {
-        l.contains("/faq") || l.contains("support.google.com") || l.contains("unsupported")
-    }) {
-        return svc_blocked_status(
-            SVC,
-            Some(page.status),
-            format!("根入口重定向至 Gemini 地区不支持说明页: {bad}"),
-            AimErrorKind::RegionRestricted,
-        );
     }
-    if final_lc.contains("/faq")
-        || final_lc.contains("support.google.com")
-        || gemini_region_text(&lc)
-    {
-        return svc_blocked_status(
-            SVC,
-            Some(page.status),
-            "根入口页面明确提示当前地区不支持 Gemini",
-            AimErrorKind::RegionRestricted,
-        );
-    }
-    if page.status == 403 && (lc.contains("recaptcha") || lc.contains("unusual traffic")) {
-        return svc_verified(SVC, 403, "已通过 Gemini 准入（触发常规真人验证，账号可用）");
-    }
-    if (200..300).contains(&page.status) {
-        return svc_verified(SVC, page.status, "Gemini 登录认证流与准入校验通过");
-    }
-    svc_accessible(SVC, page.status, "根入口可访问但未命中 Gemini 正特征")
+    buf.truncate(max_bytes);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Gemini：gemini.google.com/app（手动逐跳 + Cookie 复用 + 根入口交叉核验）。
-/// 【APP77 任务2】纯客观证据判定：零地区代码依赖，根除 302 死循环与漏判。
-async fn probe_gemini(
-    _client: &reqwest::Client,
-    nr_client: &reqwest::Client,
-) -> ServiceProbeResult {
+/// 【APP78 任务1.2】剥离 <script>/<style>，只保留可见 HTML 标签与文本。
+/// 正常解锁的 Gemini 工作区 JS 语言包内同样静态存有
+/// "isn't currently supported" 等翻译词条，严禁在原始全文上搜地区文案，
+/// 只能在剥离后的可见文本或 <title> 中检查。
+fn strip_scripts_and_styles(html: &str) -> String {
+    // to_ascii_lowercase 不改变字节长度，索引可与原串安全对应
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    while pos < html.len() {
+        let rest = &lower[pos..];
+        let next = match (rest.find("<script"), rest.find("<style")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                out.push_str(&html[pos..]);
+                break;
+            }
+        };
+        let start = pos + next;
+        out.push_str(&html[pos..start]);
+        let close = if lower[start..].starts_with("<script") {
+            "</script>"
+        } else {
+            "</style>"
+        };
+        match lower[start..].find(close) {
+            Some(end) => pos = start + end + close.len(),
+            None => pos = html.len(),
+        }
+    }
+    out
+}
+
+/// 【APP78 任务1.3】单跳客观判定结果。
+enum GeminiHop {
+    /// 携带 Cookie 继续跟随下一跳
+    Follow(String),
+    /// 已得出最终结论
+    Finish(ServiceProbeResult),
+}
+
+/// 【APP78 任务1.3】Gemini 纯客观判定状态机（零地区代码依赖）。
+/// 输入当前跳状态码 / 当前 URL / Location 原文 / 有界正文前缀，
+/// 输出「继续跟随」或「最终结论」，四种场景可被单元测试直接断言。
+fn gemini_judge(
+    status: u16,
+    current_url: &str,
+    location: Option<&str>,
+    body_prefix: &str,
+) -> GeminiHop {
     const SVC: &str = "Gemini";
-    // 初始 Cookie: CONSENT=YES+（与真实浏览器首访一致，抑制同意页跳转）
-    let mut jar: Vec<(String, String)> = vec![("CONSENT".to_string(), "YES+".to_string())];
-    let page =
-        match fetch_chain_with_cookies(nr_client, "https://gemini.google.com/app", &mut jar, 4)
-            .await
+    if matches!(status, 301 | 302 | 303 | 307 | 308) {
+        let Some(loc) = location else {
+            return GeminiHop::Finish(svc_unknown_status(
+                SVC,
+                Some(status),
+                "Gemini 重定向缺少 Location 头",
+                AimErrorKind::RedirectError,
+            ));
+        };
+        let next_url = resolve_location(current_url, loc);
+        let loc_lower = next_url.to_ascii_lowercase();
+        // 1. 客观 BLOCKED：重定向至地区不支持说明页
+        if loc_lower.contains("/faq")
+            || loc_lower.contains("support.google.com")
+            || loc_lower.contains("unsupported")
+            || loc_lower.contains("region-not-supported")
         {
-            Ok(p) => p,
+            return GeminiHop::Finish(svc_blocked_status(
+                SVC,
+                Some(status),
+                format!("重定向指向 Gemini 地区不支持页面 (/faq): {loc_lower}"),
+                AimErrorKind::RegionRestricted,
+            ));
+        }
+        // 2. 客观 VERIFIED：通过地区准入后触发 Google 真人验证
+        if loc_lower.contains("google.com/sorry") || loc_lower.contains("ipv4.google.com/sorry") {
+            return GeminiHop::Finish(svc_verified(
+                SVC,
+                status,
+                "已通过 Gemini 地区准入（触发 Google 真人验证，账号可正常使用）",
+            ));
+        }
+        // 3. Google 账号认证流：
+        //    passive=true 为静默 SSO 探测跳，必须继续跟随——它会立即 302 跳回
+        //    /app 揭晓最终是 200 工作区还是 302 /faq；
+        //    非 passive（/v3/signin、交互式 /ServiceLogin）说明已完成准入校验，
+        //    正式要求登录 Google 账号才能使用 Gemini → VERIFIED。
+        if loc_lower.contains("accounts.google.com") {
+            if loc_lower.contains("passive=true") {
+                return GeminiHop::Follow(next_url);
+            }
+            return GeminiHop::Finish(svc_verified(
+                SVC,
+                status,
+                "已通过 Gemini 准入并进入 Google 账号认证流",
+            ));
+        }
+        // 4. 其余同域重定向：携带 Cookie 继续下一跳
+        return GeminiHop::Follow(next_url);
+    }
+
+    let url_lower = current_url.to_ascii_lowercase();
+    let raw_lower = body_prefix.to_ascii_lowercase();
+    if status == 200 {
+        let visible_lower = strip_scripts_and_styles(body_prefix).to_ascii_lowercase();
+        // 1. 客观 BLOCKED：落地地区说明页，或可见文案明确提示地区不支持
+        if url_lower.contains("/faq")
+            || url_lower.contains("support.google.com")
+            || visible_lower.contains("isn't currently supported in your country")
+            || visible_lower.contains("isn’t currently supported in your country")
+            || visible_lower.contains("bard isn't currently supported")
+            || visible_lower.contains("目前不支持你所在的国家")
+        {
+            return GeminiHop::Finish(svc_blocked_status(
+                SVC,
+                Some(200),
+                "页面明确提示当前节点所在地区不支持 Gemini",
+                AimErrorKind::RegionRestricted,
+            ));
+        }
+        // 2. 客观 VERIFIED：Gemini 工作区/入口正特征
+        if url_lower.contains("gemini.google.com")
+            && (raw_lower.contains("wiz_global_data")
+                || raw_lower.contains("bardchatui")
+                || raw_lower.contains("snlm0e")
+                || raw_lower.contains("boq_bard")
+                || raw_lower.contains("gemini"))
+        {
+            return GeminiHop::Finish(svc_verified(
+                SVC,
+                200,
+                "Gemini 工作区应用入口客观验证通过 (HTTP 200)",
+            ));
+        }
+        // 3. 客观 VERIFIED：已通过准入并到达 Google 登录页
+        if url_lower.contains("accounts.google.com")
+            && (raw_lower.contains("servicelogin")
+                || raw_lower.contains("identifier")
+                || raw_lower.contains("google"))
+        {
+            return GeminiHop::Finish(svc_verified(
+                SVC,
+                200,
+                "已通过 Gemini 准入并到达 Google 登录页 (HTTP 200)",
+            ));
+        }
+        return GeminiHop::Finish(svc_accessible(
+            SVC,
+            200,
+            "页面可打开但缺少 Gemini 工作区正特征",
+        ));
+    }
+
+    if status == 403 || status == 429 {
+        // 403/429 + 真人检测特征 = 已通过地区准入，账号可用
+        if raw_lower.contains("recaptcha")
+            || raw_lower.contains("unusual traffic")
+            || raw_lower.contains("sorry")
+            || raw_lower.contains("challenge")
+        {
+            return GeminiHop::Finish(svc_verified(
+                SVC,
+                status,
+                "已通过 Gemini 地区准入（触发常规真人检测，账号可正常使用）",
+            ));
+        }
+        return GeminiHop::Finish(svc_unknown_status(
+            SVC,
+            Some(status),
+            format!("gemini.google.com 返回 {status}（无真人检测特征）"),
+            if status == 429 {
+                AimErrorKind::Http429
+            } else {
+                AimErrorKind::Http403
+            },
+        ));
+    }
+
+    GeminiHop::Finish(svc_unknown_status(
+        SVC,
+        Some(status),
+        format!("gemini.google.com 返回 {status}"),
+        classify_status(status),
+    ))
+}
+
+/// Gemini：gemini.google.com/app?hl=en（HTTP/1.1 专用客户端 + 有界流式读取
+/// + 剥离脚本后的可见文案判定 + 5 跳 Cookie 重定向追踪）。
+/// 【APP78 任务1】纯客观证据判定：零地区代码依赖，根除 GFE HTTP/2
+/// PROTOCOL_ERROR 断连、1.2MB 大包超时与 <script> 字典误判 BLOCKED。
+async fn probe_gemini(slot: usize) -> ServiceProbeResult {
+    const SVC: &str = "Gemini";
+    let client = match build_gemini_probe_client(slot) {
+        Ok(c) => c,
+        Err(e) => return svc_unknown_status(SVC, None, e, AimErrorKind::UnknownError),
+    };
+    // 初始 Cookie 与真实浏览器首访一致，抑制同意页跳转
+    let mut cookie_map: Vec<(String, String)> = vec![(
+        "CONSENT".to_string(),
+        "YES+cb.20240101-00-p0.en+FX+999".to_string(),
+    )];
+    let mut current_url = "https://gemini.google.com/app?hl=en".to_string();
+
+    for hop in 0..5 {
+        let cookie = cookie_map
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let build = |target: &str| {
+            client
+                .get(target)
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header(reqwest::header::COOKIE, cookie.clone())
+        };
+        // 【APP78 任务1.3】首跳网络瞬断（拿不到任何 HTTP 状态）→ 300ms 重试 1 次
+        let resp = match build(&current_url).send().await {
+            Ok(r) => r,
+            Err(_) if hop == 0 => {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                match build(&current_url).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return svc_unknown_status(
+                            SVC,
+                            None,
+                            format!("gemini.google.com 请求失败（300ms 重试后仍失败）: {e}"),
+                            classify_reqwest_error(&e),
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 return svc_unknown_status(
                     SVC,
                     None,
-                    format!("gemini.google.com/app 请求失败（含 300ms 重试）: {e}"),
-                    AimErrorKind::UnknownError,
+                    format!("gemini.google.com 第 {} 跳请求失败: {e}", hop + 1),
+                    classify_reqwest_error(&e),
                 );
             }
         };
-
-    // 任意一跳 Location 指向地区不支持说明页 → 客观 BLOCKED
-    if let Some(bad) = page.locations.iter().find(|l| {
-        l.contains("/faq")
-            || l.contains("support.google.com")
-            || l.contains("unsupported")
-            || l.contains("region-not-supported")
-    }) {
-        return svc_blocked_status(
-            SVC,
-            Some(page.status),
-            format!("重定向指向 Gemini 地区不支持说明页 (/faq): {bad}"),
-            AimErrorKind::RegionRestricted,
-        );
-    }
-
-    let final_lc = page.final_url.to_lowercase();
-
-    // /app 进入 Google 账号登录流 → 根入口交叉核验（避免无 Cookie 死循环）
-    if page.to_login || final_lc.contains("accounts.google.com") {
-        return gemini_root_check(nr_client, &mut jar, page.status).await;
-    }
-
-    if page.status == 200 {
-        let lc = page.body.to_lowercase();
-        if final_lc.contains("/faq") || final_lc.contains("support.google.com") {
-            return svc_blocked_status(
-                SVC,
-                Some(200),
-                "最终落地 URL 为 Gemini 地区不支持说明页",
-                AimErrorKind::RegionRestricted,
-            );
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        // 合并每一跳 Set-Cookie（取首个 ; 前的 k=v）
+        merge_set_cookies(&mut cookie_map, &headers);
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308);
+        // 重定向不读正文；200 读前 96KB；403/429 及其他状态读前 32KB
+        let body_prefix = if is_redirect {
+            String::new()
+        } else {
+            let limit = if status == 200 { 98_304 } else { 32_768 };
+            read_bounded_html_prefix(resp, limit).await
+        };
+        match gemini_judge(status, &current_url, location.as_deref(), &body_prefix) {
+            GeminiHop::Follow(next) => {
+                if next.is_empty() || next == current_url {
+                    return svc_unknown_status(
+                        SVC,
+                        Some(status),
+                        "Gemini 重定向链出现自环",
+                        AimErrorKind::RedirectError,
+                    );
+                }
+                current_url = next;
+            }
+            GeminiHop::Finish(result) => return result,
         }
-        if gemini_region_text(&lc) {
-            return svc_blocked_status(
-                SVC,
-                Some(200),
-                "页面明确提示当前地区不支持 Gemini",
-                AimErrorKind::RegionRestricted,
-            );
-        }
-        if lc.contains("wiz_global_data")
-            || lc.contains("snlm0e")
-            || lc.contains("bardchatui")
-            || lc.contains("gemini")
-        {
-            return svc_verified(SVC, 200, "Gemini 工作区与网页入口客观验证通过 (HTTP 200)");
-        }
-        return svc_accessible(SVC, 200, "页面可打开但缺少 Gemini 应用正特征");
-    }
-
-    if page.status == 403 {
-        let lc = page.body.to_lowercase();
-        if gemini_region_text(&lc) {
-            return svc_blocked_status(
-                SVC,
-                Some(403),
-                "403 页面明确提示当前地区不支持 Gemini",
-                AimErrorKind::RegionRestricted,
-            );
-        }
-        // 【APP77】403 + reCAPTCHA / unusual traffic = 已通过准入，账号可用
-        if lc.contains("recaptcha") || lc.contains("unusual traffic") {
-            return svc_verified(SVC, 403, "已通过 Gemini 准入（触发常规真人验证，账号可用）");
-        }
-        return svc_unknown_status(
-            SVC,
-            Some(403),
-            "Gemini 普通 403（无地区不支持 / 真人验证特征）",
-            AimErrorKind::Http403,
-        );
-    }
-
-    if page.status == 429 {
-        return svc_unknown_status(
-            SVC,
-            Some(429),
-            "gemini.google.com 返回 429 频率限制",
-            AimErrorKind::Http429,
-        );
-    }
-    if (500..600).contains(&page.status) {
-        return svc_unknown_status(
-            SVC,
-            Some(page.status),
-            format!("gemini.google.com 返回 {}", page.status),
-            AimErrorKind::Http5xx,
-        );
-    }
-    if page.status == 0 {
-        return svc_unknown_status(
-            SVC,
-            None,
-            "gemini 重定向链超过最大跳数",
-            AimErrorKind::RedirectError,
-        );
     }
     svc_unknown_status(
         SVC,
-        Some(page.status),
-        format!("gemini.google.com 返回 {}", page.status),
-        classify_status(page.status),
+        None,
+        "Gemini 重定向链超过 5 跳仍未落地",
+        AimErrorKind::RedirectError,
     )
 }
 
@@ -3669,7 +3795,7 @@ async fn probe_node(
         let sem = platform_sem.clone();
         futs.push(Box::pin(async move {
             let _permit = sem.acquire().await;
-            probe_platform("Gemini", || probe_gemini(client, nr_client)).await
+            probe_platform("Gemini", || probe_gemini(slot)).await
         }));
     }
     {
@@ -4908,70 +5034,144 @@ mod tests {
         );
     }
 
-    /// 【APP77 任务2】Gemini 纯客观判定回归：
-    /// - 带 Cookie 手动逐跳（初始 CONSENT=YES+，最多 4 跳）
-    /// - 任意跳 Location 命中 /faq、support.google.com、unsupported、
-    ///   region-not-supported → BLOCKED
-    /// - /app 进入 accounts.google.com 登录流时用同一 Cookie 罐复检根路径
-    /// - 200 正特征、403 reCAPTCHA → VERIFIED；网络瞬断 300ms 重试 1 次
+    /// 【APP78 任务2】提取 gemini_judge 的最终结论；若仍要求继续跟随则测试失败。
+    fn gemini_finish(hop: GeminiHop) -> ServiceProbeResult {
+        match hop {
+            GeminiHop::Finish(r) => r,
+            GeminiHop::Follow(next) => panic!("本场景应直接出结论，却要求继续跟随: {next}"),
+        }
+    }
+
+    /// 【APP78 任务2 场景1】200 OK，<script> 内含地区字典词条，
+    /// 可见正文无限制且含 WIZ_global_data → 必须 VERIFIED，绝不误判 BLOCKED。
     #[test]
-    fn test_gemini_redirect_chain_and_workspace_verified_vs_faq_blocked() {
+    fn test_gemini_200_script_dict_region_text_is_verified_not_blocked() {
+        let body = "<html><head><title>Gemini</title>\
+            <script>var msg=\"isn't currently supported in your country\";</script>\
+            <style>.x{content:\"not available in your country\"}</style></head>\
+            <body><div>WIZ_global_data={\"SNlM0e\":1}</div></body></html>";
+        let visible = strip_scripts_and_styles(body).to_ascii_lowercase();
+        assert!(
+            !visible.contains("isn't currently supported in your country"),
+            "<script> 字典词条必须被剥离"
+        );
+        assert!(
+            !visible.contains("not available in your country"),
+            "<style> 内容同样必须被剥离"
+        );
+        assert!(visible.contains("wiz_global_data"), "可见正文特征必须保留");
+        let r = gemini_finish(gemini_judge(
+            200,
+            "https://gemini.google.com/app?hl=en",
+            None,
+            body,
+        ));
+        assert_eq!(r.verdict, ProbeVerdict::Verified);
+        assert_eq!(r.status_code, Some(200));
+    }
+
+    /// 【APP78 任务2 场景2】302 → accounts.google.com/ServiceLogin?passive=true
+    /// （继续跟随）→ 302 回到 /app?osid=1 → 200 含 WIZ_global_data → VERIFIED。
+    #[test]
+    fn test_gemini_passive_sso_bounce_then_workspace_is_verified() {
+        let app = "https://gemini.google.com/app?hl=en";
+        let sso =
+            "https://accounts.google.com/ServiceLogin?passive=true&continue=gemini.google.com";
+        // 第一跳：passive=true 静默 SSO 探测，必须继续跟随而非直接下结论
+        match gemini_judge(302, app, Some(sso), "") {
+            GeminiHop::Follow(next) => assert!(next.contains("accounts.google.com")),
+            GeminiHop::Finish(r) => panic!("passive=true 必须继续跟随，而非 {:?}", r.verdict),
+        }
+        // 第二跳：跳回 /app?osid=1，同域重定向继续跟随
+        let back = "https://gemini.google.com/app?osid=1";
+        match gemini_judge(302, sso, Some(back), "") {
+            GeminiHop::Follow(next) => assert_eq!(next, back),
+            GeminiHop::Finish(r) => panic!("同域回跳必须继续跟随，而非 {:?}", r.verdict),
+        }
+        // 第三跳：200 工作区正特征 → VERIFIED
+        let r = gemini_finish(gemini_judge(200, back, None, "WIZ_global_data BardChatUi"));
+        assert_eq!(r.verdict, ProbeVerdict::Verified);
+        assert_eq!(r.status_code, Some(200));
+    }
+
+    /// 【APP78 任务2 场景3】302 重定向至 gemini.google.com/faq
+    /// （直接或经 passive=true 跳回后）→ BLOCKED。
+    #[test]
+    fn test_gemini_redirect_to_faq_is_blocked() {
+        let app = "https://gemini.google.com/app?hl=en";
+        for loc in [
+            "https://gemini.google.com/faq",
+            "/faq", // 相对路径同样解析到 /faq
+            "https://gemini.google.com/faq?hl=en",
+        ] {
+            let r = gemini_finish(gemini_judge(302, app, Some(loc), ""));
+            assert_eq!(r.verdict, ProbeVerdict::Blocked, "Location: {loc}");
+            assert_eq!(r.status_code, Some(302));
+        }
+        // 经 passive=true 跳回后再 302 到 /faq 同样 BLOCKED
+        let sso = "https://accounts.google.com/ServiceLogin?passive=true";
+        let r = gemini_finish(gemini_judge(
+            302,
+            sso,
+            Some("https://gemini.google.com/faq"),
+            "",
+        ));
+        assert_eq!(r.verdict, ProbeVerdict::Blocked);
+    }
+
+    /// 【APP78 任务2 场景4】302 到 google.com/sorry 或 403 含 recaptcha
+    /// 真人验证页 → VERIFIED。
+    #[test]
+    fn test_gemini_sorry_redirect_and_403_recaptcha_are_verified() {
+        let app = "https://gemini.google.com/app?hl=en";
+        for loc in [
+            "https://www.google.com/sorry/index?continue=gemini.google.com/app",
+            "https://ipv4.google.com/sorry/index",
+        ] {
+            let r = gemini_finish(gemini_judge(302, app, Some(loc), ""));
+            assert_eq!(r.verdict, ProbeVerdict::Verified, "Location: {loc}");
+        }
+        let r = gemini_finish(gemini_judge(
+            403,
+            app,
+            None,
+            "Our systems have detected unusual traffic from your computer network. recaptcha",
+        ));
+        assert_eq!(r.verdict, ProbeVerdict::Verified);
+        assert_eq!(r.status_code, Some(403));
+    }
+
+    /// 【APP78 任务1】机制防回归：专用客户端必须 http1_only + 零重定向；
+    /// probe_gemini 必须有界读取、5 跳追踪、300ms 重试且零地区名单依赖。
+    #[test]
+    fn test_gemini_http1_client_and_no_region_list() {
         let src = include_str!("go_aim.rs");
+        let cstart = src
+            .find("fn build_gemini_probe_client")
+            .expect("Gemini 专用客户端必须存在");
+        let cbody = &src[cstart..cstart + src[cstart..].find("\n}\n").unwrap()];
+        assert!(
+            cbody.contains(".http1_only()"),
+            "必须强制 HTTP/1.1 根除 GFE PROTOCOL_ERROR"
+        );
+        assert!(
+            cbody.contains("redirect::Policy::none()"),
+            "必须零重定向，由状态机逐跳跟踪"
+        );
         let start = src
             .find("async fn probe_gemini")
             .expect("probe_gemini 必须存在");
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
-
-        // 带 Cookie 手动逐跳，最多 4 跳 + 初始 CONSENT
+        assert!(body.contains("for hop in 0..5"), "最多 5 跳重定向追踪");
+        assert!(body.contains("98_304"), "200 必须只读前 96KB");
+        assert!(body.contains("32_768"), "403/429 必须只读前 32KB");
         assert!(
-            body.contains("fetch_chain_with_cookies"),
-            "probe_gemini 必须使用带 Cookie 的手动逐跳跟踪"
+            body.contains("from_millis(300)"),
+            "首跳网络瞬断必须 300ms 重试 1 次"
         );
-        assert!(body.contains("CONSENT"), "必须携带初始 CONSENT=YES+ Cookie");
-        assert!(body.contains(", 4)"), "Gemini 重定向链最多跟踪 4 跳");
-        // 地区不支持说明页关键词
-        for key in [
-            "/faq",
-            "support.google.com",
-            "unsupported",
-            "region-not-supported",
-        ] {
-            assert!(
-                body.contains(key),
-                "probe_gemini 必须识别重定向中的 `{key}`"
-            );
-        }
-        // 登录流 → 根入口交叉核验
-        assert!(
-            body.contains("gemini_root_check") && body.contains("accounts.google.com"),
-            "进入 Google 登录流必须改用根入口交叉核验"
-        );
-        // 200 工作区正特征
-        for key in ["wiz_global_data", "snlm0e", "bardchatui", "gemini"] {
-            assert!(
-                body.contains(key),
-                "200 判定必须识别 Gemini 工作区特征 `{key}`"
-            );
-        }
-        // 403 真人验证 → VERIFIED
-        assert!(
-            body.contains("recaptcha") && body.contains("unusual traffic"),
-            "403 必须识别 reCAPTCHA / unusual traffic 真人验证特征"
-        );
-        // 零地区名单依赖
         assert!(
             !body.contains("region_blocked") && !body.contains("exit_country"),
             "probe_gemini 严禁使用出口地区名单参与判定"
-        );
-
-        // 首跳网络瞬断 300ms 重试 1 次（在共享跟踪器中实现）
-        let retry_start = src
-            .find("async fn fetch_chain_with_cookies")
-            .expect("fetch_chain_with_cookies 必须存在");
-        let retry_body = &src[retry_start..retry_start + src[retry_start..].find("\n}\n").unwrap()];
-        assert!(
-            retry_body.contains("from_millis(300)"),
-            "首跳网络瞬断必须等待 300ms 后重试 1 次"
         );
     }
 
@@ -5224,10 +5424,10 @@ mod tests {
 
     #[test]
     fn test_version_eviction_constants() {
-        assert_eq!(CURRENT_AIM_PROBE_VERSION, 9);
-        assert_eq!(CURRENT_AIM_RULE_VERSION, 9);
-        assert!(8 < CURRENT_AIM_PROBE_VERSION, "v8 及更早缓存应被淘汰");
-        assert!(9 >= CURRENT_AIM_PROBE_VERSION, "v9 真实缓存应保留");
+        assert_eq!(CURRENT_AIM_PROBE_VERSION, 10);
+        assert_eq!(CURRENT_AIM_RULE_VERSION, 10);
+        assert!(9 < CURRENT_AIM_PROBE_VERSION, "v9 及更早缓存应被淘汰");
+        assert!(10 >= CURRENT_AIM_PROBE_VERSION, "v10 真实缓存应保留");
     }
 
     #[test]
