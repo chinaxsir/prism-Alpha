@@ -1605,10 +1605,13 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 // 【APP50 任务2】config_builder 重新启用：log11 实证 iOS 扩展内节点域名
 // UDP DNS 被 utun 自拦截失败（0ms 超时），主进程构建期 DoH 预解析为
 // 公网 IPv4 写入 server（SNI/Host 保留原域名），内核 dns-direct 兜底。
-/// 【APP80 任务1.1】节点域名 DoH 结果缓存 1800s（原 300s）。
-/// 节点服务器 IP 极少变动，5 分钟过期会让「启动 → 修改设置 → 再启动」反复
-/// 触发同步 DoH 等待；30 分钟既覆盖一次完整使用周期，又能感知 DNS 轮换。
-const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// 【APP81 任务1.1】节点域名 DoH 结果缓存 3600s。
+/// 节点服务器 IP 极少变动，延长缓存避免设置调整后的重复启动再次同步等待。
+const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+/// 配置构建期未命中缓存时的批量 DoH 最大等待；超时保留域名由内核直连 DNS 兜底。
+const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(450);
+/// 后台预热不参与启动关键路径，可等待完整 DoH 结果以提高后续缓存命中率。
+const NODE_HOST_WARMUP_WAIT: std::time::Duration = std::time::Duration::from_millis(2600);
 
 fn node_host_cache()
 -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
@@ -1619,15 +1622,14 @@ fn node_host_cache()
 }
 
 /// 【APP79 任务3.1】后台预热节点域名 DoH 缓存（不阻塞调用方）。
-/// 【APP80 任务1.1】App 启动 / 订阅更新落盘后立即调用，让随后构建配置时
-/// 的同步 DoH 100% 命中 1800s 缓存，实际耗时接近 0。
-/// 已有未过期缓存的域名直接跳过，避免重复解析；线程内部仍有 2.6s 上限。
+/// 【APP81 任务1.1】App 启动 / 订阅更新落盘后立即调用，让随后构建配置时
+/// 的同步 DoH 命中 3600s 缓存；预热不在启动关键路径，保留 2.6s 完整等待。
 pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
     if hosts.is_empty() {
         return;
     }
     std::thread::spawn(move || {
-        let _ = doh_resolve_node_hosts_ipv4(&hosts);
+        let _ = doh_resolve_node_hosts_ipv4_with_wait(&hosts, NODE_HOST_WARMUP_WAIT);
     });
 }
 
@@ -1641,11 +1643,18 @@ pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
 /// 原域名，由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡
 /// 绑定）兜底解析（保险 2）。
 ///
-/// 整体在独立工作线程 + current_thread runtime 内并发执行，调用方最多
-/// 阻塞 2600ms；命中 1800s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
+/// 整体在独立工作线程 + current_thread runtime 内并发执行。配置构建最多
+/// 阻塞 450ms；命中 3600s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
 /// 私网/fake-ip（198.18/15）等非法解析结果。
 pub(crate) fn doh_resolve_node_hosts_ipv4(
     hosts: &[String],
+) -> std::collections::HashMap<String, String> {
+    doh_resolve_node_hosts_ipv4_with_wait(hosts, NODE_HOST_BUILD_WAIT)
+}
+
+fn doh_resolve_node_hosts_ipv4_with_wait(
+    hosts: &[String],
+    max_wait: std::time::Duration,
 ) -> std::collections::HashMap<String, String> {
     let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut todo: Vec<String> = Vec::new();
@@ -1654,7 +1663,7 @@ pub(crate) fn doh_resolve_node_hosts_ipv4(
         if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
             continue;
         }
-        // 1800s 缓存命中直接用
+        // 3600s 缓存命中直接用
         if let Ok(mut c) = node_host_cache().lock() {
             if let Some((ip, at)) = c.get(&key) {
                 if at.elapsed() < NODE_HOST_CACHE_TTL {
@@ -1698,9 +1707,7 @@ pub(crate) fn doh_resolve_node_hosts_ipv4(
         };
         let _ = tx.send(result);
     });
-    let resolved = rx
-        .recv_timeout(std::time::Duration::from_millis(2600))
-        .unwrap_or_default();
+    let resolved = rx.recv_timeout(max_wait).unwrap_or_default();
     for (host, maybe_ip) in resolved {
         let Some(ip) = maybe_ip else { continue };
         // 只接受真实公网 IPv4：拒绝环回/0.0.0.0/私网/fake-ip 等污染结果

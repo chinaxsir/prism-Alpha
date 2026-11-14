@@ -442,6 +442,14 @@ pub struct PersistedNodeMetrics {
     pub updated_at: u64,
 }
 
+/// 【APP81 任务4】最近一次成功完成全量 AIM 检测的物理网络与节点指纹。
+/// 仅保存在运行时：应用/VPN 新会话的首次启动仍允许自动检测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AimNetworkSignature {
+    pub network_type: String,
+    pub nodes_hash: String,
+}
+
 /// 跨 IPC 共享的全局状态
 pub struct AppState {
     /// 应用句柄：状态流转后广播 core://status，前端无需轮询即可对齐
@@ -504,6 +512,8 @@ pub struct AppState {
     pub aim_events: Mutex<VecDeque<GoAimEvent>>,
     /// 【APP71 任务3】最近一次 Go AIM 明确失败原因
     pub aim_last_error: RwLock<Option<String>>,
+    /// 【APP81 任务4】最近一次成功全量检测的网络类型 + 节点列表指纹
+    pub last_aim_net_signature: Mutex<Option<AimNetworkSignature>>,
     /// Go Lan：回家网络配置（go_lan.json）
     pub go_lan: RwLock<super::go_lan::GoLanSettings>,
     /// Go Cus：覆写引擎配置（go_cus.json）
@@ -597,6 +607,7 @@ impl AppState {
             aim_generation: std::sync::atomic::AtomicU64::new(0),
             aim_events: Mutex::new(VecDeque::new()),
             aim_last_error: RwLock::new(None),
+            last_aim_net_signature: Mutex::new(None),
             go_lan: RwLock::new(super::go_lan::load(&data_dir)),
             go_cus: RwLock::new(super::go_cus::load(&data_dir)),
             traffic_history: RwLock::new(VecDeque::new()),

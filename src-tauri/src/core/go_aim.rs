@@ -64,9 +64,12 @@ const PROBE_TIMEOUT_MS: u64 = 2800;
 const PROBE_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// 【APP73 任务2.1】单次 HTTP 请求总超时（8 秒）
 const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
-/// 【APP76 任务2.2】单个平台完整探测硬超时（8 秒，含 0 次或 1 次补测；
-/// Semaphore 排队时间不计入）。
-const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 8;
+/// 【APP81 任务3.2】单个平台完整探测硬超时（6 秒，含响应头、正文分块
+/// 读取与最多 1 次补测；Semaphore 排队时间不计入）。
+const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 6;
+/// 【APP81 任务3.2】单节点深度探测绝对看门狗：超时直接 drop 整个 future，
+/// 半开连接不会长期占用工作槽位。
+const MAX_NODE_DEEP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
 /// 【APP75 任务3.2】单节点内部 7 平台并发上限：同一时刻最多 3 个平台
 /// 同时发起 HTTPS 握手，避免瞬时 7 路突发被中转服务器限流重置。
 const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
@@ -914,34 +917,124 @@ impl Drop for ProbeRunGuard {
     }
 }
 
-/// 【APP69 任务4】自动触发冷却：同一订阅列表 / 内核会话内 30 分钟内
-/// 最多自动全量探测一次。用户手动「AIM 检测 / 重测」直接走
-/// start_probe_with_mode，不受冷却限制。
-const AUTO_PROBE_COOLDOWN_SECS: u64 = 30 * 60;
-static LAST_AUTO_PROBE_SECS: AtomicU64 = AtomicU64::new(0);
-
-/// 【APP69 任务4】纯函数判定：首次触发放行，之后必须满 30 分钟。
-fn auto_probe_allowed(last: u64, now: u64) -> bool {
-    last == 0 || now.saturating_sub(last) >= AUTO_PROBE_COOLDOWN_SECS
+/// 【APP81 任务4】节点名与核心配置指纹共同组成有效节点列表指纹。
+/// 排序保证仅订阅顺序变化不会触发重测；增删、改名或配置变化都会改变哈希。
+fn nodes_hash_from_identities(identities: impl IntoIterator<Item = (String, String)>) -> String {
+    let mut identities: Vec<(String, String)> = identities.into_iter().collect();
+    identities.sort();
+    let payload = identities
+        .into_iter()
+        .map(|(name, id)| format!("{name}:{id}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{:x}", Sha256::digest(payload.as_bytes()))
 }
 
-/// 启动一轮自动分级探测（保持既有调用方 100% 兼容）。
-/// 自动入口（启动内核 / 订阅刷新等）统一受 30 分钟冷却保护。
+/// 根据当前活跃物理接口判断网络类型。iOS 同时枚举到 Wi-Fi 与蜂窝时，
+/// 系统默认优先 Wi-Fi；Wi-Fi 断开后 en0 不再具备可用 IPv4，转而命中蜂窝。
+fn physical_network_type() -> String {
+    classify_physical_interfaces(active_physical_network_names()).to_string()
+}
+
+fn classify_physical_interfaces(names: impl IntoIterator<Item = String>) -> &'static str {
+    let mut wifi = false;
+    let mut cellular = false;
+    for name in names {
+        let name = name.to_ascii_lowercase();
+        if name == "en0" || name.starts_with("wlan") || name.starts_with("wl") {
+            wifi = true;
+        } else if name.starts_with("pdp_ip") || name.starts_with("rmnet") {
+            cellular = true;
+        }
+    }
+    if wifi {
+        "wifi"
+    } else if cellular {
+        "cellular"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(unix)]
+fn active_physical_network_names() -> Vec<String> {
+    let mut names = Vec::new();
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) == 0 {
+            let mut cur = head;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                let flags = ifa.ifa_flags as u32;
+                if !ifa.ifa_addr.is_null()
+                    && flags & libc::IFF_UP as u32 != 0
+                    && flags & libc::IFF_RUNNING as u32 != 0
+                    && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET as i32
+                {
+                    let sin = ifa.ifa_addr as *const libc::sockaddr_in;
+                    let ip = std::net::Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
+                    if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local() {
+                        names.push(
+                            std::ffi::CStr::from_ptr(ifa.ifa_name)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(head);
+        }
+    }
+    names
+}
+
+#[cfg(not(unix))]
+fn active_physical_network_names() -> Vec<String> {
+    Vec::new()
+}
+
+fn current_aim_signature(state: &AppState) -> crate::core::state::AimNetworkSignature {
+    crate::core::state::AimNetworkSignature {
+        network_type: physical_network_type(),
+        nodes_hash: nodes_hash_from_identities(load_node_identities(&state.data_dir)),
+    }
+}
+
+/// 相同网络与节点组合已有结果时直接复用；首次、切网、节点实质变化或无结果放行。
+fn auto_probe_needed(
+    last: Option<&crate::core::state::AimNetworkSignature>,
+    current: &crate::core::state::AimNetworkSignature,
+    has_results: bool,
+) -> bool {
+    !has_results || last != Some(current)
+}
+
+/// 自动入口在创建 runId、抢占单飞锁与发射 START 之前完成签名判定。
 pub fn start_probe(app: AppHandle) {
-    let now = now_secs();
-    let last = LAST_AUTO_PROBE_SECS.load(Ordering::Acquire);
-    if !auto_probe_allowed(last, now) {
-        tracing::debug!("[go-aim] 自动探测处于 30 分钟冷却期，跳过");
+    let state = app.state::<AppState>();
+    if !state.settings.read().go_aim_enabled {
         return;
     }
-    LAST_AUTO_PROBE_SECS.store(now, Ordering::Release);
-    start_probe_inner(app, None, "auto");
+    let signature = current_aim_signature(&state);
+    let last = state.last_aim_net_signature.lock();
+    let has_results = !state.aim_results.read().is_empty();
+    if !auto_probe_needed(last.as_ref(), &signature, has_results) {
+        tracing::debug!("[go-aim] 网络与节点签名未变化，复用既有 AIM 结果");
+        return;
+    }
+    drop(last);
+    drop(state);
+    start_probe_inner(app, None, "auto", signature);
 }
 
-/// 【APP68】启动 FAST / FULL / SELECTED 或默认自动分级探测。
-/// 用户手动触发同样刷新冷却基准，避免紧接其后再自动跑一轮。
+/// 手动 AIM / 手动开启开关 / 清除锁定始终绕过签名守卫。
 pub fn start_probe_with_mode(app: AppHandle, mode: Option<AimProbeMode>) {
-    start_probe_inner(app, mode, "manual");
+    let signature = {
+        let state = app.state::<AppState>();
+        current_aim_signature(&state)
+    };
+    start_probe_inner(app, mode, "manual", signature);
 }
 
 /// 【APP71 任务2.5】被拒绝的探测请求也必须留下明确的 ERROR 事件与日志，
@@ -995,8 +1088,12 @@ fn aim_mode_label(mode: Option<AimProbeMode>) -> &'static str {
 }
 
 /// 【APP71 任务2.2】统一启动入口：生成 runId、发射 START、终态兜底。
-fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) {
-    LAST_AUTO_PROBE_SECS.store(now_secs(), Ordering::Release);
+fn start_probe_inner(
+    app: AppHandle,
+    mode: Option<AimProbeMode>,
+    trigger: &str,
+    probe_signature: crate::core::state::AimNetworkSignature,
+) {
     let run = AimRunCtx::new();
     let empty_meta = AimLogMeta::default();
     // [AIM-01] 收到请求
@@ -1121,6 +1218,14 @@ fn start_probe_inner(app: AppHandle, mode: Option<AimProbeMode>, trigger: &str) 
                         state.record_node_delays(delays);
                     }
                     state.record_aim_results(&snapshot, best_node.as_deref());
+                }
+                // 只有运行中的完整全量检测且有存活节点才记录签名；失败、离线
+                // 快筛、FAST / SELECTED 均不得把当前组合误标为已完成检测。
+                if count > 0
+                    && is_running(&state)
+                    && matches!(mode, None | Some(AimProbeMode::Full))
+                {
+                    *state.last_aim_net_signature.lock() = Some(probe_signature.clone());
                 }
                 // [AIM-18] 缓存持久化
                 let (cache_hits, updated, version) = {
@@ -2070,39 +2175,59 @@ async fn probe_all(
                         cached.is_some()
                     ),
                 );
-                let mut probe = Box::pin(probe_node(
-                    &api,
-                    &client,
-                    &nr_client,
-                    slot,
-                    &name,
-                    Some(delay),
-                    &node_id,
-                    cached,
-                    result_mode,
-                    force_full,
-                    &run,
-                    &app,
-                ));
-                // 探针 future 可被直接 drop：取消响应不等待最慢平台请求超时。
-                let outcome = loop {
-                    tokio::select! {
-                        outcome = &mut probe => break Some(outcome),
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                            let st = app.state::<AppState>();
-                            if !st.settings.read().go_aim_enabled
-                                || !is_running(&st)
-                                || st.aim_generation.load(Ordering::Acquire) != generation
-                            {
-                                break None;
-                            }
-                        }
+                let probe_started = std::time::Instant::now();
+                // 已完成的平台结果实时写入共享快照；看门狗 drop future 后仍可读取。
+                // 所有锁都只包裹内存读写，绝不跨 await。
+                let partial = Arc::new(parking_lot::Mutex::new(NodeProbePartial::default()));
+                // 【APP81 任务3.2】14s 绝对看门狗 + 50ms 取消轮询；任一终态
+                // 都立即 drop 探针 future，绝不让半开连接无限占用槽位。
+                let drive = drive_with_watchdog(
+                    probe_node(
+                        &api,
+                        &client,
+                        &nr_client,
+                        slot,
+                        &name,
+                        Some(delay),
+                        &node_id,
+                        cached,
+                        result_mode,
+                        force_full,
+                        &partial,
+                        &run,
+                        &app,
+                    ),
+                    MAX_NODE_DEEP_PROBE_TIMEOUT,
+                    || {
+                        let st = app.state::<AppState>();
+                        !st.settings.read().go_aim_enabled
+                            || !is_running(&st)
+                            || st.aim_generation.load(Ordering::Acquire) != generation
+                    },
+                )
+                .await;
+                let outcome = match drive {
+                    NodeProbeDrive::Finished(outcome) => outcome,
+                    NodeProbeDrive::Cancelled => {
+                        tracing::info!("[go-aim] 槽位 {slot} 已取消节点「{name}」探测");
+                        break;
                     }
-                };
-                drop(probe);
-                let Some(outcome) = outcome else {
-                    tracing::info!("[go-aim] 槽位 {slot} 已取消节点「{name}」探测");
-                    break;
+                    NodeProbeDrive::TimedOut => {
+                        crate::core::logger::warn(
+                            crate::core::logger::MOD_GO_AIM,
+                            format!(
+                                "[AIM-16] 节点「{name}」深度探测达到 14s 看门狗上限，已强制收尾并释放槽位 #{slot}"
+                            ),
+                        );
+                        watchdog_timeout_result(
+                            &name,
+                            delay,
+                            &node_id,
+                            result_mode,
+                            &partial.lock(),
+                            probe_started,
+                        )
+                    }
                 };
                 controller.record(outcome.elapsed_ms, outcome.timed_out);
                 // 过期结果不得污染新订阅或已停止的会话。
@@ -3767,6 +3892,15 @@ fn set_slot_state(app: &AppHandle, slot: usize, node: &str, services: String) {
     p.active_slots = p.current_nodes.iter().filter(|s| !s.is_empty()).count();
 }
 
+/// 节点级看门狗可读的部分进度；每个字段都只在短临界区内同步更新。
+#[derive(Default)]
+struct NodeProbePartial {
+    base_delay: Option<u64>,
+    proxy_health: ProxyHealthStatus,
+    egress: EgressInfo,
+    completed: Vec<ServiceProbeResult>,
+}
+
 /// 单节点探测：复用阶段1 快筛延迟 → 探针选择器切到该节点 →
 /// 【APP72 任务1.2】出口信息仅作参考证据，绝不短路 7 平台真实探测。
 /// 死节点（基线延迟失败）生成 probed=true 的空结果。
@@ -3782,6 +3916,7 @@ async fn probe_node(
     cached: Option<&AimNodeResult>,
     mode: AimProbeMode,
     force_full: bool,
+    partial: &Arc<parking_lot::Mutex<NodeProbePartial>>,
     run: &Arc<AimRunCtx>,
     app: &AppHandle,
 ) -> NodeProbeOutcome {
@@ -3813,31 +3948,49 @@ async fn probe_node(
             _ => return NodeProbeOutcome::new(stamp(dead_result(name)), false, started),
         },
     };
+    partial.lock().base_delay = Some(base_delay);
 
-    // 2. 探针选择器切到该节点
-    if let Err(e) = api.select_proxy(&probe_selector(slot), name).await {
-        tracing::warn!("[go-aim] 槽位 {slot} 切换探针到「{name}」失败: {e}");
-        return NodeProbeOutcome::new(stamp(dead_result(name)), false, started);
-    }
-    // [AIM-12] 8 阶段追踪：PROXY_SELECTED
-    crate::core::logger::info(
-        crate::core::logger::MOD_GO_AIM,
-        format!(
-            "[AIM][{name}][-] [阶段] PROXY_SELECTED selector={} target={name}",
-            probe_selector(slot)
-        ),
-    );
-
-    // 2.1 【APP73 任务1.2】PROXY_VERIFIED：选择器实际 now 必须是目标节点。
-    // 若 Clash API 返回的 now 与目标不一致，说明设置尚未生效/被其他任务抢占，
-    // 本节点所有平台一律回退 UNKNOWN，严禁继续判定任何 VERIFIED。
-    let selected_now = api.get_proxies().await.ok().and_then(|v| {
-        v.get("proxies")
-            .and_then(|p| p.get(probe_selector(slot)))
-            .and_then(|g| g.get("now"))
-            .and_then(|n| n.as_str())
-            .map(str::to_string)
-    });
+    // 2. 【APP81 任务3.2】切换 + now 核验合计最多 2500ms，严禁裸 await。
+    let selection = tokio::time::timeout(std::time::Duration::from_millis(2500), async {
+        api.select_proxy(&probe_selector(slot), name).await?;
+        crate::core::logger::info(
+            crate::core::logger::MOD_GO_AIM,
+            format!(
+                "[AIM][{name}][-] [阶段] PROXY_SELECTED selector={} target={name}",
+                probe_selector(slot)
+            ),
+        );
+        let now = api.get_proxies().await.ok().and_then(|v| {
+            v.get("proxies")
+                .and_then(|p| p.get(probe_selector(slot)))
+                .and_then(|g| g.get("now"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        });
+        Ok::<Option<String>, anyhow::Error>(now)
+    })
+    .await;
+    let selected_now = match selection {
+        Ok(Ok(now)) => now,
+        Ok(Err(e)) => {
+            tracing::warn!("[go-aim] 槽位 {slot} 切换探针到「{name}」失败: {e}");
+            return NodeProbeOutcome::new(stamp(dead_result(name)), false, started);
+        }
+        Err(_) => {
+            crate::core::logger::warn(
+                crate::core::logger::MOD_GO_AIM,
+                format!("[AIM][{name}][-] [阶段] PROXY_ERROR 选择器切换/核验超过 2500ms"),
+            );
+            let result = all_unknown_result(
+                name,
+                base_delay,
+                "TASK_TIMEOUT: 选择器切换与 now 核验超过 2500ms".to_string(),
+                AimErrorKind::TaskTimeout,
+            );
+            return NodeProbeOutcome::new(stamp(result), false, started);
+        }
+    };
+    // 2.1 PROXY_VERIFIED：选择器实际 now 必须是目标节点，否则全部回退 UNKNOWN。
     if selected_now.as_deref() != Some(name) {
         let actual = selected_now.unwrap_or_else(|| "<unknown>".to_string());
         crate::core::logger::warn(
@@ -3863,18 +4016,28 @@ async fn probe_node(
     // 任意 1 路成功即视为代理通道畅通；全部失败时，若 EGRESS_CHECK 仍能
     // 拿到出口 IP，也视为畅通并继续 7 平台检测。只有「3 路全挂且出口不可达」
     // 才判定 PROXY_FAILED，确保所有可用节点 100% 跑完 AIM 检测。
-    let (mut proxy_health, _health_hits) =
-        verify_basic_https_proxy_health(client, slot, name).await;
-    let egress = if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
-        // 3 路基础检测全失败 → 以出口预检结果作为最后一道放行依据
-        let probe = fetch_egress(client).await;
-        if probe.ip.is_some() {
-            proxy_health = ProxyHealthStatus::ProxyOk;
-        }
-        probe
-    } else {
-        fetch_egress(client).await
+    let (mut proxy_health, _health_hits) = match tokio::time::timeout(
+        std::time::Duration::from_millis(4500),
+        verify_basic_https_proxy_health(client, slot, name),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => (ProxyHealthStatus::ProxyFailed, Vec::new()),
     };
+    // 【APP81 任务3.2】出口检测独立 3000ms 硬超时；健康检查失败时仍可
+    // 凭出口 IP 放行，保持 APP80 的宽松准入语义。
+    let egress = tokio::time::timeout(std::time::Duration::from_millis(3000), fetch_egress(client))
+        .await
+        .unwrap_or_default();
+    if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) && egress.ip.is_some() {
+        proxy_health = ProxyHealthStatus::ProxyOk;
+    }
+    {
+        let mut snapshot = partial.lock();
+        snapshot.proxy_health = proxy_health;
+        snapshot.egress = egress.clone();
+    }
     if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) {
         let mut detail = String::from("基础 HTTPS 代理不可用且出口不可达: ");
         for (label, status, elapsed, kind) in &_health_hits {
@@ -4005,7 +4168,7 @@ async fn probe_node(
             ),
         );
     }
-    let mut results: Vec<ServiceProbeResult> = Vec::with_capacity(7);
+    partial.lock().completed.reserve(7);
     // [AIM-15] 单平台探测结果 + 8 阶段中的 RESPONSE/BODY/RESULT 追踪；
     // 使用 FuturesUnordered 逐平台完成即刷新 UI，满足实时平台/阶段展示。
     // [AIM-16] 异常 / 重试
@@ -4106,11 +4269,36 @@ async fn probe_node(
                 ),
             );
         }
-        results.push(r);
+        partial.lock().completed.push(r);
     }
     // 释放 futures 对 egress.country 的借用，后续才能把 egress 字段移入结果。
     drop(futs);
+    let results = std::mem::take(&mut partial.lock().completed);
 
+    summarize_deep_probe_result(
+        name,
+        node_id,
+        base_delay,
+        mode,
+        proxy_health,
+        egress,
+        results,
+        started,
+    )
+}
+
+/// 正常完成与看门狗超时共用同一汇总逻辑，确保证据、评分和解锁标签口径一致。
+#[allow(clippy::too_many_arguments)]
+fn summarize_deep_probe_result(
+    name: &str,
+    node_id: &str,
+    base_delay: u64,
+    mode: AimProbeMode,
+    proxy_health: ProxyHealthStatus,
+    egress: EgressInfo,
+    results: Vec<ServiceProbeResult>,
+    started: std::time::Instant,
+) -> NodeProbeOutcome {
     // 6. 汇总：只有 Verified 进入 unlocked_tags；评分按五级权重累计。
     let mut services: HashMap<String, ServiceProbeResult> = HashMap::with_capacity(results.len());
     let mut evidence = HashMap::new();
@@ -4175,6 +4363,42 @@ async fn probe_node(
     NodeProbeOutcome::new(result, false, started)
 }
 
+/// 看门狗收尾：保留已完成平台，只为未返回的平台补 UNKNOWN/TASK_TIMEOUT。
+/// 部分结果禁止标记为完整深测，避免后续被增量缓存当作七平台完整结果复用。
+fn watchdog_timeout_result(
+    name: &str,
+    delay: u64,
+    node_id: &str,
+    mode: AimProbeMode,
+    partial: &NodeProbePartial,
+    started: std::time::Instant,
+) -> NodeProbeOutcome {
+    let reason = "TASK_TIMEOUT: 节点深度探测超过 14s，平台未完成";
+    let mut results = partial.completed.clone();
+    for service in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
+        if results.iter().any(|result| result.service == service) {
+            continue;
+        }
+        let mut result = svc_unknown_status(service, None, reason, AimErrorKind::TaskTimeout);
+        result.verdict_basis = "TASK_TIMEOUT: 节点级 14s 看门狗中断，平台未返回结果".to_string();
+        results.push(result);
+    }
+    let mut outcome = summarize_deep_probe_result(
+        name,
+        node_id,
+        partial.base_delay.unwrap_or(delay),
+        mode,
+        partial.proxy_health,
+        partial.egress.clone(),
+        results,
+        started,
+    );
+    outcome.result.probed = false;
+    outcome.result.probe_stage = AimProbeStage::ScreenedAlive;
+    outcome.timed_out = true;
+    outcome
+}
+
 struct NodeProbeOutcome {
     result: AimNodeResult,
     cache_hit: bool,
@@ -4196,6 +4420,39 @@ impl NodeProbeOutcome {
             cache_hit,
             elapsed_ms: started.elapsed().as_millis() as u64,
             timed_out,
+        }
+    }
+}
+
+/// 【APP81 任务3.2】保留原 50ms 取消响应，同时叠加节点级绝对看门狗。
+/// 返回时 future 立即 drop，关联的 reqwest 连接与 SlotGuard 一并释放。
+enum NodeProbeDrive<T> {
+    Finished(T),
+    Cancelled,
+    TimedOut,
+}
+
+async fn drive_with_watchdog<F, T, C>(
+    future: F,
+    watchdog: std::time::Duration,
+    mut cancelled: C,
+) -> NodeProbeDrive<T>
+where
+    F: std::future::Future<Output = T>,
+    C: FnMut() -> bool,
+{
+    let mut future = Box::pin(future);
+    let deadline = tokio::time::sleep(watchdog);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            outcome = &mut future => return NodeProbeDrive::Finished(outcome),
+            _ = &mut deadline => return NodeProbeDrive::TimedOut,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                if cancelled() {
+                    return NodeProbeDrive::Cancelled;
+                }
+            }
         }
     }
 }
@@ -4329,7 +4586,7 @@ fn all_unknown_result(name: &str, delay: u64, reason: String, kind: AimErrorKind
     }
 }
 
-/// 【APP73 任务3.3】平台级 10 秒硬超时包裹（含 Unknown 补测 1 次）。
+/// 【APP81 任务3.2】平台级 6 秒硬超时包裹（含正文读取与 Unknown 补测 1 次）。
 async fn probe_platform<F, Fut>(service: &'static str, f: F) -> ServiceProbeResult
 where
     F: Fn() -> Fut + Send,
@@ -4880,10 +5137,26 @@ pub fn spawn_monitor(app: AppHandle) {
     }
     drop(state);
     tauri::async_runtime::spawn(async move {
+        // 复用既有 20 秒故障转移监控观察物理网络，不新增高频定时器，也不在
+        // 每轮读取订阅文件。短暂无接口的 unknown 不视为一次实质切网。
+        let mut observed_network = physical_network_type();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(MONITOR_INTERVAL_SECS)).await;
+            let current_network = physical_network_type();
+            let network_changed = current_network != "unknown"
+                && observed_network != "unknown"
+                && current_network != observed_network;
+            if current_network != "unknown" {
+                observed_network = current_network;
+            }
             let state = app.state::<AppState>();
             if !is_running(&state) || !state.settings.read().go_aim_enabled {
+                continue;
+            }
+            if network_changed {
+                drop(state);
+                tracing::info!("[go-aim] 检测到物理网络类型切换，触发签名守卫复核");
+                start_probe(app.clone());
                 continue;
             }
             let Some(locked) = state.aim_locked_node.read().clone() else {
@@ -5712,14 +5985,196 @@ mod tests {
         assert_ne!(fingerprint, node_fingerprint(&changed));
     }
 
-    /// 【APP69 任务4】自动 AIM 探测 30 分钟冷却：首次放行，冷却期内跳过
+    /// 【APP81 任务4】相同签名复用结果；首次、无结果、切网与节点变化放行。
     #[test]
-    fn test_auto_probe_cooldown() {
-        assert!(auto_probe_allowed(0, 1_700_000_000));
-        let last = 1_700_000_000;
-        assert!(!auto_probe_allowed(last, last + 29 * 60));
-        assert!(auto_probe_allowed(last, last + 30 * 60));
-        assert!(auto_probe_allowed(last, last + 31 * 60));
+    fn test_auto_probe_network_signature_guard() {
+        use crate::core::state::AimNetworkSignature;
+        let wifi = AimNetworkSignature {
+            network_type: "wifi".into(),
+            nodes_hash: "nodes-a".into(),
+        };
+        assert!(auto_probe_needed(None, &wifi, true));
+        assert!(auto_probe_needed(Some(&wifi), &wifi, false));
+        assert!(!auto_probe_needed(Some(&wifi), &wifi, true));
+
+        let cellular = AimNetworkSignature {
+            network_type: "cellular".into(),
+            nodes_hash: wifi.nodes_hash.clone(),
+        };
+        assert!(auto_probe_needed(Some(&wifi), &cellular, true));
+        let changed_nodes = AimNetworkSignature {
+            network_type: wifi.network_type.clone(),
+            nodes_hash: "nodes-b".into(),
+        };
+        assert!(auto_probe_needed(Some(&wifi), &changed_nodes, true));
+    }
+
+    #[test]
+    fn test_nodes_hash_is_order_independent_and_tracks_real_changes() {
+        let original = vec![
+            ("节点A".to_string(), "fingerprint-a".to_string()),
+            ("节点B".to_string(), "fingerprint-b".to_string()),
+        ];
+        let mut reordered = original.clone();
+        reordered.reverse();
+        let original_hash = nodes_hash_from_identities(original.clone());
+        assert_eq!(original_hash, nodes_hash_from_identities(reordered));
+
+        let mut renamed = original.clone();
+        renamed[0].0 = "节点A-新名称".into();
+        assert_ne!(original_hash, nodes_hash_from_identities(renamed));
+        let mut changed = original.clone();
+        changed[1].1 = "fingerprint-changed".into();
+        assert_ne!(original_hash, nodes_hash_from_identities(changed));
+        let mut added = original;
+        added.push(("节点C".into(), "fingerprint-c".into()));
+        assert_ne!(original_hash, nodes_hash_from_identities(added));
+    }
+
+    #[test]
+    fn test_physical_network_type_classification() {
+        assert_eq!(
+            classify_physical_interfaces(vec!["en0".to_string()]),
+            "wifi"
+        );
+        assert_eq!(
+            classify_physical_interfaces(vec!["wlan0".to_string()]),
+            "wifi"
+        );
+        assert_eq!(
+            classify_physical_interfaces(vec!["pdp_ip0".to_string()]),
+            "cellular"
+        );
+        assert_eq!(
+            classify_physical_interfaces(vec!["rmnet_data0".to_string()]),
+            "cellular"
+        );
+        assert_eq!(
+            classify_physical_interfaces(vec!["pdp_ip0".to_string(), "en0".to_string()]),
+            "wifi"
+        );
+        assert_eq!(
+            classify_physical_interfaces(vec!["utun3".to_string()]),
+            "unknown"
+        );
+    }
+
+    /// 挂起 30 秒的节点必须在看门狗处被 drop，随后立即可处理下一节点。
+    #[tokio::test]
+    async fn test_app81_watchdog_drops_hung_node_and_advances() {
+        struct DropNotice(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notice = DropNotice(dropped.clone());
+        let started = std::time::Instant::now();
+        let outcome = drive_with_watchdog(
+            async move {
+                let _notice = notice;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                1u8
+            },
+            std::time::Duration::from_millis(40),
+            || false,
+        )
+        .await;
+        assert!(matches!(outcome, NodeProbeDrive::TimedOut));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(dropped.load(Ordering::Acquire), "挂起 future 必须被析构");
+
+        let next = drive_with_watchdog(async { 2u8 }, std::time::Duration::from_millis(40), || {
+            false
+        })
+        .await;
+        assert!(matches!(next, NodeProbeDrive::Finished(2)));
+    }
+
+    /// 看门狗不得抹掉已完成的平台证据；仅未完平台补 TASK_TIMEOUT。
+    #[tokio::test]
+    async fn test_app81_watchdog_preserves_completed_platform_results() {
+        let partial = Arc::new(parking_lot::Mutex::new(NodeProbePartial {
+            base_delay: Some(123),
+            proxy_health: ProxyHealthStatus::ProxyOk,
+            egress: EgressInfo {
+                ip: Some("203.0.113.8".into()),
+                country: Some("US".into()),
+                asn: Some("13335".into()),
+            },
+            completed: Vec::new(),
+        }));
+        let probe_partial = partial.clone();
+        let started = std::time::Instant::now();
+        let drive = drive_with_watchdog(
+            async move {
+                probe_partial.lock().completed.push(ServiceProbeResult {
+                    service: "GPT".into(),
+                    verdict: ProbeVerdict::Verified,
+                    status_code: Some(200),
+                    evidence: "gpt-ok".into(),
+                    verdict_basis: "HTTP 200 + 正文业务证据".into(),
+                    ..Default::default()
+                });
+                probe_partial.lock().completed.push(ServiceProbeResult {
+                    service: "Claude".into(),
+                    verdict: ProbeVerdict::Accessible,
+                    status_code: Some(200),
+                    evidence: "claude-accessible".into(),
+                    ..Default::default()
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            },
+            std::time::Duration::from_millis(40),
+            || false,
+        )
+        .await;
+        assert!(matches!(drive, NodeProbeDrive::TimedOut));
+
+        let outcome = watchdog_timeout_result(
+            "部分完成节点",
+            999,
+            "node-id",
+            AimProbeMode::Full,
+            &partial.lock(),
+            started,
+        );
+        assert!(outcome.timed_out);
+        let result = outcome.result;
+        assert_eq!(result.delay_ms, 123);
+        assert_eq!(result.services.len(), 7);
+        assert_eq!(result.services["GPT"].verdict, ProbeVerdict::Verified);
+        assert_eq!(result.services["GPT"].evidence, "gpt-ok");
+        assert_eq!(result.services["Claude"].verdict, ProbeVerdict::Accessible);
+        assert_eq!(result.score, 28);
+        assert_eq!(result.unlocked_tags, vec!["GPT"]);
+        assert_eq!(result.egress_ip.as_deref(), Some("203.0.113.8"));
+        assert!(!result.probed, "部分结果不得作为完整深测缓存复用");
+        assert_eq!(result.probe_stage, AimProbeStage::ScreenedAlive);
+        for service in ["Gemini", "NF", "YT", "Disney+", "TK"] {
+            let unfinished = &result.services[service];
+            assert_eq!(unfinished.verdict, ProbeVerdict::Unknown);
+            assert_eq!(unfinished.error_kind, Some(AimErrorKind::TaskTimeout));
+            assert!(
+                unfinished
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("TASK_TIMEOUT"))
+            );
+        }
+    }
+
+    /// 既有 RAII 终态守卫必须同时释放单飞锁与进度 running，不得只改其中一个。
+    #[test]
+    fn test_probe_run_guard_releases_all_running_state() {
+        let src = include_str!("go_aim.rs");
+        let start = src.find("impl Drop for ProbeRunGuard").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("state.aim_probing.store(false"));
+        assert!(body.contains("progress.running = false"));
+        assert!(body.contains("p.running = false") || body.contains("self.run.emit"));
     }
 
     #[test]

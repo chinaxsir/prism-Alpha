@@ -384,6 +384,52 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostStartOptimizationRoute {
+    Latency,
+    Aim,
+}
+
+/// 【APP81 任务2.1】唯一分流规则：Pro 且明确开启 Go AIM 才走深度探测。
+fn post_start_optimization_route(
+    pro_unlocked: bool,
+    go_aim_enabled: bool,
+) -> PostStartOptimizationRoute {
+    if pro_unlocked && go_aim_enabled {
+        PostStartOptimizationRoute::Aim
+    } else {
+        PostStartOptimizationRoute::Latency
+    }
+}
+
+/// 内核就绪 800ms 后在后台执行启动择优；AppState 由 Tauri 管理，后台任务
+/// 通过 AppHandle 重新取用，避免为单一函数改变全局状态所有权。
+fn spawn_post_start_node_optimization(app_handle: AppHandle, _state: &AppState) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let state = app_handle.state::<AppState>();
+        if *state.status.read() != CoreStatus::Running {
+            return;
+        }
+        // 800ms 内用户可能关闭开关或授权状态发生变化，以执行时状态为准。
+        let route = post_start_optimization_route(
+            state.is_pro_active(),
+            state.settings.read().go_aim_enabled,
+        );
+        match route {
+            PostStartOptimizationRoute::Aim => {
+                crate::core::go_aim::spawn_monitor(app_handle.clone());
+                crate::core::go_aim::start_probe(app_handle.clone());
+            }
+            PostStartOptimizationRoute::Latency => {
+                if let Err(e) = run_all_delays(app_handle.clone(), &state, true).await {
+                    tracing::warn!("启动后全量测速择优失败: {e}");
+                }
+            }
+        }
+    });
+}
+
 /// 应用已校验的启动准备：写 API 状态 → 启动内核 → 主选择组 → 系统代理
 async fn apply_prepared(
     prepared: PreparedStart,
@@ -501,17 +547,9 @@ async fn apply_prepared(
             }
         }
 
-        // Go AIM（Pro）：授权激活即后台探测评级；开关打开时自动锁定 + 故障转移监控
-        {
-            let pro_unlocked = state.is_pro_active();
-            if pro_unlocked {
-                let enabled = state.settings.read().go_aim_enabled;
-                if enabled {
-                    crate::core::go_aim::spawn_monitor(bg_app.clone());
-                }
-                crate::core::go_aim::start_probe(bg_app.clone());
-            }
-        }
+        // 【APP81 任务2】启动后统一双轨调度：非 Pro / 未开 AIM 走全量
+        // 测速与最低延迟择优；Pro + AIM 保留现有两阶段七平台探测。
+        spawn_post_start_node_optimization(bg_app.clone(), state);
     });
 
     Ok(())
@@ -2582,12 +2620,20 @@ async fn measure_tls_fallback(n: &CachedProxyDto, timeout_ms: u64) -> u32 {
 /// - 每节点写入延迟缓存（超时记 0），每 6 个落盘，每 3 个推送增量；
 /// - 完成后未手动选点则自动切换到最低延迟节点。
 /// 任何情况下都绝不清空已有延迟缓存（切页/启停/重启不丢失）。
-#[tauri::command]
-pub async fn test_all_delays(
+fn lowest_latency_node(delays: &[(String, u32)]) -> Option<(String, u32)> {
+    delays
+        .iter()
+        .filter(|(_, delay)| *delay > 0)
+        .min_by_key(|(_, delay)| *delay)
+        .map(|(name, delay)| (name.clone(), *delay))
+}
+
+async fn run_all_delays(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: &AppState,
+    startup_optimization: bool,
 ) -> Result<serde_json::Value, String> {
-    let nodes = collect_cached_proxies(&state);
+    let nodes = collect_cached_proxies(state);
     if nodes.is_empty() {
         return Err("节点列表为空，请先刷新订阅".into());
     }
@@ -2641,9 +2687,23 @@ pub async fn test_all_delays(
             .map(|n| {
                 let api = api.clone();
                 async move {
-                    let d = if running {
-                        // 内核运行：真实隧道 gstatic generate_204 2500ms；
-                        // `< 5 ms` 视为假值不采纳，回退 TLS 真握手
+                    let d = if running && startup_optimization {
+                        // 【APP81 任务2.1】启动择优与 AIM 快筛同口径：
+                        // Cloudflare 主测，失败后 gstatic 补测一次，均为真实隧道 RTT。
+                        if let Some(d) = api
+                            .test_delay(&n.name, "http://cp.cloudflare.com/generate_204", 3000)
+                            .await
+                            .filter(|d| *d >= 5)
+                        {
+                            d as u32
+                        } else {
+                            api.test_delay(&n.name, "http://www.gstatic.com/generate_204", 3000)
+                                .await
+                                .filter(|d| *d >= 5)
+                                .unwrap_or(0) as u32
+                        }
+                    } else if running {
+                        // 手动测速保留 TLS 兜底，避免单一 204 端点异常误杀可用节点。
                         if let Some(d) = api
                             .test_delay(&n.name, "http://www.gstatic.com/generate_204", 2500)
                             .await
@@ -2688,39 +2748,57 @@ pub async fn test_all_delays(
         }
     }
 
-    // 自动选点：用户未手动锁定 → 最低延迟（仅实测 > 0）
-    let best = all
-        .iter()
-        .filter(|(_, d)| *d > 0)
-        .min_by_key(|(_, d)| *d)
-        .map(|(n, d)| (n.clone(), *d));
-    if !*state.user_manually_selected_node.read()
-        && let Some((best_name, best_delay)) = best.clone()
+    // 【APP81 任务2.1】启动择优不读旧手动锁；手动点击「测速」仍尊重用户选点。
+    let best = lowest_latency_node(&all);
+    let manually_locked = *state.user_manually_selected_node.read() && !startup_optimization;
+    if let Some((best_name, best_delay)) = best.clone()
+        && (!manually_locked || startup_optimization)
     {
         let mut settings = state.settings.read().clone();
-        if settings.selected_node.as_deref() != Some(best_name.as_str()) {
-            settings.selected_node = Some(best_name.clone());
-            settings.user_manually_selected_node = false;
-            if let Err(e) = state.save_settings(settings) {
-                tracing::warn!("[APP54] 测速自动选点落盘失败: {e}");
-            }
+        let selection_changed = settings.selected_node.as_deref() != Some(best_name.as_str())
+            || settings.user_manually_selected_node;
+        settings.selected_node = Some(best_name.clone());
+        settings.user_manually_selected_node = false;
+        *state.user_manually_selected_node.write() = false;
+        if selection_changed && let Err(e) = state.save_settings(settings) {
+            tracing::warn!("[APP54] 测速自动选点落盘失败: {e}");
         }
         if running {
-            let group = state.main_selector.read().clone();
-            if let Some(group) = group {
-                let _ = api.select_proxy(&group, &best_name).await;
-                let _ = api.select_proxy("GLOBAL", &best_name).await;
+            let main = state.main_selector.read().clone();
+            let mut groups = vec![String::from("Proxy"), String::from("GLOBAL")];
+            if let Some(group) = main
+                && !groups.contains(&group)
+            {
+                groups.insert(0, group);
+            }
+            for group in groups {
+                if let Err(e) = api.select_proxy(&group, &best_name).await {
+                    tracing::debug!("测速择优同步选择组 {group} 失败: {e}");
+                }
+            }
+            if startup_optimization {
+                let _ = api.close_all_connections().await;
             }
         }
         let _ = app.emit("proxies://changed", ());
         crate::core::logger::info(
             crate::core::logger::MOD_NODE,
-            &format!("全量测速完成，自动选择最低延迟节点「{best_name}」({best_delay}ms)"),
+            &if startup_optimization {
+                format!(
+                    "[自动择优] 全量测速完成，已自动选择最低延迟节点「{best_name}」（{best_delay}ms）"
+                )
+            } else {
+                format!("全量测速完成，自动选择最低延迟节点「{best_name}」({best_delay}ms)")
+            },
         );
     } else {
         crate::core::logger::info(
             crate::core::logger::MOD_NODE,
-            &format!("全量测速完成，共 {total} 个节点（用户手动锁定，未自动切换）"),
+            &if best.is_some() {
+                format!("全量测速完成，共 {total} 个节点（用户手动锁定，未自动切换）")
+            } else {
+                format!("全量测速完成，共 {total} 个节点（无可用节点，保持当前选择）")
+            },
         );
     }
 
@@ -2750,6 +2828,14 @@ pub async fn test_all_delays(
             .map(|(n, d)| (n, serde_json::json!(d)))
             .collect(),
     ))
+}
+
+#[tauri::command]
+pub async fn test_all_delays(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    run_all_delays(app, &state, false).await
 }
 
 /// 域名 → 过滤 FakeIP 与虚拟网段 → 真实 TCP 握手计时。
@@ -4366,15 +4452,13 @@ pub async fn set_go_aim_enabled(
             {
                 return;
             }
-            // 内存已有探测结果 → 按评级规则再校准一次；
-            // 否则启动新一轮探测，完成后 apply_selection 自动锁定最佳节点
-            let has_results = !state.aim_results.read().is_empty();
-            if has_results {
+            // 【APP81 任务4】亲手开启开关属于明确人工触发：即使已有缓存，
+            // 也立即复用其选点结果，同时后台重新检测，绝不走自动签名守卫。
+            if !state.aim_results.read().is_empty() {
                 let _ = crate::core::go_aim::apply_selection(&app2, &state).await;
-            } else {
-                crate::core::go_aim::spawn_monitor(app2.clone());
-                crate::core::go_aim::start_probe(app2.clone());
             }
+            crate::core::go_aim::spawn_monitor(app2.clone());
+            crate::core::go_aim::start_probe_with_mode(app2.clone(), None);
         });
     }
     if !enabled {
@@ -4473,7 +4557,7 @@ pub async fn clear_go_aim_pinned_node(
     // 解除手动指定后立即重新评级选点（运行中才有意义）
     if state.settings.read().go_aim_enabled && *state.status.read() == CoreStatus::Running {
         crate::core::go_aim::spawn_monitor(app.clone());
-        crate::core::go_aim::start_probe(app);
+        crate::core::go_aim::start_probe_with_mode(app, None);
     }
     Ok(())
 }
@@ -5231,6 +5315,43 @@ pub async fn export_single_node_report(
             .map_err(|e| format!("写入单节点报告失败：{e}"))?;
     }
     Ok(filename)
+}
+
+#[cfg(test)]
+mod app81_tests {
+    use super::{PostStartOptimizationRoute, lowest_latency_node, post_start_optimization_route};
+
+    #[test]
+    fn test_post_start_optimization_dual_track() {
+        assert_eq!(
+            post_start_optimization_route(false, false),
+            PostStartOptimizationRoute::Latency
+        );
+        assert_eq!(
+            post_start_optimization_route(false, true),
+            PostStartOptimizationRoute::Latency
+        );
+        assert_eq!(
+            post_start_optimization_route(true, false),
+            PostStartOptimizationRoute::Latency
+        );
+        assert_eq!(
+            post_start_optimization_route(true, true),
+            PostStartOptimizationRoute::Aim
+        );
+    }
+
+    #[test]
+    fn test_startup_optimization_selects_lowest_alive_latency() {
+        let delays = vec![
+            ("timeout".to_string(), 0),
+            ("slow".to_string(), 280),
+            ("fast".to_string(), 45),
+            ("middle".to_string(), 120),
+        ];
+        assert_eq!(lowest_latency_node(&delays), Some(("fast".to_string(), 45)));
+        assert_eq!(lowest_latency_node(&[("dead".to_string(), 0)]), None);
+    }
 }
 
 #[cfg(test)]

@@ -1633,7 +1633,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// 若 dns-direct(-bak) 解析被 RST 会中断整个 VPN 启动。提前在扩展侧
     /// 把 server 域名替换为 IP，post-start 零 DNS 请求、瞬时启动。
     /// 优先返回 IPv4，无 IPv4 时返回第一个 IPv6；解析失败返回 nil。
-    /// 【APP22 任务2.2】限时 1.5 秒：getaddrinfo 在弱网/无网下可能阻塞
+    /// 【APP81 任务1.1】限时 0.6 秒：getaddrinfo 在弱网/无网下可能阻塞
     /// 数秒，拖垮 startTunnel 触发 code=12。超时按解析失败处理（保留
     /// 原域名交给内核解析），绝不卡住启动流程；已是 IP 字面量时调用方
     /// 经 isIPLiteral 守卫直接跳过本函数，0ms 通过。
@@ -1646,7 +1646,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             box.value = self.resolveHostToIPInner(trimmed)
             sem.signal()
         }
-        let waitRet = sem.wait(timeout: .now() + 1.5)
+        let waitRet = sem.wait(timeout: .now() + 0.6)
         if waitRet == .timedOut { return nil }
         return box.value
     }
@@ -3113,8 +3113,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             .deletingLastPathComponent()
         for name in ["geoip.db", "geosite.db"] {
             let dst = workDir.appendingPathComponent(name)
+            // 【APP81 任务1.1】完整数据库直接复用；0 字节残留必须移除后重拷，
+            // 否则 copyItem 会因目标已存在而静默失败，内核随后无法启动。
             if FileManager.default.fileExists(atPath: dst.path) {
-                continue
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: dst.path),
+                   let size = attrs[.size] as? NSNumber, size.intValue > 0 {
+                    continue
+                }
+                try? FileManager.default.removeItem(at: dst)
             }
             if let src = Bundle.main.url(forResource: name, withExtension: nil) {
                 try? FileManager.default.copyItem(at: src, to: dst)

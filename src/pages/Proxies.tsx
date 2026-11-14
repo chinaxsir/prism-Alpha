@@ -558,8 +558,6 @@ export default function Proxies() {
     (n) => !keywordLower || n.name.toLowerCase().includes(keywordLower),
   );
 
-  /// 已探测到的结果数：为 0 说明还没跑过探测
-  const aimResultCount = Object.keys(aimResults).length;
   const aimProbing = Boolean(aim?.probing);
   /// 【APP54 任务5】已测速节点数（实测 >0 或超时 0 都算已测，未测为 undefined）
   const testedCount = nodes.filter((n) => typeof lastDelay(n) === "number").length;
@@ -611,18 +609,8 @@ export default function Proxies() {
     return () => clearTimeout(timer);
   }, [aimFinishedAt]);
 
-  // 【APP56 任务2.2】Pro + Go AIM 且尚无解锁标识时自动补一次全量探测
-  const aimAutoProbeRef = useRef(false);
-  useEffect(() => {
-    if (!isProAimMode) {
-      aimAutoProbeRef.current = false;
-      return;
-    }
-    if (coreStatus !== "running") return;
-    if (aimAutoProbeRef.current || aimProbing || aimResultCount > 0) return;
-    aimAutoProbeRef.current = true;
-    runGoAimProbe().catch(() => undefined);
-  }, [isProAimMode, coreStatus, aimProbing, aimResultCount]);
+  // 【APP81 任务4】切页 / 无结果不再自动补测；只有用户按钮、手动开启
+  // Go AIM、VPN 首次启动、实质切网或订阅变化才能发起检测。
 
   const resetFilters = () => {
     setKeyword("");

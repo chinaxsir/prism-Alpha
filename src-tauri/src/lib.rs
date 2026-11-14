@@ -111,8 +111,8 @@ pub fn run() {
                 core::license::clear_cache(&data_dir);
             }
 
-            // 【APP80 任务1.1】启动即后台预热节点域名 DoH 缓存，
-            // 让首次「启动内核」的同步 DoH 直接命中 1800s 缓存。
+            // 【APP81 任务1.1】启动即后台预热节点域名 DoH 缓存，
+            // 让首次「启动内核」的同步 DoH 直接命中 3600s 缓存。
             core::config_builder::warm_node_host_cache(&data_dir);
 
             // 【APP52 任务2】常驻后台遥测：600ms 采样 + telemetry://tick，

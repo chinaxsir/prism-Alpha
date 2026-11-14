@@ -257,14 +257,15 @@ impl KernelHandle {
         let api = KernelApi::new(&config.api_addr, &config.api_secret);
         let mut ready = false;
 
-        for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
+        // 【APP81 任务1.2】先探测再等待，本地控制端口就绪即继续；
+        // 60ms 细粒度轮询取代 500ms 粗等待，总上限仍为 15 秒。
+        for _ in 0..250 {
             if let Ok(value) = api.get_version().await {
                 tracing::info!("sing-box ready: {}", value);
                 ready = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(60)).await;
         }
 
         if !ready {

@@ -576,6 +576,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
   // 与事件流合并后进度、事件、结果完全一致，彻底消除 listen 注册前的丢包。
   applyAimSnapshot: (snap) => {
     if (!snap) return;
+    const previous = get();
     const events = Array.isArray(snap.events) ? snap.events.slice(-30) : [];
     const last = events.length > 0 ? events[events.length - 1] : null;
     const runId = snap.progress?.runId || last?.runId || null;
@@ -588,7 +589,7 @@ export const useCoreStore = create<CoreState>((set, get) => ({
       aimSequence: sequence,
       aimLastError: snap.lastError ?? null,
     };
-    const current = get().goAimStatus;
+    const current = previous.goAimStatus;
     if (current) {
       patch.goAimStatus = {
         ...current,
@@ -598,6 +599,19 @@ export const useCoreStore = create<CoreState>((set, get) => ({
         lockedNode: snap.bestNode ?? current.lockedNode,
         results: snap.results ?? current.results,
       };
+    }
+    // 【APP81 任务3.2】心跳发现后端已结束时，同步完成态与最优节点，
+    // 让运行横幅立即消失，并复用现有 3s 完成横幅/徽章渲染链路。
+    if (!snap.progress.running && !snap.probing) {
+      if (previous.aimProgress.running || previous.goAimStatus?.probing) {
+        patch.aimFinishedAt = Date.now();
+      }
+      if (snap.bestNode) {
+        patch.aimBestNode = {
+          name: snap.bestNode,
+          delayMs: snap.results?.[snap.bestNode]?.delayMs ?? null,
+        };
+      }
     }
     set(patch);
   },
@@ -612,9 +626,27 @@ function aimRunIdNum(runId: string): number {
 // 【APP71 任务2.3】Go AIM 事件监听单例：整个 APP 生命周期只注册一次，
 // 任意页面挂载/卸载都不会重复监听或漏接事件。
 let aimListenersReady: Promise<void> | null = null;
+let aimHeartbeatStarted = false;
+let aimHeartbeatBusy = false;
+
+/** 【APP81 任务3.2】全局 2500ms 心跳：只读快照对账，绝不触发新探测。 */
+function ensureAimHeartbeatStarted(): void {
+  if (aimHeartbeatStarted) return;
+  aimHeartbeatStarted = true;
+  window.setInterval(() => {
+    const state = useCoreStore.getState();
+    const running = state.aimProgress.running || Boolean(state.goAimStatus?.probing);
+    if (!running || aimHeartbeatBusy) return;
+    aimHeartbeatBusy = true;
+    void syncAimSnapshot().finally(() => {
+      aimHeartbeatBusy = false;
+    });
+  }, 2500);
+}
 
 /** 注册 `go-aim://event` 与兼容 `aim://progress` 监听（幂等）。 */
 export function ensureAimListenersRegistered(): Promise<void> {
+  ensureAimHeartbeatStarted();
   if (aimListenersReady) return aimListenersReady;
   aimListenersReady = (async () => {
     await listen<GoAimEvent>("go-aim://event", (e) => {

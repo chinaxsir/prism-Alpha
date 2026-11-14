@@ -1368,8 +1368,8 @@ pub fn build(
     // 阿里/腾讯 DoH 把节点 server 域名解析为真实公网 IPv4 写入配置
     // （tls.server_name / ws Host 已在 node_to_outbound 从独立字段写入，
     // SNI/Host 校验不受影响）；仅接受合法公网 IPv4（剔除 198.18/127/0.0.0.0/
-    // 私网），解析失败或超时（整体 ≤2.6s，结果 1800s 缓存）的域名保留原样，
-    // 由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡绑定）兜底。
+    // 私网），解析失败或超时（构建期整体 ≤450ms，结果 3600s 缓存）的域名保留
+    // 原样，由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡绑定）兜底。
     let mut node_hosts: Vec<String> = Vec::new();
     for parsed in &parsed_list {
         for node in parsed
@@ -1386,7 +1386,7 @@ pub fn build(
     }
     // 【APP80 任务1.1】同步 DoH 预解析恢复（APP79 的纯缓存方案在冷启动时
     // 会让节点域名直接交给内核 dns-direct 兜底，iOS 扩展上首包解析偶发超时）。
-    // 命中 1800s 缓存立即返回；未命中才发起 DoH（整体 ≤2.6s）。
+    // 【APP81 任务1.1】命中 3600s 缓存立即返回；未命中最多等待 450ms。
     // 配合 App 启动 / 订阅更新后的后台预热，绝大多数情况下这里是 0 网络等待。
     let mut node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
     // 【APP65 任务2.1】只保留通过严格公网校验的解析结果（拒绝环回 / 私网 /
@@ -1397,7 +1397,7 @@ pub fn build(
     });
     if !node_ip_map.is_empty() {
         warnings.push(format!(
-            "已预解析 {} 个节点域名为公网 IPv4（300s 缓存，SNI/Host 保留原域名）",
+            "已预解析 {} 个节点域名为公网 IPv4（3600s 缓存，SNI/Host 保留原域名）",
             node_ip_map.len()
         ));
     }
