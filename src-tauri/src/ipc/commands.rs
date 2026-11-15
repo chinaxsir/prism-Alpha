@@ -402,11 +402,13 @@ fn post_start_optimization_route(
     }
 }
 
-/// 内核就绪 800ms 后在后台执行启动择优；AppState 由 Tauri 管理，后台任务
-/// 通过 AppHandle 重新取用，避免为单一函数改变全局状态所有权。
+/// 【APP82 任务3.2.1】内核就绪 1200ms 后在后台执行启动择优：给 iOS utun
+/// 路由与物理网卡绑定留出稳定时间，避免启动后 24ms 抢跑导致全员 0ms DEAD。
+/// AppState 由 Tauri 管理，后台任务通过 AppHandle 重新取用，避免为单一
+/// 函数改变全局状态所有权。
 fn spawn_post_start_node_optimization(app_handle: AppHandle, _state: &AppState) {
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         let state = app_handle.state::<AppState>();
         if *state.status.read() != CoreStatus::Running {
             return;
@@ -800,9 +802,9 @@ fn ensure_valid_selected_node(state: &AppState) -> Option<String> {
 fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group: String) {
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter as _;
-        // 【APP26 任务2.3 时机2】启动成功后延迟 800ms 再整组测速：给内核
+        // 【APP82 任务3.2.1】启动成功后延迟 1200ms 再整组测速：给内核
         // Clash API 与代理连接留出就绪时间，测速结果更准确
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         // 等待期间用户手动点选节点或开启了 Go AIM → 尊重用户，不覆盖
         {
             let st = app.state::<AppState>();
