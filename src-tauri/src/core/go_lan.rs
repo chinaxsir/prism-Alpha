@@ -1605,12 +1605,16 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 // 【APP50 任务2】config_builder 重新启用：log11 实证 iOS 扩展内节点域名
 // UDP DNS 被 utun 自拦截失败（0ms 超时），主进程构建期 DoH 预解析为
 // 公网 IPv4 写入 server（SNI/Host 保留原域名），内核 dns-direct 兜底。
-/// 【APP81 任务1.1】节点域名 DoH 结果缓存 3600s。
+/// 【APP81 任务1.1】节点域名解析结果缓存 3600s。
 /// 节点服务器 IP 极少变动，延长缓存避免设置调整后的重复启动再次同步等待。
 const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-/// 【APP83 任务3.1】配置构建期不再同步 DoH（只读内存缓存），未命中的
-/// 域名由内核 dns-direct 兜底；后台解析使用下面的预热等待。
-/// 后台预热不参与启动关键路径，可等待完整 DoH 结果以提高后续缓存命中率。
+/// 【APP84 任务1.1】配置构建期同步预解析的硬上限 1200ms：
+/// 未命中缓存的域名并发走 UDP 53（223.5.5.5 / 119.29.29.29，单次 800ms）
+/// + 阿里 DoH 兜底，超时即放弃（保留原域名交给内核 dns-direct），
+/// 既不重演 v0.4.13「18 个长域名节点全部裸域名下发」的全挂，
+/// 也不重演更早版本 5.7s 的启动阻塞。
+const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(1200);
+/// 后台预热不参与启动关键路径，可等待更完整的解析结果以提高缓存命中率。
 const NODE_HOST_WARMUP_WAIT: std::time::Duration = std::time::Duration::from_millis(2600);
 
 fn node_host_cache()
@@ -1663,39 +1667,44 @@ pub(crate) fn get_cached_node_hosts_ipv4(
     out
 }
 
-/// 【APP45 任务2.2】并发 DoH 批量解析代理节点域名 → 真实公网 IPv4。
+/// 【APP84 任务1.1】配置构建期同步批量解析（命中缓存 0ms）：
+/// `config_builder::build()` 直接调用本函数，保证「节点3」等长域名节点
+/// 在写入 `prism_config.json` 前就被替换为真实公网 IPv4（SNI/Host 保留
+/// 原域名）。总阻塞上限 1200ms。
+pub(crate) fn doh_resolve_node_hosts_ipv4(
+    hosts: &[String],
+) -> std::collections::HashMap<String, String> {
+    doh_resolve_node_hosts_ipv4_with_wait(hosts, NODE_HOST_BUILD_WAIT)
+}
+
+/// 【APP45 任务2.2】并发批量解析代理节点域名 → 真实公网 IPv4。
 ///
 /// 背景：`hk1.xxx.the-best-airport.com` 等多级动态域名在 iOS
 /// NEPacketTunnelProvider 扩展内经系统 DNS 解析会被 utun 自拦截超时；
-/// 主进程（有正常网络权限）在构建配置前并发 DoH 解析并把节点 server
+/// 主进程（有正常网络权限）在构建配置前并发解析并把节点 server
 /// 替换为真实 IPv4（TLS server_name 已独立保存 SNI，不受影响），内核
 /// 0ms 直接 TCP+TLS 握手。解析失败/超时的域名不在返回表内，调用方保留
-/// 原域名，由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡
-/// 绑定）兜底解析（保险 2）。
+/// 原域名，由内核 dns-direct（UDP 223.5.5.5）兜底解析（保险 2）。
 ///
-/// 整体在独立工作线程 + current_thread runtime 内并发执行，仅供后台预热
-/// 使用；配置构建只走 `get_cached_node_hosts_ipv4`。拒绝返回环回/未指定/
-/// 私网/fake-ip（198.18/15）等非法解析结果。
+/// 【APP84 任务1.1】解析通道改为「阿里/腾讯 UDP 53 并发 + 阿里 DoH 兜底」：
+/// 纯 HTTP DoH 在部分机场节点封禁 HTTPS 出站时会全灭，UDP 53 是节点
+/// 域名解析的最后一公里。整体在独立工作线程 + current_thread runtime 内
+/// 逐域名流式回传（先完成的先写入缓存，超时不影响其它域名）。
+/// 拒绝返回环回/未指定/私网/fake-ip（198.18/15）等非法解析结果。
 fn doh_resolve_node_hosts_ipv4_with_wait(
     hosts: &[String],
     max_wait: std::time::Duration,
 ) -> std::collections::HashMap<String, String> {
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // 3600s 缓存命中直接返回（热路径 0ms）
+    let mut out = get_cached_node_hosts_ipv4(hosts);
     let mut todo: Vec<String> = Vec::new();
     for h in hosts {
         let key = h.trim().to_ascii_lowercase();
         if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
             continue;
         }
-        // 3600s 缓存命中直接用
-        if let Ok(mut c) = node_host_cache().lock() {
-            if let Some((ip, at)) = c.get(&key) {
-                if at.elapsed() < NODE_HOST_CACHE_TTL {
-                    out.insert(key, ip.clone());
-                    continue;
-                }
-                c.remove(&key);
-            }
+        if out.contains_key(&key) {
+            continue;
         }
         if !todo.contains(&key) {
             todo.push(key);
@@ -1704,35 +1713,35 @@ fn doh_resolve_node_hosts_ipv4_with_wait(
     if todo.is_empty() {
         return out;
     }
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, Option<String>)>>();
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
     std::thread::spawn(move || {
-        let result = match tokio::runtime::Builder::new_current_thread()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt.block_on(async move {
-                let mut set: tokio::task::JoinSet<(String, Option<String>)> =
-                    tokio::task::JoinSet::new();
-                for host in todo {
-                    set.spawn(async move {
-                        let ip = doh_query_ipv4(&host).await;
-                        (host, ip)
-                    });
-                }
-                let mut done = Vec::new();
-                while let Some(joined) = set.join_next().await {
-                    if let Ok(pair) = joined {
-                        done.push(pair);
-                    }
-                }
-                done
-            }),
-            Err(_) => Vec::new(),
+        else {
+            return;
         };
-        let _ = tx.send(result);
+        rt.block_on(async move {
+            let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            for host in todo {
+                let tx = tx.clone();
+                set.spawn(async move {
+                    let ip = resolve_host_ipv4(&host).await;
+                    // 逐域名回传：慢域名不拖累已完成的结果
+                    let _ = tx.send((host, ip));
+                });
+            }
+            while set.join_next().await.is_some() {}
+        });
     });
-    let resolved = rx.recv_timeout(max_wait).unwrap_or_default();
-    for (host, maybe_ip) in resolved {
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Ok((host, maybe_ip)) = rx.recv_timeout(remaining) else {
+            break;
+        };
         let Some(ip) = maybe_ip else { continue };
         // 只接受真实公网 IPv4：拒绝环回/0.0.0.0/私网/fake-ip 等污染结果
         let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() else {
@@ -1752,6 +1761,24 @@ fn doh_resolve_node_hosts_ipv4_with_wait(
         out.insert(host, ip);
     }
     out
+}
+
+/// 【APP84 任务1.1】单域名解析总编排：UDP 53（阿里 + 腾讯并发）优先，
+/// 两者都失败再走阿里 DoH（HTTPS 443）兜底。
+/// 复用 `ipc::commands` 中 APP66 已落地的纯异步 UDP/DoH 实现，避免重复
+/// 维护两套 DNS 报文编解码。
+async fn resolve_host_ipv4(host: &str) -> Option<String> {
+    let ali = crate::ipc::commands::udp_dns_query_ipv4(host, "223.5.5.5:53");
+    let tencent = crate::ipc::commands::udp_dns_query_ipv4(host, "119.29.29.29:53");
+    let (a, b) = tokio::join!(ali, tencent);
+    if let Some(ip) = a.into_iter().next().or_else(|| b.into_iter().next()) {
+        return Some(ip.to_string());
+    }
+    crate::ipc::commands::doh_alias_ipv4(host)
+        .await
+        .into_iter()
+        .next()
+        .map(|ip| ip.to_string())
 }
 
 /// 从 DoH JSON 的 Answer 数组取第一条 `type == 1` 的合法 IPv4 记录。
@@ -4353,6 +4380,35 @@ mod tests {
             "缓存读取必须瞬时完成"
         );
         assert!(out.is_empty(), "IP 字面量与空域名不得走 DoH 缓存");
+    }
+
+    /// 【APP84 任务1.1】构建期同步预解析必须存在且总预算 ≤1200ms；
+    /// UDP 53 双通道并发 + 阿里 DoH 兜底，且不得回退到 getaddrinfo。
+    #[test]
+    fn test_app84_build_time_resolve_budget() {
+        let src = include_str!("go_lan.rs");
+        assert!(
+            src.contains(
+                "NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(1200)"
+            ),
+            "构建期解析阻塞上限必须锁定 1200ms"
+        );
+        assert!(
+            src.contains("pub(crate) fn doh_resolve_node_hosts_ipv4("),
+            "build() 依赖的公开同步解析入口必须存在"
+        );
+        assert!(src.contains("udp_dns_query_ipv4(host, \"223.5.5.5:53\")"));
+        assert!(src.contains("udp_dns_query_ipv4(host, \"119.29.29.29:53\")"));
+        assert!(
+            src.contains("crate::ipc::commands::doh_alias_ipv4(host)"),
+            "UDP 双通道失败后必须有 DoH 兜底"
+        );
+        // 用 concat! 拆开字面量，避免 include_str! 命中本测试自身的源码文本
+        let system_lookup = concat!(".lookup", "_host(");
+        assert!(
+            !src.contains(system_lookup),
+            "节点域名解析严禁回退到系统解析器（iOS mDNSResponder 单线程会堵死）"
+        );
     }
 
     #[test]

@@ -2493,7 +2493,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 3. 重构 DNS：
         //    - dns-remote 使用 ipv4_only（确保返回给 Safari 的全为 IPv4，100% 流量进入 utun）
         //    - dns-direct 使用 prefer_ipv4（确保蜂窝流量下解析 VLESS 节点域名时同时支持 IPv4 与 IPv6）
-        //    - dns-remote 用 tcp://8.8.8.8：Cloudflare 官方安全策略禁止
+        //    - dns-remote 用 https://8.8.8.8/dns-query：Cloudflare 官方安全策略禁止
         //      Worker 节点出站连接 1.1.1.1，代理 DNS 请求 100% 被边缘拒绝
         //    - rules 补齐直连/全局模式与国内域名分流：直连模式下 DNS
         //      也必须走 dns-direct（223.5.5.5），否则连百度都打不开

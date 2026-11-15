@@ -64,9 +64,10 @@ const PROBE_TIMEOUT_MS: u64 = 2800;
 const PROBE_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// 【APP73 任务2.1】单次 HTTP 请求总超时（8 秒）
 const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
-/// 【APP81 任务3.2】单个平台完整探测硬超时（6 秒，含响应头、正文分块
+/// 【APP84 任务2.3】单个平台完整探测硬超时（5500ms，含响应头、正文分块
 /// 读取与最多 1 次补测；Semaphore 排队时间不计入）。
-const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 6;
+/// 7 平台在 4 路并发下最多 2 波 ≈ 11s，给 15s 单节点看门狗留出余量。
+const PROBE_PLATFORM_HARD_TIMEOUT_MS: u64 = 5500;
 /// 【APP83 任务2.2】单节点全流程绝对看门狗（15s）：从选择器切换、健康检查、
 /// 出口检测到 7 平台探测整体计时，超时直接 drop 整个 future。
 const MAX_NODE_DEEP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -202,7 +203,7 @@ async fn fetch_egress(client: &reqwest::Client) -> EgressInfo {
         if !resp.status().is_success() {
             continue;
         }
-        if let Ok(text) = resp.text().await {
+        if let Ok(text) = read_bounded_body_lossy(resp, 65536).await {
             let egress = EgressInfo {
                 ip: parse_trace_ip(&text),
                 country: parse_trace_loc(&text),
@@ -1146,6 +1147,14 @@ fn start_probe_inner(
     // 【APP54 任务2】防重复：swap 返回 true 表示上一轮仍在进行，直接跳过；
     // 返回 false 表示刚抢到执行权，继续启动本轮探测。
     if state.aim_probing.swap(true, Ordering::AcqRel) {
+        // 【APP84 任务2.1】自动触发的重复请求必须 100% 静默：绝不写
+        // state.aim_progress.error_message、绝不发射 ERROR 事件、绝不打印
+        // [AIM-21] ERROR，也绝不触碰在途任务的进度（此前 14:22:20.879 的
+        // 重复 auto 触发把「已有 Go AIM 检测任务在运行」红字留到了检测结束）。
+        if trigger == "auto" {
+            tracing::debug!("[go-aim] 探测已在进行中，静默忽略重复的自动触发");
+            return;
+        }
         tracing::debug!("[go-aim] 探测已在进行中，跳过重复触发");
         let msg = "已有 Go AIM 检测任务在运行，请稍候";
         run.log(
@@ -1295,12 +1304,6 @@ fn start_probe_inner(
                     AimLogMeta::default(),
                     format!("锁定状态: mode={lock_mode}, active_node={active}"),
                 );
-                // 只有正常完成才允许 100%
-                {
-                    let mut p = state.aim_progress.lock();
-                    p.done = p.total;
-                    p.pending_count = 0;
-                }
                 if count == 0 {
                     // [AIM-21] 零存活：明确 ERROR，绝不显示 100%/成功
                     let msg = "本轮 0 个节点存活，探测结束（可能节点全部失效或网络不可用）";
@@ -1319,6 +1322,22 @@ fn start_probe_inner(
                         None,
                     );
                 } else {
+                    // 【APP84 任务2.2】阶段二队列全部处理完毕 → 无条件终态收尾：
+                    // full_total 在阶段二初始化时已锁定为 alive_count，这里把
+                    // full_done 补齐到同一数值，recompute_aim 才能把
+                    // pending_count 归零并让 FINISHED 事件携带 percent=100。
+                    {
+                        let mut p = state.aim_progress.lock();
+                        let alive_total = p.full_total.max(1);
+                        p.full_total = alive_total;
+                        p.full_done = alive_total;
+                        p.done = p.total.max(p.failed_count + alive_total);
+                        p.total = p.done;
+                        p.pending_count = 0;
+                        p.percent = 100;
+                        p.running = false;
+                        p.error_message = None;
+                    }
                     run.log(
                         21,
                         "INFO",
@@ -1624,12 +1643,35 @@ async fn probe_all(
         use futures_util::StreamExt as _;
         let sem = Arc::new(tokio::sync::Semaphore::new(SCREEN_BATCH_SIZE));
         let ep_map_c = ep_map.clone();
+        // 【APP84 任务2.1】阶段一复用「全量测速」的 60 秒内新鲜结果：
+        // 内核刚启动时 commands.rs 的 test_all_delays 与 Go AIM 会同时抢
+        // Clash API，28 个正常节点在队列里被挤成 0ms 假死（diagnostic-log
+        // 第 120～160 行）。60s 内已测出的有效延迟直接复用，0 重复请求。
+        let fresh_delays: std::collections::HashMap<String, u64> = {
+            let metrics = state.node_metrics.read();
+            let fresh = now_secs().saturating_sub(metrics.updated_at) <= 60;
+            if fresh {
+                metrics
+                    .delays
+                    .iter()
+                    .filter(|(_, d)| **d > 0 && (**d as u64) < PROBE_MAX_DELAY_MS)
+                    .map(|(name, d)| (name.clone(), *d as u64))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        };
         let mut stream = futures_util::stream::iter(nodes.iter().cloned())
             .map(move |(name, _)| {
                 let api = api.clone();
                 let sem = sem.clone();
                 let ep_map = ep_map_c.clone();
+                let cached = fresh_delays.get(&name).copied();
                 async move {
+                    // 已在本轮全量测速中测出的节点直接复用，不占用并发许可
+                    if let Some(d) = cached {
+                        return (name, Some(d));
+                    }
                     let _permit = sem.acquire_owned().await.ok();
                     let delay = if let Some((server, port)) = ep_map.get(&name) {
                         // 预览模式：离线 TCP 握手测速
@@ -2099,14 +2141,16 @@ async fn probe_all(
     // 现在只以 cdn-cgi/trace 的 egress_ip + country 作为参考证据，
     // 即使 trace 偶发超时也照常执行 7 平台实测，绝不提前短路。
 
-    // 【APP72 任务1.3】阶段2 进度初始化：full_total 必须是「全部候选节点总数」
-    //（含阶段1 已淘汰节点），processed = failed_count + full_done + cache_hits，
-    // 只有 processed == total 时进度才允许到达 100%。
+    // 【APP84 任务2.2】阶段2 进度初始化：`full_total` 必须严格等于实际进入
+    // 阶段二队列的存活节点数（`alive_count`），否则 6 个存活节点全部测完时
+    // 分母仍是 34，进度永远停在 63%（IMG_0236 卡死根因）。
+    // 整体进度 =（死亡节点 + 已深测节点）/ 总候选节点，死亡节点在阶段一已
+    // 计入 `failed_count`，因此只有全部节点处理完 `pending_count` 才归零。
     {
         let mut p = state.aim_progress.lock();
         p.phase = "DEEP_PROBE".into();
         p.run_id = run.run_id.clone();
-        p.full_total = p.total.max(alive_count);
+        p.full_total = alive_count;
         p.full_done = 0;
         p.cache_hits = 0;
         p.active_slots = slot_clients.len();
@@ -2585,7 +2629,7 @@ async fn read_verified_body(
     if status == 429 {
         return Err(ProbeVerdict::Unknown);
     }
-    let body = match resp.text().await {
+    let body = match read_bounded_body_lossy(resp, 65536).await {
         Ok(b) => b,
         Err(_) => return Err(ProbeVerdict::Unknown),
     };
@@ -2730,7 +2774,9 @@ async fn fetch_chain_with_cookies(
             continue;
         }
 
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_bounded_body_lossy(resp, 65536)
+            .await
+            .unwrap_or_default();
         return Ok(ChainPage {
             status,
             headers,
@@ -2765,6 +2811,48 @@ fn body_region_evidence(lc: &str) -> bool {
         || lc.contains("this content is not available in your location")
 }
 
+/// 【APP84 任务2.3】统一流式有界容错正文读取。
+///
+/// 替代 `resp.text().await`：后者在大页面（YouTube / Netflix / ChatGPT 首页）
+/// 传输中途被 gzip 截断或连接保持时会苦等十几秒，然后丢弃已收到的全部
+/// HTML 并报 `error decoding response body`（诊断日志实测 18,292ms）。
+/// 本函数：
+/// 1. 最多只读 `max_bytes`（默认 64KB），单 chunk 最多等 2.2s；
+/// 2. 已读到 ≥256 字节后，无论 EOF 截断还是单 chunk 超时，都返回已读部分
+///    用于业务特征匹配，绝不再报 BODY_PARSE_ERROR 丢弃证据。
+async fn read_bounded_body_lossy(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(65536));
+    while buf.len() < max_bytes {
+        match tokio::time::timeout(std::time::Duration::from_millis(2200), resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                let remain = max_bytes - buf.len();
+                buf.extend_from_slice(&chunk[..chunk.len().min(remain)]);
+                if buf.len() >= max_bytes {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break, // 正常读完 EOF
+            Ok(Err(e)) => {
+                // 关键容错：已读到 ≥256 字节有效内容后发生流截断，返回已读部分
+                if buf.len() >= 256 {
+                    break;
+                }
+                return Err(format!("BODY_PARSE_ERROR: {e}"));
+            }
+            Err(_) => {
+                if buf.len() >= 256 {
+                    break;
+                }
+                return Err("TASK_TIMEOUT: 读取响应正文超时".to_string());
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// 读取响应状态码、响应头与正文；正文读取失败统一归为 BODY_PARSE_ERROR。
 async fn read_body(
     resp: reqwest::Response,
@@ -2772,7 +2860,7 @@ async fn read_body(
 ) -> Result<(u16, reqwest::header::HeaderMap, String), ServiceProbeResult> {
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    match resp.text().await {
+    match read_bounded_body_lossy(resp, 65536).await {
         Ok(body) => Ok((status, headers, body)),
         Err(e) => Err(svc_unknown_status(
             service,
@@ -4117,9 +4205,12 @@ async fn probe_node(
     let mut futs: futures_util::stream::FuturesUnordered<
         std::pin::Pin<Box<dyn std::future::Future<Output = ServiceProbeResult> + Send>>,
     > = futures_util::stream::FuturesUnordered::new();
-    // 【APP75 任务3.2】单节点内部并发闸门：同一节点同一时刻最多 3 个平台
-    // 同时发起 HTTPS 请求，避免 7 路同一毫秒突发握手被中转服务器限流重置
+    // 【APP84 任务2.3】单节点内部并发闸门：同一节点同一时刻最多
+    // PER_NODE_PLATFORM_CONCURRENCY（4）个平台同时发起 HTTPS 请求，
+    // 避免 7 路同一毫秒突发握手被中转服务器限流重置
     // （diagnostic log 中 Claude/Gemini 报 error sending request 的根因）。
+    // 计时在 acquire() 之后才开始（probe_platform 内部），排队时间不计入
+    // 平台 5.5s 硬超时，杜绝 elapsed=0ms 的假超时。
     let platform_sem =
         std::sync::Arc::new(tokio::sync::Semaphore::new(PER_NODE_PLATFORM_CONCURRENCY));
     {
@@ -4639,18 +4730,18 @@ fn all_unknown_result(name: &str, delay: u64, reason: String, kind: AimErrorKind
     }
 }
 
-/// 【APP81 任务3.2】平台级 6 秒硬超时包裹（含正文读取与 Unknown 补测 1 次）。
+/// 【APP84 任务2.3】平台级 5.5 秒硬超时包裹（含正文读取与 Unknown 补测 1 次）。
 async fn probe_platform<F, Fut>(service: &'static str, f: F) -> ServiceProbeResult
 where
     F: Fn() -> Fut + Send,
     Fut: std::future::Future<Output = ServiceProbeResult> + Send,
 {
-    probe_platform_timeout(service, PROBE_PLATFORM_HARD_TIMEOUT_SECS, f).await
+    probe_platform_timeout(service, PROBE_PLATFORM_HARD_TIMEOUT_MS, f).await
 }
 
 async fn probe_platform_timeout<F, Fut>(
     service: &'static str,
-    timeout_secs: u64,
+    timeout_ms: u64,
     f: F,
 ) -> ServiceProbeResult
 where
@@ -4658,7 +4749,7 @@ where
     Fut: std::future::Future<Output = ServiceProbeResult> + Send,
 {
     match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
+        std::time::Duration::from_millis(timeout_ms),
         probe_with_retry(f),
     )
     .await
@@ -4668,7 +4759,7 @@ where
             let mut result = svc_unknown_status(
                 service,
                 None,
-                format!("平台探测硬超时({timeout_secs}s)"),
+                format!("平台探测硬超时({timeout_ms}ms)"),
                 AimErrorKind::TaskTimeout,
             );
             result.verdict_basis = "TASK_TIMEOUT: 超过平台级硬超时上限".to_string();
@@ -4755,7 +4846,7 @@ async fn verify_basic_https_proxy_health(
     for (label, url) in &TARGETS {
         let start = std::time::Instant::now();
         let r = tokio::time::timeout(
-            std::time::Duration::from_secs(PROBE_PLATFORM_HARD_TIMEOUT_SECS),
+            std::time::Duration::from_millis(PROBE_PLATFORM_HARD_TIMEOUT_MS),
             client.get(*url).send(),
         )
         .await;
@@ -6233,6 +6324,47 @@ mod tests {
         assert!(
             src.contains("TASK_TIMEOUT: 节点深度探测超过 15s"),
             "看门狗超时文案必须与 15s 预算一致"
+        );
+    }
+
+    /// 【APP84 任务2】自动触发静默、full_total=alive_count、终态 100%、
+    /// 有界正文读取四项必须同时成立，任一退化都会复现「卡 63% / 红字」。
+    #[test]
+    fn test_app84_aim_terminal_and_silent_auto_trigger() {
+        let src = include_str!("go_aim.rs");
+        assert!(
+            src.contains("if trigger == \"auto\" {\n            tracing::debug!(\"[go-aim] 探测已在进行中，静默忽略重复的自动触发\");\n            return;\n        }"),
+            "auto 重复触发必须静默返回，禁止写 error_message / 发射 ERROR"
+        );
+        assert!(
+            src.contains("p.full_total = alive_count;"),
+            "阶段二分母必须严格等于存活节点数，否则永远停在 63%"
+        );
+        // 用 concat! 拆开字面量，避免 include_str! 命中本测试自身的源码文本
+        let old_total = concat!("p.full_total = p.total.max(", "alive_count);");
+        assert!(
+            !src.contains(old_total),
+            "旧的分母写法会把分母放大到候选总数，必须删除"
+        );
+        assert!(
+            src.contains("p.full_done = alive_total;\n                        p.done = p.total.max(p.failed_count + alive_total);")
+                && src.contains("p.percent = 100;"),
+            "全部节点处理完必须无条件收尾为 100%"
+        );
+        assert!(
+            src.contains("async fn read_bounded_body_lossy"),
+            "必须存在统一有界容错正文读取"
+        );
+        let live_code = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("///") && !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 用 concat! 拆开字面量，避免命中本测试自身的源码文本
+        let unbounded_read = concat!("resp", ".text().await");
+        assert!(
+            !live_code.contains(unbounded_read),
+            "严禁再使用无界的响应正文读取"
         );
     }
 

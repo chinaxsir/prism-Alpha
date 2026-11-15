@@ -1384,10 +1384,13 @@ pub fn build(
             }
         }
     }
-    // 【APP83 任务3.1】配置构建严禁同步 DoH：只读内存缓存（0ms），未命中
-    // 的域名交给内核 dns-direct 直连解析，同时起后台线程静默补缓存，
-    // 下次构建命中。App 启动 / 订阅更新已有后台预热，热路径通常全命中。
-    let mut node_ip_map = crate::core::go_lan::get_cached_node_hosts_ipv4(&node_hosts);
+    // 【APP84 任务1.1】恢复构建期同步预解析（命中 3600s 缓存时 0ms）：
+    // v0.4.13 改成只读空缓存后，「节点3」的 18 个长域名节点在内核里
+    // 全部以裸域名下发，iOS 扩展内解析失败导致 18 个 DEAD 0ms。
+    // 现在未命中的域名由 go_lan 并发走 UDP 53（223.5.5.5 / 119.29.29.29）
+    // + 阿里 DoH 兜底，整体阻塞上限 1200ms；仍失败的域名保留原样，
+    // 由内核 dns-direct 兜底。
+    let mut node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
     crate::core::go_lan::spawn_background_resolve_node_hosts(node_hosts.clone());
     // 【APP65 任务2.1】只保留通过严格公网校验的解析结果（拒绝环回 / 私网 /
     // FakeIP 198.18/15 / CGNAT 100.64/10 / TUN 172.19/16 等污染地址）
@@ -1427,6 +1430,7 @@ pub fn build(
                 &apply,
                 &mut total_nodes,
                 &node_ip_map,
+                settings.ipv6,
             ) {
                 node_tags.push(t);
             }
@@ -1442,6 +1446,7 @@ pub fn build(
                     &apply,
                     &mut total_nodes,
                     &node_ip_map,
+                    settings.ipv6,
                 ) {
                     node_tags.push(t);
                 }
@@ -2462,7 +2467,19 @@ fn emit_node(
     apply: &dyn Fn(&str) -> String,
     total_nodes: &mut usize,
     _ip_map: &std::collections::HashMap<String, String>,
+    allow_ipv6: bool,
 ) -> Option<String> {
+    // 【APP84 任务1.3】IPv4 模式下过滤纯 IPv6 字面量节点：
+    // 这类节点会让内核发起 `dial udp [2607:...]:5021: connect: no route to
+    // host`（诊断日志第 17～24 行），既刷屏又拖慢启动。仅在用户显式开启
+    // IPv6 时保留。
+    if !allow_ipv6 && node.server.trim().parse::<std::net::Ipv6Addr>().is_ok() {
+        warnings.push(format!(
+            "节点 '{}' 为纯 IPv6 字面量地址，IPv4 模式下已跳过",
+            node.name
+        ));
+        return None;
+    }
     // 【APP32 任务1.2】同名节点自动去重：两个相同 tag 的 outbound 会让
     // sing-box 直接启动失败，自动追加 " (2)"/" (3)" 序号后缀确保 tag 唯一。
     let mut tag = apply(&node.name);
@@ -6231,6 +6248,65 @@ rules:
                 Some(format!("GO-AIM-PROBE-{slot}").as_str())
             );
         }
+    }
+
+    // ================= 【APP84】回归测试 =================
+
+    /// APP84 任务1.1/1.3：构建期必须同步预解析节点域名（v0.4.13 改成纯缓存
+    /// 后，节点3 的 18 个长域名节点在 iOS 扩展内全部 DEAD 0ms）；
+    /// IPv4 模式下纯 IPv6 字面量节点必须被跳过，杜绝
+    /// `dial udp [2607:...]:5021: no route to host`。
+    #[test]
+    fn app84_test1_sync_resolve_and_ipv6_filter() {
+        let src = include_str!("config_builder.rs");
+        assert!(
+            src.contains("crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts)"),
+            "build() 必须同步调用 doh_resolve_node_hosts_ipv4"
+        );
+        // 用 concat! 拆开字面量，避免 include_str! 命中本测试自身的源码文本
+        let old_call = concat!(
+            "let mut node_ip_map = crate::core::go_lan::get_cached",
+            "_node_hosts_ipv4(&node_hosts);"
+        );
+        assert!(!src.contains(old_call), "严禁退回只读空缓存的构建路径");
+
+        let sub = vec![(
+            "https://sub.example".into(),
+            "订阅1".into(),
+            "proxies:\n  - {name: V4, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}\n  - {name: V6, type: ss, server: '2607:5300:203:1d1e::1', port: 8388, cipher: aes-256-gcm, password: pw}\nproxy-groups:\n  - {name: 节点选择, type: select, proxies: [V4, V6]}\nrules:\n  - MATCH,节点选择\n".to_string(),
+        )];
+        let built = build(
+            &sub,
+            &[],
+            RunMode::Tun,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-app84-t1"),
+            &std::env::temp_dir().join("prism-cb-test-app84-t1/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+        let outbounds = built.config["outbounds"].as_array().unwrap();
+        assert!(
+            outbounds.iter().any(|o| o["tag"].as_str() == Some("V4")),
+            "IPv4 节点必须保留"
+        );
+        assert!(
+            !outbounds.iter().any(|o| o["tag"].as_str() == Some("V6")),
+            "IPv4 模式下纯 IPv6 字面量节点必须被过滤"
+        );
+        // 策略组成员不得残留悬空引用
+        let group = outbounds
+            .iter()
+            .find(|o| o["tag"].as_str() == Some("节点选择"))
+            .expect("策略组缺失");
+        let members = group["outbounds"].as_array().unwrap();
+        assert!(
+            !members.iter().any(|m| m.as_str() == Some("V6")),
+            "策略组必须同步剔除被过滤的节点"
+        );
     }
 
     // ================= 【APP72】回归测试 =================

@@ -3044,32 +3044,37 @@ fn parse_dns_a_response(buf: &[u8], query_id: u16) -> Vec<std::net::Ipv4Addr> {
 /// 【APP66 任务5.1】异步 UDP DNS A 查询：223.5.5.5 → 119.29.29.29 依次兜底，
 /// 单服务器超时 800ms；完全不触碰系统 getaddrinfo / mDNSResponder。
 async fn resolve_ipv4_via_udp_dns(domain: &str) -> Vec<std::net::Ipv4Addr> {
-    let Some((query, id)) = build_dns_a_query(domain) else {
-        return Vec::new();
-    };
     for server in ["223.5.5.5:53", "119.29.29.29:53"] {
-        let Ok(socket) = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await else {
-            continue;
-        };
-        if socket.connect(server).await.is_err() {
-            continue;
-        }
-        if socket.send(&query).await.is_err() {
-            continue;
-        }
-        let mut buf = [0u8; 1500];
-        let recv =
-            tokio::time::timeout(std::time::Duration::from_millis(800), socket.recv(&mut buf))
-                .await;
-        let Ok(Ok(n)) = recv else {
-            continue;
-        };
-        let ips = parse_dns_a_response(&buf[..n], id);
+        let ips = udp_dns_query_ipv4(domain, server).await;
         if !ips.is_empty() {
             return ips;
         }
     }
     Vec::new()
+}
+
+/// 【APP84 任务1.1】对单个公共 DNS 服务器做一次 UDP A 查询（超时 800ms）。
+/// 供 `go_lan` 的节点域名预解析并发调用（阿里 / 腾讯双通道）。
+pub(crate) async fn udp_dns_query_ipv4(domain: &str, server: &str) -> Vec<std::net::Ipv4Addr> {
+    let Some((query, id)) = build_dns_a_query(domain) else {
+        return Vec::new();
+    };
+    let Ok(socket) = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await else {
+        return Vec::new();
+    };
+    if socket.connect(server).await.is_err() {
+        return Vec::new();
+    }
+    if socket.send(&query).await.is_err() {
+        return Vec::new();
+    }
+    let mut buf = [0u8; 1500];
+    let recv =
+        tokio::time::timeout(std::time::Duration::from_millis(800), socket.recv(&mut buf)).await;
+    let Ok(Ok(n)) = recv else {
+        return Vec::new();
+    };
+    parse_dns_a_response(&buf[..n], id)
 }
 
 static SPEEDTEST_DOH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -3084,6 +3089,17 @@ async fn resolve_real_ipv4s(server: &str, _port: u16, _timeout_ms: u32) -> Vec<s
             vec![ip]
         };
     }
+    let mut out: Vec<std::net::Ipv4Addr> = doh_alias_ipv4(server).await;
+    if out.is_empty() {
+        // 【APP66 任务5.1】系统 DNS 兜底 → 纯异步 UDP DNS（不经过 mDNSResponder）
+        out = resolve_ipv4_via_udp_dns(server).await;
+    }
+    out
+}
+
+/// 【APP84 任务1.1】阿里 DoH（223.5.5.5:443）一次性 A 记录查询。
+/// 供 `go_lan` 的节点域名预解析在 UDP 53 双通道全部失败后兜底。
+pub(crate) async fn doh_alias_ipv4(server: &str) -> Vec<std::net::Ipv4Addr> {
     let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
     let client = SPEEDTEST_DOH_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -3111,10 +3127,6 @@ async fn resolve_real_ipv4s(server: &str, _port: u16, _timeout_ms: u32) -> Vec<s
                 out.push(ip);
             }
         }
-    }
-    if out.is_empty() {
-        // 【APP66 任务5.1】系统 DNS 兜底 → 纯异步 UDP DNS（不经过 mDNSResponder）
-        out = resolve_ipv4_via_udp_dns(server).await;
     }
     out
 }
