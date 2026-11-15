@@ -1608,8 +1608,8 @@ async fn doh_query_ipv4(host: &str) -> Option<String> {
 /// 【APP81 任务1.1】节点域名 DoH 结果缓存 3600s。
 /// 节点服务器 IP 极少变动，延长缓存避免设置调整后的重复启动再次同步等待。
 const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-/// 配置构建期未命中缓存时的批量 DoH 最大等待；超时保留域名由内核直连 DNS 兜底。
-const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(450);
+/// 【APP83 任务3.1】配置构建期不再同步 DoH（只读内存缓存），未命中的
+/// 域名由内核 dns-direct 兜底；后台解析使用下面的预热等待。
 /// 后台预热不参与启动关键路径，可等待完整 DoH 结果以提高后续缓存命中率。
 const NODE_HOST_WARMUP_WAIT: std::time::Duration = std::time::Duration::from_millis(2600);
 
@@ -1625,12 +1625,42 @@ fn node_host_cache()
 /// 【APP81 任务1.1】App 启动 / 订阅更新落盘后立即调用，让随后构建配置时
 /// 的同步 DoH 命中 3600s 缓存；预热不在启动关键路径，保留 2.6s 完整等待。
 pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
+    spawn_background_resolve_node_hosts(hosts);
+}
+
+/// 【APP83 任务3.1】后台静默解析并写入 3600s 缓存，绝不阻塞配置构建。
+pub(crate) fn spawn_background_resolve_node_hosts(hosts: Vec<String>) {
     if hosts.is_empty() {
         return;
     }
     std::thread::spawn(move || {
         let _ = doh_resolve_node_hosts_ipv4_with_wait(&hosts, NODE_HOST_WARMUP_WAIT);
     });
+}
+
+/// 【APP83 任务3.1】纯内存缓存读取（0ms）：只返回 3600s 内命中的公网 IPv4，
+/// 未命中的域名不等待、不发起任何网络请求，由调用方交给内核 dns-direct。
+pub(crate) fn get_cached_node_hosts_ipv4(
+    hosts: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(mut cache) = node_host_cache().lock() else {
+        return out;
+    };
+    for host in hosts {
+        let key = host.trim().to_ascii_lowercase();
+        if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        if let Some((ip, at)) = cache.get(&key) {
+            if at.elapsed() < NODE_HOST_CACHE_TTL {
+                out.insert(key, ip.clone());
+                continue;
+            }
+            cache.remove(&key);
+        }
+    }
+    out
 }
 
 /// 【APP45 任务2.2】并发 DoH 批量解析代理节点域名 → 真实公网 IPv4。
@@ -1643,15 +1673,9 @@ pub(crate) fn spawn_node_host_dns_warmup(hosts: Vec<String>) {
 /// 原域名，由内核 dns-direct（UDP 223.5.5.5 + detour direct + 物理网卡
 /// 绑定）兜底解析（保险 2）。
 ///
-/// 整体在独立工作线程 + current_thread runtime 内并发执行。配置构建最多
-/// 阻塞 450ms；命中 3600s 缓存的域名 0ms 返回。拒绝返回环回/未指定/
+/// 整体在独立工作线程 + current_thread runtime 内并发执行，仅供后台预热
+/// 使用；配置构建只走 `get_cached_node_hosts_ipv4`。拒绝返回环回/未指定/
 /// 私网/fake-ip（198.18/15）等非法解析结果。
-pub(crate) fn doh_resolve_node_hosts_ipv4(
-    hosts: &[String],
-) -> std::collections::HashMap<String, String> {
-    doh_resolve_node_hosts_ipv4_with_wait(hosts, NODE_HOST_BUILD_WAIT)
-}
-
 fn doh_resolve_node_hosts_ipv4_with_wait(
     hosts: &[String],
     max_wait: std::time::Duration,
@@ -4315,6 +4339,20 @@ mod tests {
             normalized.contains(&"192.168.10.0/24".to_string()),
             "主机位非零必须归一化为网络前缀: {normalized:?}"
         );
+    }
+
+    /// 【APP83 任务3.1】配置构建只读缓存：必须 0ms 返回，且不把 IP 字面量
+    /// 或空域名写进结果（它们由内核直接使用）。
+    #[test]
+    fn test_app83_cached_node_hosts_is_non_blocking() {
+        let hosts = vec!["1.1.1.1".to_string(), String::new(), "  ".to_string()];
+        let started = std::time::Instant::now();
+        let out = get_cached_node_hosts_ipv4(&hosts);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "缓存读取必须瞬时完成"
+        );
+        assert!(out.is_empty(), "IP 字面量与空域名不得走 DoH 缓存");
     }
 
     #[test]

@@ -900,11 +900,11 @@ impl KernelApi {
         }
     }
 
-    /// 获取版本信息（探活场景，300ms 内必须返回）
+    /// 获取版本信息（【APP83 任务3.2】本地 9090 探活，200ms 内必须返回）
     pub async fn get_version(&self) -> Result<serde_json::Value> {
         Ok(self
             .authed(shared_client().get(format!("{}/version", self.base)))
-            .timeout(Duration::from_millis(300))
+            .timeout(Duration::from_millis(200))
             .send()
             .await?
             .json::<serde_json::Value>()

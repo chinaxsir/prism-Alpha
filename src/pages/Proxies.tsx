@@ -597,7 +597,24 @@ export default function Proxies() {
               ? t("proxies.aimBoard.cancelled")
               : t("proxies.aimBoard.start");
   const activeServiceLines = (aimProgress.currentServices ?? []).filter(Boolean);
+  const currentNodes = (aimProgress.currentNodes ?? []).filter(Boolean);
   const aimBoardError = aimProgress.errorMessage || aimLastError;
+
+  // 【APP83 任务2.3】检测中每秒滴答：后端事件间隔较长（每个平台 1~6s），
+  // 若只依赖 elapsedMs 会出现「已耗时」长时间静止，看起来像卡死。
+  const [aimTick, setAimTick] = useState(0);
+  useEffect(() => {
+    if (!aimRunning) {
+      setAimTick(0);
+      return;
+    }
+    const timer = window.setInterval(() => setAimTick((v) => v + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [aimRunning]);
+  const aimElapsedSecs = Math.max(
+    Math.round((aimProgress.elapsedMs ?? 0) / 1000),
+    aimTick,
+  );
 
   // 【APP80 任务2.1.4】完成横幅只在检测结束后展示 3s，随后自动隐藏；
   // 运行中则一直显示真实进度，绝不出现「已启动」这种静态残留提示。
@@ -819,7 +836,15 @@ export default function Proxies() {
           (aimRunning || aimPhase === "ERROR" || aimPhase === "CANCELLED") && (
             <div className="mt-0.5 flex flex-col gap-1 rounded-xl border border-border bg-surface-card px-3 py-2 text-[11px]">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-bold text-gray-200">{aimPhaseText}</span>
+                <span className="flex items-center gap-1.5 font-bold text-gray-200">
+                  {aimRunning && (
+                    <span
+                      aria-hidden
+                      className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#30D158]"
+                    />
+                  )}
+                  {aimPhaseText}
+                </span>
                 <span className="tabular-nums font-semibold text-gray-300">
                   {aimProgress.percent}%
                 </span>
@@ -846,12 +871,19 @@ export default function Proxies() {
                     })}
                   </span>
                 )}
-                {(aimProgress.elapsedMs ?? 0) > 0 && (
+                {aimRunning && aimElapsedSecs > 0 && (
                   <span className="tabular-nums">
-                    {Math.round((aimProgress.elapsedMs ?? 0) / 1000)}s
+                    {t("proxies.aimBoard.elapsed", { secs: aimElapsedSecs })}
                   </span>
                 )}
               </div>
+              {aimRunning && currentNodes.length > 0 && (
+                <div className="truncate text-gray-400">
+                  {t("proxies.aimBoard.currentNodes", {
+                    nodes: currentNodes.join(" · "),
+                  })}
+                </div>
+              )}
               {activeServiceLines.length > 0 && (
                 <div className="truncate text-gray-500">
                   {activeServiceLines.join(" · ")}

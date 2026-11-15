@@ -728,6 +728,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// 【APP83 任务4.2】自检压缩：vpn_trace.log 超过 256KB 时只保留末尾
+    /// 128KB，避免扩展长期运行被日志占满内存配额触发 Jetsam。
+    private func trimExtLogIfNeeded() {
+        let maxBytes: UInt64 = 256 * 1024
+        let keepBytes: UInt64 = 128 * 1024
+        for dir in sharedDirURLs() {
+            let url = dir.appendingPathComponent("vpn_trace.log")
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let size = attrs[.size] as? NSNumber,
+                  size.uint64Value > maxBytes,
+                  let handle = try? FileHandle(forReadingFrom: url)
+            else { continue }
+            try? handle.seek(toOffset: size.uint64Value - keepBytes)
+            let tail = try? handle.readToEnd()
+            try? handle.close()
+            guard let data = tail, !data.isEmpty else { continue }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
     private func loadRawConfigText() throws -> String {
         if let configPath = (protocolConfiguration as? NETunnelProviderProtocol)?
             .providerConfiguration?["config_path"] as? String,
@@ -1142,6 +1162,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let t = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.writeHeartbeat("alive(\(self.activeBoundInterface))")
+            // 【APP83 任务4.2】心跳顺带压缩扩展日志，防止 vpn_trace.log
+            // 无限增长占满扩展内存配额触发 Jetsam。
+            self.trimExtLogIfNeeded()
         }
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t

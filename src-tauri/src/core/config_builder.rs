@@ -1384,11 +1384,11 @@ pub fn build(
             }
         }
     }
-    // 【APP80 任务1.1】同步 DoH 预解析恢复（APP79 的纯缓存方案在冷启动时
-    // 会让节点域名直接交给内核 dns-direct 兜底，iOS 扩展上首包解析偶发超时）。
-    // 【APP81 任务1.1】命中 3600s 缓存立即返回；未命中最多等待 450ms。
-    // 配合 App 启动 / 订阅更新后的后台预热，绝大多数情况下这里是 0 网络等待。
-    let mut node_ip_map = crate::core::go_lan::doh_resolve_node_hosts_ipv4(&node_hosts);
+    // 【APP83 任务3.1】配置构建严禁同步 DoH：只读内存缓存（0ms），未命中
+    // 的域名交给内核 dns-direct 直连解析，同时起后台线程静默补缓存，
+    // 下次构建命中。App 启动 / 订阅更新已有后台预热，热路径通常全命中。
+    let mut node_ip_map = crate::core::go_lan::get_cached_node_hosts_ipv4(&node_hosts);
+    crate::core::go_lan::spawn_background_resolve_node_hosts(node_hosts.clone());
     // 【APP65 任务2.1】只保留通过严格公网校验的解析结果（拒绝环回 / 私网 /
     // FakeIP 198.18/15 / CGNAT 100.64/10 / TUN 172.19/16 等污染地址）
     node_ip_map.retain(|_, ip| match ip.parse::<std::net::Ipv4Addr>() {
@@ -2500,11 +2500,13 @@ fn emit_node(
             if let Some(ip) = resolve_node_server_ipv4(&node.server, _ip_map) {
                 outbound["server"] = json!(ip);
             }
-            // 【APP64 任务2.1】统一给每个节点出站注入 "domain_strategy":
-            // "prefer_ipv4"，让 sing-box 优先 IPv4 Socket 直连。
+            // 【APP83 任务1.1】严禁给代理出站注入 "domain_strategy"。
+            // prefer_ipv4 会让 sing-box 在本地把目标域名解析成 IPv4 再发往
+            // 代理，破坏远端 DNS：被污染域名直接 name error，normal 域名也
+            // 多付一次本地解析 RTT。节点 server 已在上面用 DoH 结果替换为
+            // 真实 IP，域名转发本身不受影响。
             // 注：Go Lan WireGuard 出站（go-lan-home / go-lan-*）由独立代码
-            // 路径构建，不受此段影响，继续保留域名预解析（需求明确）。
-            outbound["domain_strategy"] = json!("prefer_ipv4");
+            // 路径构建，不受此段影响。
             if let Some(note) = note {
                 warnings.push(format!("节点 '{}': {}", node.name, note));
             }
@@ -5573,7 +5575,7 @@ rules:
     /// - Trojan / VLESS(Vision) 缺指纹自动补 chrome（APP65 任务2.2）；
     /// - 伪装 SNI（peer/sni 根域名 ≠ server 根域名）自动补 insecure=true
     /// - VLESS outbound 必须带 flow + packet_encoding=xudp
-    /// - 每个代理节点统一 domain_strategy=prefer_ipv4
+    /// - 每个代理节点严禁注入 domain_strategy（APP83：保留远端 DNS）
     /// - DNS 对标 Karing：dns-remote=udp://8.8.8.8 + Proxy；final=dns-direct；
     ///   DNS 规则首条 outbound:any → dns-direct；含 clash_mode:direct/global
     /// - **严禁** 给未知 network（tcp/空）的节点写多余 transport 字段
@@ -5675,7 +5677,9 @@ rules:
             "xtls-rprx-vision 必须默认补 uTLS chrome: {hk1_vless}"
         );
 
-        // —— 每个代理节点统一 domain_strategy=prefer_ipv4 ——
+        // —— 【APP83 任务1.1】代理节点严禁注入 domain_strategy ——
+        // prefer_ipv4 会在本地解析目标域名，破坏远端 DNS 并让被污染域名
+        // 直接 name error。
         for o in outbounds.iter().filter(|o| {
             let t = o["type"].as_str().unwrap_or("");
             matches!(
@@ -5683,10 +5687,9 @@ rules:
                 "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria" | "hysteria2" | "tuic"
             )
         }) {
-            assert_eq!(
-                o["domain_strategy"].as_str(),
-                Some("prefer_ipv4"),
-                "{} 必须注入 domain_strategy=prefer_ipv4",
+            assert!(
+                o.get("domain_strategy").is_none(),
+                "{} 严禁注入 domain_strategy",
                 o["tag"]
             );
         }

@@ -67,12 +67,12 @@ const PROBE_REQUEST_TIMEOUT_MS: u64 = 8000;
 /// 【APP81 任务3.2】单个平台完整探测硬超时（6 秒，含响应头、正文分块
 /// 读取与最多 1 次补测；Semaphore 排队时间不计入）。
 const PROBE_PLATFORM_HARD_TIMEOUT_SECS: u64 = 6;
-/// 【APP81 任务3.2】单节点深度探测绝对看门狗：超时直接 drop 整个 future，
-/// 半开连接不会长期占用工作槽位。
-const MAX_NODE_DEEP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
-/// 【APP75 任务3.2】单节点内部 7 平台并发上限：同一时刻最多 3 个平台
-/// 同时发起 HTTPS 握手，避免瞬时 7 路突发被中转服务器限流重置。
-const PER_NODE_PLATFORM_CONCURRENCY: usize = 3;
+/// 【APP83 任务2.2】单节点全流程绝对看门狗（15s）：从选择器切换、健康检查、
+/// 出口检测到 7 平台探测整体计时，超时直接 drop 整个 future。
+const MAX_NODE_DEEP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 【APP83 任务2.1】单节点内部 7 平台并发上限提升到 4：2 波（4+3）即可
+/// 跑完，既压缩单节点耗时，又不至于 7 路瞬时突发触发上游限流。
+const PER_NODE_PLATFORM_CONCURRENCY: usize = 4;
 /// 【APP79 任务1.1】阶段1 平滑并发：32 → 8（iOS 6 路）。
 /// 32 路同时打 Clash API `/proxies/{tag}/delay` 会让 iOS 扩展内核瞬时拥塞，
 /// 28 个正常节点在队列里排队超时后被直接判死（实测「存活 6/34」）。
@@ -1364,6 +1364,15 @@ fn start_probe_inner(
                 let _ = run.emit(&app, phase, &AimLogMeta::default(), Some(phase), e, None);
             }
         }
+        // 【APP83 任务4.3】本轮结束后回收所有探针槽位残留连接。
+        {
+            let api_addr = state.api_addr.read().clone();
+            let api_secret = state.api_secret.read().clone();
+            if !api_addr.is_empty() {
+                let api = crate::core::kernel::KernelApi::new(&api_addr, &api_secret);
+                release_probe_connections(&api, None).await;
+            }
+        }
         guard.mark_terminal();
     });
 }
@@ -2179,7 +2188,7 @@ async fn probe_all(
                 // 已完成的平台结果实时写入共享快照；看门狗 drop future 后仍可读取。
                 // 所有锁都只包裹内存读写，绝不跨 await。
                 let partial = Arc::new(parking_lot::Mutex::new(NodeProbePartial::default()));
-                // 【APP81 任务3.2】14s 绝对看门狗 + 50ms 取消轮询；任一终态
+                // 【APP83 任务2.2】15s 全流程绝对看门狗 + 50ms 取消轮询；任一终态
                 // 都立即 drop 探针 future，绝不让半开连接无限占用槽位。
                 let drive = drive_with_watchdog(
                     probe_node(
@@ -2216,9 +2225,12 @@ async fn probe_all(
                         crate::core::logger::warn(
                             crate::core::logger::MOD_GO_AIM,
                             format!(
-                                "[AIM-16] 节点「{name}」深度探测达到 14s 看门狗上限，已强制收尾并释放槽位 #{slot}"
+                                "[AIM-16] 节点「{name}」深度探测达到 15s 看门狗上限，已强制收尾并释放槽位 #{slot}"
                             ),
                         );
+                        // 【APP83 任务4.3】只回收该槽位的探针连接，
+                        // 不影响其他槽位正在进行的探测。
+                        release_probe_connections(&api, Some(slot)).await;
                         watchdog_timeout_result(
                             &name,
                             delay,
@@ -3938,7 +3950,9 @@ async fn probe_node(
         result
     };
     // 1. 基线延迟
-    let base_delay = match prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS) {
+    let phase1_prescreened = prescreened_delay.filter(|d| *d > 0 && *d < PROBE_MAX_DELAY_MS);
+    let phase1_delay_ok = phase1_prescreened.is_some();
+    let base_delay = match phase1_prescreened {
         Some(d) => d,
         None => match api
             .test_delay(name, BASELINE_URL, BASELINE_TIMEOUT_MS as u32)
@@ -3950,8 +3964,8 @@ async fn probe_node(
     };
     partial.lock().base_delay = Some(base_delay);
 
-    // 2. 【APP81 任务3.2】切换 + now 核验合计最多 2500ms，严禁裸 await。
-    let selection = tokio::time::timeout(std::time::Duration::from_millis(2500), async {
+    // 2. 【APP83 任务2.2】切换 + now 核验合计最多 2000ms，严禁裸 await。
+    let selection = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
         api.select_proxy(&probe_selector(slot), name).await?;
         crate::core::logger::info(
             crate::core::logger::MOD_GO_AIM,
@@ -3979,12 +3993,12 @@ async fn probe_node(
         Err(_) => {
             crate::core::logger::warn(
                 crate::core::logger::MOD_GO_AIM,
-                format!("[AIM][{name}][-] [阶段] PROXY_ERROR 选择器切换/核验超过 2500ms"),
+                format!("[AIM][{name}][-] [阶段] PROXY_ERROR 选择器切换/核验超过 2000ms"),
             );
             let result = all_unknown_result(
                 name,
                 base_delay,
-                "TASK_TIMEOUT: 选择器切换与 now 核验超过 2500ms".to_string(),
+                "TASK_TIMEOUT: 选择器切换与 now 核验超过 2000ms".to_string(),
                 AimErrorKind::TaskTimeout,
             );
             return NodeProbeOutcome::new(stamp(result), false, started);
@@ -4016,18 +4030,25 @@ async fn probe_node(
     // 任意 1 路成功即视为代理通道畅通；全部失败时，若 EGRESS_CHECK 仍能
     // 拿到出口 IP，也视为畅通并继续 7 平台检测。只有「3 路全挂且出口不可达」
     // 才判定 PROXY_FAILED，确保所有可用节点 100% 跑完 AIM 检测。
-    let (mut proxy_health, _health_hits) = match tokio::time::timeout(
-        std::time::Duration::from_millis(4500),
-        verify_basic_https_proxy_health(client, slot, name),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => (ProxyHealthStatus::ProxyFailed, Vec::new()),
+    // 【APP83 任务1.2】阶段一已测出有效延迟（如 198ms）说明代理通道真实
+    // 可用，直接视为 ProxyOk，跳过重复的 3 路健康检查，单节点省 1~3s。
+    // 未测出延迟（0ms / 超时）的节点仍走完整健康检测，语义不放宽。
+    let (mut proxy_health, _health_hits) = if phase1_delay_ok {
+        (ProxyHealthStatus::ProxyOk, Vec::new())
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(4500),
+            verify_basic_https_proxy_health(client, slot, name),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => (ProxyHealthStatus::ProxyFailed, Vec::new()),
+        }
     };
-    // 【APP81 任务3.2】出口检测独立 3000ms 硬超时；健康检查失败时仍可
+    // 【APP83 任务2.2】出口检测独立 2500ms 硬超时；健康检查失败时仍可
     // 凭出口 IP 放行，保持 APP80 的宽松准入语义。
-    let egress = tokio::time::timeout(std::time::Duration::from_millis(3000), fetch_egress(client))
+    let egress = tokio::time::timeout(std::time::Duration::from_millis(2500), fetch_egress(client))
         .await
         .unwrap_or_default();
     if matches!(proxy_health, ProxyHealthStatus::ProxyFailed) && egress.ip.is_some() {
@@ -4373,14 +4394,14 @@ fn watchdog_timeout_result(
     partial: &NodeProbePartial,
     started: std::time::Instant,
 ) -> NodeProbeOutcome {
-    let reason = "TASK_TIMEOUT: 节点深度探测超过 14s，平台未完成";
+    let reason = "TASK_TIMEOUT: 节点深度探测超过 15s，平台未完成";
     let mut results = partial.completed.clone();
     for service in ["GPT", "Claude", "Gemini", "NF", "YT", "Disney+", "TK"] {
         if results.iter().any(|result| result.service == service) {
             continue;
         }
         let mut result = svc_unknown_status(service, None, reason, AimErrorKind::TaskTimeout);
-        result.verdict_basis = "TASK_TIMEOUT: 节点级 14s 看门狗中断，平台未返回结果".to_string();
+        result.verdict_basis = "TASK_TIMEOUT: 节点级 15s 看门狗中断，平台未返回结果".to_string();
         results.push(result);
     }
     let mut outcome = summarize_deep_probe_result(
@@ -4397,6 +4418,38 @@ fn watchdog_timeout_result(
     outcome.result.probe_stage = AimProbeStage::ScreenedAlive;
     outcome.timed_out = true;
     outcome
+}
+
+/// 【APP83 任务4.3】清理探针槽位残留连接：只关闭 chains 命中
+/// `GO-AIM-PROBE-*` 的连接，绝不触碰用户正在使用的业务连接。
+/// `slot = Some(n)` 只清理该槽位，避免误伤其他槽位正在进行的探测。
+async fn release_probe_connections(api: &crate::core::kernel::KernelApi, slot: Option<usize>) {
+    let Ok(value) = api.get_connections_with_timeout(1200).await else {
+        return;
+    };
+    let Some(list) = value.get("connections").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let slot_tag = slot.map(probe_selector);
+    for conn in list {
+        let Some(id) = conn.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let is_probe = conn
+            .get("chains")
+            .and_then(|v| v.as_array())
+            .is_some_and(|chains| {
+                chains.iter().any(|chain| {
+                    chain.as_str().is_some_and(|tag| match slot_tag.as_deref() {
+                        Some(wanted) => tag == wanted,
+                        None => tag.starts_with("GO-AIM-PROBE-"),
+                    })
+                })
+            });
+        if is_probe {
+            let _ = api.close_connection(id).await;
+        }
+    }
 }
 
 struct NodeProbeOutcome {
@@ -6164,6 +6217,23 @@ mod tests {
                     .is_some_and(|reason| reason.starts_with("TASK_TIMEOUT"))
             );
         }
+    }
+
+    /// 【APP83】单节点预算与健康检查短路必须同时满足，防止回归：
+    /// 并发 4、全流程看门狗 15s、切换 2s、出口 2.5s、阶段一正常节点跳过健康检查。
+    #[test]
+    fn test_app83_node_budget_and_health_skip() {
+        let src = include_str!("go_aim.rs");
+        assert!(src.contains("const PER_NODE_PLATFORM_CONCURRENCY: usize = 4;"));
+        assert!(src.contains("Duration::from_secs(15)"));
+        assert!(src.contains("Duration::from_millis(2000)"));
+        assert!(src.contains("Duration::from_millis(2500)"));
+        assert!(src.contains("if phase1_delay_ok {"));
+        assert!(src.contains("fn release_probe_connections"));
+        assert!(
+            src.contains("TASK_TIMEOUT: 节点深度探测超过 15s"),
+            "看门狗超时文案必须与 15s 预算一致"
+        );
     }
 
     /// 既有 RAII 终态守卫必须同时释放单飞锁与进度 running，不得只改其中一个。
