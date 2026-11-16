@@ -2,18 +2,17 @@ pub mod core;
 pub mod ipc;
 pub mod platform;
 pub mod plugins;
+#[cfg(desktop)]
+pub mod tray;
 
 #[cfg(desktop)]
 use tauri::WindowEvent;
-#[cfg(desktop)]
-use tauri::menu::{Menu, MenuItem};
-#[cfg(desktop)]
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent};
 use tracing_subscriber::EnvFilter;
 
 /// 显示并聚焦主窗口（托盘左键 / 菜单“显示主窗口”）
 #[cfg(desktop)]
+#[allow(dead_code)]
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -257,35 +256,10 @@ pub fn run() {
             }
 
             // 系统托盘（仅桌面端；menu/tray API 在移动端被 cfg 移除）：
-            // 左键单击显示主窗口；菜单提供 显示/退出
+            // macOS 顶部状态栏：实时网速 + 快捷切换节点/模式/Pro 引擎菜单
             #[cfg(desktop)]
             {
-                let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-                let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show, &quit])?;
-                let mut tray = TrayIconBuilder::with_id("main-tray")
-                    .menu(&menu)
-                    .tooltip("Prism Proxy")
-                    .show_menu_on_left_click(false)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
-                        "show" => show_main_window(app),
-                        "quit" => quit_app(app),
-                        _ => {}
-                    })
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            show_main_window(tray.app_handle());
-                        }
-                    });
-                if let Some(icon) = app.default_window_icon() {
-                    tray = tray.icon(icon.clone());
-                }
-                tray.build(app)?;
+                crate::tray::init_tray(app.handle())?;
             }
             Ok(())
         })
@@ -304,6 +278,7 @@ pub fn run() {
             ipc::commands::stop_core,
             ipc::commands::get_core_status,
             ipc::commands::set_app_foreground,
+            ipc::commands::app_window_control,
             ipc::commands::open_external_url,
             ipc::commands::set_mode,
             ipc::commands::url_test,

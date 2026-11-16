@@ -449,6 +449,9 @@ async fn apply_prepared(
     *state.api_addr.write() = api_addr.clone();
     *state.api_secret.write() = api_secret.clone();
     tracing::info!("clash api listening on {api_addr}");
+    // 【v0.4.16 任务2】内核启动/重启入口：清理例行运行日志（保留 ERROR/WARN），
+    // 防止移动端长时间运行后内存日志累积导致 OOM。
+    crate::core::logger::clear_routine_logs_on_kernel_restart();
     // 【APP52 任务4】[握手阶段] 发起：记录内核进程启动与 Clash API 接管
     crate::core::logger::info(
         crate::core::logger::MOD_NODE,
@@ -557,7 +560,7 @@ async fn apply_prepared(
     Ok(())
 }
 
-async fn do_start(app: &AppHandle, state: &AppState) -> Result<(), String> {
+pub(crate) async fn do_start(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let prepared = prepare_start(app, state).await?;
     apply_prepared(prepared, app, state).await
 }
@@ -1107,6 +1110,53 @@ pub fn set_app_foreground(app: AppHandle, foreground: bool, state: State<'_, App
     if foreground {
         crate::core::app_control::schedule_foreground_check(app);
     }
+}
+
+/// 【mac 任务1.1】零权限阻碍的窗口控制命令：
+/// 前端不直接调 Tauri JS API（ACL 可能拦截），统一走 invoke 转发。
+/// action: close / minimize / toggle_maximize / start_dragging
+#[tauri::command]
+pub fn app_window_control(window: tauri::Window, action: String) -> Result<(), String> {
+    match action.as_str() {
+        "close" => {
+            // macOS 点击关闭按钮 → 隐藏到后台（保持托盘与代理运行），
+            // 符合 Surge / ClashX Pro 商业习惯；窗口关闭事件在 lib.rs
+            // 已用 CloseRequested prevent_close + hide() 兜底。
+            #[cfg(target_os = "macos")]
+            {
+                let _ = window.hide();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = window.close();
+            }
+        }
+        "minimize" => {
+            #[cfg(desktop)]
+            {
+                let _ = window.minimize();
+            }
+        }
+        "toggle_maximize" => {
+            #[cfg(desktop)]
+            {
+                if window.is_maximized().unwrap_or(false) {
+                    let _ = window.unmaximize();
+                } else {
+                    let _ = window.maximize();
+                }
+            }
+        }
+        "start_dragging" => {
+            // 窗口拖拽仅桌面端支持（移动端无此概念）
+            #[cfg(desktop)]
+            {
+                let _ = window.start_dragging();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// 【APP58 任务2.2】原生级跨平台打开外链：
@@ -2335,7 +2385,7 @@ pub async fn get_cached_proxies(state: State<'_, AppState>) -> Result<Vec<Cached
 }
 
 /// 【APP44 任务1.3】内核未运行时从订阅缓存读取节点列表（测速复用同一份解析）
-fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
+pub(crate) fn collect_cached_proxies(state: &AppState) -> Vec<CachedProxyDto> {
     let records = crate::core::store::load_subscriptions(&state.data_dir);
     let mut out: Vec<CachedProxyDto> = Vec::new();
     for r in records {

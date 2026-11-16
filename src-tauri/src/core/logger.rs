@@ -23,16 +23,14 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-/// 内存环形缓冲上限（条，兼容旧常量；实际按分类分桶，见 PER_CATEGORY_MAX）
-pub const MAX_ENTRIES: usize = 800;
-/// 【APP59 任务2.2】每个分类独立环形队列的容量：7 个物理分桶各 150 条，
-/// 任一分类刷屏都不会挤掉其他分类的日志。
-pub const PER_CATEGORY_MAX: usize = 150;
+/// 【v0.4.16 任务2】内存环形缓冲总上限：300 条（防止移动端内存累积）。
+pub const MAX_ENTRIES: usize = 300;
+/// 【v0.4.16 任务2】每个分类独立环形队列的容量：80 条。
+pub const PER_CATEGORY_MAX: usize = 80;
 /// 持久化文件容量上限：512 KB（524,288 字节）
 pub const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
-/// 【APP71 任务1.1】Go AIM 专属有界队列上限：400 条，超出自动弹出最旧条目。
-/// 与其余 6 个分类桶（150 条）物理隔离，AIM 高频日志绝不挤掉其他模块。
-pub const AIM_BUCKET_MAX: usize = 400;
+/// 【v0.4.16 任务2】Go AIM 专属有界队列上限：80 条（与其余分类统一上限）。
+pub const AIM_BUCKET_MAX: usize = 80;
 /// 【APP71 任务1.1】Go AIM 结构化日志落盘防抖窗口（毫秒）
 pub const AIM_FLUSH_DEBOUNCE_MS: u64 = 250;
 /// 【APP71 任务1.1】待落盘 AIM 日志硬上限：超过立即同步刷盘，防内存无限增长
@@ -1331,6 +1329,23 @@ pub fn clear_logs(data_dir: &std::path::Path) {
     }
 }
 
+/// 【v0.4.16 任务2】内核重启时自动清理例行运行日志：
+/// 保留 ERROR / WARN 级别条目（用户可追溯故障），清除 INFO 例行日志
+/// （kernel 转发、go_aim 探测、go_lan/go_cus 运行等高频刷屏），
+/// 避免长时间运行后内存日志无限累积导致移动端 OOM。
+pub fn clear_routine_logs_on_kernel_restart() {
+    if let Some(mutex) = state()
+        && let Ok(mut st) = mutex.lock()
+    {
+        for bucket in st.buckets.values_mut() {
+            bucket.retain(|entry| {
+                let lvl = entry.level.to_ascii_uppercase();
+                lvl == "ERROR" || lvl == "WARN" || lvl == "FATAL"
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 导出脱敏
 
 /// 把标准 44 位 Base64 WG 密钥（数据位 43 + '='）中间打星：
@@ -1811,12 +1826,12 @@ mod tests {
         assert!(keep.contains("https://chatgpt.com/"), "{keep}");
     }
 
-    /// 【APP71 任务6 测试9】GoAIM 有界队列：写入 1000 条后严格保持 400 条
+    /// 【v0.4.16 任务2】GoAIM 有界队列：写入 1000 条后严格保持 80 条
     #[test]
-    fn test_aim_bucket_bounded_400() {
+    fn test_aim_bucket_bounded_80() {
         let cap = super::bucket_capacity(super::MOD_GO_AIM);
         assert_eq!(cap, super::AIM_BUCKET_MAX);
-        assert_eq!(cap, 400);
+        assert_eq!(cap, 80);
         assert_eq!(
             super::bucket_capacity(super::MOD_KERNEL),
             super::PER_CATEGORY_MAX
@@ -1835,8 +1850,8 @@ mod tests {
                 cap,
             );
         }
-        assert_eq!(q.len(), 400, "有界队列必须恒定封顶 400 条");
-        assert_eq!(q.front().map(|e| e.id), Some(600), "应淘汰最旧 600 条");
+        assert_eq!(q.len(), 80, "有界队列必须恒定封顶 80 条");
+        assert_eq!(q.front().map(|e| e.id), Some(920), "应淘汰最旧 920 条");
         assert_eq!(q.back().map(|e| e.id), Some(999));
     }
 

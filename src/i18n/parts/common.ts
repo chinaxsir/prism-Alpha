@@ -221,6 +221,7 @@ const zh: Record<string, string> = {
   // ---- 标题栏 ----
   "titlebar.minimize": "最小化",
   "titlebar.closeToTray": "隐藏到托盘（托盘菜单可退出）",
+  "titlebar.zoom": "缩放窗口",
 
   // ---- 功能名（Pro 门控） ----
   "feature.multiSubscription": "多订阅",
@@ -591,6 +592,7 @@ const en: Record<string, string> = {
   // ---- Title bar ----
   "titlebar.minimize": "Minimize",
   "titlebar.closeToTray": "Hide to tray (quit from tray menu)",
+  "titlebar.zoom": "Zoom window",
 
   // ---- Feature names (Pro gate) ----
   "feature.multiSubscription": "Multi-Subscription",

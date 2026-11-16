@@ -1,5 +1,5 @@
 import { Minus, X } from "lucide-react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 
 import { useTranslation } from "@/i18n";
 
@@ -8,11 +8,11 @@ export default function TitleBar() {
   const { t } = useTranslation();
 
   // Conditionally render the TitleBar only if running in Tauri environment
-  if (typeof window !== 'undefined' && !(window as any).__TAURI__) {
+  if (typeof window !== "undefined" && !(window as any).__TAURI__) {
     return null; // Don't render TitleBar if not in Tauri
   }
 
-  const appWindow = getCurrentWindow();
+  const ctrl = (action: string) => void invoke("app_window_control", { action });
 
   return (
     <div
@@ -28,14 +28,14 @@ export default function TitleBar() {
 
       <div className="flex items-center gap-1">
         <button
-          onClick={() => appWindow.minimize()}
+          onClick={() => ctrl("minimize")}
           className="p-1.5 rounded-md hover:bg-surface-hover text-gray-400 hover:text-gray-200 transition-colors"
           title={t("titlebar.minimize")}
         >
           <Minus size={14} />
         </button>
         <button
-          onClick={() => appWindow.close()}
+          onClick={() => ctrl("close")}
           className="p-1.5 rounded-md hover:bg-latency-bad/80 text-gray-400 hover:text-white transition-colors"
           title={t("titlebar.closeToTray")}
         >

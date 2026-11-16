@@ -1673,28 +1673,45 @@ async fn probe_all(
                         return (name, Some(d));
                     }
                     let _permit = sem.acquire_owned().await.ok();
-                    let delay = if let Some((server, port)) = ep_map.get(&name) {
-                        // 预览模式：离线 TCP 握手测速
-                        crate::ipc::commands::measure_offline_node_delay(
-                            server,
-                            *port,
-                            PROBE_TIMEOUT_MS as u32,
-                        )
-                        .await
-                    } else {
-                        // 【APP80 任务2.1.2】与「⚡ 测速」同源的稳健快筛：
-                        // 先 cp.cloudflare.com（3500ms），未响应再 gstatic
-                        // （3500ms）重试 1 次；仍失败者由下方调用方回退到
-                        // state.node_delays 的有效历史延迟，绝不轻易判死。
-                        let first = api
-                            .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
-                            .await;
-                        if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
-                            first
-                        } else {
-                            api.test_delay(&name, SCREEN_RETRY_URL, SCREEN_TIMEOUT_MS as u32)
+                    // 【v0.4.16 任务1】每节点 stage-1 快筛硬超时 2800ms：
+                    // 死节点会让 Clash API /delay 在底层 TCP 重传上挂起数秒，
+                    // 47 节点并发 8 最坏 253s。硬超时包住「真实测速逻辑」
+                    // （permit 已获取，排队等待时间不计入），超时节点本轮
+                    // 回退历史延迟，绝不阻塞整轮。
+                    let timed =
+                        tokio::time::timeout(std::time::Duration::from_millis(2800), async {
+                            if let Some((server, port)) = ep_map.get(&name) {
+                                // 预览模式：离线 TCP 握手测速
+                                crate::ipc::commands::measure_offline_node_delay(
+                                    server,
+                                    *port,
+                                    PROBE_TIMEOUT_MS as u32,
+                                )
                                 .await
-                        }
+                            } else {
+                                // 【APP80 任务2.1.2】与「⚡ 测速」同源的稳健快筛：
+                                // 先 cp.cloudflare.com，未响应再 gstatic 重试 1 次；
+                                // 仍失败者由下方调用方回退到 state.node_delays 的
+                                // 有效历史延迟，绝不轻易判死。
+                                let first = api
+                                    .test_delay(&name, SCREEN_URL, SCREEN_TIMEOUT_MS as u32)
+                                    .await;
+                                if matches!(first, Some(d) if d > 0 && d < PROBE_MAX_DELAY_MS) {
+                                    first
+                                } else {
+                                    api.test_delay(
+                                        &name,
+                                        SCREEN_RETRY_URL,
+                                        SCREEN_TIMEOUT_MS as u32,
+                                    )
+                                    .await
+                                }
+                            }
+                        })
+                        .await;
+                    let delay = match timed {
+                        Ok(d) => d,
+                        Err(_) => None,
                     };
                     (name, delay)
                 }

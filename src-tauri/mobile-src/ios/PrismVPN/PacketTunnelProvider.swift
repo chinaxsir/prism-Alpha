@@ -818,7 +818,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             do {
                 try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
-                try? self.copyGeoDatabases(to: workDir)
+                // 【v0.4.16 任务1】不再拷贝 geoip.db / geosite.db：iOS 扩展已剥离所有
+                // geosite/geoip 规则与 route.geoip/geosite/rule_set，NE 扩展进程
+                // 不加载任何 rule-provider 数据文件，避免启动时 I/O 与内存开销。
 
                 // 【APP11 任务5.1】启动前清空 box.log / vpn_trace.log：
                 // 内核以 append 模式写 box.log，跨会话累积会让运行日志里
@@ -2620,10 +2622,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     ".home", ".internal", ".localdomain"
                 ],
                 "server": "dns-direct"
-            ],
-            [
-                "geosite": ["cn", "private"],
-                "server": "dns-direct"
             ]
         ])
         // 【APP70 任务2.1】仅在「阻止 QUIC」开启（Rust 已下发 quic → block）
@@ -2679,7 +2677,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var rules = (route["rules"] as? [[String: Any]]) ?? []
         rules.removeAll { rule in
             let p = rule["protocol"]
-            return (p as? String) == "dns" || ((p as? [String])?.contains("dns") == true) || (rule["action"] as? String) == "hijack-dns"
+            let isDns = (p as? String) == "dns" || ((p as? [String])?.contains("dns") == true) || (rule["action"] as? String) == "hijack-dns"
+            // 【v0.4.16 任务1】iOS 扩展剥离 geosite/geoip 规则：NE 扩展不支持 rule-provider
+            // 与 geosite 数据文件，保留会导致 sing-box 反复重试加载、推高启动内存与耗时。
+            let hasGeosite = rule["geosite"] != nil
+            let hasGeoip = rule["geoip"] != nil
+            return isDns || hasGeosite || hasGeoip
         }
 
         let finalDnsTag = dnsOutboundTag ?? "dns-out"
@@ -2705,11 +2708,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let meta = goLanProfileMeta[tag]
             let bypassEnabled = meta?.bypass ?? true
             guard bypassEnabled else { return }
-            // 【APP60 任务2.3】同子网（零 I/O 快路径）OR 跨子网 TCP 短探测（65ms，
-            // 扩展进程 Socket 天然走物理网卡）任一命中即判直连
+            // 【v0.4.16 任务1】移除 crossSubnetProbe 同步 TCP 探测：该调用发生在
+            // sanitizeConfigForExtension 启动同步路径，65ms × N 个 CIDR 会显著拖慢
+            // 启动（>12s）并推高扩展进程内存。仅保留同子网纯数学判断，跨子网一律
+            // 走 go-lan 隧道（Rust 侧仍会在后台按需探测，不阻塞启动）。
             let sameSubnet = goLanWifiIP.flatMap { ipv4InCidr($0, cidr) } ?? false
-            let probedDirect = sameSubnet || crossSubnetProbe(cidr: cidr, meta: meta)
-            if probedDirect {
+            if sameSubnet {
                 if !onDemandBypassCidrs.contains(cidr) { onDemandBypassCidrs.append(cidr) }
                 var list = onDemandBypassByTag[tag] ?? []
                 if !list.contains(cidr) { list.append(cidr) }
@@ -2721,73 +2725,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        // 【APP60 任务2.3】跨子网 TCP 短探测：仅在 Rust 签名变化（切 Wi-Fi / 改配置）
-        // 导致的 sanitize 阶段执行一次，结果按 (cidr, probeTarget) 签名缓存，
-        // 绝非轮询。NWConnection 天然走物理网卡（扩展进程），不经过 utun。
-        // Connected / ConnectionRefused 均视为局域网 L2/L3 真实可达。
-        func crossSubnetProbe(cidr: String, meta: GoLanProfileMeta?) -> Bool {
-            guard let prefix = parseIPv4Prefix(cidr), prefix.prefix <= 30 else { return false }
-            var candidates: [String] = []
-            // 优先：probeTarget 的 IP（如果它属于本网段）
-            if let probe = meta?.probeTarget, !probe.isEmpty {
-                let hostPart = probe.split(separator: ":").first.map { String($0) } ?? probe
-                let trimmed = hostPart.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
-                if ipv4InCidr(trimmed, cidr) {
-                    candidates.append(trimmed)
-                }
-            }
-            // 其次：.1 / .254 网关（最多选 2 个）
-            let net = prefix.net
-            for last in [UInt32(1), UInt32(254)] {
-                if candidates.count >= 2 { break }
-                let gw = net | last
-                let gwIP = ipv4String(gw)
-                if !candidates.contains(gwIP) { candidates.append(gwIP) }
-            }
-            let fallbackPorts: [UInt16] = [80, 445, 443, 22]
-            for ip in candidates {
-                // 候选端口：probeTarget 自带端口优先（若它属于本网段），然后 fallback
-                var ports: [UInt16] = []
-                if let probe = meta?.probeTarget,
-                   let colon = probe.lastIndex(of: ":"),
-                   let p = UInt16(probe[probe.index(after: colon)...]),
-                   ipv4InCidr(String(probe[probe.startIndex..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[] ")), cidr) {
-                    ports.append(p)
-                }
-                for p in fallbackPorts where !ports.contains(p) { ports.append(p) }
-                for port in ports {
-                    // NWEndpoint.Port(rawValue:) 是可失败初始化器（RawRepresentable），
-                    // 不能写成 .rawValue(port) —— 后者在 Swift 中不存在该静态方法
-                    guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
-                    let sem = DispatchSemaphore(value: 0)
-                    let flag = GoLanProbeFlag()
-                    let conn = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: .tcp)
-                    conn.stateUpdateHandler = { state in
-                        switch state {
-                        case .ready:
-                            flag.hit = true
-                            conn.cancel()
-                            sem.signal()
-                        case .failed(let err):
-                            let code = (err as NSError).code
-                            // 连接被拒绝（端口关）仍代表 ARP 可达 / 局域网真实连通
-                            if code == 61 || code == 111 { flag.hit = true }
-                            conn.cancel()
-                            sem.signal()
-                        case .cancelled:
-                            sem.signal()
-                        default: break
-                        }
-                    }
-                    conn.start(queue: .global(qos: .background))
-                    let timeout = DispatchTime.now() + 0.065
-                    _ = sem.wait(timeout: timeout)
-                    conn.cancel()
-                    if flag.hit { return true }
-                }
-            }
-            return false
-        }
+        // 【v0.4.16 任务1】crossSubnetProbe 已移除：启动同步路径不再做同步 TCP 探测，
+        // 避免 65ms × N CIDR 拖慢启动并推高内存。跨子网一律走 go-lan 隧道。
 
         for i in rules.indices {
             guard let outTag = rules[i]["outbound"] as? String, outTag.hasPrefix("go-lan"),
@@ -3021,27 +2960,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 + "总规则数=\(rules.count)"
         )
 
-        if var geoip = route["geoip"] as? [String: Any], geoip["path"] != nil {
-            geoip["path"] = workDir.appendingPathComponent("geoip.db").path
-            route["geoip"] = geoip
-        }
-        if var geosite = route["geosite"] as? [String: Any], geosite["path"] != nil {
-            geosite["path"] = workDir.appendingPathComponent("geosite.db").path
-            route["geosite"] = geosite
-        }
-        if var ruleSets = route["rule_set"] as? [[String: Any]] {
-            for i in ruleSets.indices {
-                if (ruleSets[i]["type"] as? String) == "local",
-                   let oldPath = ruleSets[i]["path"] as? String,
-                   oldPath.contains("/Containers/Data/Application/")
-                {
-                    let fileName = (oldPath as NSString).lastPathComponent
-                    let newPath = workDir.appendingPathComponent("rulesets").appendingPathComponent(fileName).path
-                    ruleSets[i]["path"] = newPath
-                }
-            }
-            route["rule_set"] = ruleSets
-        }
+        // 【v0.4.16 任务1】彻底移除 route.geoip / route.geosite / route.rule_set：
+        // NE 扩展进程不加载任何 rule-provider / geosite 数据文件，避免 sing-box
+        // 在启动时反复尝试加载失败文件、推高内存与启动耗时。
+        route.removeValue(forKey: "geoip")
+        route.removeValue(forKey: "geosite")
+        route.removeValue(forKey: "rule_set")
         root["route"] = route
 
         // 5. 修正 experimental.cache_file / clash_api
@@ -3128,32 +3052,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if mask >= 32 { return ipU == cidrU }
         let maskBits: UInt32 = ~UInt32(0) << (32 - UInt32(mask))
         return (ipU & maskBits) == (cidrU & maskBits)
-    }
-
-    private func copyGeoDatabases(to workDir: URL) throws {
-        let mainAppBundleURL = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        for name in ["geoip.db", "geosite.db"] {
-            let dst = workDir.appendingPathComponent(name)
-            // 【APP81 任务1.1】完整数据库直接复用；0 字节残留必须移除后重拷，
-            // 否则 copyItem 会因目标已存在而静默失败，内核随后无法启动。
-            if FileManager.default.fileExists(atPath: dst.path) {
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: dst.path),
-                   let size = attrs[.size] as? NSNumber, size.intValue > 0 {
-                    continue
-                }
-                try? FileManager.default.removeItem(at: dst)
-            }
-            if let src = Bundle.main.url(forResource: name, withExtension: nil) {
-                try? FileManager.default.copyItem(at: src, to: dst)
-            } else {
-                let fallbackSrc = mainAppBundleURL.appendingPathComponent(name)
-                if FileManager.default.fileExists(atPath: fallbackSrc.path) {
-                    try? FileManager.default.copyItem(at: fallbackSrc, to: dst)
-                }
-            }
-        }
     }
 }
 

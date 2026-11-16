@@ -1613,7 +1613,9 @@ const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// + 阿里 DoH 兜底，超时即放弃（保留原域名交给内核 dns-direct），
 /// 既不重演 v0.4.13「18 个长域名节点全部裸域名下发」的全挂，
 /// 也不重演更早版本 5.7s 的启动阻塞。
-const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(1200);
+/// 【v0.4.16 任务2】节点主机预解析最长等待：原 1200ms 在移动端叠加到启动路径
+/// 会导致 >12s 拉起；收窄到 600ms（国内 DoH 通常 100~300ms 内返回）。
+const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
 /// 后台预热不参与启动关键路径，可等待更完整的解析结果以提高缓存命中率。
 const NODE_HOST_WARMUP_WAIT: std::time::Duration = std::time::Duration::from_millis(2600);
 
@@ -4382,16 +4384,16 @@ mod tests {
         assert!(out.is_empty(), "IP 字面量与空域名不得走 DoH 缓存");
     }
 
-    /// 【APP84 任务1.1】构建期同步预解析必须存在且总预算 ≤1200ms；
+    /// 【APP84 任务1.1】【v0.4.16 任务2】构建期同步预解析必须存在且总预算 ≤600ms；
     /// UDP 53 双通道并发 + 阿里 DoH 兜底，且不得回退到 getaddrinfo。
     #[test]
     fn test_app84_build_time_resolve_budget() {
         let src = include_str!("go_lan.rs");
         assert!(
             src.contains(
-                "NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(1200)"
+                "NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(600)"
             ),
-            "构建期解析阻塞上限必须锁定 1200ms"
+            "构建期解析阻塞上限必须锁定 600ms（移动端启动 <12s）"
         );
         assert!(
             src.contains("pub(crate) fn doh_resolve_node_hosts_ipv4("),
