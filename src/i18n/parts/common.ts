@@ -362,6 +362,10 @@ const zh: Record<string, string> = {
   "app.vpnRevoked": "系统 VPN 已被关闭，代理已停止",
   "appControl.versionBlocked": "当前版本已停止支持",
   "appControl.userBlocked": "账号使用受限",
+  "appControl.deviceBlocked": "当前终端已被限制使用",
+  "appControl.blocked": "当前 APP 已被限制使用",
+  "pro.verifyAlphaUnbound": "校验完成：内测授权已绑定其他设备，请联系管理员解绑",
+  "pro.verifyAlphaExpired": "校验完成：Alpha 内测授权已到期，Pro 功能已停止",
 };
 
 const en: Record<string, string> = {
@@ -739,6 +743,12 @@ const en: Record<string, string> = {
   "app.vpnRevoked": "System VPN was turned off, proxy stopped",
   "appControl.versionBlocked": "This app version is no longer supported",
   "appControl.userBlocked": "Account restricted",
+  "appControl.deviceBlocked": "This device has been restricted",
+  "appControl.blocked": "This app has been restricted",
+  "pro.verifyAlphaUnbound":
+    "Verification done: this Alpha license is bound to another device. Contact the administrator to unbind it.",
+  "pro.verifyAlphaExpired":
+    "Verification done: your Alpha license has expired and Pro features are stopped.",
 };
 
 export default { zh, en };

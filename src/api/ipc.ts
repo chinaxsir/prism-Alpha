@@ -208,9 +208,11 @@ export const activatePro = (code: string, email: string) =>
   invoke<Entitlement>("activate_pro", { code, email });
 export const getEntitlement = () =>
   invoke<Entitlement>("get_entitlement");
-/** 最近一次授权剥夺原因：unbound（设备解绑）/ expired（到期）/ null */
+/** 最近一次授权剥夺原因：unbound / expired / alpha_unbound / alpha_expired / null */
 export const getRevokeReason = () =>
-  invoke<"unbound" | "expired" | null>("get_revoke_reason");
+  invoke<
+    "unbound" | "expired" | "alpha_unbound" | "alpha_expired" | null
+  >("get_revoke_reason");
 /** 读取本机设备 ID（激活绑定与设置页展示用） */
 export const getDeviceId = () => invoke<string>("get_device_id");
 export const refreshEntitlement = () =>

@@ -154,6 +154,10 @@ export default function ProManageModal({ open, onClose }: Props) {
     } else if (s.revokeReason === "unbound") {
       // IPA-3 任务2：设备被官网解绑 ≠ 授权到期，必须给出独立的重新激活引导
       toast.error(t("pro.verifyUnbound"));
+    } else if (s.revokeReason === "alpha_unbound") {
+      toast.error(t("pro.verifyAlphaUnbound"));
+    } else if (s.revokeReason === "alpha_expired") {
+      toast.error(t("pro.verifyAlphaExpired"));
     } else if (st === "expired" || st === "revoked") {
       toast.error(t("pro.verifyExpired"));
     } else if (st === "offline") {

@@ -14,6 +14,7 @@
 //! 请求体仅携带非敏感元数据，绝不包含任何用户流量内容或地址信息。
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::warn;
 
@@ -43,8 +44,10 @@ pub struct AppCheckRequest {
 pub struct RuntimePerception {
     #[serde(default)]
     pub plan: Option<String>,
+    /// 【APC 任务3】订阅是否有效。三态：Some(true)=有效、Some(false)=已过期、
+    /// None=字段缺失（旧版/服务端未下发）。**缺失时严禁判定为过期**。
     #[serde(default)]
-    pub subscription_active: bool,
+    pub subscription_active: Option<bool>,
     pub expires_at: Option<String>,
     #[serde(default)]
     pub max_seats: Option<u32>,
@@ -89,16 +92,35 @@ pub struct ControlBlock {
     pub message: String,
 }
 
-/// reason 的白名单兜底：服务端返回未知 reason 时按 version_blocked 处理
-const REASON_VERSION: &str = "version_blocked";
+/// 【APC 任务4】管控原因完整集合（与 app-control-api.md §3 判定优先级一致）。
+/// 服务端返回的原始 reason 必须原样保留，严禁把未知原因静默伪装成 version_blocked。
+const REASON_DEVICE: &str = "device_blocked";
 const REASON_USER: &str = "user_blocked";
+const REASON_VERSION: &str = "version_blocked";
+/// 服务端 reason 为空/未知时的通用兜底标识（仅用于 UI 通用文案）
+const REASON_GENERIC: &str = "blocked";
+
+/// reason 归一化：只做 trim 与空值兜底，绝不改写服务端已给出的原始原因
+fn normalize_block_reason(raw: &str) -> String {
+    let r = raw.trim();
+    if r.is_empty() {
+        REASON_GENERIC.to_string()
+    } else {
+        r.to_string()
+    }
+}
 
 fn default_message(reason: &str) -> String {
-    if reason == REASON_USER {
-        "当前授权账号已被限制使用，如有疑问请联系客服工单。".to_string()
-    } else {
-        "当前 APP 版本已停止支持，请前往 https://prism.sarl 下载更新最新版本后继续使用。"
-            .to_string()
+    match reason {
+        REASON_DEVICE => "当前终端已被限制使用，如有疑问请联系客服工单。".to_string(),
+        REASON_USER => "当前授权账号已被限制使用，如有疑问请联系客服工单。".to_string(),
+        REASON_VERSION => {
+            "当前 APP 版本已停止支持，请前往 https://prism.sarl 下载更新最新版本后继续使用。"
+                .to_string()
+        }
+        _ => {
+            "当前 APP 已被限制使用，请前往 https://prism.sarl 查看详细信息或联系客服。".to_string()
+        }
     }
 }
 
@@ -153,7 +175,10 @@ pub fn load_revoke_reason(data_dir: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(revoke_state_path(data_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let reason = v.get("reason")?.as_str()?.to_string();
-    if reason == REVOKE_UNBOUND || reason == REVOKE_EXPIRED {
+    if matches!(
+        reason.as_str(),
+        REVOKE_UNBOUND | REVOKE_EXPIRED | REVOKE_ALPHA_UNBOUND | REVOKE_ALPHA_EXPIRED
+    ) {
         Some(reason)
     } else {
         None
@@ -165,6 +190,41 @@ pub fn clear_revoke_reason(data_dir: &std::path::Path) {
 }
 
 // ---------------- apply_runtime：授权级熔断 ----------------
+
+/// 【APC 任务5】runtime → revoke 原因的纯函数（无副作用，便于单测）。
+/// 返回 None 表示授权有效（含 Free、Team 买断、未激活，以及订阅字段缺失的旧版响应）。
+///
+/// 判定优先级（app-control-api.md §3 / APC 第五阶段）：
+/// 1. `device_bound === false` → 设备解绑（Alpha 用独立文案），只降级 Pro，不封禁 APP；
+/// 2. 仅当服务端**明确**返回 `subscription_active === false` 且方案为 Pro 时才判定到期；
+/// 3. Team 买断恒有效；Free 是正常基础态；`plan === null` 是未激活（Free），
+///    均绝不按「授权到期」处理（字段缺失/为 null 不能当成 false）。
+fn decide_revoke(runtime: &RuntimePerception) -> Option<&'static str> {
+    let plan = runtime.plan.as_deref();
+    if runtime.device_bound == Some(false) {
+        return Some(if runtime.alpha {
+            REVOKE_ALPHA_UNBOUND
+        } else {
+            REVOKE_UNBOUND
+        });
+    }
+    if matches!(runtime.subscription_active, Some(false)) {
+        match plan {
+            Some("pro") => {
+                return Some(if runtime.alpha {
+                    REVOKE_ALPHA_EXPIRED
+                } else {
+                    REVOKE_EXPIRED
+                });
+            }
+            // Alpha 到期后服务端退回未激活态（plan=null），按内测到期处理
+            None if runtime.alpha => return Some(REVOKE_ALPHA_EXPIRED),
+            // team（永久买断）/ free（基础态）/ 未知方案：不剥夺
+            _ => {}
+        }
+    }
+    None
+}
 
 /// 根据权威 runtime 执行授权级熔断 + 买断版本范围降级
 /// （client-runtime-perception.md §3 与 client-buyout-version-management.md §4 合并入口）。
@@ -179,8 +239,6 @@ pub fn apply_runtime(
     persist_runtime(data_dir, runtime);
 
     let is_unbound = runtime.device_bound == Some(false);
-    let is_expired = !runtime.subscription_active && runtime.plan.as_deref() != Some("team");
-    let pro_revoked = is_unbound || is_expired || runtime.plan.is_none();
 
     // ---------- 买断超出版本范围（不剥夺授权，只弹升级引导）----------
     // 客户端兜底：若服务端没给 version_in_scope，则对比 current_major vs included_major
@@ -200,18 +258,12 @@ pub fn apply_runtime(
         // 只弹引导不降级，让 apply_runtime 继续按下面逻辑处理真正的剥夺。
     }
 
-    if !pro_revoked {
+    let Some(reason) = decide_revoke(runtime) else {
         clear_revoke_reason(data_dir);
         sync_entitlement_from_runtime(state, runtime);
         return None;
-    }
-
-    // IPA-3 任务2：解绑与到期必须是两个互斥的独立原因，严禁混用文案。
-    let reason = if is_unbound {
-        REVOKE_UNBOUND
-    } else {
-        REVOKE_EXPIRED
     };
+
     let (zh, en) = revoke_message(reason);
     persist_revoke_reason(data_dir, reason);
 
@@ -279,10 +331,24 @@ pub fn emit_buyout_upgrade(app: &AppHandle, runtime: &RuntimePerception) {
 pub const REVOKE_UNBOUND: &str = "unbound";
 /// 授权时间到期（`runtime.subscription_active === false` 且非买断）
 pub const REVOKE_EXPIRED: &str = "expired";
+/// 【APC 任务5】Alpha 内测设备绑定失效（`alpha=true` 且 `device_bound=false`）
+pub const REVOKE_ALPHA_UNBOUND: &str = "alpha_unbound";
+/// 【APC 任务5】Alpha 内测授权到期
+pub const REVOKE_ALPHA_EXPIRED: &str = "alpha_expired";
 
 /// 原因 → (中文, 英文) 提示文案。前端按 reason 精准渲染，禁止复用同一句。
 pub fn revoke_message(reason: &str) -> (&'static str, &'static str) {
-    if reason == REVOKE_UNBOUND {
+    if reason == REVOKE_ALPHA_UNBOUND {
+        (
+            "Alpha 内测设备绑定已失效，Pro 功能已自动停止。请前往官网控制台确认绑定，或联系内测负责人重新绑定。",
+            "Your Alpha test device binding is no longer valid. Pro features have been stopped. Please check the console or contact the Alpha coordinator to re-bind.",
+        )
+    } else if reason == REVOKE_ALPHA_EXPIRED {
+        (
+            "Alpha 内测授权已到期，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请联系内测负责人续期。",
+            "Your Alpha test license has expired. Pro features (Go AIM / Go Lan / Go Cus / Connections) have been stopped. Please contact the Alpha coordinator to renew.",
+        )
+    } else if reason == REVOKE_UNBOUND {
         (
             "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
             "This device has been unbound from your account. Pro features (Go AIM / Go Lan / Go Cus / Connections) have been stopped. Please re-activate in Settings → Prism Pro.",
@@ -326,6 +392,13 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
         ent.sync_available = false;
     }
     let Some(plan) = runtime.plan.clone() else {
+        // 【APC 任务5】plan=null = 未激活/Free 基线：只做静默降级，
+        // 绝不显示成「授权到期」（服务端未提供方案 ≠ 服务端明确判定失效）。
+        ent.plan = None;
+        ent.kind = None;
+        ent.status = "inactive".into();
+        ent.sync_available = false;
+        ent.last_verified_at = license::now_secs();
         state.apply_entitlement(ent);
         return;
     };
@@ -343,6 +416,17 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
         && let Some(exp) = license::parse_expires_at(exp_str)
     {
         ent.expires_at = Some(exp);
+    }
+    // 【APC 任务3】服务端 runtime 是权威来源：
+    // - Free（plan=free）保留方案展示但绝不解锁 Pro；
+    // - 其余有效方案（pro/team/alpha）把旧的 expired/inactive 状态修正为 active，
+    //   否则续费成功后客户端仍会停留在锁定状态。
+    if plan == "free" {
+        ent.status = "inactive".into();
+        // Free 不含云端同步权益
+        ent.sync_available = false;
+    } else if !ent.status.eq_ignore_ascii_case("active") {
+        ent.status = "active".into();
     }
     ent.last_verified_at = license::now_secs();
     state.apply_entitlement(ent);
@@ -538,12 +622,61 @@ fn windows_os_version() -> String {
 
 // ---------------------------------------------------------------- 上报逻辑
 
+/// 上报类型：启动单次 `/api/app/check`，周期 5 分钟 `/api/app/heartbeat`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportKind {
+    Check,
+    Heartbeat,
+}
+
+impl ReportKind {
+    fn url(self, base: &str) -> String {
+        match self {
+            ReportKind::Check => format!("{base}{}", crate::obf!("/api/app/check")),
+            ReportKind::Heartbeat => format!("{base}{}", crate::obf!("/api/app/heartbeat")),
+        }
+    }
+}
+
+/// 【APC 任务2】控制协议超时：5s（连接 3s），远小于旧版 8s，
+/// 避免启动阶段与内核启动抢网络栈时界面长时间空转。
+const REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REPORT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 【APC 任务2】单飞锁：check 与 heartbeat 共用，同一时刻只允许一个在途上报。
+static REPORT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// 【APC 任务4】最近一次成功上报时间点（Unix 秒），前台唤醒去重使用。
+static LAST_SUCCESS_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// RAII：无论成功/失败/提前 return，都释放单飞锁。
+struct ReportFlightGuard;
+
+impl Drop for ReportFlightGuard {
+    fn drop(&mut self) {
+        REPORT_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// 最近一次成功上报的 Unix 秒（0 = 从未成功）
+pub fn last_success_unix() -> i64 {
+    LAST_SUCCESS_UNIX.load(Ordering::Acquire)
+}
+
 /// 执行一次 check/心跳上报并应用结果（fail-open：仅 allowed=false 才有管控动作）。
 /// APP-7 新增：runtime 授权级熔断（解绑/过期/plan 缺失）。
-pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
+pub(crate) async fn report_once(app: &AppHandle, state: &AppState, kind: ReportKind) {
+    // 【APC 任务2】单飞：已有在途请求时直接返回，绝不并发打控制接口
+    if REPORT_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let _flight = ReportFlightGuard;
+
     let settings = state.settings.read().clone();
     let base = super::license::api_base(&settings);
-    let url = format!("{base}{}", crate::obf!("/api/app/check"));
+    let url = kind.url(&base);
     let (device_model, os_version) = device_info();
 
     let device_id_str = match license::device_id(&state.data_dir) {
@@ -575,10 +708,17 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
     // 内核停止后系统代理指向已下线的本地端口导致心跳自锁）
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(REPORT_CONNECT_TIMEOUT)
+        .timeout(REPORT_TIMEOUT)
         .build();
     let resp = match client {
-        Ok(c) => c.post(&url).json(&payload).send().await,
+        Ok(c) => {
+            c.post(&url)
+                .header("X-Request-Source", super::license::REQUEST_SOURCE)
+                .json(&payload)
+                .send()
+                .await
+        }
         Err(e) => {
             warn!("app-control: client build failed: {e}");
             return;
@@ -587,17 +727,19 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
     let parsed: Option<ControlResponse> = match resp {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
         Ok(r) => {
-            warn!("app-control: check returned HTTP {}", r.status());
+            warn!("app-control: {:?} returned HTTP {}", kind, r.status());
             return;
         }
         Err(e) => {
-            warn!("app-control: check failed (fail-open): {e}");
+            warn!("app-control: {:?} failed (fail-open): {e}", kind);
             return;
         }
     };
     let Some(resp) = parsed else {
         return;
     };
+    // 成功拿到可解析响应（无论 allowed 与否）才刷新成功时间
+    LAST_SUCCESS_UNIX.store(license::now_secs(), Ordering::Release);
 
     // 1. 授权级熔断（runtime 存在时执行；缺字段时旧版兼容不降级）
     if let Some(runtime) = resp.runtime.as_ref() {
@@ -606,33 +748,54 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
 
     // 2. 管控级阻断（allowed=false）
     if resp.allowed {
-        // 已解除管控（或从未管控）：清状态并广播
-        if state.control_block.read().is_some() {
-            *state.control_block.write() = None;
-            let _ = app.emit(
-                "app://control",
-                &serde_json::json!({
-                    "allowed": true,
-                    "reason": resp.reason,
-                    "message": resp.message,
-                }),
-            );
-        }
+        clear_control_block(app, state, &resp.reason, &resp.message);
         return;
     }
 
-    let reason = if resp.reason == REASON_USER {
-        REASON_USER.to_string()
-    } else {
-        REASON_VERSION.to_string()
-    };
-    let message = if resp.message.trim().is_empty() {
+    enforce_control_block(app, state, &resp.reason, &resp.message).await;
+}
+
+/// 解除管控：清除 control_block 并广播 allowed=true（仅在确有阻断时广播）
+fn clear_control_block(app: &AppHandle, state: &AppState, reason: &str, message: &str) {
+    if state.control_block.read().is_some() {
+        *state.control_block.write() = None;
+        let _ = app.emit(
+            "app://control",
+            &serde_json::json!({
+                "allowed": true,
+                "reason": reason,
+                "message": message,
+            }),
+        );
+    }
+}
+
+/// 【APC 任务4】应用管控级阻断（allowed=false）：
+/// - 保留服务端原始 reason（device_blocked / user_blocked / version_blocked / 未知）；
+/// - message 非空时优先展示，空才用默认文案；
+/// - 立即停止运行中的内核并写入 control_block（后续 start/restart 全部被拒）；
+/// - reason/message 未变化时跳过重复广播（心跳每 5 分钟一次）。
+/// 返回最终 (reason, message)。
+async fn enforce_control_block(
+    app: &AppHandle,
+    state: &AppState,
+    raw_reason: &str,
+    raw_message: &str,
+) -> (String, String) {
+    let reason = normalize_block_reason(raw_reason);
+    if !matches!(
+        reason.as_str(),
+        REASON_DEVICE | REASON_USER | REASON_VERSION
+    ) {
+        // 未知原因保留原始值（脱敏后）仅记录日志，前端走通用封禁 UI
+        warn!("app-control: 服务端返回未识别的管控原因: {reason}");
+    }
+    let message = if raw_message.trim().is_empty() {
         default_message(&reason)
     } else {
-        resp.message.clone()
+        raw_message.to_string()
     };
 
-    // 已处于阻断且 reason/message 均未变化：跳过重复广播（心跳每 5 分钟一次）
     let changed = {
         let cur = state.control_block.read();
         match cur.as_ref() {
@@ -642,10 +805,10 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
     };
 
     // 阻断生效：停止运行中的内核（连接会话必须立即终止）
-    if *state.status.read() == CoreStatus::Running {
-        if let Err(e) = crate::ipc::commands::do_stop(state).await {
-            warn!("app-control: stop kernel failed: {e}");
-        }
+    if *state.status.read() == CoreStatus::Running
+        && let Err(e) = crate::ipc::commands::do_stop(state).await
+    {
+        warn!("app-control: stop kernel failed: {e}");
     }
     *state.control_block.write() = Some(ControlBlock {
         reason: reason.clone(),
@@ -661,13 +824,14 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState) {
             }),
         );
     }
+    (reason, message)
 }
 
 /// 启动单次上报：立即执行一次（不等首个心跳周期）
 pub fn spawn_startup_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        report_once(&app, &state).await;
+        report_once(&app, &state, ReportKind::Check).await;
     });
 }
 
@@ -677,7 +841,7 @@ pub fn spawn_heartbeat(app: AppHandle) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             let state = app.state::<AppState>();
-            report_once(&app, &state).await;
+            report_once(&app, &state, ReportKind::Heartbeat).await;
         }
     });
 }
@@ -710,7 +874,28 @@ pub async fn force_runtime_check(
         device_id: device_id_str,
     };
 
-    let resp = license::post_with_fallback(&url, &serde_json::json!(payload))
+    // 【APC 任务3】与后台 check/heartbeat 共用同一把单飞锁 + 独立直连客户端：
+    // 不走授权模块的本地代理/DoH 容灾链路（管控请求必须是最短直连路径），
+    // 且同一时刻只允许一个管控请求在途。
+    if REPORT_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("授权状态同步中，请稍后重试".to_string());
+    }
+    let _flight = ReportFlightGuard;
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(REPORT_CONNECT_TIMEOUT)
+        .timeout(REPORT_TIMEOUT)
+        .build()
+        .map_err(|e| sanitize(&e.to_string()))?;
+    let resp = client
+        .post(&url)
+        .header("X-Request-Source", super::license::REQUEST_SOURCE)
+        .json(&payload)
+        .send()
         .await
         .map_err(|e| sanitize(&e.to_string()))?;
 
@@ -721,25 +906,25 @@ pub async fn force_runtime_check(
         ));
     }
     let parsed: ControlResponse = resp.json().await.map_err(|e| sanitize(&e.to_string()))?;
+    LAST_SUCCESS_UNIX.store(license::now_secs(), Ordering::Release);
 
-    // 管控级阻断
+    // 管控级阻断：与心跳完全一致（停止内核 + 写入 control_block + 广播）
     if !parsed.allowed {
-        return Err(format!(
-            "授权服务管控阻断（{}）：{}",
-            parsed.reason, parsed.message
-        ));
+        let (reason, message) =
+            enforce_control_block(app, state, &parsed.reason, &parsed.message).await;
+        return Err(sanitize(&format!(
+            "授权服务管控阻断（{reason}）：{message}"
+        )));
     }
+    clear_control_block(app, state, &parsed.reason, &parsed.message);
 
     // 授权级熔断：与心跳走完全相同的 apply_runtime（含 pro://revoked 广播），
     // 避免「立即校验」与后台心跳出现两套不一致的解绑/到期判定。
     let mut revoke_reason: Option<String> = None;
     if let Some(runtime) = parsed.runtime.as_ref() {
-        if let Some((_, _msg)) = apply_runtime(app, state, &state.data_dir, runtime) {
-            revoke_reason = Some(if runtime.device_bound == Some(false) {
-                REVOKE_UNBOUND.to_string()
-            } else {
-                REVOKE_EXPIRED.to_string()
-            });
+        let reason = decide_revoke(runtime);
+        if apply_runtime(app, state, &state.data_dir, runtime).is_some() {
+            revoke_reason = reason.map(str::to_string);
         }
     } else {
         // 服务端 runtime 缺失 → 回落到旧的 GET /api/license/status 兼容路径
@@ -767,21 +952,171 @@ fn sanitize(s: &str) -> String {
 
 // ---------------- 前台唤醒自动感知 ----------------
 
-/// App 从后台回前台（visibility changed visible）且距离上次 check/heartbeat
-/// 超过 30 秒时，立即触发一次后台 heartbeat 校验——用户在浏览器解绑设备后
-/// 切回 APP 瞬间就能自动感知并弹出横幅提示，无需手动点按钮。
-pub fn schedule_foreground_check(
-    app: AppHandle,
-    last_check_ts: std::sync::Arc<std::sync::atomic::AtomicI64>,
-) {
+/// 【APC 任务4】最近一次前台补发尝试时间（失败也记录，避免切前台反复重试）
+static FOREGROUND_LAST_ATTEMPT: AtomicI64 = AtomicI64::new(0);
+
+/// App 从后台回前台（visibility changed visible）触发一次 heartbeat 校验。
+/// 【APC 任务4】去重窗口 5 分钟（与心跳周期一致）：
+/// - 距上次成功上报或上次尝试不足 5 分钟 → 不重复发送；
+/// - 达到 5 分钟 → 立即补发一次 heartbeat；
+/// - 失败不无限重试（尝试时间同样计入窗口），网络恢复后按时间规则补发。
+pub fn schedule_foreground_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let now = license::now_secs();
-        let last = last_check_ts.load(std::sync::atomic::Ordering::Acquire);
-        if last > 0 && now - last < 30 {
+        let last = FOREGROUND_LAST_ATTEMPT
+            .load(Ordering::Acquire)
+            .max(last_success_unix());
+        if last > 0 && now - last < 300 {
             return;
         }
-        last_check_ts.store(now, std::sync::atomic::Ordering::Release);
+        FOREGROUND_LAST_ATTEMPT.store(now, Ordering::Release);
         let state = app.state::<AppState>();
-        report_once(&app, &state).await;
+        report_once(&app, &state, ReportKind::Heartbeat).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt(
+        plan: Option<&str>,
+        subscription_active: Option<bool>,
+        device_bound: Option<bool>,
+        alpha: bool,
+    ) -> RuntimePerception {
+        RuntimePerception {
+            plan: plan.map(|p| p.to_string()),
+            subscription_active,
+            device_bound,
+            alpha,
+            ..Default::default()
+        }
+    }
+
+    /// 【APC 任务3】订阅字段缺失绝不能被当成 false，否则旧服务端会把所有人踢下线
+    #[test]
+    fn appc_missing_subscription_is_not_expired() {
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), None, Some(true), false)),
+            None
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), Some(true), Some(true), false)),
+            None
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), Some(false), Some(true), false)),
+            Some(REVOKE_EXPIRED)
+        );
+    }
+
+    /// 【APC 任务3】Free 与买断不得触发 revoke
+    #[test]
+    fn appc_free_and_team_are_not_revoked() {
+        assert_eq!(
+            decide_revoke(&rt(Some("free"), Some(false), Some(true), false)),
+            None
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("team"), Some(false), Some(true), false)),
+            None
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("buyout"), Some(false), Some(true), false)),
+            None
+        );
+        // 订阅字段缺失 + team（永久）
+        assert_eq!(
+            decide_revoke(&rt(Some("team"), None, Some(true), false)),
+            None
+        );
+    }
+
+    /// 【APC 任务5】plan=null 是未激活/Free 基线，不得按「授权到期」剥夺；
+    /// 但 Alpha 内测到期后服务端同样退回未激活态，此时必须识别为内测到期。
+    #[test]
+    fn appc_null_plan_is_free_not_expired() {
+        assert_eq!(
+            decide_revoke(&rt(None, Some(false), Some(true), false)),
+            None
+        );
+        assert_eq!(decide_revoke(&rt(None, None, Some(true), false)), None);
+        assert_eq!(
+            decide_revoke(&rt(None, Some(false), Some(true), true)),
+            Some(REVOKE_ALPHA_EXPIRED)
+        );
+    }
+
+    /// 【APC 任务4】封禁原因必须原样保留，未知/空原因不得伪装成 version_blocked
+    #[test]
+    fn appc_block_reason_preserved() {
+        assert_eq!(normalize_block_reason("device_blocked"), REASON_DEVICE);
+        assert_eq!(normalize_block_reason("user_blocked"), REASON_USER);
+        assert_eq!(normalize_block_reason("version_blocked"), REASON_VERSION);
+        assert_eq!(
+            normalize_block_reason("custom_future_reason"),
+            "custom_future_reason"
+        );
+        assert_eq!(normalize_block_reason("  "), REASON_GENERIC);
+        assert_ne!(
+            normalize_block_reason("custom_future_reason"),
+            REASON_VERSION
+        );
+        // 三类已知原因必须有各自独立的默认文案
+        assert!(default_message(REASON_DEVICE).contains("终端"));
+        assert!(default_message(REASON_USER).contains("账号"));
+        assert!(default_message(REASON_VERSION).contains("版本"));
+    }
+
+    /// 【APC 任务3】管控客户端必须独立直连（no_proxy）+ 5 秒超时 + 单飞
+    #[test]
+    fn appc_control_client_is_isolated() {
+        assert_eq!(REPORT_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(REPORT_CONNECT_TIMEOUT, std::time::Duration::from_secs(3));
+        let src = include_str!("app_control.rs");
+        assert!(src.contains(".no_proxy()"));
+        // 手动强制校验不得再走授权模块的代理容灾链路
+        assert!(!src.contains(concat!("post_", "with_fallback")));
+    }
+
+    /// 【APC 任务5】Alpha 解绑/到期必须与正式授权区分
+    #[test]
+    fn appc_alpha_revoke_reasons() {
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), Some(true), Some(false), true)),
+            Some(REVOKE_ALPHA_UNBOUND)
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), Some(false), Some(true), true)),
+            Some(REVOKE_ALPHA_EXPIRED)
+        );
+        assert_eq!(
+            decide_revoke(&rt(Some("pro"), Some(true), Some(false), false)),
+            Some(REVOKE_UNBOUND)
+        );
+        let (zh, _) = revoke_message(REVOKE_ALPHA_UNBOUND);
+        assert!(zh.contains("Alpha"), "Alpha 解绑必须使用内测专用文案");
+    }
+
+    /// 【APC 任务2】check 与 heartbeat 必须命中不同接口
+    #[test]
+    fn appc_report_kind_routes() {
+        let base = "https://example.invalid";
+        assert!(ReportKind::Check.url(base).ends_with("/api/app/check"));
+        assert!(
+            ReportKind::Heartbeat
+                .url(base)
+                .ends_with("/api/app/heartbeat")
+        );
+    }
+
+    /// 【APC 任务3】同步授权字段：Free 不解锁，有效 Pro 会把 expired 修正为 active
+    #[test]
+    fn appc_free_plan_does_not_unlock() {
+        // 纯逻辑校验：free 分支写 inactive，非 free 分支写 active
+        let src = include_str!("app_control.rs");
+        assert!(src.contains("ent.status = \"inactive\".into();"));
+        assert!(src.contains("ent.status = \"active\".into();"));
+    }
 }

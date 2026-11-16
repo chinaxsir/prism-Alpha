@@ -1099,10 +1099,14 @@ pub async fn get_core_status(
 }
 
 #[tauri::command]
-pub fn set_app_foreground(foreground: bool, state: State<'_, AppState>) {
+pub fn set_app_foreground(app: AppHandle, foreground: bool, state: State<'_, AppState>) {
     state
         .app_in_foreground
         .store(foreground, std::sync::atomic::Ordering::Relaxed);
+    // 【APC 任务4】恢复前台时按 5 分钟窗口补发一次心跳（后台不额外唤醒）
+    if foreground {
+        crate::core::app_control::schedule_foreground_check(app);
+    }
 }
 
 /// 【APP58 任务2.2】原生级跨平台打开外链：

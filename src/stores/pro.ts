@@ -10,8 +10,14 @@ import {
   type Entitlement,
 } from "@/api/ipc";
 
-/** 授权被剥夺的原因：unbound=设备被官网解绑，expired=授权到期（IPA-3 任务2） */
-export type RevokeReason = "unbound" | "expired" | null;
+/** 授权被剥夺的原因：unbound=设备被官网解绑，expired=授权到期；
+ *  alpha_unbound / alpha_expired = Alpha 内测设备失效 / 内测到期（APC 任务5） */
+export type RevokeReason =
+  | "unbound"
+  | "expired"
+  | "alpha_unbound"
+  | "alpha_expired"
+  | null;
 
 const INACTIVE: Entitlement = {
   status: "inactive",

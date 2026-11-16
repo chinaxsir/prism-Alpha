@@ -56,7 +56,7 @@ export default function App() {
   const setTheme = usePrefsStore((s) => s.setTheme);
   // APP 远程管控阻断状态（app://control 事件维护；null = 无管控）
   const [controlBlock, setControlBlock] = useState<{
-    reason: "version_blocked" | "user_blocked";
+    reason: string;
     message: string;
   } | null>(null);
 
@@ -268,13 +268,21 @@ export default function App() {
   // 启动与巡检时的到期提示已全部清除。
   useEffect(() => {
     const unlisten = listen<{
-      reason?: "unbound" | "expired";
+      reason?: string;
       zh?: string;
       en?: string;
     }>("pro://revoked", (event) => {
-      const reason =
-        event.payload?.reason === "unbound" ? "unbound" : "expired";
-      useProStore.getState().setRevokeReason(reason);
+      const reason = event.payload?.reason;
+      // 【APC 任务5】Alpha 解绑/到期使用独立原因，其余（含未知）按到期处理
+      useProStore
+        .getState()
+        .setRevokeReason(
+          reason === "unbound" || reason === "alpha_unbound"
+            ? reason
+            : reason === "alpha_expired"
+              ? "alpha_expired"
+              : "expired"
+        );
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -430,7 +438,7 @@ export default function App() {
         return;
       }
       setControlBlock({
-        reason: event.payload.reason === "user_blocked" ? "user_blocked" : "version_blocked",
+        reason: event.payload.reason,
         message: event.payload.message,
       });
     });
@@ -478,9 +486,13 @@ export default function App() {
               <ShieldBan size={22} className="text-latency-bad" />
             </span>
             <h2 className="text-base font-semibold text-gray-100">
-              {controlBlock.reason === "user_blocked"
-                ? t("appControl.userBlocked")
-                : t("appControl.versionBlocked")}
+              {controlBlock.reason === "device_blocked"
+                ? t("appControl.deviceBlocked")
+                : controlBlock.reason === "user_blocked"
+                  ? t("appControl.userBlocked")
+                  : controlBlock.reason === "version_blocked"
+                    ? t("appControl.versionBlocked")
+                    : t("appControl.blocked")}
             </h2>
             <p className="break-all text-xs leading-relaxed text-gray-400">
               {controlBlock.message}

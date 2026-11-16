@@ -41,7 +41,7 @@ fn default_server() -> String {
 }
 
 /// 新协议要求的请求来源标识头
-const REQUEST_SOURCE: &str = "prism-app";
+pub(crate) const REQUEST_SOURCE: &str = "prism-app";
 
 // ---------------- 对外类型 ----------------
 
@@ -182,13 +182,14 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// 读取/首次生成设备 ID（每安装实例唯一，落盘 device.json）。
 ///
-/// APP-7 任务2.1 核心规则（必须严格遵守，否则所有老用户会被解绑）：
+/// 【APC 任务6】身份生成策略（必须严格遵守，否则所有老用户会被解绑）：
 /// - **向后兼容铁律**：如果 device.json 已存在且含 `id` 字段，
-///   **无论它是旧版 UUID v4 还是新版 SHA-256 硬件指纹**，直接返回；
-///   绝不重新生成——老用户在服务端 devices 表里绑定的就是这枚 UUID，
-///   切 SHA-256 会让所有老用户突然 device_bound=false 被解绑。
-/// - **首次安装（device.json 不存在）**：按目标平台采集硬件指纹并
-///   计算 SHA-256 64 位小写 hex（见各平台 hardware_fingerprint 实现）。
+///   **无论它是旧版 UUID v4 还是旧版 SHA-256 硬件指纹**，直接返回；
+///   绝不重新生成——老用户在服务端 devices 表里绑定的就是这枚 ID。
+/// - **首次安装（device.json 不存在）**：生成随机 UUID v4 并做 SHA-256，
+///   得到 64 位小写 hex 落盘。**严禁采集任何硬件标识**（MachineGuid /
+///   IOPlatformUUID / ANDROID_ID / identifierForVendor / MAC 等），
+///   避免设备指纹合规风险与跨版本漂移。
 /// - **全 APP 统一铁律**：activate / check / heartbeat / 订阅同步 /
 ///   设置页「设备 ID」展示，必须 100% 调用同一个 `device_id(data_dir)`。
 ///   任何绕过本函数直接生成 UUID 的路径都是 bug。
@@ -202,11 +203,15 @@ pub fn device_id(data_dir: &Path) -> Result<String> {
         return Ok(id.to_string());
     }
 
-    let fp = hardware_fingerprint();
-    let hex = hex_lower(&Sha256::digest(fp.as_bytes()));
+    let raw_uuid = uuid::Uuid::new_v4().to_string();
+    let hex = hex_lower(&Sha256::digest(raw_uuid.as_bytes()));
     std::fs::write(
         &path,
-        serde_json::to_vec(&serde_json::json!({ "id": hex, "fingerprint_fp": fp }))?,
+        serde_json::to_vec(&serde_json::json!({
+            "id": hex,
+            "source": "random-uuid-v4",
+            "created_at": now_secs(),
+        }))?,
     )?;
     Ok(hex)
 }
@@ -242,105 +247,6 @@ fn license_ref(key: &str) -> String {
     let mut h = Sha256::new();
     h.update(key.trim().as_bytes());
     hex_lower(&h.finalize()[..8])
-}
-
-/// 平台硬件指纹原始串（送入 SHA-256 算 device_id）。
-/// 不同平台用各自权威系统标识：iOS identifierForVendor + hostname、
-/// Android ANDROID_ID + Build.MODEL、macOS IOPlatformUUID、Windows MachineGuid、
-/// Linux machine-id。指纹变化 → SHA-256 变化 → 视为新设备，合理。
-fn hardware_fingerprint() -> String {
-    #[cfg(target_os = "ios")]
-    {
-        // iOS 端硬件指纹由 Swift @_cdecl prism_ios_get_device_id 直接返回
-        // （Keychain 读取 identifierForVendor + hostname 的 SHA-256，
-        // 且 kSecAttrSynchronizable = false 绝不 iCloud 同步）。
-        // 这里直接返回 Swift 侧已经算好的 hex 值——它本身就是 64 位 hex，
-        // 绕过再算一次 SHA-256（license::device_id 会再算一次；我们让
-        // hardware_fingerprint 返回已经是 hex 的值，再 SHA-256 也能得到
-        // 稳定值；更简单的方案是直接让 iOS 的 device_id 用 Swift 值）。
-        // 但为了统一全平台 device_id 的「硬件指纹 → SHA-256 hex」语义，
-        // 这里返回 Swift 值作为硬件指纹串即可。
-        if let Some(swift_hex) = crate::platform::ios::get_device_id() {
-            return swift_hex;
-        }
-        return "ios-fallback-".into();
-    }
-    #[cfg(target_os = "android")]
-    {
-        // Android 设备标识（Settings.Secure.ANDROID_ID + Model）
-        return "android-fallback-".into();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let uuid = std::process::Command::new("ioreg")
-            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
-                    if l.contains("IOPlatformUUID") {
-                        l.split('"').nth(3).map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| "macos-unknown-uuid".into());
-        let host = hostname_fallback();
-        return format!("macos|{uuid}|{host}");
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
-        let guid = std::process::Command::new("reg")
-            .args([
-                "query",
-                r"HKLM\SOFTWARE\Microsoft\Cryptography",
-                "/v",
-                "MachineGuid",
-            ])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
-                    let mut p = l.split_whitespace();
-                    let _ = p.next()?; // "MachineGuid"
-                    let _ = p.next()?; // "REG_SZ"
-                    Some(p.collect::<Vec<_>>().join(" "))
-                })
-            })
-            .unwrap_or_else(|| "windows-unknown".into());
-        let host = hostname_fallback();
-        return format!("windows|{guid}|{host}");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let machine_id = std::fs::read_to_string("/etc/machine-id")
-            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "linux-unknown".into());
-        let host = hostname_fallback();
-        return format!("linux|{machine_id}|{host}");
-    }
-    #[cfg(not(any(
-        target_os = "ios",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "linux"
-    )))]
-    {
-        hostname_fallback()
-    }
-}
-
-/// 主机名兜底（仅 Windows/Linux 及未知平台使用；iOS/Android/macOS 走各自分支）
-#[allow(dead_code)]
-fn hostname_fallback() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .or_else(|_| std::env::var("USERDOMAIN"))
-        .unwrap_or_else(|_| "unknown-host".into())
 }
 
 /// 设备名：主机名优先，缺失时用固定值（activate 协议要求 device_name 字段）
@@ -1663,5 +1569,41 @@ mod tests {
     fn license_ref_trims_but_preserves_case() {
         assert_eq!(license_ref("  ASKC-LDP2-M4VT-ZSBU  "), "02d716abf16c817c");
         assert_ne!(license_ref("askc-ldp2-m4vt-zsbu"), "02d716abf16c817c");
+    }
+
+    /// 【APC 任务6】首次安装必须生成随机 UUID → SHA-256（64 位 hex），
+    /// 二次读取必须复用同一 ID；且 device.json 严禁写任何硬件指纹字段。
+    #[test]
+    fn appc_device_id_is_random_not_hardware() {
+        let dir =
+            std::env::temp_dir().join(format!("prism-device-id-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let first = device_id(&dir).expect("device id");
+        assert_eq!(first.len(), 64, "必须是 64 位 hex");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        let second = device_id(&dir).expect("device id again");
+        assert_eq!(first, second, "已存在的 device.json 必须复用，绝不重新生成");
+
+        let raw = std::fs::read_to_string(dir.join("device.json")).expect("device.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(
+            v.get("source").and_then(|s| s.as_str()),
+            Some("random-uuid-v4")
+        );
+        assert!(v.get("fingerprint_fp").is_none(), "严禁再落盘任何硬件指纹");
+
+        // 不同安装实例必须得到不同身份
+        let dir2 =
+            std::env::temp_dir().join(format!("prism-device-id-test2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).expect("create temp dir 2");
+        let other = device_id(&dir2).expect("device id 2");
+        assert_ne!(first, other, "随机身份不得跨安装复用");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
