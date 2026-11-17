@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Power,
   Globe,
-  BarChart3,
+  Activity,
   X,
   ChevronRight,
   Crosshair,
@@ -171,8 +171,11 @@ export default function Dashboard() {
   const cus = useCoreStore((s) => s.goCusSettings);
   // 【APP54 任务5】Go AIM 实时进度（全局 store，事件驱动）
   const aimProgress = useCoreStore((s) => s.aimProgress);
-  // 【APP40 任务2】内网档案运行状态（⚡同网段直连 / 🔒隧道）
-  const [lanState, setLanState] = useState<GoLanStatus | null>(null);
+  // 【v0.4.17】Go AIM 最近事件：探测中用它展示「正在检测: 节点」
+  const aimEvent = useCoreStore((s) => s.aimEvent);
+  // 【v0.4.17】Go Lan 内网档案运行状态仍按需拉取更新（状态胶囊改用短状态，
+  // 不再直接渲染档案明细），因此只保留 setter，避免未读变量告警。
+  const [, setLanState] = useState<GoLanStatus | null>(null);
 
   const running = status === "running";
   // 【APP53 任务1.2】运行模式字样已从主控卡移除，outboundMode/mode 不再直接渲染；
@@ -558,70 +561,38 @@ export default function Dashboard() {
     }
   };
 
-  // ---- Pro 引擎矩阵状态文案（ipa-8：横向通栏卡片，一行完整状态信息） ----
-  // APP-5 任务3：Go AIM 状态副标题严格区分「手动锁定」与「自动优选」；
-  // 【APP54 任务5】探测中优先展示实时进度（位置 C）
+  // ---- 【v0.4.17 任务3】Pro 引擎状态：胶囊只放「短状态」，长句仅出现在底行简介 ----
+  // 旧实现把长描述同时塞进状态胶囊与副标题，移动端出现同一句话重复两遍，
+  // 且挤压掉 Go Lan / Go Cus 的「配置」按钮。
   const aimRated = Object.keys(aim?.results ?? {}).length;
   const aimRunning = aimProgress.running || Boolean(aim?.probing);
-  // 【APP60 任务1.1】未开启/未激活时展示核心功能简介，替代「未激活 · Pro 专属」
-  const aimStatus = aim?.enabled
-    ? aimRunning
-      ? t("dashboard.aim.progress", {
+  const aimPill = !aim?.enabled
+    ? t("engine.status.standby")
+    : aimRunning
+      ? t("engine.status.probing", {
           done: aimProgress.done,
           total: aimProgress.total || aimRated,
-          percent: aimProgress.percent,
-          unlocked: aimProgress.unlockedCount,
         })
-      : aim.pinnedNode
-        ? t("dashboard.aim.pinned", { node: aim.pinnedNode })
-        : t("dashboard.aim.rated", {
-            node: aim.lockedNode || currentNode || "—",
-            rated: aimRated,
-            total: aimProgress.total || aimRated,
-          })
+      : t("engine.status.optimized", { count: aimRated });
+  // Go AIM 底行：探测中动态展示当前检测节点与进度，平时展示功能简介
+  const aimDesc = aimRunning
+    ? t("dashboard.aim.probingDetail", {
+        node: aimEvent?.message?.trim() || t("dashboard.aim.probing"),
+        percent: aimProgress.percent,
+      })
     : t("engine.goAim.desc");
-  // 【APP23 任务1.2】字段缺失兜底：goLanSettings 任一层为 undefined 时
-  // 直接 join 会抛异常导致 React 渲染崩溃黑屏，统一用可选链 + 空数组兜底
-  const lanCidrs = lan?.lanCidrs ?? [];
-  // 【APP40 任务2】多档案副标题：已启用: 家里 (⚡ 直连) · 公司 (🔒 隧道)
-  // 【APP55 任务3】多隧道精准直连：只看本档案自身网段是否命中，
-  // 严禁用「任一档案直连」的全局状态给所有隧道挂 ⚡
-  const enabledLanProfiles = (lan?.profiles ?? []).filter((p) => p.enabled);
-  const lanDirectMap = lanState?.goLanProfileDirectMap ?? {};
-  const lanStatus =
-    lan?.enabled && enabledLanProfiles.length > 0
-      ? t("dashboard.lan.profiles", {
-          profiles: enabledLanProfiles
-            .map((p) => {
-              // 【APP56 任务3 / APP57 任务1.3】严格只读本档案自身的直连结果，
-              // 支持 id 与名称双键查找，仍禁止任何跨档案聚合
-              const isDirect = Boolean(
-                p.enabled &&
-                  p.bypassOnLocalLan &&
-                  (lanDirectMap[p.id] === true || lanDirectMap[p.name] === true),
-              );
-              const badge = isDirect
-                ? t("goLan.statusDirect")
-                : t("goLan.statusTunnel");
-              return `${p.name} (${badge})`;
-            })
-            .join(" · "),
-        })
-      : lan?.enabled && lanCidrs.length > 0
-        ? t("dashboard.lan.configured", {
-            mode: t(lan?.mode === "managed" ? "dashboard.lan.managed" : "dashboard.lan.manual"),
-            cidrs: lanCidrs.join(", "),
-          })
-        : t("engine.goLan.desc");
-  const cusEnabledModules = cus?.modules.filter((m) => m.enabled) ?? [];
-  const cusStatus =
-    cus?.enabled && cus.modules.length > 0
-      ? t("dashboard.cus.enabled", {
-          modules: cusEnabledModules.length,
-          rewrites: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.rewrites ?? 0), 0),
-          scripts: cusEnabledModules.reduce((acc, m) => acc + (m.stats?.scripts ?? 0), 0),
-        })
-      : t("engine.goCus.desc");
+  const lanPill = lan?.enabled
+    ? t("engine.status.active")
+    : t("engine.status.standby");
+  const cusPill = cus?.enabled
+    ? t("engine.status.active")
+    : t("engine.status.standby");
+
+  // 【v0.4.17 任务1】当前节点展示名与实时延迟（未启动时回退持久化选择）
+  const displayNodeName =
+    currentNode || persistedNode || nodes[0]?.name || t("dashboard.noSelection");
+  const activeNode = nodes.find((n) => n.name === displayNodeName);
+  const currentDelay = activeNode ? (nodeDelay(activeNode) ?? 0) : 0;
 
   // Go AIM 开启时的「重测」：立即触发一轮评级探测（结果经 go-aim://updated 事件刷新）
   const runAimProbe = async () => {
@@ -642,15 +613,15 @@ export default function Dashboard() {
         <OutboundModeSwitch />
       </div>
 
-      {/* 第二层：连接状态主控卡（左：状态+运行时长+当前节点+今日流量 三合一横向信息带；右：启停按钮） */}
+      {/* 【v0.4.17 任务1】卡片 A：连接状态与启停主控卡（左：呼吸灯+文案+大号等宽时长；右：启停胶囊） */}
       <div className="rounded-2xl py-3.5 px-4 border bg-surface-card border-border shrink-0">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">
+            <div className="flex items-center gap-2 text-xs text-gray-400">
               <span
-                className={`inline-block w-2 h-2 rounded-full ${
+                className={`inline-block w-2 h-2 shrink-0 rounded-full ${
                   running
-                    ? "bg-latency-good"
+                    ? "bg-emerald-500"
                     : status === "starting"
                       ? "bg-amber-400"
                       : manualStartFailed
@@ -666,34 +637,14 @@ export default function Dashboard() {
                     ? t("status.startFailed")
                     : t("status.disconnected")}
             </div>
-            <div className="text-2xl font-bold tabular-nums text-gray-100">
+            <div className="mt-0.5 truncate text-2xl md:text-3xl font-bold font-mono tracking-tight tabular-nums text-gray-100">
               {running ? formatUptime(displayUptimeSecs) : "Prism"}
-            </div>
-            {/* 当前节点 + 今日流量 紧凑横向信息带 */}
-            <div className="mt-1.5 flex items-center gap-4 text-xs text-text-muted min-w-0">
-              <div
-                className={clsx(
-                  "flex items-center gap-1.5 min-w-0",
-                  nodes.length > 0 && "cursor-pointer hover:text-accent"
-                )}
-                onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
-              >
-                <Globe size={13} className="shrink-0 text-[#007AFF] dark:text-[#0A84FF]" />
-                <span className="truncate" title={currentNode || persistedNode || nodes[0]?.name}>
-                  {currentNode || persistedNode || nodes[0]?.name || t("dashboard.noSelection")}
-                </span>
-                {nodes.length > 0 && <ChevronRight size={12} className="shrink-0" />}
-              </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <BarChart3 size={13} className="shrink-0 text-[#00C7BE]" />
-                <span className="tabular-nums">{formatBytes(todayBytes || 0)}</span>
-              </div>
             </div>
           </div>
           <button
             onClick={toggle}
             disabled={status === "starting"}
-            className={`shrink-0 flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+            className={`shrink-0 flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
               running
                 ? "bg-latency-bad/20 text-latency-bad hover:bg-latency-bad/30"
                 : "bg-accent text-white hover:bg-accent-hover"
@@ -706,6 +657,66 @@ export default function Dashboard() {
                 ? t("action.starting")
                 : t("action.start")}
           </button>
+        </div>
+      </div>
+
+      {/* 【v0.4.17 任务1】卡片 B：当前节点 + 今日流量 独立双栏 Bento 网格
+          （左 7/12 ≈ 62% 展示节点与延迟，右 5/12 ≈ 38% 展示今日流量） */}
+      <div className="grid grid-cols-12 gap-3 shrink-0">
+        <button
+          type="button"
+          onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
+          disabled={nodes.length === 0}
+          className={clsx(
+            "col-span-7 md:col-span-8 min-w-0 rounded-2xl bg-surface-card border border-border px-3.5 py-3 text-left flex flex-col justify-between transition-colors",
+            nodes.length > 0
+              ? "cursor-pointer hover:border-accent/30 active:opacity-80"
+              : "cursor-default"
+          )}
+        >
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Globe size={14} className="shrink-0 text-[#007AFF] dark:text-[#0A84FF]" />
+            <span className="text-xs font-medium text-text-muted whitespace-nowrap">
+              {t("metric.currentNode")}
+            </span>
+            {currentDelay > 0 && (
+              <span
+                className={clsx(
+                  "ml-auto shrink-0 text-[11px] font-mono tabular-nums",
+                  delayClass(currentDelay)
+                )}
+              >
+                {delayText(currentDelay)}
+              </span>
+            )}
+            {nodes.length > 0 && (
+              <ChevronRight
+                size={14}
+                className={clsx(
+                  "shrink-0 text-text-muted",
+                  currentDelay <= 0 && "ml-auto"
+                )}
+              />
+            )}
+          </div>
+          <div
+            className="mt-1 min-w-0 truncate text-sm md:text-base font-semibold text-text"
+            title={displayNodeName}
+          >
+            {displayNodeName}
+          </div>
+        </button>
+
+        <div className="col-span-5 md:col-span-4 min-w-0 rounded-2xl bg-surface-card border border-border px-3.5 py-3 flex flex-col justify-between">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Activity size={14} className="shrink-0 text-[#00C7BE]" />
+            <span className="text-xs font-medium text-text-muted whitespace-nowrap">
+              {t("metric.todayTraffic")}
+            </span>
+          </div>
+          <div className="mt-1 min-w-0 truncate text-sm md:text-base font-bold font-mono tabular-nums text-text">
+            {formatBytes(todayBytes || 0)}
+          </div>
         </div>
       </div>
 
@@ -728,14 +739,15 @@ export default function Dashboard() {
         t={t}
       />
 
-      {/* 第四层：Go AIM / Go Lan / Go Cus Pro 引擎三联卡片矩阵 */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 shrink-0">
+      {/* 第四层：Go AIM / Go Lan / Go Cus Pro 引擎卡片
+          移动端单列舒展，Mac 端等高三级列矩阵 */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 shrink-0">
         <EngineCard
           icon={<Crosshair size={16} className="text-surge-green" />}
           tone="text-surge-green"
           name={t("engine.goAim")}
-          status={proUnlocked ? aimStatus : t("engine.goAim.desc")}
-          subtitle={t("engine.goAim.desc")}
+          status={aimPill}
+          subtitle={aimDesc}
           enabled={proUnlocked && (aim?.enabled ?? false)}
           locked={!proUnlocked}
           onToggle={toggleAim}
@@ -744,7 +756,7 @@ export default function Dashboard() {
               <button
                 onClick={runAimProbe}
                 disabled={aim.probing}
-                className="text-xs text-accent hover:underline px-1.5 py-0.5 whitespace-nowrap disabled:opacity-50 disabled:no-underline"
+                className="text-xs font-medium px-2.5 py-1 rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition-colors whitespace-nowrap disabled:opacity-50"
               >
                 {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
               </button>
@@ -755,7 +767,7 @@ export default function Dashboard() {
           icon={<Home size={16} className="text-surge-orange" />}
           tone="text-surge-orange"
           name={t("engine.goLan")}
-          status={proUnlocked ? lanStatus : t("engine.goLan.desc")}
+          status={lanPill}
           subtitle={t("engine.goLan.desc")}
           enabled={proUnlocked && (lan?.enabled ?? false)}
           locked={!proUnlocked}
@@ -764,9 +776,9 @@ export default function Dashboard() {
             proUnlocked ? (
               <button
                 onClick={() => setGoLanModalOpen(true)}
-                className="text-xs text-accent hover:underline px-1.5 py-0.5 whitespace-nowrap"
+                className="text-xs font-medium px-2.5 py-1 rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition-colors whitespace-nowrap"
               >
-                {t("common.configure")} ›
+                {t("common.configure")}
               </button>
             ) : undefined
           }
@@ -775,7 +787,7 @@ export default function Dashboard() {
           icon={<Wand2 size={16} className="text-surge-purple" />}
           tone="text-surge-purple"
           name={t("engine.goCus")}
-          status={proUnlocked ? cusStatus : t("engine.goCus.desc")}
+          status={cusPill}
           subtitle={t("engine.goCus.desc")}
           enabled={proUnlocked && (cus?.enabled ?? false)}
           locked={!proUnlocked}
@@ -784,9 +796,9 @@ export default function Dashboard() {
             proUnlocked ? (
               <button
                 onClick={() => navigate("/proxies?tab=goCus")}
-                className="text-xs text-accent hover:underline px-1.5 py-0.5 whitespace-nowrap"
+                className="text-xs font-medium px-2.5 py-1 rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition-colors whitespace-nowrap"
               >
-                {t("common.configure")} ›
+                {t("common.configure")}
               </button>
             ) : undefined
           }
@@ -869,10 +881,9 @@ export default function Dashboard() {
   );
 }
 
-/// 【mac 任务3.3】Pro 引擎卡 3 行布局：
-/// 第一行：图标 + 标题（左）| Switch 开关（右）
-/// 第二行：状态胶囊（左）| 配置/重测轻按钮（右）
-/// 第三行：单行功能简介副标题
+/// 【v0.4.17 任务3】Pro 引擎卡两行结构：
+/// 顶行：图标 + 标题 + 短状态胶囊 | 右侧：配置/重测按钮 + Switch
+/// 底行：唯一一行功能简介（禁止与胶囊文案重复）
 function EngineCard({
   icon,
   name,
@@ -896,17 +907,17 @@ function EngineCard({
 }) {
   return (
     <div
-      className={`card-sheen flex flex-col gap-2 px-4 py-3 rounded-xl bg-surface-card border border-border transition-colors min-h-[108px] ${
+      className={`card-sheen flex flex-col gap-1.5 px-3.5 py-3 rounded-xl bg-surface-card border border-border transition-colors ${
         locked ? "select-none cursor-not-allowed" : "hover:border-accent/30"
       }`}
     >
-      {/* 第一行：图标 + 标题 | 开关 */}
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          {icon}
+      {/* 顶行：图标 + 标题 + 短状态胶囊 | 操作按钮 + 开关 */}
+      <div className="flex items-center gap-2 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0 shrink">
+          <span className="shrink-0">{icon}</span>
           <span
             className={clsx(
-              "min-w-0 truncate text-[17px] font-bold tracking-tight",
+              "min-w-0 truncate text-[15px] font-bold tracking-tight",
               tone ?? "text-gray-100"
             )}
             title={name}
@@ -914,14 +925,9 @@ function EngineCard({
             {name}
           </span>
         </div>
-        <Switch checked={enabled} disabled={locked} onChange={onToggle} />
-      </div>
-
-      {/* 第二行：状态胶囊 | 轻按钮 */}
-      <div className="flex items-center justify-between gap-2">
         <span
           className={clsx(
-            "inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap",
+            "inline-flex shrink-0 items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full font-medium whitespace-nowrap",
             enabled
               ? "bg-emerald-500/15 text-emerald-400"
               : "bg-gray-500/15 text-gray-400"
@@ -935,14 +941,14 @@ function EngineCard({
           />
           {status}
         </span>
-        {action}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {action}
+          <Switch checked={enabled} disabled={locked} onChange={onToggle} />
+        </div>
       </div>
 
-      {/* 第三行：单行功能简介副标题 */}
-      <div
-        className="text-xs text-text-muted truncate leading-snug"
-        title={subtitle}
-      >
+      {/* 底行：唯一一行功能简介 */}
+      <div className="min-w-0 truncate text-xs text-text-muted" title={subtitle}>
         {subtitle}
       </div>
     </div>
@@ -979,7 +985,9 @@ function buildSmoothSvgPath(
   return d;
 }
 
-/// 【mac 任务3.2】实时速率监控 + 双轨流量波形图大卡片
+/// 【v0.4.17 任务2】实时速率监控 + 双轨流量波形图：
+/// 顶部为左右严格对称的 2 等分网格（标题+峰值一行，大号网速独占第二行），
+/// 物理隔离彻底杜绝窄屏下「网速数字 / 峰值徽章」重叠；量程移入波形图右上角角标。
 function TrafficWaveformCard({
   down,
   up,
@@ -1014,107 +1022,116 @@ function TrafficWaveformCard({
   const lastX = W;
 
   return (
-    <div className="card-sheen rounded-2xl px-4 py-3.5 border border-border bg-surface-card">
-      {/* 顶部双通道速率指标栏 */}
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5 text-xs font-medium text-text-muted">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            {t("metric.download")}
+    <div className="card-sheen rounded-2xl px-3.5 py-3 md:px-4 md:py-3.5 border border-border bg-surface-card shrink-0">
+      {/* 顶部：左右严格对称 2 等分网格，中间细分隔线 */}
+      <div className="grid grid-cols-2 gap-3 pb-3 border-b border-border">
+        {/* 左栏：下载 */}
+        <div className="flex min-w-0 flex-col justify-between">
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex shrink-0 items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-500" />
+              <span className="text-xs font-medium text-text-secondary whitespace-nowrap">
+                ↓ {t("metric.download")}
+              </span>
+            </div>
+            <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+              {t("dashboard.peak")} {formatSpeed(peakDown)}
+            </span>
           </div>
-          <div className="text-2xl font-bold font-mono text-emerald-500 tabular-nums mt-0.5 whitespace-nowrap">
+          <div className="mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-emerald-500 tracking-tight tabular-nums">
             {formatSpeed(down)}
           </div>
         </div>
-        <div className="text-right min-w-0">
-          <div className="inline-flex items-center gap-1 text-[10px] text-text-muted bg-emerald-500/10 px-1.5 py-0.5 rounded-full">
-            峰值: {formatSpeed(peakDown)}
+
+        {/* 右栏：上传 */}
+        <div className="flex min-w-0 flex-col justify-between border-l border-border pl-3">
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex shrink-0 items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-blue-500" />
+              <span className="text-xs font-medium text-text-secondary whitespace-nowrap">
+                ↑ {t("metric.upload")}
+              </span>
+            </div>
+            <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+              {t("dashboard.peak")} {formatSpeed(peakUp)}
+            </span>
           </div>
-        </div>
-        <div className="min-w-0 text-right">
-          <div className="flex items-center justify-end gap-1.5 text-xs font-medium text-text-muted">
-            {t("metric.upload")}
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
-          </div>
-          <div className="text-2xl font-bold font-mono text-blue-500 tabular-nums mt-0.5 whitespace-nowrap">
+          <div className="mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-blue-500 tracking-tight tabular-nums">
             {formatSpeed(up)}
           </div>
         </div>
-        <div className="text-left min-w-0">
-          <div className="inline-flex items-center gap-1 text-[10px] text-text-muted bg-blue-500/10 px-1.5 py-0.5 rounded-full">
-            峰值: {formatSpeed(peakUp)}
-          </div>
-        </div>
-        <div className="shrink-0 text-[10px] text-text-muted text-right whitespace-nowrap">
-          量程: {formatSpeed(maxVal)}
-        </div>
       </div>
 
-      {/* 双轨平滑贝塞尔波形图 */}
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
-        className="w-full h-36 mt-2"
-      >
-        <defs>
-          <linearGradient id="downGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#10B981" stopOpacity="0.30" />
-            <stop offset="100%" stopColor="#10B981" stopOpacity="0" />
-          </linearGradient>
-          <linearGradient id="upGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#3B82F6" stopOpacity="0.25" />
-            <stop offset="100%" stopColor="#3B82F6" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-        {/* 3 条水平参考虚线 */}
-        {[0.25, 0.5, 0.75].map((r) => (
-          <line
-            key={r}
-            x1="0"
-            y1={H * r}
-            x2={W}
-            y2={H * r}
-            stroke="currentColor"
-            strokeOpacity="0.08"
-            strokeWidth="1"
-            strokeDasharray="4 4"
-            className="text-gray-400"
-          />
-        ))}
-        {/* 下载波形层 */}
-        {downArea && <path d={downArea} fill="url(#downGrad)" />}
-        {downPath && (
-          <path
-            d={downPath}
-            fill="none"
-            stroke="#10B981"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        )}
-        {/* 上传波形层 */}
-        {upArea && <path d={upArea} fill="url(#upGrad)" />}
-        {upPath && (
-          <path
-            d={upPath}
-            fill="none"
-            stroke="#3B82F6"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        )}
-        {/* 实时脉动圆点 */}
-        <circle cx={lastX} cy={lastDownY} r="3" fill="#10B981">
-          <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
-          <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
-        </circle>
-        <circle cx={lastX} cy={lastUpY} r="3" fill="#3B82F6">
-          <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
-          <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
-        </circle>
-      </svg>
+      {/* 下部：实时双轨平滑 SVG 波形图，量程为右上角悬浮角标 */}
+      <div className="relative mt-2.5 h-24 md:h-32 w-full overflow-hidden rounded-xl bg-surface/40">
+        <span className="absolute top-1.5 right-2 z-10 rounded border border-border bg-surface-card/80 px-1.5 py-0.5 text-[10px] font-mono text-text-muted backdrop-blur-sm">
+          {t("dashboard.scale")}: {formatSpeed(maxVal)}
+        </span>
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          preserveAspectRatio="none"
+          className="h-full w-full"
+        >
+          <defs>
+            <linearGradient id="downGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10B981" stopOpacity="0.30" />
+              <stop offset="100%" stopColor="#10B981" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id="upGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#3B82F6" stopOpacity="0.25" />
+              <stop offset="100%" stopColor="#3B82F6" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {/* 3 条水平参考虚线 */}
+          {[0.25, 0.5, 0.75].map((r) => (
+            <line
+              key={r}
+              x1="0"
+              y1={H * r}
+              x2={W}
+              y2={H * r}
+              stroke="currentColor"
+              strokeOpacity="0.08"
+              strokeWidth="1"
+              strokeDasharray="4 4"
+              className="text-gray-400"
+            />
+          ))}
+          {/* 下载波形层 */}
+          {downArea && <path d={downArea} fill="url(#downGrad)" />}
+          {downPath && (
+            <path
+              d={downPath}
+              fill="none"
+              stroke="#10B981"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          )}
+          {/* 上传波形层 */}
+          {upArea && <path d={upArea} fill="url(#upGrad)" />}
+          {upPath && (
+            <path
+              d={upPath}
+              fill="none"
+              stroke="#3B82F6"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          )}
+          {/* 实时脉动圆点 */}
+          <circle cx={lastX} cy={lastDownY} r="3" fill="#10B981">
+            <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
+          </circle>
+          <circle cx={lastX} cy={lastUpY} r="3" fill="#3B82F6">
+            <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
+          </circle>
+        </svg>
+      </div>
     </div>
   );
 }

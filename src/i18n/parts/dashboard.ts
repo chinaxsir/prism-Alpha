@@ -31,6 +31,14 @@ const zh: Record<string, string> = {
   "dashboard.lan.configureFirst":
     "请先配置 Go Lan 回家网络参数并保存后，再启用该功能",
   "dashboard.cus.configureFirst": "请先添加或导入至少一个 Go Cus 模块后再启用",
+  // 【v0.4.17】速率表峰值/量程与 Pro 引擎短状态
+  "dashboard.peak": "峰值",
+  "dashboard.scale": "量程",
+  "engine.status.standby": "待机中",
+  "engine.status.active": "已启用",
+  "engine.status.probing": "探测中 {done}/{total}",
+  "engine.status.optimized": "已优选 · {count} 节点",
+  "dashboard.aim.probingDetail": "正在检测: {node} · 已完成 {percent}%",
 };
 
 const en: Record<string, string> = {
@@ -67,6 +75,14 @@ const en: Record<string, string> = {
     "Please configure and save Go Lan home network parameters before enabling",
   "dashboard.cus.configureFirst":
     "Add or import at least one Go Cus module before enabling",
+  // 【v0.4.17】rate table peak/scale & Pro engine short status
+  "dashboard.peak": "Peak",
+  "dashboard.scale": "Scale",
+  "engine.status.standby": "Standby",
+  "engine.status.active": "Enabled",
+  "engine.status.probing": "Probing {done}/{total}",
+  "engine.status.optimized": "Optimized · {count} nodes",
+  "dashboard.aim.probingDetail": "Probing: {node} · {percent}%",
 };
 
 export default { zh, en };
