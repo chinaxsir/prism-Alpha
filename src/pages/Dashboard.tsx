@@ -39,7 +39,7 @@ import {
   syncAimSnapshot,
 } from "@/stores/core";
 import { useProStore } from "@/stores/pro";
-import { useTranslation } from "@/i18n";
+import { useTranslation, translateBackendMessage } from "@/i18n";
 import { useAppVisible } from "@/hooks/useAppVisible";
 import { formatBytes, formatSpeed, formatUptime } from "@/utils/format";
 import { delayClass, delayText } from "@/utils/latency";
@@ -95,7 +95,7 @@ function useSmoothSpeed(target: number, active: boolean): number {
 }
 
 export default function Dashboard() {
-  const { t } = useTranslation();
+  const { t, resolved: lang } = useTranslation();
   const status = useCoreStore((s) => s.status);
   const upSpeed = useCoreStore((s) => s.upSpeed);
   const downSpeed = useCoreStore((s) => s.downSpeed);
@@ -589,9 +589,11 @@ export default function Dashboard() {
     : t("engine.status.standby");
 
   // 【v0.4.17 任务1】当前节点展示名与实时延迟（未启动时回退持久化选择）
-  const displayNodeName =
+  const rawNodeName =
     currentNode || persistedNode || nodes[0]?.name || t("dashboard.noSelection");
-  const activeNode = nodes.find((n) => n.name === displayNodeName);
+  // 【v0.4.18 任务1】英文模式下翻译特殊占位符（自动/未选择/未测速/超时/代理不可用）
+  const displayNodeName = translateBackendMessage(rawNodeName, lang);
+  const activeNode = nodes.find((n) => n.name === rawNodeName);
   const currentDelay = activeNode ? (nodeDelay(activeNode) ?? 0) : 0;
 
   // Go AIM 开启时的「重测」：立即触发一轮评级探测（结果经 go-aim://updated 事件刷新）
@@ -604,17 +606,16 @@ export default function Dashboard() {
   };
 
   return (
-    // 【mac 任务3.1】商业级四层 Bento 网格布局：自上而下无缝排列，
-    // 统一 gap-3.5，消除原先中间大片空白断层。
-    <div className="flex h-full min-h-0 flex-col gap-3.5 pb-2">
+    // 【v0.4.18 任务3】移动端统一 gap-2.5，桌面端 gap-3.5；pb-4 预留底部导航安全区。
+    <div className="flex h-full min-h-0 flex-col gap-2.5 md:gap-3.5 pb-4">
       {/* 第一层：标题 + 出站模式分段控制器 */}
-      <h1 className="text-[22px] font-bold tracking-tight shrink-0">{t("dashboard.title")}</h1>
+      <h1 className="text-[22px] font-bold tracking-tight shrink-0 pt-1">{t("dashboard.title")}</h1>
       <div className="shrink-0">
         <OutboundModeSwitch />
       </div>
 
-      {/* 【v0.4.17 任务1】卡片 A：连接状态与启停主控卡（左：呼吸灯+文案+大号等宽时长；右：启停胶囊） */}
-      <div className="rounded-2xl py-3.5 px-4 border bg-surface-card border-border shrink-0">
+      {/* 【v0.4.18 任务3】卡片 A：移动端紧凑内边距 p-3，桌面端 md:p-4 */}
+      <div className="rounded-2xl p-3 md:p-4 border bg-surface-card border-border shrink-0">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 text-xs text-gray-400">
@@ -662,13 +663,13 @@ export default function Dashboard() {
 
       {/* 【v0.4.17 任务1】卡片 B：当前节点 + 今日流量 独立双栏 Bento 网格
           （左 7/12 ≈ 62% 展示节点与延迟，右 5/12 ≈ 38% 展示今日流量） */}
-      <div className="grid grid-cols-12 gap-3 shrink-0">
+      <div className="grid grid-cols-12 gap-2 md:gap-3 shrink-0">
         <button
           type="button"
           onClick={nodes.length > 0 ? () => setPickerOpen(true) : undefined}
           disabled={nodes.length === 0}
           className={clsx(
-            "col-span-7 md:col-span-8 min-w-0 rounded-2xl bg-surface-card border border-border px-3.5 py-3 text-left flex flex-col justify-between transition-colors",
+            "col-span-7 md:col-span-8 min-w-0 rounded-2xl bg-surface-card border border-border p-3 md:p-4 text-left flex flex-col justify-between transition-colors",
             nodes.length > 0
               ? "cursor-pointer hover:border-accent/30 active:opacity-80"
               : "cursor-default"
@@ -707,7 +708,7 @@ export default function Dashboard() {
           </div>
         </button>
 
-        <div className="col-span-5 md:col-span-4 min-w-0 rounded-2xl bg-surface-card border border-border px-3.5 py-3 flex flex-col justify-between">
+        <div className="col-span-5 md:col-span-4 min-w-0 rounded-2xl bg-surface-card border border-border p-3 md:p-4 flex flex-col justify-between">
           <div className="flex items-center gap-1.5 min-w-0">
             <Activity size={14} className="shrink-0 text-[#00C7BE]" />
             <span className="text-xs font-medium text-text-muted whitespace-nowrap">
@@ -724,7 +725,9 @@ export default function Dashboard() {
       {errorMsg && (
         <div className="rounded-xl p-4 text-sm bg-red-500/10 text-red-700 dark:text-red-300 border border-red-500/30 shrink-0">
           <div className="font-semibold mb-1">{t("dashboard.errorTitle")}</div>
-          <div className="text-xs break-all text-red-700/90 dark:text-red-200">{errorMsg}</div>
+          <div className="text-xs break-all text-red-700/90 dark:text-red-200">
+            {translateBackendMessage(errorMsg, lang)}
+          </div>
         </div>
       )}
 
@@ -736,12 +739,13 @@ export default function Dashboard() {
         upHistory={upHistory}
         peakDown={peakDown}
         peakUp={peakUp}
+        running={running}
         t={t}
       />
 
       {/* 第四层：Go AIM / Go Lan / Go Cus Pro 引擎卡片
           移动端单列舒展，Mac 端等高三级列矩阵 */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 shrink-0">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 md:gap-3.5 shrink-0">
         <EngineCard
           icon={<Crosshair size={16} className="text-surge-green" />}
           tone="text-surge-green"
@@ -907,7 +911,7 @@ function EngineCard({
 }) {
   return (
     <div
-      className={`card-sheen flex flex-col gap-1.5 px-3.5 py-3 rounded-xl bg-surface-card border border-border transition-colors ${
+      className={`card-sheen flex flex-col gap-1.5 py-2.5 px-3.5 md:p-4 rounded-xl bg-surface-card border border-border transition-colors ${
         locked ? "select-none cursor-not-allowed" : "hover:border-accent/30"
       }`}
     >
@@ -947,8 +951,11 @@ function EngineCard({
         </div>
       </div>
 
-      {/* 底行：唯一一行功能简介 */}
-      <div className="min-w-0 truncate text-xs text-text-muted" title={subtitle}>
+      {/* 底行：唯一一行功能简介，字号紧凑 mt-1 消行高 */}
+      <div
+        className="min-w-0 truncate text-[11px] md:text-xs text-text-muted mt-1"
+        title={subtitle}
+      >
         {subtitle}
       </div>
     </div>
@@ -985,9 +992,8 @@ function buildSmoothSvgPath(
   return d;
 }
 
-/// 【v0.4.17 任务2】实时速率监控 + 双轨流量波形图：
-/// 顶部为左右严格对称的 2 等分网格（标题+峰值一行，大号网速独占第二行），
-/// 物理隔离彻底杜绝窄屏下「网速数字 / 峰值徽章」重叠；量程移入波形图右上角角标。
+/// 【v0.4.18 任务2】实时速率监控 + 双轨流量波形图：
+/// 移除量程角标，零流量/未连接时隐藏峰值，移动端波形画布 h-[60px] 节省 40px。
 function TrafficWaveformCard({
   down,
   up,
@@ -995,6 +1001,7 @@ function TrafficWaveformCard({
   upHistory,
   peakDown,
   peakUp,
+  running,
   t,
 }: {
   down: number;
@@ -1003,12 +1010,13 @@ function TrafficWaveformCard({
   upHistory: number[];
   peakDown: number;
   peakUp: number;
+  running: boolean;
   t: (k: string) => string;
 }) {
   const W = 600;
   const H = 144;
-  // Y 轴量程：取双通道最大值，保底 64 KB/s
-  const maxVal = Math.max(64 * 1024, ...downHistory, ...upHistory);
+  // Y 轴量程：保底 100 KB/s（十进制直觉，原 64KB/s 二进制已废弃）
+  const maxVal = Math.max(102400, ...downHistory, ...upHistory);
   const downPath = buildSmoothSvgPath(downHistory, W, H, maxVal);
   const upPath = buildSmoothSvgPath(upHistory, W, H, maxVal);
   const downArea = downPath
@@ -1022,9 +1030,9 @@ function TrafficWaveformCard({
   const lastX = W;
 
   return (
-    <div className="card-sheen rounded-2xl px-3.5 py-3 md:px-4 md:py-3.5 border border-border bg-surface-card shrink-0">
+    <div className="card-sheen rounded-2xl p-3 md:p-4 border border-border bg-surface-card shrink-0">
       {/* 顶部：左右严格对称 2 等分网格，中间细分隔线 */}
-      <div className="grid grid-cols-2 gap-3 pb-3 border-b border-border">
+      <div className="grid grid-cols-2 gap-3 pb-2.5 md:pb-3 border-b border-border">
         {/* 左栏：下载 */}
         <div className="flex min-w-0 flex-col justify-between">
           <div className="flex items-center justify-between gap-1">
@@ -1034,11 +1042,13 @@ function TrafficWaveformCard({
                 ↓ {t("metric.download")}
               </span>
             </div>
-            <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
-              {t("dashboard.peak")} {formatSpeed(peakDown)}
-            </span>
+            {running && peakDown > 0 && (
+              <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+                {t("dashboard.peak")} {formatSpeed(peakDown)}
+              </span>
+            )}
           </div>
-          <div className="mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-emerald-500 tracking-tight tabular-nums">
+          <div className="mt-1 md:mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-emerald-500 tracking-tight tabular-nums">
             {formatSpeed(down)}
           </div>
         </div>
@@ -1052,21 +1062,20 @@ function TrafficWaveformCard({
                 ↑ {t("metric.upload")}
               </span>
             </div>
-            <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
-              {t("dashboard.peak")} {formatSpeed(peakUp)}
-            </span>
+            {running && peakUp > 0 && (
+              <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+                {t("dashboard.peak")} {formatSpeed(peakUp)}
+              </span>
+            )}
           </div>
-          <div className="mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-blue-500 tracking-tight tabular-nums">
+          <div className="mt-1 md:mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-blue-500 tracking-tight tabular-nums">
             {formatSpeed(up)}
           </div>
         </div>
       </div>
 
-      {/* 下部：实时双轨平滑 SVG 波形图，量程为右上角悬浮角标 */}
-      <div className="relative mt-2.5 h-24 md:h-32 w-full overflow-hidden rounded-xl bg-surface/40">
-        <span className="absolute top-1.5 right-2 z-10 rounded border border-border bg-surface-card/80 px-1.5 py-0.5 text-[10px] font-mono text-text-muted backdrop-blur-sm">
-          {t("dashboard.scale")}: {formatSpeed(maxVal)}
-        </span>
+      {/* 下部：移动端 h-[60px] 紧凑，桌面端 h-32 灵动波形；移除量程角标 */}
+      <div className="relative mt-2 md:mt-2.5 h-[60px] md:h-32 w-full overflow-hidden rounded-xl bg-surface/40">
         <svg
           viewBox={`0 0 ${W} ${H}`}
           preserveAspectRatio="none"

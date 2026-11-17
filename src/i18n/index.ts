@@ -114,3 +114,48 @@ export const t = (key: string, vars?: Record<string, string | number>) =>
   translate(key, usePrefsStore.getState().language, vars);
 
 export { DICT };
+
+/**
+ * 【v0.4.18 任务1】统一翻译 Rust 后端返回的中文错误/状态文案。
+ * 仅当目标语言为 `en` 时做中英映射；`zh` 原样返回。
+ * 覆盖 Dashboard 弹窗、Toast、节点页、订阅页共用的中文报错与状态描述。
+ */
+export function translateBackendMessage(
+  raw: string | null | undefined,
+  lang: ResolvedLang,
+): string {
+  if (!raw || lang !== "en") return raw ?? "";
+  const replacements: Array<[string, string]> = [
+    ["尚未导入订阅：请先在「订阅」页添加订阅", "No subscription imported: Please add a subscription on the 'Subs' page first"],
+    ["请先在「订阅」页添加订阅", "Please add a subscription on the 'Subs' page first"],
+    ["尚未导入订阅", "No subscription imported"],
+    ["所有订阅均已停用，请先启用至少一个订阅", "All subscriptions are disabled. Please enable at least one subscription"],
+    ["订阅内容未解析到任何节点或策略组", "No valid proxy nodes or groups found in subscription"],
+    ["未找到可用节点，请先更新或导入订阅", "No available nodes found. Please update or import a subscription first"],
+    ["内核正在运行或状态切换中", "Kernel is already running or switching state"],
+    ["正在停止 VPN 内核...", "Stopping VPN kernel..."],
+    ["VPN 内核启动成功", "VPN kernel started successfully"],
+    ["无法读取共享配置文件", "Failed to read shared configuration file"],
+    ["缺少配置", "Configuration missing"],
+    ["本地代理端口未就绪", "Local proxy port is not ready"],
+    ["请先启动代理以执行真实隧道 AI/流媒体解锁验证", "Please start the proxy first to run real-tunnel AI & streaming verification"],
+    ["所有候选节点快筛均超时不可达", "All candidate nodes timed out during fast screening"],
+    ["已有 Go AIM 检测任务在运行，请稍候", "A Go AIM inspection task is already running, please wait"],
+    ["该内测授权已绑定其他设备", "This license is already bound to another device"],
+    ["License Key 与邮箱不匹配，或授权已失效", "License Key does not match email, or license has expired"],
+    ["激活失败", "Activation failed"],
+    ["操作失败", "Operation Failed"],
+    ["自动（等待测速）", "Auto (Pending Speedtest)"],
+    ["未选择", "Not selected"],
+    ["未测速", "Untested"],
+    ["超时", "Timeout"],
+    ["代理不可用", "Proxy Unavailable"],
+  ];
+  let out = raw;
+  for (const [zh, en] of replacements) {
+    if (out.includes(zh)) {
+      out = out.split(zh).join(en);
+    }
+  }
+  return out;
+}
