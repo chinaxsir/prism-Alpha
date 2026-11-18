@@ -558,10 +558,23 @@ export default function Proxies() {
     (n) => !keywordLower || n.name.toLowerCase().includes(keywordLower),
   );
 
-  const aimProbing = Boolean(aim?.probing);
   /// 【APP54 任务5】已测速节点数（实测 >0 或超时 0 都算已测，未测为 undefined）
   const testedCount = nodes.filter((n) => typeof lastDelay(n) === "number").length;
-  const aimRunning = aimProgress.running || aimProbing;
+  // 【v0.4.19 任务2.2】完成态加固：阶段二全部测完即视为已结束，
+  // 即使后端 running 字段短暂滞留，也不再显示「探测中 N/N」。
+  const isAimProbing = Boolean(
+    aimProgress.running &&
+    aimProgress.phase !== "FINISHED" &&
+    aimProgress.phase !== "ERROR" &&
+    aimProgress.phase !== "CANCELLED" &&
+    !(
+      aimProgress.total > 0 &&
+      aimProgress.done >= aimProgress.total &&
+      (aimProgress.fullTotal ?? 0) > 0 &&
+      (aimProgress.fullDone ?? 0) >= (aimProgress.fullTotal ?? 0)
+    )
+  );
+  const aimRunning = isAimProbing;
 
   /// 【APP56 任务1.2 情况 A】默认：总节点数 + 测速进度
   const totalCount = nodes.length;
@@ -574,7 +587,7 @@ export default function Proxies() {
   const supportedAimCount = nodes.filter(
     (n) => aimScoreOf(aimResults[n.name]) > 0 && isValidDelay(lastDelay(n)),
   ).length;
-  const aimDone = aimProgress.running ? aimProgress.done : testedCount;
+  const aimDone = isAimProbing ? aimProgress.done : testedCount;
   const aimPct = aimRunning
     ? aimProgress.percent
     : totalCount > 0

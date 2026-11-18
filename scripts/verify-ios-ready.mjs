@@ -1053,13 +1053,22 @@ try {
   const bannedSwift = [
     ['["protocol": ["quic"], "outbound": finalBlockTag]', '扩展层无条件 QUIC 阻断'],
     ['["network": ["udp"], "port": [443], "outbound": finalBlockTag]', '扩展层无条件 UDP/443 阻断'],
-    ['dnsRules.insert(["query_type": ["SVCB", "HTTPS"], "action": "reject"], at: 0)', '扩展层无条件 SVCB/HTTPS 拒绝'],
   ];
   for (const [token, desc] of bannedSwift) {
     if (pttCode.includes(token)) fail(`${pttRel} 仍含${desc}：${token}`);
     else pass(`扩展层已移除${desc} ✓`);
   }
-  if (ptt.includes('incomingQuicBlocked')) pass('扩展层 SVCB 拒绝由 QUIC 阻断状态驱动 ✓');
+  // 【v0.4.19 任务1.4】HTTPS/SVCB 查询必须在 _dns.resolver.arpa 之后无条件快速拒绝
+  if (
+    pttCode.includes(
+      'dnsRules.insert(["query_type": ["HTTPS", "SVCB"], "action": "reject"], at: 1)'
+    )
+  ) {
+    pass('扩展层无条件拦截 HTTPS/SVCB 查询（紧随 _dns.resolver.arpa）✓');
+  } else {
+    fail('扩展层缺少 HTTPS/SVCB 查询拦截规则');
+  }
+  if (ptt.includes('incomingQuicBlocked')) pass('扩展层仍保留 QUIC 阻断状态判定 ✓');
   else fail('扩展层缺少 incomingQuicBlocked 条件判定');
   if (ptt.includes('cnDirectDomainSuffixes') && ptt.includes('cnDirectCIDRs')) {
     pass('扩展层内置大陆域名后缀 + 大陆 ip_cidr 直连兜底 ✓');
@@ -1078,14 +1087,12 @@ try {
   } else {
     pass('QUIC 阻断仅由 settings.block_quic 驱动 ✓');
   }
-  const svcbIdx = cbSrc.indexOf('"query_type": ["SVCB", "HTTPS"], "action": "reject"');
-  const quicGuardIdx = cbSrc.indexOf('if settings.block_quic {');
+  // 【v0.4.19 任务1.4】SVCB/HTTPS 拦截已升级为无条件规则（紧随 resolver.arpa）
+  const svcbIdx = cbSrc.indexOf('json!({ "query_type": ["HTTPS", "SVCB"], "action": "reject" })');
   if (svcbIdx < 0) {
-    fail('config_builder 缺少受控 SVCB/HTTPS 拦截规则');
-  } else if (quicGuardIdx < 0 || svcbIdx - quicGuardIdx > 200) {
-    fail('config_builder 的 SVCB/HTTPS 拦截未置于 block_quic 条件内');
+    fail('config_builder 缺少无条件 SVCB/HTTPS 拦截规则');
   } else {
-    pass('SVCB/HTTPS 拦截仅在 block_quic 开启时生成 ✓');
+    pass('config_builder 无条件拦截 HTTPS/SVCB（v0.4.19 任务1.4）✓');
   }
   if (cbSrc.includes('CN_DIRECT_DOMAIN_SUFFIXES') && cbSrc.includes('CN_DIRECT_CIDRS')) {
     pass('config_builder 内置大陆域名后缀 + 大陆 ip_cidr 直连清单 ✓');

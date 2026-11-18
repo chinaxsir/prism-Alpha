@@ -1975,12 +1975,8 @@ pub fn build(
         "server": "dns-local"
     }));
     dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-direct" }));
-    // 【APP70 任务2.1】SVCB/HTTPS 仅在用户开启「阻止 QUIC」时拦截（防止
-    // 浏览器从 HTTPS 记录取到 alpn="h3" 去撞已阻断的 QUIC），且必须排在
-    // 大陆直连规则之后、clash_mode: global 之前——不再无条件拒绝。
-    if settings.block_quic {
-        dns_rules.push(json!({ "query_type": ["SVCB", "HTTPS"], "action": "reject" }));
-    }
+    // 【APP70 任务2.1】SVCB/HTTPS 拦截已升级为无条件规则（见下方 index 1），
+    // 此处不再按 block_quic 追加重复规则。
     dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
     // 【APP76 任务1.1】规则模式 / Direct 模式下所有普通域名统一交由
     // `dns.final = dns-direct`（udp://223.5.5.5，53 端口）极速返回，
@@ -1993,6 +1989,15 @@ pub fn build(
     dns_rules.insert(
         0,
         json!({ "domain": ["_dns.resolver.arpa"], "action": "reject" }),
+    );
+    // 【v0.4.19 任务1.4】紧随其后无条件拦截 HTTPS/SVCB(Type 64/65) 查询：
+    // 大量 `xxx.apple.com. IN HTTPS` / `m5.amap.com. IN HTTPS` 在 DoH 通道
+    // 被对端 EOF，刷屏 `IN HTTPS: EOF` / `empty result`。sing-box 1.11 对
+    // 这两类查询快速返回空应答后，客户端立即使用已拿到的 IN A 记录，
+    // 完全不影响 HTTP/3 与普通 HTTPS。（与 PacketTunnelProvider.swift 同序）
+    dns_rules.insert(
+        1,
+        json!({ "query_type": ["HTTPS", "SVCB"], "action": "reject" }),
     );
 
     // dns-local 地址：Go Cus DNS 覆写优先（[General] dns-server / 手动设置）
@@ -2015,14 +2020,16 @@ pub fn build(
         if let Some(main_tag) = &main_group_tag {
             json!({
                 "tag": "dns-remote",
-                "address": "https://8.8.8.8/dns-query",
+                "address": "https://1.1.1.1/dns-query",
+                "address_resolver": "dns-direct",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             })
         } else {
             json!({
                 "tag": "dns-remote",
-                "address": "https://8.8.8.8/dns-query",
+                "address": "https://1.1.1.1/dns-query",
+                "address_resolver": "dns-direct",
                 "detour": "direct",
                 "strategy": "ipv4_only",
             })
@@ -2062,7 +2069,8 @@ pub fn build(
         if let Some(main_tag) = &main_group_tag {
             dns_servers[0] = json!({
                 "tag": "dns-remote",
-                "address": "https://8.8.8.8/dns-query",
+                "address": "https://1.1.1.1/dns-query",
+                "address_resolver": "dns-direct",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
             });
@@ -3953,8 +3961,13 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("https://8.8.8.8/dns-query"),
-            "dns-remote 锁定 DoH 443 经主选择器出境（APP76 任务1.1 规避机场 53 端口封禁）"
+            Some("https://1.1.1.1/dns-query"),
+            "dns-remote 锁定 DoH 443 经主选择器出境（v0.4.19 任务1.4 统一 1.1.1.1）"
+        );
+        assert_eq!(
+            remote["address_resolver"].as_str(),
+            Some("dns-direct"),
+            "dns-remote 必须用 dns-direct 引导解析，杜绝自回环"
         );
 
         let outbound_rule = dns["rules"]
@@ -5732,7 +5745,7 @@ rules:
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-remote"))
             .unwrap();
-        assert_eq!(remote["address"], "https://8.8.8.8/dns-query");
+        assert_eq!(remote["address"], "https://1.1.1.1/dns-query");
         assert_eq!(remote["detour"], "Proxy");
         assert_eq!(dns["final"], "dns-direct", "dns.final 必须固定 dns-direct");
         let rules = dns["rules"].as_array().unwrap();
@@ -5993,10 +6006,11 @@ rules:
         assert!(quic < udp443, "protocol quic 与 udp/443 必须成对相邻");
     }
 
-    /// APP70 测试3：无条件 SVCB/HTTPS reject 已删除；仅在 block_quic=true
-    /// 时拦截，且排在 cn 直连规则之后；dns.strategy 恒为 ipv4_only。
+    /// v0.4.19 任务1.4：SVCB/HTTPS 查询无条件快速拒绝（位于 _dns.resolver.arpa
+    /// 之后、所有域名规则之前），block_quic 开关不再影响 DNS 规则；
+    /// dns.strategy 恒为 ipv4_only。
     #[test]
-    fn app70_test3_svcb_only_when_block_quic() {
+    fn app70_test3_svcb_always_rejected_at_top() {
         let build_with = |quic: bool| {
             build(
                 &app70_sub(),
@@ -6015,40 +6029,32 @@ rules:
             )
             .expect("build must succeed")
         };
-        let off = build_with(false);
-        let off_rules = off.config["dns"]["rules"].as_array().unwrap();
-        assert!(
-            off_rules.iter().all(|r| r.get("query_type").is_none()),
-            "block_quic=false 时不得拒绝 SVCB/HTTPS 查询"
-        );
-        assert_eq!(
-            off.config["dns"]["strategy"].as_str(),
-            Some("ipv4_only"),
-            "ipv4_only 策略严禁删除"
-        );
-
-        let on = build_with(true);
-        let on_rules = on.config["dns"]["rules"].as_array().unwrap();
-        let svcb = on_rules
-            .iter()
-            .position(|r| r.get("query_type").is_some())
-            .expect("block_quic=true 必须拦截 SVCB/HTTPS");
-        let cn = on_rules
-            .iter()
-            .position(|r| {
-                r.get("domain_suffix")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("weixin.qq.com")))
-            })
-            .expect("dns.rules 缺少内置大陆域名后缀");
-        let global = on_rules
-            .iter()
-            .position(|r| r.get("clash_mode").and_then(Value::as_str) == Some("global"))
-            .expect("dns.rules 缺少 clash_mode: global");
-        assert!(
-            cn < svcb && svcb < global,
-            "SVCB 拦截必须位于 cn 直连之后、global 之前"
-        );
+        for quic in [false, true] {
+            let built = build_with(quic);
+            let rules = built.config["dns"]["rules"].as_array().unwrap();
+            assert_eq!(
+                rules[0]["domain"].as_array().map(|a| a.len()),
+                Some(1),
+                "index 0 必须是 _dns.resolver.arpa 拒绝"
+            );
+            assert_eq!(rules[0]["domain"][0].as_str(), Some("_dns.resolver.arpa"));
+            assert_eq!(
+                rules[1]["query_type"].as_array(),
+                Some(&vec![json!("HTTPS"), json!("SVCB")]),
+                "index 1 必须无条件拒绝 HTTPS/SVCB 查询（block_quic={quic}）"
+            );
+            assert_eq!(rules[1]["action"].as_str(), Some("reject"));
+            let svcb_count = rules
+                .iter()
+                .filter(|r| r.get("query_type").is_some())
+                .count();
+            assert_eq!(svcb_count, 1, "SVCB/HTTPS 拒绝规则不得重复");
+            assert_eq!(
+                built.config["dns"]["strategy"].as_str(),
+                Some("ipv4_only"),
+                "ipv4_only 策略严禁删除"
+            );
+        }
     }
 
     /// APP70 测试4：Rule / Global / Direct × Go Lan 开/关 组合矩阵。
@@ -6206,7 +6212,7 @@ rules:
                 .map(|s| s["address"].as_str().unwrap_or("").to_string())
                 .unwrap_or_default()
         };
-        assert_eq!(addr("dns-remote"), "https://8.8.8.8/dns-query");
+        assert_eq!(addr("dns-remote"), "https://1.1.1.1/dns-query");
         assert_eq!(addr("dns-direct"), "udp://223.5.5.5");
         assert_eq!(addr("dns-direct-backup"), "udp://119.29.29.29");
         assert_eq!(addr("dns-local"), "223.5.5.5");

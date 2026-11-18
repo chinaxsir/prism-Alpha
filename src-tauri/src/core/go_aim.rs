@@ -1203,6 +1203,23 @@ fn start_probe_inner(
         let outcome = probe_all(&app, &state, mode, &run).await;
         match outcome {
             Ok(count) => {
+                // 【v0.4.19 任务2.2】阶段二 join_all 刚返回的第一时间收尾：
+                // 立即把 running=false / phase=FINISHED / percent=100 写入
+                // 共享进度，再执行落盘与选点（磁盘 I/O 期间前端也已是
+                // 「已优选」终态，不会卡在「探测中 28/28」）。
+                if count > 0 {
+                    let mut p = state.aim_progress.lock();
+                    let alive_total = p.full_total.max(1);
+                    p.full_total = alive_total;
+                    p.full_done = alive_total;
+                    p.done = p.total.max(p.failed_count + alive_total);
+                    p.total = p.done;
+                    p.pending_count = 0;
+                    p.percent = 100;
+                    p.phase = "FINISHED".to_string();
+                    p.running = false;
+                    p.error_message = None;
+                }
                 // 【APP37 任务3.2】探测只被「Go AIM 开关关闭 / VPN 停止」
                 // 中止；完成日志必须携带参与评级总数与最优节点。
                 let best = pick_best(&state.aim_results.read())
@@ -1322,10 +1339,9 @@ fn start_probe_inner(
                         None,
                     );
                 } else {
-                    // 【APP84 任务2.2】阶段二队列全部处理完毕 → 无条件终态收尾：
-                    // full_total 在阶段二初始化时已锁定为 alive_count，这里把
-                    // full_done 补齐到同一数值，recompute_aim 才能把
-                    // pending_count 归零并让 FINISHED 事件携带 percent=100。
+                    // 【APP84 任务2.2】正常情况下终态已在 probe_all 返回时
+                    // 立即写入（见上方 v0.4.19 收尾块）；这里再次补齐
+                    // full_done/pending_count，保证并发路径下同样呈现 100%。
                     {
                         let mut p = state.aim_progress.lock();
                         let alive_total = p.full_total.max(1);
@@ -1335,6 +1351,7 @@ fn start_probe_inner(
                         p.total = p.done;
                         p.pending_count = 0;
                         p.percent = 100;
+                        p.phase = "FINISHED".to_string();
                         p.running = false;
                         p.error_message = None;
                     }

@@ -102,24 +102,38 @@ export default function Dashboard() {
   // 【APP66 任务3】渲染值走 160ms 缓动插值，数字连续滚动不顿挫
   const smoothDown = useSmoothSpeed(downSpeed, status === "running");
   const smoothUp = useSmoothSpeed(upSpeed, status === "running");
-  // 【mac 任务3.2】双轨流量波形图：42 点滑动窗口历史队列
-  const HISTORY_LEN = 42;
-  const [downHistory, setDownHistory] = useState<number[]>(() => new Array(HISTORY_LEN).fill(0));
-  const [upHistory, setUpHistory] = useState<number[]>(() => new Array(HISTORY_LEN).fill(0));
+  // 【v0.4.19 任务2.1】双轨流量波形图：36 点滑动窗口 + latestSpeedRef
+  // 采样。ref 保证 650ms 定时器永远读到最新网速（不再被 stale closure
+  // 冻结在初值 0，从根本上修复波形空白）。后端每来一帧非零速率也会
+  // 立即入队，无需干等定时器周期。
+  const WAVE_POINTS = 36;
+  const [downSeries, setDownSeries] = useState<number[]>(() => new Array(WAVE_POINTS).fill(0));
+  const [upSeries, setUpSeries] = useState<number[]>(() => new Array(WAVE_POINTS).fill(0));
   const [peakDown, setPeakDown] = useState(0);
   const [peakUp, setPeakUp] = useState(0);
-  // 每 500ms 采样一次当前平滑速率入队
+  const latestSpeedRef = useRef({ down: 0, up: 0, running: false });
+
   useEffect(() => {
-    const id = window.setInterval(() => {
-      const d = status === "running" ? smoothDown : 0;
-      const u = status === "running" ? smoothUp : 0;
-      setDownHistory((prev) => [...prev.slice(1), d]);
-      setUpHistory((prev) => [...prev.slice(1), u]);
-      setPeakDown((p) => (d > p ? d : p));
-      setPeakUp((p) => (u > p ? u : p));
-    }, 500);
-    return () => window.clearInterval(id);
-  }, [smoothDown, smoothUp, status]);
+    const isRun = status === "running";
+    const rawDown = isRun ? Math.max(0, downSpeed) : 0;
+    const rawUp = isRun ? Math.max(0, upSpeed) : 0;
+    latestSpeedRef.current = { down: rawDown, up: rawUp, running: isRun };
+    if (isRun && (rawDown > 0 || rawUp > 0)) {
+      setDownSeries((prev) => [...prev.slice(1), rawDown]);
+      setUpSeries((prev) => [...prev.slice(1), rawUp]);
+      setPeakDown((p) => (rawDown > p ? rawDown : p));
+      setPeakUp((p) => (rawUp > p ? rawUp : p));
+    }
+  }, [downSpeed, upSpeed, status]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const { down, up, running } = latestSpeedRef.current;
+      setDownSeries((prev) => [...prev.slice(1), running ? down : 0]);
+      setUpSeries((prev) => [...prev.slice(1), running ? up : 0]);
+    }, 650);
+    return () => window.clearInterval(timer);
+  }, []);
   // 停止时峰值归零（下次启动重新统计）
   useEffect(() => {
     if (status !== "running") {
@@ -565,7 +579,21 @@ export default function Dashboard() {
   // 旧实现把长描述同时塞进状态胶囊与副标题，移动端出现同一句话重复两遍，
   // 且挤压掉 Go Lan / Go Cus 的「配置」按钮。
   const aimRated = Object.keys(aim?.results ?? {}).length;
-  const aimRunning = aimProgress.running || Boolean(aim?.probing);
+  // 【v0.4.19 任务2.2】完成态加固：后端在 28/28 后若 running 尚未收敛，
+  // 前端也必须立即判定为「已优选」，绝不再卡在「探测中 28/28」。
+  const isAimProbing = Boolean(
+    aimProgress.running &&
+    aimProgress.phase !== "FINISHED" &&
+    aimProgress.phase !== "ERROR" &&
+    aimProgress.phase !== "CANCELLED" &&
+    !(
+      aimProgress.total > 0 &&
+      aimProgress.done >= aimProgress.total &&
+      (aimProgress.fullTotal ?? 0) > 0 &&
+      (aimProgress.fullDone ?? 0) >= (aimProgress.fullTotal ?? 0)
+    )
+  );
+  const aimRunning = isAimProbing;
   const aimPill = !aim?.enabled
     ? t("engine.status.standby")
     : aimRunning
@@ -735,8 +763,8 @@ export default function Dashboard() {
       <TrafficWaveformCard
         down={smoothDown}
         up={smoothUp}
-        downHistory={downHistory}
-        upHistory={upHistory}
+        downSeries={downSeries}
+        upSeries={upSeries}
         peakDown={peakDown}
         peakUp={peakUp}
         running={running}
@@ -759,10 +787,10 @@ export default function Dashboard() {
             proUnlocked && aim?.enabled ? (
               <button
                 onClick={runAimProbe}
-                disabled={aim.probing}
+                disabled={isAimProbing}
                 className="text-xs font-medium px-2.5 py-1 rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition-colors whitespace-nowrap disabled:opacity-50"
               >
-                {aim.probing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
+                {isAimProbing ? t("dashboard.aim.probing") : t("dashboard.aim.retest")}
               </button>
             ) : undefined
           }
@@ -962,21 +990,22 @@ function EngineCard({
   );
 }
 
-/// 三次贝塞尔曲线插值：把离散采样点连成平滑连续的 SVG 路径
-function buildSmoothSvgPath(
-  points: number[],
-  width: number,
-  height: number,
-  maxVal: number
-): string {
+/// 【v0.4.19 任务2.1】三次贝塞尔曲线插值：把离散速率点连成平滑连续的
+/// SVG 路径（360×76 像素坐标系）。零流量贴底，非零值至少抬升 3px，
+/// 保证几 KB/s 的轻量流量也能画出肉眼可见的波峰。
+function buildSmoothSvgPath(points: number[], maxVal: number): string {
   const n = points.length;
   if (n === 0) return "";
-  const stepX = width / Math.max(1, n - 1);
+  const W = 360;
+  const bottomY = 72;
+  const topPad = 8;
+  const stepX = W / Math.max(1, n - 1);
   const safeMax = Math.max(maxVal, 1);
-  const coords = points.map((v, i) => ({
-    x: i * stepX,
-    y: height - (Math.min(v, safeMax) / safeMax) * height,
-  }));
+  const coords = points.map((v, i) => {
+    const ratio = Math.min(1, v / safeMax);
+    const y = v > 0 ? Math.min(bottomY - 3, bottomY - ratio * (bottomY - topPad)) : bottomY;
+    return { x: i * stepX, y };
+  });
   let d = `M ${coords[0].x.toFixed(2)} ${coords[0].y.toFixed(2)}`;
   for (let i = 0; i < coords.length - 1; i++) {
     const p0 = coords[Math.max(0, i - 1)];
@@ -992,13 +1021,14 @@ function buildSmoothSvgPath(
   return d;
 }
 
-/// 【v0.4.18 任务2】实时速率监控 + 双轨流量波形图：
-/// 移除量程角标，零流量/未连接时隐藏峰值，移动端波形画布 h-[60px] 节省 40px。
+/// 【v0.4.19 任务2.1】实时速率监控 + 双轨流量波形图：
+/// 自适应 Y 轴（最小保底 4 KB/s）+ 高对比度渐变，任何真实流量都能
+/// 呈现饱满波峰；零流量/未连接时隐藏峰值与发光点。
 function TrafficWaveformCard({
   down,
   up,
-  downHistory,
-  upHistory,
+  downSeries,
+  upSeries,
   peakDown,
   peakUp,
   running,
@@ -1006,28 +1036,34 @@ function TrafficWaveformCard({
 }: {
   down: number;
   up: number;
-  downHistory: number[];
-  upHistory: number[];
+  downSeries: number[];
+  upSeries: number[];
   peakDown: number;
   peakUp: number;
   running: boolean;
   t: (k: string) => string;
 }) {
-  const W = 600;
-  const H = 144;
-  // Y 轴量程：保底 100 KB/s（十进制直觉，原 64KB/s 二进制已废弃）
-  const maxVal = Math.max(102400, ...downHistory, ...upHistory);
-  const downPath = buildSmoothSvgPath(downHistory, W, H, maxVal);
-  const upPath = buildSmoothSvgPath(upHistory, W, H, maxVal);
-  const downArea = downPath
-    ? `${downPath} L ${W} ${H} L 0 ${H} Z`
-    : "";
-  const upArea = upPath ? `${upPath} L ${W} ${H} L 0 ${H} Z` : "";
-  const lastDown = downHistory[downHistory.length - 1] ?? 0;
-  const lastUp = upHistory[upHistory.length - 1] ?? 0;
-  const lastDownY = H - (Math.min(lastDown, maxVal) / maxVal) * H;
-  const lastUpY = H - (Math.min(lastUp, maxVal) / maxVal) * H;
-  const lastX = W;
+  const W = 360;
+  const H = 76;
+  const bottomY = 72;
+  // 【v0.4.19 任务2.1】动态自适应量程：不再锁死 100 KB/s，否则几 KB/s
+  // 的轻量流量只有不到 8% 高度贴在底部几乎看不见。最小保底仅 4 KB/s。
+  const maxInWindow = Math.max(...downSeries, ...upSeries, 1);
+  const dynamicMax = Math.max(maxInWindow * 1.25, 4096);
+  const downPath = buildSmoothSvgPath(downSeries, dynamicMax);
+  const upPath = buildSmoothSvgPath(upSeries, dynamicMax);
+  const downArea = downPath ? `${downPath} L ${W} ${bottomY} L 0 ${bottomY} Z` : "";
+  const upArea = upPath ? `${upPath} L ${W} ${bottomY} L 0 ${bottomY} Z` : "";
+  const lastDown = downSeries[downSeries.length - 1] ?? 0;
+  const lastUp = upSeries[upSeries.length - 1] ?? 0;
+  const lastDownY = lastDown > 0
+    ? Math.min(bottomY - 3, bottomY - Math.min(1, lastDown / dynamicMax) * (bottomY - 8))
+    : bottomY;
+  const lastUpY = lastUp > 0
+    ? Math.min(bottomY - 3, bottomY - Math.min(1, lastUp / dynamicMax) * (bottomY - 8))
+    : bottomY;
+  const lastX = 356;
+  const showPulse = running && (lastDown > 0 || lastUp > 0);
 
   return (
     <div className="card-sheen rounded-2xl p-3 md:p-4 border border-border bg-surface-card shrink-0">
@@ -1074,21 +1110,21 @@ function TrafficWaveformCard({
         </div>
       </div>
 
-      {/* 下部：移动端 h-[60px] 紧凑，桌面端 h-32 灵动波形；移除量程角标 */}
-      <div className="relative mt-2 md:mt-2.5 h-[60px] md:h-32 w-full overflow-hidden rounded-xl bg-surface/40">
+      {/* 下部：波形画布（360×76 像素坐标系，preserveAspectRatio=none 拉伸铺满） */}
+      <div className="relative mt-2 md:mt-2.5 h-[60px] md:h-24 w-full overflow-hidden rounded-xl bg-surface/40">
         <svg
           viewBox={`0 0 ${W} ${H}`}
           preserveAspectRatio="none"
-          className="h-full w-full"
+          className="w-full h-full block overflow-visible"
         >
           <defs>
             <linearGradient id="downGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#10B981" stopOpacity="0.30" />
-              <stop offset="100%" stopColor="#10B981" stopOpacity="0" />
+              <stop offset="0%" stopColor="#10B981" stopOpacity="0.38" />
+              <stop offset="100%" stopColor="#10B981" stopOpacity="0.04" />
             </linearGradient>
             <linearGradient id="upGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#3B82F6" stopOpacity="0.25" />
-              <stop offset="100%" stopColor="#3B82F6" stopOpacity="0" />
+              <stop offset="0%" stopColor="#3B82F6" stopOpacity="0.30" />
+              <stop offset="100%" stopColor="#3B82F6" stopOpacity="0.02" />
             </linearGradient>
           </defs>
           {/* 3 条水平参考虚线 */}
@@ -1096,9 +1132,9 @@ function TrafficWaveformCard({
             <line
               key={r}
               x1="0"
-              y1={H * r}
+              y1={bottomY * r}
               x2={W}
-              y2={H * r}
+              y2={bottomY * r}
               stroke="currentColor"
               strokeOpacity="0.08"
               strokeWidth="1"
@@ -1113,7 +1149,7 @@ function TrafficWaveformCard({
               d={downPath}
               fill="none"
               stroke="#10B981"
-              strokeWidth="2"
+              strokeWidth="2.2"
               strokeLinecap="round"
               strokeLinejoin="round"
             />
@@ -1130,15 +1166,19 @@ function TrafficWaveformCard({
               strokeLinejoin="round"
             />
           )}
-          {/* 实时脉动圆点 */}
-          <circle cx={lastX} cy={lastDownY} r="3" fill="#10B981">
-            <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
-            <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
-          </circle>
-          <circle cx={lastX} cy={lastUpY} r="3" fill="#3B82F6">
-            <animate attributeName="r" values="3;5;3" dur="1.4s" repeatCount="indefinite" />
-            <animate attributeName="opacity" values="1;0.5;1" dur="1.4s" repeatCount="indefinite" />
-          </circle>
+          {/* 最新数据点发光圆点（仅运行且有真实流量时显示） */}
+          {showPulse && (
+            <>
+              <circle cx={lastX} cy={lastDownY} r="3.5" fill="#10B981">
+                <animate attributeName="r" values="3.5;5.5;3.5" dur="1.4s" repeatCount="indefinite" />
+                <animate attributeName="opacity" values="1;0.55;1" dur="1.4s" repeatCount="indefinite" />
+              </circle>
+              <circle cx={lastX} cy={lastUpY} r="3.5" fill="#3B82F6">
+                <animate attributeName="r" values="3.5;5.5;3.5" dur="1.4s" repeatCount="indefinite" />
+                <animate attributeName="opacity" values="1;0.55;1" dur="1.4s" repeatCount="indefinite" />
+              </circle>
+            </>
+          )}
         </svg>
       </div>
     </div>

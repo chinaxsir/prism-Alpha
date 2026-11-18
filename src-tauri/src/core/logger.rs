@@ -974,6 +974,10 @@ fn is_benign_close_line(line: &str) -> bool {
         "connection upload closed: unexpected eof",
         "context canceled",
         "use of closed network connection",
+        // 【v0.4.19 任务1.4】iOS 切网 / 连接回收的正常瞬态，不得当作 ERROR 刷屏
+        "operation was canceled",
+        "software caused connection abort",
+        "empty result",
         "listen outbound packet connection: operation not permitted",
         "open outbound connection: operation not permitted",
         "report handshake success",
@@ -1770,6 +1774,16 @@ mod tests {
             "connection: report handshake success: connection refused"
         ));
         assert!(is_benign_close_line("context canceled"));
+        // 【v0.4.19 任务1.4】切网 / EOF / 空应答噪音
+        assert!(is_benign_close_line(
+            "dial tcp 1.1.1.1:443: operation was canceled"
+        ));
+        assert!(is_benign_close_line(
+            "read udp: software caused connection abort"
+        ));
+        assert!(is_benign_close_line(
+            "cl4-cn.apple.com. IN HTTPS: empty result"
+        ));
     }
 
     /// 真实故障绝不能误伤

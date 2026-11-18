@@ -314,6 +314,10 @@ private func isRoutableAddress(_ addrPtr: UnsafePointer<sockaddr>) -> Bool {
             let b1 = (ip >> 16) & 0xff
             if b0 == 0 || b0 == 127 { return false }
             if b0 == 169 && b1 == 254 { return false } // 排除 169.254.0.0/16 链路本地地址
+            // 【v0.4.19 任务1.1】排除 Prism TUN 虚拟网段 172.19.0.0/16（172.19.0.1）
+            // 与 FakeIP 网段 198.18.0.0/15，杜绝把虚拟网卡地址误判为物理网卡
+            if b0 == 172 && b1 == 19 { return false }
+            if b0 == 198 && (b1 == 18 || b1 == 19) { return false }
             return true
         }
     } else if family == AF_INET6 {
@@ -406,7 +410,16 @@ private func findActivePhysicalInterface() -> PhysicalInterface {
 
         if let addr = current.pointee.ifa_addr, Int32(addr.pointee.sa_family) == AF_INET {
             let name = String(cString: current.pointee.ifa_name)
-            if ipv4ByName[name] == nil, isRoutableAddress(addr) {
+            // 【v0.4.19 任务1.1】物理网卡白名单：仅 en0/en*/pdp_ip* 可写入
+            // ipv4ByName。严禁 utun*/ipsec*/ppp*/llw*/awdl*/lo*/bridge* 等
+            // 虚拟网卡污染映射，否则切网时会把隧道自身地址（172.19.0.1）
+            // 当成物理网卡重绑，导致 pdp_ip0 -> utun5 自杀式崩溃。
+            if !name.hasPrefix("utun"), !name.hasPrefix("ipsec"), !name.hasPrefix("ppp"),
+               !name.hasPrefix("llw"), !name.hasPrefix("awdl"), !name.hasPrefix("lo"),
+               !name.hasPrefix("bridge"),
+               name == "en0" || name.hasPrefix("en") || name.hasPrefix("pdp_ip"),
+               ipv4ByName[name] == nil, isRoutableAddress(addr)
+            {
                 ipv4ByName[name] = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sinPtr in
                     var raw = sinPtr.pointee.sin_addr
                     var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
@@ -911,6 +924,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 盲猜兜底（hasRoutableIP=false），此时保持现有隧道待机，等
         // 信号恢复（真实网卡出现）后再平滑切网，绝不报错停止
         guard !latestPhy.name.isEmpty, latestPhy.hasRoutableIP else { return }
+        // 【v0.4.19 任务1.1】双重保险：即使前面采集逻辑被其他路径改动，也
+        // 绝不允许把隧道虚拟网卡（utun*/ipsec*/lo*）或 Prism TUN 地址
+        // 172.19.0.1 当作物理网络切换目标，根治 pdp_ip0 -> utun5 自锁崩溃。
+        guard !latestPhy.name.hasPrefix("utun"),
+              !latestPhy.name.hasPrefix("ipsec"),
+              !latestPhy.name.hasPrefix("lo"),
+              latestPhy.ipv4 != "172.19.0.1"
+        else { return }
 
         // 【APP62 任务1 机制3】同时比对网卡名称与物理 IPv4：
         // - 名称变化：Wi-Fi ↔ 蜂窝 物理通道切换；
@@ -1691,6 +1712,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var ptr: UnsafeMutablePointer<addrinfo>? = first
         while let info = ptr {
             if info.pointee.ai_family == AF_INET, let addr = info.pointee.ai_addr {
+                // 【v0.4.19 任务1.3】拒绝 FakeIP(198.18.0.0/15)、Prism TUN
+                // (172.19.0.0/16)、回环与链路本地地址，彻底根除
+                // `go-lan-nidec -> server=198.18.0.43` 假 IP 污染。
+                guard isRoutableAddress(addr) else {
+                    ptr = info.pointee.ai_next
+                    continue
+                }
                 var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                 let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
                 var inAddr = sin.sin_addr
@@ -2551,9 +2579,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 原先 tcp://8.8.8.8（53 端口）在被机场封禁时所有命中的域名等待 7.5 秒后
             // 全部以 IN A: EOF 失败，Safari 因拿不到 IP 根本无法发起连接。DoH 走
             // HTTPS 443 端口经主代理出境，彻底绕过 53 端口封堵。
+            // 【v0.4.19 任务1.4】dns-remote 统一为 1.1.1.1 DoH，并显式声明
+            // address_resolver=dns-direct：DoH 服务端域名/IP 的引导解析必须
+            // 走本地直连 DNS，避免「解析 DoH 又需要 DoH」的自回环。
             [
                 "tag": "dns-remote",
-                "address": "https://8.8.8.8/dns-query",
+                "address": "https://1.1.1.1/dns-query",
+                "address_resolver": "dns-direct",
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
@@ -2578,11 +2610,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var dnsRules: [[String: Any]] = preservedDnsRules
         // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，
         // VPN 场景下无意义，固定在最顶部快速拦截。
-        // 【APP70 任务2.1】已删除无条件 SVCB/HTTPS(Type 64/65) 拒绝规则：
-        // 它干扰 iOS Network.framework 的服务端点发现与连接复用状态机，
-        // 造成首包额外等待；仅在用户开启「阻止 QUIC」（Rust 已下发 QUIC
-        // 阻断规则）时才拦截，且必须排在 cn 直连规则之后。
+        // 【v0.4.19 任务1.4】紧随其后拦截 HTTPS/SVCB(Type 64/65) 查询：
+        // prism-log_2.txt 中 `cl4-cn.apple.com. IN HTTPS`、`m5.amap.com. IN HTTPS`
+        // 等大量查询在 DoH 通道被对端 EOF，刷屏 `IN HTTPS: EOF` / `empty result`。
+        // sing-box 1.11 对这两类查询快速返回空应答后，iOS 会立即使用已拿到的
+        // IN A 记录建立连接，完全不影响 HTTP/3 与普通 HTTPS。
         dnsRules.insert(["domain": ["_dns.resolver.arpa"], "action": "reject"], at: 0)
+        dnsRules.insert(["query_type": ["HTTPS", "SVCB"], "action": "reject"], at: 1)
         // 【APP70 任务2.2】dns.rules 严格顺序（与 config_builder.rs 一致）：
         // 1. outbound:any → dns-direct（节点自身域名解析直连）
         // 2. clash_mode:direct → dns-direct（直连模式 100% 走国内 DNS）
