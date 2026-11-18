@@ -630,7 +630,11 @@ export default function Dashboard() {
   // Go AIM 底行：探测中动态展示当前检测节点与进度，平时展示功能简介
   const aimDesc = aimRunning
     ? t("dashboard.aim.probingDetail", {
-        node: aimEvent?.message?.trim() || t("dashboard.aim.probing"),
+        // 【ACP7 任务2】Go AIM 动态进度是后端英文原文（如 Probing 12/28），
+        // 渲染前必须经 translateBackendMessage 转成当前语言
+        node:
+          translateBackendMessage(aimEvent?.message?.trim() || "", lang) ||
+          t("dashboard.aim.probing"),
         percent: aimProgress.percent,
       })
     : t("engine.goAim.desc");
@@ -1112,43 +1116,56 @@ function TrafficWaveformCard({
       {/* 顶部：左右严格对称 2 等分网格，中间细分隔线 */}
       <div className="grid grid-cols-2 gap-3 pb-2.5 md:pb-3 border-b border-border">
         {/* 左栏：下载 */}
-        <div className="flex min-w-0 flex-col justify-between">
-          <div className="flex items-center justify-between gap-1">
-            <div className="flex shrink-0 items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              <span className="text-xs font-medium text-text-secondary whitespace-nowrap">
+        <div className="flex min-w-0 flex-col justify-between overflow-hidden">
+          {/* 【ACP7 任务1】移动端三层纵向堆叠（名称 / 速率 / 峰值），
+              桌面端（md+）名称与峰值同行两端对齐；全部 min-w-0 +
+              overflow-hidden，英文长文案绝不碰撞或撑破卡片 */}
+          <div className="flex min-w-0 items-center justify-between gap-1.5 overflow-hidden">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="w-2 h-2 shrink-0 rounded-full bg-emerald-500" />
+              <span className="min-w-0 truncate text-xs font-medium text-text-secondary">
                 ↓ {t("metric.download")}
               </span>
             </div>
             {running && peakDown > 0 && (
-              <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+              <span className="hidden shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap md:inline">
                 {t("dashboard.peak")} {formatSpeed(peakDown)}
               </span>
             )}
           </div>
-          <div className="mt-1 md:mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-emerald-500 tracking-tight tabular-nums">
+          <div className="mt-1 min-w-0 overflow-hidden truncate text-xl md:mt-1.5 md:text-2xl font-bold font-mono text-emerald-500 tracking-tight tabular-nums">
             {formatSpeed(down)}
           </div>
+          {running && peakDown > 0 && (
+            <div className="mt-0.5 min-w-0 overflow-hidden truncate text-[10px] font-mono text-text-muted tabular-nums md:hidden">
+              {t("dashboard.peak")} {formatSpeed(peakDown)}
+            </div>
+          )}
         </div>
 
         {/* 右栏：上传 */}
-        <div className="flex min-w-0 flex-col justify-between border-l border-border pl-3">
-          <div className="flex items-center justify-between gap-1">
-            <div className="flex shrink-0 items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-blue-500" />
-              <span className="text-xs font-medium text-text-secondary whitespace-nowrap">
+        <div className="flex min-w-0 flex-col justify-between overflow-hidden border-l border-border pl-3">
+          <div className="flex min-w-0 items-center justify-between gap-1.5 overflow-hidden">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="w-2 h-2 shrink-0 rounded-full bg-blue-500" />
+              <span className="min-w-0 truncate text-xs font-medium text-text-secondary">
                 ↑ {t("metric.upload")}
               </span>
             </div>
             {running && peakUp > 0 && (
-              <span className="shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap">
+              <span className="hidden shrink-0 text-[11px] font-mono text-text-muted tabular-nums whitespace-nowrap md:inline">
                 {t("dashboard.peak")} {formatSpeed(peakUp)}
               </span>
             )}
           </div>
-          <div className="mt-1 md:mt-1.5 min-w-0 truncate text-xl md:text-2xl font-bold font-mono text-blue-500 tracking-tight tabular-nums">
+          <div className="mt-1 min-w-0 overflow-hidden truncate text-xl md:mt-1.5 md:text-2xl font-bold font-mono text-blue-500 tracking-tight tabular-nums">
             {formatSpeed(up)}
           </div>
+          {running && peakUp > 0 && (
+            <div className="mt-0.5 min-w-0 overflow-hidden truncate text-[10px] font-mono text-text-muted tabular-nums md:hidden">
+              {t("dashboard.peak")} {formatSpeed(peakUp)}
+            </div>
+          )}
         </div>
       </div>
 

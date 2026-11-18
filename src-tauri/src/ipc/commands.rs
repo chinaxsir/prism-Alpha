@@ -1463,12 +1463,15 @@ pub async fn update_subscription(
             .map_err(|e| format!("保存订阅备注名失败: {e}"))?;
     }
     // Pro/买断：静默上报云端（其他设备下次对账时拉取）
-    let app2 = app.clone();
-    let url2 = url.clone();
-    let name2 = name.clone();
-    tauri::async_runtime::spawn(async move {
-        super::super::core::sync_links::push_link(&app2, &url2, name2).await;
-    });
+    // 【ACP7 任务1】本地手动节点订阅永不参与云端同步
+    if !crate::core::subscription::is_local_subscription(&url) {
+        let app2 = app.clone();
+        let url2 = url.clone();
+        let name2 = name.clone();
+        tauri::async_runtime::spawn(async move {
+            super::super::core::sync_links::push_link(&app2, &url2, name2).await;
+        });
+    }
     Ok(())
 }
 
@@ -1522,12 +1525,14 @@ pub async fn rename_subscription(
     if !found {
         return Err("订阅记录不存在".into());
     }
-    let app2 = app.clone();
-    let url2 = url.clone();
-    let name2 = name.clone();
-    tauri::async_runtime::spawn(async move {
-        super::super::core::sync_links::push_link(&app2, &url2, Some(name2)).await;
-    });
+    if !crate::core::subscription::is_local_subscription(&url) {
+        let app2 = app.clone();
+        let url2 = url.clone();
+        let name2 = name.clone();
+        tauri::async_runtime::spawn(async move {
+            super::super::core::sync_links::push_link(&app2, &url2, Some(name2)).await;
+        });
+    }
     use tauri::Emitter;
     let _ = app.emit("subscriptions://changed", ());
     Ok(())
@@ -1543,6 +1548,36 @@ pub(crate) async fn refresh_subscription(
     // 入口即清洗：微信/网页复制的链接常带 \u2060 等零宽字符，
     // 若不清洗会污染 profile 文件哈希、订阅记录与后续所有请求
     let url = sanitize_subscription_url(url);
+
+    // 【ACP7 任务1】本地手动节点订阅：只读磁盘，禁止发起任何 HTTP 请求
+    if crate::core::subscription::is_local_subscription(&url) {
+        let text = crate::core::subscription::manual_nodes_text(&state.data_dir);
+        if subscription_real_node_count(&text) == 0 {
+            return Err("本地手动节点为空：请先扫码或手动添加节点".into());
+        }
+        let profile_path = crate::core::store::profile_path(&state.data_dir, &url);
+        if let Some(parent) = profile_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| sanitize_err(&e.to_string()))?;
+        }
+        crate::core::store::atomic_write(&profile_path, text.as_bytes())
+            .map_err(|e| format!("写入本地订阅文件失败: {e}"))?;
+        crate::core::store::upsert_subscription(&state.data_dir, &url)
+            .map_err(|e| format!("保存订阅记录失败: {e}"))?;
+        crate::core::config_builder::warm_node_host_cache(&state.data_dir);
+        purge_disabled_or_deleted_subscription_nodes(state);
+        if *state.status.read() == CoreStatus::Running {
+            #[cfg(target_os = "ios")]
+            {
+                let _ = hot_reload_mobile_config(app, state).await;
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                restart_core(app, state).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // 内核运行中时，直连失败的最终兜底是经本地 mixed 入站转发。
     // 移动端 mixed 入站已移除，流量全走 TUN，无需本地代理兜底。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -1634,6 +1669,483 @@ pub(crate) async fn refresh_subscription(
     }
 
     Ok(())
+}
+
+// ==================== ACP7 任务1：扫码 / 手动节点导入 ====================
+
+/// 导入结果（前端 Toast / 列表刷新用）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportOutcome {
+    /// subscription | nodes
+    pub kind: String,
+    /// 本次导入/更新的节点数（订阅为拉取到的节点数）
+    pub node_count: usize,
+    /// 本地手动节点合并后的总数（订阅导入为 0）
+    pub total: usize,
+    /// 最终使用的展示名
+    pub name: String,
+}
+
+/// 手动结构化节点入参（前端可视化表单）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualNodeInput {
+    pub name: String,
+    /// ss / vmess / vless / trojan / hysteria2 / socks5 / http
+    pub protocol: String,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub cipher: Option<String>,
+    #[serde(default)]
+    pub alter_id: Option<u32>,
+    #[serde(default)]
+    pub tls: Option<bool>,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub ws_path: Option<String>,
+    #[serde(default)]
+    pub ws_host: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: Option<bool>,
+}
+
+/// 导入载荷归一化：剥离零宽字符 + 解开 shadowrocket / clash 等深链外壳
+fn normalize_import_payload(raw: &str) -> String {
+    let mut text = sanitize_subscription_url(raw);
+    // shadowrocket://add/sub://<base64> 或 shadowrocket://add/<percent-url>
+    for prefix in ["shadowrocket://add/", "clash://install-config?url="] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let decoded = percent_decode(rest);
+            let candidate = decoded.strip_prefix("sub://").unwrap_or(&decoded).to_string();
+            text = if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                candidate
+            } else if let Some(url) = base64_decode_text(&candidate) {
+                url
+            } else {
+                candidate
+            };
+            break;
+        }
+    }
+    // sub://<base64>（Quantumult X / Shadowrocket 订阅分享）
+    if let Some(rest) = text.strip_prefix("sub://") {
+        if let Some(url) = base64_decode_text(rest) {
+            text = url;
+        }
+    }
+    text.trim().to_string()
+}
+
+/// 宽松百分号解码（仅处理 %XX；非法序列原样保留）
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 宽松 Base64 解码为 UTF-8 文本（兼容标准/URL-safe、有无 padding）
+fn base64_decode_text(s: &str) -> Option<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(clean.as_bytes())
+        .or_else(|_| URL_SAFE.decode(clean.as_bytes()))
+        .or_else(|_| STANDARD_NO_PAD.decode(clean.as_bytes()))
+        .or_else(|_| STANDARD.decode(clean.as_bytes()));
+    let bytes = decoded.ok()?;
+    let text = String::from_utf8(bytes).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// http(s) 单条代理节点识别：`http://user:pass@host:port` 或 `https://host:8443`
+/// （无路径的裸 host:port），避免被误当成订阅链接去发 HTTP 拉取。
+fn parse_http_proxy_node(raw: &str) -> Option<serde_json::Value> {
+    let (scheme, rest) = raw.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let (host, port) = hostport.rsplit_once(':')?;
+    if host.trim().is_empty() {
+        return None;
+    }
+    let port: u16 = port.trim().parse().ok()?;
+    let mut node = serde_json::json!({
+        "name": host,
+        "type": "http",
+        "server": host,
+        "port": port,
+    });
+    if scheme == "https" {
+        node["tls"] = serde_json::json!(true);
+    }
+    if let Some(ui) = userinfo {
+        let (user, pass) = ui.split_once(':')?;
+        node["username"] = serde_json::json!(percent_decode(user));
+        node["password"] = serde_json::json!(percent_decode(pass));
+    } else if !path.trim_matches('/').is_empty() {
+        // 有路径却没有账号信息 → 更像订阅链接，不按节点处理
+        return None;
+    }
+    Some(node)
+}
+
+/// 把任意导入文本解析为 Clash 节点列表（URI / Base64 / YAML / JSON 全格式）
+fn parse_import_nodes(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    let prepared = crate::core::subscription::auto_decrypt_base64_payload(text);
+    let (mut nodes, errors) = crate::core::subscription::parse_subscription_content(&prepared);
+    if nodes.is_empty() {
+        if let Some(notice) = errors
+            .iter()
+            .find_map(|e| e.strip_prefix("AIRPORT_NOTICE:"))
+        {
+            return Err(format!("机场提示：{}", notice.trim()));
+        }
+        return Err(format!(
+            "未能识别出节点：{}",
+            errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "请检查粘贴内容是否为节点链接 / YAML / Base64".into())
+        ));
+    }
+    // 节点名去重（同名互相覆盖会让用户看不到完整列表）
+    let mut seen = std::collections::HashSet::new();
+    for node in nodes.iter_mut() {
+        let base = crate::core::uri_parser::fix_utf8_mojibake(
+            node.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
+        );
+        let base = if base.is_empty() {
+            format!(
+                "{}:{}",
+                node.get("server").and_then(|s| s.as_str()).unwrap_or("节点"),
+                node.get("port").and_then(|p| p.as_u64()).unwrap_or(0)
+            )
+        } else {
+            base
+        };
+        let mut name = base.clone();
+        let mut i = 2;
+        while !seen.insert(name.clone()) {
+            name = format!("{base} #{i}");
+            i += 1;
+        }
+        node["name"] = serde_json::json!(name);
+    }
+    Ok(nodes)
+}
+
+/// 结构化表单 → Clash 节点对象
+fn build_manual_node(input: ManualNodeInput) -> Result<serde_json::Value, String> {
+    let protocol = input.protocol.trim().to_ascii_lowercase();
+    let server = input.server.trim().to_string();
+    if server.is_empty() {
+        return Err("服务器地址不能为空".into());
+    }
+    if input.port == 0 {
+        return Err("端口必须为 1-65535".into());
+    }
+    let name = if input.name.trim().is_empty() {
+        format!("{server}:{}", input.port)
+    } else {
+        input.name.trim().to_string()
+    };
+    let required = |v: &Option<String>, label: &str| -> Result<String, String> {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| format!("{label}不能为空"))
+    };
+    let network = input
+        .network
+        .as_deref()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| matches!(n.as_str(), "ws" | "grpc" | "tcp"))
+        .unwrap_or_else(|| "tcp".into());
+    let tls = input.tls.unwrap_or(false);
+    let skip_cert_verify = input.skip_cert_verify.unwrap_or(false);
+    let sni = input.sni.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let mut node = serde_json::json!({
+        "name": name,
+        "type": protocol,
+        "server": server,
+        "port": input.port,
+    });
+    match protocol.as_str() {
+        "ss" => {
+            node["cipher"] = serde_json::json!(input
+                .cipher
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("aes-256-gcm"));
+            node["password"] = serde_json::json!(required(&input.password, "密码")?);
+        }
+        "vmess" => {
+            node["uuid"] = serde_json::json!(required(&input.uuid, "UUID")?);
+            node["alterId"] = serde_json::json!(input.alter_id.unwrap_or(0));
+            node["cipher"] = serde_json::json!(input
+                .cipher
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("auto"));
+            node["tls"] = serde_json::json!(tls);
+        }
+        "vless" => {
+            node["uuid"] = serde_json::json!(required(&input.uuid, "UUID")?);
+            node["tls"] = serde_json::json!(tls);
+        }
+        "trojan" | "hysteria2" | "hysteria" => {
+            node["password"] = serde_json::json!(required(&input.password, "密码")?);
+            node["skip-cert-verify"] = serde_json::json!(skip_cert_verify);
+            if protocol.starts_with("hysteria") {
+                node["type"] = serde_json::json!("hysteria2");
+            }
+        }
+        "socks5" | "socks" => {
+            node["type"] = serde_json::json!("socks5");
+            if let Some(user) = input.password.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                node["password"] = serde_json::json!(user);
+            }
+        }
+        "http" => {
+            if let Some(user) = input.password.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                node["password"] = serde_json::json!(user);
+            }
+        }
+        "ssh" | "wireguard" | "tuic" | "anytls" => {
+            node["password"] = serde_json::json!(input.password.unwrap_or_default());
+        }
+        other => return Err(format!("暂不支持的协议：{other}")),
+    }
+    if let Some(sni) = sni {
+        match protocol.as_str() {
+            "trojan" | "hysteria2" | "hysteria" => node["sni"] = serde_json::json!(sni),
+            _ => node["servername"] = serde_json::json!(sni),
+        }
+    }
+    if matches!(protocol.as_str(), "vmess" | "vless" | "trojan") && network != "tcp" {
+        node["network"] = serde_json::json!(network);
+        if network == "ws" {
+            let path = input
+                .ws_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("/");
+            let mut ws = serde_json::json!({ "path": path });
+            if let Some(host) = input.ws_host.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                ws["headers"] = serde_json::json!({ "Host": host });
+            }
+            node["ws-opts"] = ws;
+        }
+        if network == "grpc" {
+            let service = input
+                .ws_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
+            node["grpc-opts"] = serde_json::json!({ "grpc-service-name": service });
+        }
+    }
+    Ok(node)
+}
+
+/// 导入收尾：落盘 → 建本地订阅记录 → 预热 → 清理失效缓存 → 热重载 → 广播事件。
+/// `local://manual-nodes` 是纯本地订阅，全程不发任何 HTTP 请求。
+async fn finalize_manual_import(
+    app: &AppHandle,
+    state: &AppState,
+    nodes: Vec<serde_json::Value>,
+    display_name: Option<&str>,
+) -> Result<(usize, usize), String> {
+    let (touched, total) =
+        crate::core::subscription::merge_manual_nodes(&state.data_dir, nodes)?;
+    crate::core::store::upsert_subscription(
+        &state.data_dir,
+        crate::core::subscription::MANUAL_SUB_URL,
+    )
+    .map_err(|e| format!("保存本地订阅记录失败: {e}"))?;
+    // 未指定备注名时只在记录无自定义名时写默认名，绝不覆盖用户已设置的名称
+    if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = crate::core::store::set_subscription_name(
+            &state.data_dir,
+            crate::core::subscription::MANUAL_SUB_URL,
+            Some(name),
+        );
+    } else {
+        let has_name = crate::core::store::load_subscriptions(&state.data_dir)
+            .into_iter()
+            .find(|r| r.url == crate::core::subscription::MANUAL_SUB_URL)
+            .and_then(|r| r.name)
+            .map(|n| !n.trim().is_empty())
+            .unwrap_or(false);
+        if !has_name {
+            let _ = crate::core::store::set_subscription_name(
+                &state.data_dir,
+                crate::core::subscription::MANUAL_SUB_URL,
+                Some("手动节点"),
+            );
+        }
+    }
+
+    // 新节点落盘后预热 DoH 缓存，随后的热重载构建配置直接命中
+    crate::core::config_builder::warm_node_host_cache(&state.data_dir);
+    purge_disabled_or_deleted_subscription_nodes(state);
+
+    // 内核运行中：立即重建配置让新节点生效
+    if *state.status.read() == CoreStatus::Running {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = hot_reload_mobile_config(app, state).await;
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            restart_core(app, state).await?;
+        }
+    }
+
+    // 节点集合已变化：重置 Go AIM 网络签名，触发下一轮重新评级
+    *state.last_aim_net_signature.lock() = None;
+
+    let _ = app.emit(
+        "subscriptions://updated",
+        serde_json::json!({
+            "url": crate::core::subscription::MANUAL_SUB_URL,
+            "nodeCount": total,
+        }),
+    );
+    let _ = app.emit("subscriptions://changed", ());
+    let _ = app.emit(
+        "proxies://updated",
+        serde_json::json!({ "url": crate::core::subscription::MANUAL_SUB_URL }),
+    );
+    let _ = app.emit("proxies://changed", ());
+    Ok((touched, total))
+}
+
+/// 【ACP7 任务1.1】扫码 / 粘贴导入：智能识别订阅链接、节点 URI、Base64、
+/// Clash YAML / JSON；全部落到 `local://manual-nodes` 本地订阅（订阅链接除外）。
+#[tauri::command]
+pub async fn import_qr_or_text_payload(
+    payload: String,
+    name: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ImportOutcome, String> {
+    let text = normalize_import_payload(&payload);
+    if text.is_empty() {
+        return Err("导入内容为空".into());
+    }
+    let display_name = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // 单行 http(s)：先判代理节点，再判订阅链接（绝不盲目发 HTTP）
+    let single_line = !text.contains('\n') && !text.contains('\r');
+    if single_line && (text.starts_with("http://") || text.starts_with("https://")) {
+        if let Some(node) = parse_http_proxy_node(&text) {
+            let (_, total) = finalize_manual_import(&app, &state, vec![node], display_name).await?;
+            return Ok(ImportOutcome {
+                kind: "nodes".into(),
+                node_count: 1,
+                total,
+                name: display_name.unwrap_or("手动节点").to_string(),
+            });
+        }
+        let url = text.clone();
+        refresh_subscription(&app, &state, &url).await?;
+        if let Some(n) = display_name {
+            crate::core::store::set_subscription_name(&state.data_dir, &url, Some(n))
+                .map_err(|e| format!("保存订阅备注名失败: {e}"))?;
+        }
+        let app2 = app.clone();
+        let url2 = url.clone();
+        let name2 = display_name.map(String::from);
+        tauri::async_runtime::spawn(async move {
+            crate::core::sync_links::push_link(&app2, &url2, name2).await;
+        });
+        let node_count = std::fs::read_to_string(crate::core::store::profile_path(
+            &state.data_dir,
+            &url,
+        ))
+        .map(|t| subscription_real_node_count(&t))
+        .unwrap_or(0);
+        return Ok(ImportOutcome {
+            kind: "subscription".into(),
+            node_count,
+            total: 0,
+            name: display_name.unwrap_or("订阅").to_string(),
+        });
+    }
+
+    let nodes = parse_import_nodes(&text)?;
+    let node_count = nodes.len();
+    let (_, total) = finalize_manual_import(&app, &state, nodes, display_name).await?;
+    Ok(ImportOutcome {
+        kind: "nodes".into(),
+        node_count,
+        total,
+        name: display_name.unwrap_or("手动节点").to_string(),
+    })
+}
+
+/// 【ACP7 任务1.2】可视化表单自建节点 → 合并进 `local://manual-nodes`
+#[tauri::command]
+pub async fn add_manual_node_struct(
+    node: ManualNodeInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ImportOutcome, String> {
+    let name = node.name.trim().to_string();
+    let value = build_manual_node(node)?;
+    let (_, total) = finalize_manual_import(
+        &app,
+        &state,
+        vec![value],
+        if name.is_empty() { None } else { Some(&name) },
+    )
+    .await?;
+    Ok(ImportOutcome {
+        kind: "nodes".into(),
+        node_count: 1,
+        total,
+        name: if name.is_empty() {
+            "手动节点".into()
+        } else {
+            name
+        },
+    })
 }
 
 /// 【APP65 任务3.1】移动端 VPN 运行中订阅 / 节点热生效：
@@ -3412,11 +3924,14 @@ pub async fn delete_subscription(
         // 【APP51 任务1】删除订阅后立即清理其全部节点缓存与失效选中节点
         purge_disabled_or_deleted_subscription_nodes(&state);
         // Pro/买断：静默上报云端删除（其他设备下次对账时同步删除）
-        let app2 = app.clone();
-        let url2 = url.clone();
-        tauri::async_runtime::spawn(async move {
-            super::super::core::sync_links::push_delete(&app2, &url2).await;
-        });
+        // 【ACP7 任务1】本地手动节点订阅不参与云端同步
+        if !crate::core::subscription::is_local_subscription(&url) {
+            let app2 = app.clone();
+            let url2 = url.clone();
+            tauri::async_runtime::spawn(async move {
+                super::super::core::sync_links::push_delete(&app2, &url2).await;
+            });
+        }
         if *state.status.read() == CoreStatus::Running {
             restart_core(&app, &state).await?;
         }
@@ -3565,6 +4080,23 @@ pub async fn get_device_id(state: State<'_, AppState>) -> Result<String, String>
     crate::core::license::device_id(&state.data_dir).map_err(|e| sanitize_err(&e.to_string()))
 }
 
+/// 【ACP7 任务2】只同步席位（used_seats / max_seats）实时值：
+/// 授权信息弹窗打开 / 「校验」按钮点击时调用，绝不修改授权有效性。
+#[tauri::command]
+pub async fn sync_license_seats(
+    state: State<'_, AppState>,
+) -> Result<EntitlementStatus, String> {
+    let settings = state.settings.read().clone();
+    match crate::core::license::refresh_seats_only(&state.data_dir, &settings).await {
+        Some(ent) => {
+            state.apply_entitlement(ent.clone());
+            Ok(ent)
+        }
+        // 网络失败 / 未激活：保留内存现有席位，绝不清空
+        None => Ok(state.entitlement.read().clone()),
+    }
+}
+
 /// 主动联网刷新授权（设置页「立即校验」按钮；APP-7：改用权威 runtime 校验，
 /// 自动感知解绑/过期/plan 缺失并执行授权级熔断）
 #[tauri::command]
@@ -3572,9 +4104,20 @@ pub async fn refresh_entitlement(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EntitlementStatus, String> {
-    let (ent, revoke_msg) = crate::core::app_control::force_runtime_check(&app, &state)
+    let (mut ent, revoke_msg) = crate::core::app_control::force_runtime_check(&app, &state)
         .await
         .map_err(|e| sanitize_err(&e))?;
+    // 【ACP7 任务2】校验按钮同时刷新席位实时值（只改 seats，不动授权状态）
+    if ent.is_unlocked() {
+        let settings = state.settings.read().clone();
+        if let Some(seats) =
+            crate::core::license::refresh_seats_only(&state.data_dir, &settings).await
+        {
+            ent.max_seats = seats.max_seats;
+            ent.used_seats = seats.used_seats;
+            state.apply_entitlement(ent.clone());
+        }
+    }
     // 【APP6 任务3】校验确认 Pro 有效：自动同步云端订阅并刷新节点
     //（reconcile 内部自校验同步资格并幂等去重；auto_sync 内部 24h 节流）
     if ent.is_unlocked() {

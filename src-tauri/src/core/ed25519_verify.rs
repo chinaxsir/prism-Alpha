@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::core::logger::MOD_PRO;
@@ -23,11 +23,34 @@ use crate::core::logger::MOD_PRO;
 // 生产公钥 prism-1（固定向量，不得变更）
 //   base64url (无 padding): UzKKqVLOFJuozWM2UGbkKDezvzMpn7crq019eMs0F_k
 //   hex:                    53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9
-//   raw bytes (32):         硬编码下方数组（不再混淆：还原逻辑曾出错导致验签直接失败）
-const PUBKEY_PRISM_1: [u8; 32] = [
-    0x53, 0x32, 0x8a, 0xa9, 0x52, 0xce, 0x14, 0x9b, 0xa8, 0xcd, 0x63, 0x36, 0x50, 0x66, 0xe4, 0x28,
-    0x37, 0xb3, 0xbf, 0x33, 0x29, 0x9f, 0xb7, 0x2b, 0xab, 0x4d, 0x7d, 0x78, 0xcb, 0x34, 0x17, 0xf9,
-];
+//   raw bytes (32):         由 hex 运行期解码
+//
+// 【ACP7 任务3】公钥常量经 `crate::obf!` 编译期混淆：发布包二进制中
+// 不再出现可被 `strings` / IDA 直接检索的 hex 明文。
+/// 运行期还原生产公钥（32 字节 raw）。任何解码异常返回 None → 验签失败。
+fn pubkey_prism_1() -> Option<[u8; 32]> {
+    let hex = crate::obf!("53328aa952ce149ba8cd63365066e42837b3bf33299fb72bab4d7d78cb3417f9");
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 
 pub const PRISM_KEY_ID: &str = "prism-1";
 
@@ -38,7 +61,9 @@ pub fn init_key_map() -> &'static std::collections::HashMap<&'static str, Verify
     static MAP: OnceLock<HashMap<&'static str, VerifyingKey>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
-        if let Ok(k) = VerifyingKey::from_bytes(&PUBKEY_PRISM_1) {
+        if let Some(bytes) = pubkey_prism_1()
+            && let Ok(k) = VerifyingKey::from_bytes(&bytes)
+        {
             m.insert(PRISM_KEY_ID, k);
         }
         m
@@ -145,9 +170,12 @@ pub fn verify(
     expected_kind: Option<&str>,
     now: i64,
 ) -> std::result::Result<TokenPayload, VerifyError> {
-    // 方案 3 前置：公钥长度兜底（理论上 VerifyingKey 构造时已校验）
-    if PUBKEY_PRISM_1.len() != 32 {
-        return Err(VerifyError::PubKeyLength(PUBKEY_PRISM_1.len()));
+    // 方案 3 前置：公钥解码兜底（obf 还原异常直接拒绝，绝不静默放行）
+    let Some(pubkey) = pubkey_prism_1() else {
+        return Err(VerifyError::PubKeyLength(0));
+    };
+    if pubkey.len() != 32 {
+        return Err(VerifyError::PubKeyLength(pubkey.len()));
     }
     let key_map = init_key_map();
 
@@ -177,9 +205,11 @@ pub fn verify(
         return Err(VerifyError::SigLength(sig_bytes.len()));
     }
 
-    // 方案 4：Ed25519-Verifier.verify(sig, payloadBytes) == true 才继续
+    // 方案 4：Ed25519-Verifier.verify_strict(sig, payloadBytes) == true 才继续
+    // 【ACP7 任务3】使用 verify_strict：拒绝「小阶点 / 非规范编码」签名，
+    // 防签名可塑性攻击；任何篡改 payload 字节都会直接失败。
     let sig = Signature::from_slice(&sig_bytes).map_err(|e| VerifyError::SigB64(e.to_string()))?;
-    key.verify(&payload_bytes, &sig)
+    key.verify_strict(&payload_bytes, &sig)
         .map_err(|_| VerifyError::SignatureMismatch)?;
 
     // 方案 5：验签通过后才把 payloadBytes 解析成 JSON 读取 claims
@@ -272,7 +302,7 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
 
     /// 固定向量：用户指定的生产公钥 base64url / hex / raw bytes 三者必须一一对应
     const PUBKEY_B64URL: &str = "UzKKqVLOFJuozWM2UGbkKDezvzMpn7crq019eMs0F_k";
@@ -291,15 +321,16 @@ mod tests {
 
     #[test]
     fn test_hardcoded_pubkey_matches_fixed_vector() {
-        // 硬编码的 PUBKEY_PRISM_1 必须等于用户给定的 hex → 防止混淆还原出错
+        // obf 还原出的公钥必须等于用户给定的 hex → 防止混淆还原出错
+        let bytes = pubkey_prism_1().expect("obf 公钥必须可还原");
         assert_eq!(
-            hex_encode(&PUBKEY_PRISM_1).to_ascii_lowercase(),
+            hex_encode(&bytes).to_ascii_lowercase(),
             PUBKEY_HEX.to_ascii_lowercase(),
-            "硬编码公钥必须精确匹配用户给定的 hex 固定向量"
+            "obf 还原公钥必须精确匹配用户给定的 hex 固定向量"
         );
         // 硬编码公钥必须等于 base64url 解码结果
         let from_b64 = base64url_no_pad_decode(PUBKEY_B64URL).unwrap();
-        assert_eq!(from_b64.as_slice(), PUBKEY_PRISM_1);
+        assert_eq!(from_b64.as_slice(), bytes);
     }
 
     #[test]

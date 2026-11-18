@@ -173,6 +173,46 @@ export const saveCustomRules = (rules: string[]) =>
 export const deleteSubscription = (url: string) =>
   invoke<boolean>("delete_subscription", { url });
 
+/** 【ACP7 任务1】扫码 / 粘贴导入结果 */
+export interface ImportOutcome {
+  /** subscription（订阅链接）| nodes（节点/手动） */
+  kind: "subscription" | "nodes";
+  nodeCount: number;
+  total: number;
+  name: string;
+}
+
+/** 扫码 / 粘贴导入：自动识别订阅链接、节点 URI、Base64、YAML */
+export const importQrOrTextPayload = (payload: string, name?: string | null) =>
+  invoke<ImportOutcome>("import_qr_or_text_payload", {
+    payload,
+    name: name ?? null,
+  });
+
+/** 可视化表单自建节点入参（Clash 字段 camelCase） */
+export interface ManualNodeInput {
+  name: string;
+  /** ss / vmess / vless / trojan / hysteria2 / socks5 / http */
+  protocol: string;
+  server: string;
+  port: number;
+  password?: string | null;
+  uuid?: string | null;
+  cipher?: string | null;
+  alterId?: number | null;
+  tls?: boolean | null;
+  sni?: string | null;
+  /** tcp / ws / grpc */
+  network?: string | null;
+  wsPath?: string | null;
+  wsHost?: string | null;
+  skipCertVerify?: boolean | null;
+}
+
+/** 结构化表单节点 → 合并进 local://manual-nodes */
+export const addManualNodeStruct = (node: ManualNodeInput) =>
+  invoke<ImportOutcome>("add_manual_node_struct", { node });
+
 /** 授权类型 */
 export type EntitlementKind = "lifetime" | "subscription";
 /** 授权来源 */
@@ -222,6 +262,9 @@ export const getRevokeReason = () =>
 export const getDeviceId = () => invoke<string>("get_device_id");
 export const refreshEntitlement = () =>
   invoke<Entitlement>("refresh_entitlement");
+/** 【ACP7 任务2】只刷新席位（used/max）实时值，绝不影响授权有效性 */
+export const syncLicenseSeats = () =>
+  invoke<Entitlement>("sync_license_seats");
 export const deactivatePro = () =>
   invoke<Entitlement>("deactivate_pro");
 /** 【APC4】解绑本机（反激活）：先释放服务端席位，成功后才清本地授权 */

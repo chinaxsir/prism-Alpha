@@ -6601,4 +6601,89 @@ rules:
             );
         }
     }
+
+    /// 【ACP7 任务1】本地手动节点（local://manual-nodes）：
+    /// 合并落盘后必须并入节点出站 / GLOBAL / Proxy 选择组以及
+    /// GO-AIM-PROBE-0..3 四个探针组；本地订阅刷新全程不发起 HTTP。
+    #[test]
+    fn acp7_manual_nodes_join_all_groups_without_http() {
+        use crate::core::subscription::{
+            is_local_subscription, manual_nodes_text, merge_manual_nodes, MANUAL_SUB_URL,
+        };
+        assert!(is_local_subscription(MANUAL_SUB_URL), "local:// 必须识别为本地订阅");
+        assert!(!is_local_subscription("https://airport.example/sub"));
+
+        let base = std::env::temp_dir().join("prism-cb-test-acp7-manual");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let nodes = vec![
+            serde_json::json!({
+                "name": "手动A", "type": "ss", "server": "1.2.3.4", "port": 8388,
+                "cipher": "aes-256-gcm", "password": "pw"
+            }),
+            serde_json::json!({
+                "name": "手动B", "type": "trojan", "server": "example.com", "port": 443,
+                "password": "pw", "tls": true
+            }),
+        ];
+        let (touched, total) = merge_manual_nodes(&base, nodes.clone()).expect("合并手动节点");
+        assert_eq!((touched, total), (2, 2));
+        // 同名再次导入 → 原地覆盖，总数不变
+        let (_, total2) = merge_manual_nodes(&base, vec![nodes[0].clone()]).expect("同名覆盖");
+        assert_eq!(total2, 2, "同名节点必须原地覆盖而非追加");
+
+        let text = manual_nodes_text(&base);
+        assert!(text.contains("手动A") && text.contains("手动B"));
+
+        let built = build(
+            &[(MANUAL_SUB_URL.into(), "手动节点".into(), text)],
+            &[],
+            RunMode::Tun,
+            &UserSettings::default(),
+            &base,
+            &base.join("kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("本地手动节点配置构建成功");
+
+        let outbounds = built.config["outbounds"].as_array().expect("outbounds");
+        for name in ["手动A", "手动B"] {
+            assert!(
+                outbounds.iter().any(|o| o["tag"].as_str() == Some(name)),
+                "{name} 必须生成为独立出站"
+            );
+        }
+        // GLOBAL / Proxy 选择组必须包含手动节点
+        for group in ["GLOBAL", "Proxy"] {
+            let Some(g) = outbounds.iter().find(|o| o["tag"].as_str() == Some(group)) else {
+                continue;
+            };
+            let members: Vec<&str> = g["outbounds"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for name in ["手动A", "手动B"] {
+                assert!(members.contains(&name), "{group} 必须包含 {name}: {members:?}");
+            }
+        }
+        // GO-AIM-PROBE-0..3 四个探针组必须覆盖手动节点
+        for slot in 0..4 {
+            let tag = format!("GO-AIM-PROBE-{slot}");
+            let g = outbounds
+                .iter()
+                .find(|o| o["tag"].as_str() == Some(tag.as_str()))
+                .unwrap_or_else(|| panic!("缺少探针组 {tag}"));
+            let members: Vec<&str> = g["outbounds"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for name in ["手动A", "手动B"] {
+                assert!(members.contains(&name), "{tag} 必须包含 {name}");
+            }
+        }
+    }
 }

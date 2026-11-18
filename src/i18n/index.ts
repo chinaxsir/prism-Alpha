@@ -157,5 +157,52 @@ export function translateBackendMessage(
       out = out.split(zh).join(en);
     }
   }
+  // 【ACP7 任务2】Go AIM 动态进度是后端拼接的中文长句（含实时数字），
+  // 固定词条替换覆盖不到，必须用正则翻译（顺序：从最具体到最宽泛）。
+  const aimRules: Array<[RegExp, string]> = [
+    [
+      /阶段一极速存活快筛开始，共 (\d+) 个节点/g,
+      "Stage 1 fast screening started · $1 nodes",
+    ],
+    [
+      /阶段一快筛 (\d+)\/(\d+)，存活 (\d+)/g,
+      "Fast screening $1/$2 · $3 alive",
+    ],
+    [
+      /节点「([^」]+)」完成检测：([A-Z_]+)/g,
+      'Node "$1" checked: $2',
+    ],
+    [
+      /检测完成，共 (\d+) 个节点参与评级；最优节点「([^」]+)」(\d+)ms/g,
+      'Probe finished · $1 nodes rated · best "$2" $3 ms',
+    ],
+    [
+      /检测完成，共 (\d+) 个节点参与评级/g,
+      "Probe finished · $1 nodes rated",
+    ],
+    [
+      /检测任务结束: status=([A-Z_]+)（([^）]*)）: (.*)/g,
+      "Task ended: status=$1 ($2): $3",
+    ],
+    [
+      /检测任务结束: status=([A-Z_]+), reason=(.*)/g,
+      "Task ended: status=$1, reason=$2",
+    ],
+    [
+      /最优节点: ([^,]+), score=(\d+), delay=(\d+)ms/g,
+      "Best node: $1, score=$2, delay=$3 ms",
+    ],
+    [
+      /锁定状态: mode=([^,]+), active_node=(.*)/g,
+      "Locked: mode=$1, node=$2",
+    ],
+    [
+      /正在检测[:：]\s*([^·]+?)·\s*已完成\s*(\d+)%/g,
+      "Probing: $1 · $2%",
+    ],
+  ];
+  for (const [re, en] of aimRules) {
+    out = out.replace(re, en);
+  }
   return out;
 }

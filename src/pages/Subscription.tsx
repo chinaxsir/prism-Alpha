@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { RefreshCw, Rss, Trash2, Pencil, Check, X } from "lucide-react";
+import { RefreshCw, Rss, Trash2, Pencil, Check, X, ScanLine, Plus } from "lucide-react";
 
 import {
   deleteSubscription,
@@ -9,8 +9,11 @@ import {
   toggleSubscription,
   updateAllSubscriptions,
   updateSubscription,
+  type ImportOutcome,
   type SubscriptionRecord,
 } from "@/api/ipc";
+import ManualNodeModal from "@/components/ManualNodeModal";
+import QrScannerModal from "@/components/QrScannerModal";
 import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
 import Switch from "@/components/ui/Switch";
@@ -54,6 +57,9 @@ export default function Subscription() {
   // 行内重命名：正在编辑的 URL 与草稿值
   const [editingUrl, setEditingUrl] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
+  // 【ACP7 任务1】扫码 / 手动节点双入口
+  const [scanOpen, setScanOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const unlocked = useProStore((s) => s.unlocked);
 
   const load = useCallback(async () => {
@@ -106,6 +112,23 @@ export default function Subscription() {
       setAdding(false);
     }
   };
+
+  /// 【ACP7 任务1】扫码 / 手动节点入口：与本页免费版单订阅门控保持一致
+  const MANUAL_SUB_URL = "local://manual-nodes";
+  const hasManualSub = subs.some((r) => r.url === MANUAL_SUB_URL);
+  const openImport = (which: "scan" | "manual") => {
+    if (!unlocked && subs.length >= 1 && !hasManualSub) return;
+    if (which === "scan") setScanOpen(true);
+    else setManualOpen(true);
+  };
+
+  /// 导入成功后刷新订阅列表（全局 store 同步，切页首帧即最新）
+  const handleImported = useCallback(
+    async (_outcome: ImportOutcome) => {
+      await load();
+    },
+    [load],
+  );
 
   /// 【APP42 任务2.1】行内重命名：本地立即生效，Pro 用户静默上行云端
   const handleRename = async (record: SubscriptionRecord) => {
@@ -212,6 +235,23 @@ export default function Subscription() {
       {/* 添加订阅 */}
       <div className="bg-surface-card rounded-xl p-5">
         <h2 className="text-[16px] font-bold text-text mb-4">{t("sub.addTitle")}</h2>
+        {/* 【ACP7 任务1】双入口：扫码 / 手动节点（移动端纵向堆叠，桌面端同行） */}
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row">
+          <button
+            onClick={() => openImport("scan")}
+            className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-border bg-surface-hover px-4 py-2.5 text-[13px] font-semibold text-text transition-colors hover:border-accent/60 hover:text-accent"
+          >
+            <ScanLine size={15} />
+            {t("sub.scanQr")}
+          </button>
+          <button
+            onClick={() => openImport("manual")}
+            className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-border bg-surface-hover px-4 py-2.5 text-[13px] font-semibold text-text transition-colors hover:border-accent/60 hover:text-accent"
+          >
+            <Plus size={15} />
+            {t("sub.manualNode")}
+          </button>
+        </div>
         <div className="flex flex-col gap-3 md:flex-row">
           <input
             type="text"
@@ -443,6 +483,18 @@ export default function Subscription() {
           </div>
         )}
       </div>
+
+      {/* 【ACP7 任务1】扫码 / 手动节点弹窗 */}
+      <QrScannerModal
+        open={scanOpen}
+        onClose={() => setScanOpen(false)}
+        onImported={handleImported}
+      />
+      <ManualNodeModal
+        open={manualOpen}
+        onClose={() => setManualOpen(false)}
+        onImported={handleImported}
+      />
     </div>
   );
 }

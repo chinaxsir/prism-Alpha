@@ -669,7 +669,9 @@ pub(crate) fn http_builder() -> Result<reqwest::ClientBuilder> {
         .connect_timeout(std::time::Duration::from_secs(8))
         // 不走系统代理：内核运行时系统代理指向本机，走代理会自回环；
         // 授权服务为公网 HTTPS，直连即可
-        .no_proxy())
+        .no_proxy()
+        // 【ACP7 任务3】只允许 HTTPS：任何 HTTP 明文降级请求直接拒绝
+        .https_only(true))
 }
 
 /// 授权服务固定域名（编译期 obf，运行时判断隐身白名单时使用明文常量）
@@ -789,6 +791,7 @@ pub async fn doh_resolve_ips(target_host: &str) -> Vec<IpAddr> {
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .no_proxy()
+            .https_only(true)
             .resolve(host, SocketAddr::new(addr, 443))
             .build()
         {
@@ -840,6 +843,7 @@ pub(crate) async fn send_with_v4_fallback(
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3))
             .no_proxy()
+            .https_only(true)
             .proxy(proxy)
             .build();
         if let Ok(client) = client {
@@ -1213,11 +1217,12 @@ async fn fetch_status(
     if !resp.status().is_success() {
         return Err(StatusError::Rejected(code, error_message(resp).await));
     }
-    let status: StatusResponse = resp
+    let root: Value = resp
         .json()
         .await
         .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
-    // 【110.txt】GET /api/license/status 响应验签（仅在服务端返回了 signed 信封时执行）。
+    let mut status: StatusResponse = serde_json::from_value(root.clone())
+        .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
     // 【APC6 任务1.2】若无 signed 信封但顶层 valid=true（扁平 JSON），
     // 直接采信——这是《License 激活接口对接文档》第 2 节标准格式，
     // 严禁因此报错或清除本地授权。
@@ -1237,13 +1242,66 @@ async fn fetch_status(
             now,
         )
         .map_err(|e| StatusError::Rejected(401, format!("signature_invalid: {e}")))?;
+        // 【ACP7 任务2】席位数据双源：验签通过的 signed.payload 与响应顶层
+        // 都可能携带 used_seats / max_seats（服务端不同版本字段位置不一致）。
+        if let Ok(bytes) = crate::core::ed25519_verify::base64url_no_pad_decode(&env.payload)
+            && let Ok(payload) = serde_json::from_slice::<Value>(&bytes)
+        {
+            status.max_seats = extract_seat(&payload, MAX_SEAT_KEYS).or(status.max_seats);
+            status.used_seats = extract_seat(&payload, USED_SEAT_KEYS).or(status.used_seats);
+        }
     } else {
         crate::core::logger::info(
             crate::core::logger::MOD_PRO,
             "GET /api/license/status 返回扁平 JSON（无 signed 信封），直接采信",
         );
     }
+    // 顶层多别名兜底（usedSeats / active_seats / bound_devices…）
+    status.max_seats = status
+        .max_seats
+        .or_else(|| extract_seat(&root, MAX_SEAT_KEYS));
+    status.used_seats = status
+        .used_seats
+        .or_else(|| extract_seat(&root, USED_SEAT_KEYS));
     Ok(status)
+}
+
+/// 席位字段别名（各版本服务端字段命名不完全一致，按优先级依次尝试）
+const MAX_SEAT_KEYS: &[&str] = &[
+    "max_seats",
+    "maxSeats",
+    "seat_limit",
+    "seatLimit",
+    "max_devices",
+    "maxDevices",
+    "device_limit",
+];
+const USED_SEAT_KEYS: &[&str] = &[
+    "used_seats",
+    "usedSeats",
+    "active_seats",
+    "activeSeats",
+    "bound_devices",
+    "boundDevices",
+    "device_count",
+    "deviceCount",
+    "used",
+];
+
+/// 从 JSON 对象中按别名列表提取非负整数（兼容 number / 数字字符串）
+fn extract_seat(value: &Value, keys: &[&str]) -> Option<u32> {
+    for key in keys {
+        let Some(v) = value.get(*key) else { continue };
+        let parsed = v
+            .as_u64()
+            .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+            .or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+        if let Some(n) = parsed {
+            return Some(n.min(u32::MAX as u64) as u32);
+        }
+    }
+    None
 }
 
 // ---------------- 状态映射 ----------------
@@ -1268,6 +1326,15 @@ fn map_entitlement(
     let expired =
         server_status == "expired" || expires_at.map(|exp| exp <= now_secs()).unwrap_or(false);
     let status = if expired { "expired" } else { "active" };
+    // 【ACP7 任务2】席位展示兜底：Alpha 内测恒为 1/1；正式授权 max 缺失按 1，
+    // used 缺失按 1（绝不显示空值导致前端渲染成「? / ?」）。
+    let (max_seats, used_seats) = if alpha {
+        (Some(1), Some(1))
+    } else {
+        let max = max_seats.or(Some(1));
+        let used = used_seats.or(Some(1)).map(|u| max.map(|m| u.min(m)).unwrap_or(u));
+        (max, used)
+    };
     EntitlementStatus {
         status: status.into(),
         // 【APP48】Alpha 内测授权虽是 plan=pro，但绝不能被渲染成「买断/永久」；
@@ -1689,6 +1756,41 @@ pub async fn verify_remote_forced(
     settings: &UserSettings,
 ) -> Result<EntitlementStatus> {
     verify_remote(data_dir, settings, true).await
+}
+
+/// 【ACP7 任务2】只同步席位数据（used_seats / max_seats）：
+/// 拉取 `GET /api/license/status`，仅回写两个席位字段，
+/// **绝不修改 status / expires_at / plan** ——即使服务端瞬时报错，
+/// 也不可能因为「刷新名额」把有效授权刷掉（不掉授权的硬性红线）。
+pub async fn refresh_seats_only(
+    data_dir: &Path,
+    settings: &UserSettings,
+) -> Option<EntitlementStatus> {
+    let mut cache = load_cache(data_dir)?;
+    let base = api_base(settings);
+    let s = fetch_status(&base, &cache.license, data_dir).await.ok()?;
+    if !s.valid {
+        return None;
+    }
+    let (max, used) = if s.alpha || cache.entitlement.alpha {
+        (Some(1), Some(1))
+    } else {
+        (s.max_seats, s.used_seats)
+    };
+    let mut ent = cache.entitlement.clone();
+    if let Some(v) = max {
+        ent.max_seats = Some(v);
+    }
+    if let Some(v) = used {
+        let v = ent.max_seats.map(|m| v.min(m)).unwrap_or(v);
+        ent.used_seats = Some(v);
+    }
+    if ent.max_seats.is_some() && ent.used_seats.is_none() {
+        ent.used_seats = Some(1);
+    }
+    cache.entitlement = ent.clone();
+    let _ = save_cache(data_dir, &cache);
+    Some(ent)
 }
 
 /// 每天首次启动时与服务器同步授权；当天内已同步则只读本地加密缓存，不再联网。
@@ -2328,5 +2430,41 @@ mod tests {
         );
         assert_eq!(normalize_ts_millis_to_sec(Some(0)), None);
         assert_eq!(normalize_ts_millis_to_sec(None), None);
+    }
+
+    /// 【ACP7 任务2】used_seats=2 / max_seats=3：
+    /// 顶层与 signed.payload 双源多别名都能解析，且 /api/app/check
+    /// 的 runtime 合并绝不能把 used_seats 覆盖/清空。
+    #[test]
+    fn acp7_seat_parse_and_app_check_never_resets_used_seats() {
+        let root = serde_json::json!({ "used_seats": 2, "max_seats": 3 });
+        assert_eq!(extract_seat(&root, USED_SEAT_KEYS), Some(2));
+        assert_eq!(extract_seat(&root, MAX_SEAT_KEYS), Some(3));
+        // 别名 + 字符串数字（服务端不同版本）
+        let alias = serde_json::json!({
+            "usedSeats": "2",
+            "active_seats": 2,
+            "bound_devices": 2,
+            "maxSeats": 3,
+            "seat_limit": 3,
+        });
+        assert_eq!(extract_seat(&alias, USED_SEAT_KEYS), Some(2));
+        assert_eq!(extract_seat(&alias, MAX_SEAT_KEYS), Some(3));
+
+        let mut ent = map_entitlement("pro", "active", None, Some(3), Some(2), true, false);
+        assert_eq!(ent.max_seats, Some(3));
+        assert_eq!(ent.used_seats, Some(2));
+
+        // app/check 不携带席位 → 必须原样保留 2/3
+        crate::core::app_control::merge_runtime_seats(&mut ent, None);
+        assert_eq!((ent.max_seats, ent.used_seats), (Some(3), Some(2)));
+        // runtime 明确返回 max=5 时只更新 max，used 保持不变
+        crate::core::app_control::merge_runtime_seats(&mut ent, Some(5));
+        assert_eq!((ent.max_seats, ent.used_seats), (Some(5), Some(2)));
+
+        // Alpha 内测恒为 1/1
+        let mut alpha = map_entitlement("pro", "active", None, Some(3), Some(2), false, true);
+        crate::core::app_control::merge_runtime_seats(&mut alpha, None);
+        assert_eq!((alpha.max_seats, alpha.used_seats), (Some(1), Some(1)));
     }
 }

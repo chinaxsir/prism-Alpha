@@ -298,6 +298,10 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
     // 「订阅同步了却没有节点」的场景：上一台设备同步时只建了记录
     // （下载失败保底），本台设备对账必须重新拉取内容
     for link in &cloud {
+        // 【ACP7 任务1】本地手动节点订阅永不参与云端同步
+        if super::subscription::is_local_subscription(&link.url) {
+            continue;
+        }
         let has_record = local.iter().any(|r| r.url == link.url);
         if has_record && !profile_is_empty_shell(&data_dir, &link.url) {
             continue;
@@ -370,6 +374,9 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
 
     // 3. 云端无、本地有、在基线中 → 其他设备已删除，静默删除本地
     for record in &local {
+        if super::subscription::is_local_subscription(&record.url) {
+            continue;
+        }
         if cloud_urls.contains(record.url.as_str()) || !mirror_urls.contains(record.url.as_str()) {
             continue;
         }
@@ -390,6 +397,9 @@ async fn reconcile_inner(app: &AppHandle) -> Result<(), SyncError> {
 
     // 4. 云端无、本地有、不在基线中 → 本地新增未上报，逐条上传
     for record in &local {
+        if super::subscription::is_local_subscription(&record.url) {
+            continue;
+        }
         if cloud_urls.contains(record.url.as_str()) || mirror_urls.contains(record.url.as_str()) {
             continue;
         }

@@ -8,6 +8,7 @@ import {
   getRevokeReason,
   pollLicenseStatus,
   refreshEntitlement,
+  syncLicenseSeats,
   type Entitlement,
 } from "@/api/ipc";
 
@@ -78,6 +79,8 @@ interface ProState {
   /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
+  /** 【ACP7 任务2】只同步席位实时值（打开授权信息弹窗时调用），绝不影响解锁态 */
+  syncSeats: () => Promise<void>;
   /** 【APC4】解绑本机（反激活）：失败时保留本地授权，绝不乐观清空 */
   deactivateDevice: () => Promise<void>;
   /** 【APC4】前台 60s 在线复核；断网/429 静默保持当前授权 */
@@ -197,6 +200,24 @@ export const useProStore = create<ProState>((set, get) => ({
     } catch (err) {
       // 【APP43】刷新失败（超时/断网）：保留当前授权态，绝不清除 Pro
       set({ busy: false, error: String(err) });
+    }
+  },
+
+  syncSeats: async () => {
+    // 【ACP7 任务2】打开授权信息弹窗时拉取最新 used/max；
+    // 只合并两个席位字段，status / unlocked / 到期时间一律不动。
+    try {
+      const e = await syncLicenseSeats();
+      const cur = get().entitlement;
+      set({
+        entitlement: {
+          ...cur,
+          maxSeats: e.maxSeats ?? cur.maxSeats,
+          usedSeats: e.usedSeats ?? cur.usedSeats,
+        },
+      });
+    } catch {
+      /* 断网/未激活：静默保留现有席位 */
     }
   },
 

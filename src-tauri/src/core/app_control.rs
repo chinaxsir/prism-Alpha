@@ -437,7 +437,10 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
         }
         .into(),
     );
-    ent.max_seats = runtime.max_seats;
+    // 【ACP7 任务2】/api/app/check 只负责方案与到期校验，不携带席位数据：
+    // 只在 runtime 明确返回 max_seats 时才覆盖；used_seats 一律保留
+    // /api/license/status 同步下来的实时值，严禁被清空成 None。
+    merge_runtime_seats(&mut ent, runtime.max_seats);
     if let Some(exp_str) = runtime.expires_at.as_deref()
         && let Some(exp) = license::parse_expires_at(exp_str)
     {
@@ -456,6 +459,30 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
     }
     ent.last_verified_at = license::now_secs();
     state.apply_entitlement(ent);
+}
+
+/// 【ACP7 任务2】/api/app/check 席位合并规则（纯函数，便于单测）：
+/// - runtime 只在明确返回 max_seats 时才覆盖，None 绝不能清空 status 同步值；
+/// - used_seats 永不覆盖（app/check 不携带该字段）；
+/// - Alpha 内测恒为 1/1；正式授权 max 缺失按 1、used 缺失按 1。
+pub(crate) fn merge_runtime_seats(
+    ent: &mut crate::core::license::EntitlementStatus,
+    runtime_max_seats: Option<u32>,
+) {
+    if let Some(max) = runtime_max_seats {
+        ent.max_seats = Some(max);
+    }
+    if ent.alpha {
+        ent.max_seats = Some(1);
+        ent.used_seats = Some(1);
+    } else {
+        if ent.max_seats.is_none() {
+            ent.max_seats = Some(1);
+        }
+        if ent.used_seats.is_none() {
+            ent.used_seats = Some(1);
+        }
+    }
 }
 
 /// 关闭所有 Pro 专属开关（Go AIM / Go Lan / Go Cus）并持久化，

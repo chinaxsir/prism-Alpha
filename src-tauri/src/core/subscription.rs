@@ -1261,6 +1261,116 @@ fn truthy(v: &str) -> bool {
     )
 }
 
+// ---------------- 本地手动节点（local://manual-nodes） ----------------
+//
+// ACP7 任务1：扫码 / 粘贴 / 结构化表单导入的节点统一落到固定本地订阅
+// `local://manual-nodes`。它是一条「本地订阅」，永远不发 HTTP 请求，
+// 也不参与云端订阅同步（上传/删除/对账全部跳过），与机场订阅完全隔离。
+
+/// 手动节点 / 扫码导入的固定本地订阅 URL
+pub const MANUAL_SUB_URL: &str = "local://manual-nodes";
+
+/// 是否本地订阅（local:// 前缀）：刷新必须读磁盘、禁止发起网络请求
+pub fn is_local_subscription(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("local://")
+}
+
+/// 本地订阅的 profile 文件路径（与机场订阅共用 URL 哈希规则）
+fn manual_profile_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    crate::core::store::profile_path(data_dir, MANUAL_SUB_URL)
+}
+
+/// 读取本地手动节点（Clash 节点 JSON 列表；文件不存在/损坏返回空）
+pub fn load_manual_nodes(data_dir: &std::path::Path) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(manual_profile_path(data_dir)) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("proxies")
+        .and_then(|p| p.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|item| serde_json::to_value(item).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 本地手动节点 YAML 文本（refresh_subscription 本地分支直接落盘复用）
+pub fn manual_nodes_text(data_dir: &std::path::Path) -> String {
+    let nodes = load_manual_nodes(data_dir);
+    serde_yaml::to_string(&json!({ "proxies": nodes }))
+        .unwrap_or_else(|_| "proxies: []\n".to_string())
+}
+
+/// 覆盖写入手动节点列表（原子写，防断电写坏）
+fn save_manual_nodes(data_dir: &std::path::Path, nodes: &[Value]) -> Result<(), String> {
+    let path = manual_profile_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建订阅目录失败: {e}"))?;
+    }
+    let text = serde_yaml::to_string(&json!({ "proxies": nodes }))
+        .map_err(|e| format!("序列化手动节点失败: {e}"))?;
+    crate::core::store::atomic_write(&path, text.as_bytes())
+        .map_err(|e| format!("写入手动节点失败: {e}"))
+}
+
+/// 合并导入节点：同名节点原地覆盖（更新），新节点追加。
+/// 返回 (本次处理节点数, 合并后总数)。
+pub fn merge_manual_nodes(
+    data_dir: &std::path::Path,
+    incoming: Vec<Value>,
+) -> Result<(usize, usize), String> {
+    let mut nodes = load_manual_nodes(data_dir);
+    let mut touched = 0usize;
+    for mut node in incoming {
+        if !node.is_object() {
+            continue;
+        }
+        let raw_name = node
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let name = if raw_name.is_empty() {
+            let server = node.get("server").and_then(|s| s.as_str()).unwrap_or("手动节点");
+            let port = node.get("port").and_then(|p| p.as_u64()).unwrap_or(0);
+            unique_node_name(&format!("{server}:{port}"), &nodes)
+        } else {
+            raw_name
+        };
+        node["name"] = json!(name);
+        match nodes
+            .iter()
+            .position(|n| n.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+        {
+            Some(idx) => nodes[idx] = node,
+            None => nodes.push(node),
+        }
+        touched += 1;
+    }
+    save_manual_nodes(data_dir, &nodes)?;
+    Ok((touched, nodes.len()))
+}
+
+/// 生成不冲突的节点名（同名追加 ` #2`、` #3`…）
+fn unique_node_name(base: &str, existing: &[Value]) -> String {
+    let mut name = base.to_string();
+    let mut i = 2;
+    while existing
+        .iter()
+        .any(|n| n.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+    {
+        name = format!("{base} #{i}");
+        i += 1;
+    }
+    name
+}
+
 // ---------------- 单元测试 ----------------
 
 #[cfg(test)]

@@ -102,6 +102,7 @@ export default function ProManageModal({ open, onClose }: Props) {
   const entitlement = useProStore((s) => s.entitlement);
   const proBusy = useProStore((s) => s.busy);
   const refreshPro = useProStore((s) => s.refresh);
+  const syncSeats = useProStore((s) => s.syncSeats);
   const deactivateDevice = useProStore((s) => s.deactivateDevice);
   const [deviceId, setDeviceId] = useState<string | null>(null);
 
@@ -124,6 +125,9 @@ export default function ProManageModal({ open, onClose }: Props) {
     // 【APC5 任务2.2】打开弹窗时静默刷新：确保 used_seats 是服务端最新值，
     // 彻底消灭 "? / 3" Bug；刷新失败（断网/429）静默忽略，不打扰当前弹窗。
     void refreshPro().catch(() => undefined);
+    // 【ACP7 任务2】打开授权信息弹窗的同一时机，额外拉取 /api/license/status
+    // 的最新 used_seats / max_seats（只改席位，不影响授权有效性）
+    void syncSeats();
   }, [open]);
 
   const copyDeviceId = async () => {
