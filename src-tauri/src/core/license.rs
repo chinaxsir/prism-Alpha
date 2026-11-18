@@ -447,13 +447,23 @@ struct CachedLicense {
     /// 旧版缓存缺失时默认 0，首次读取自动补写为当前时间。
     #[serde(default)]
     max_seen_unix: i64,
-    /// 【APC4 任务1.3】本地激活令牌签发时间（Unix 秒）。
-    /// isTokenUsable 用它对比服务端 revoked_before；旧缓存缺失时按激活时间兜底。
+    /// 本地激活令牌签发时间（Unix 秒）。
+    /// 【APC6 任务1.1】激活响应无 issuedAt 时，一律对齐为
+    /// max(status.server_time, status.revoked_before)，避免老 revoke 记录误杀新激活。
     #[serde(default)]
     token_issued_at: i64,
-    /// 【APC4 任务1.3】本地激活令牌过期时间（Unix 秒，默认 24h）。
+    /// 本地激活令牌过期时间（Unix 秒，默认 24h）。
     #[serde(default)]
     token_expires_at: i64,
+    /// 【APC6 任务1.1】激活时刻服务端已有的历史吊销基线（revoked_before）。
+    /// 仅当服务端返回的 revoked_before **严格大于** 此基线（且晚于 issued_at + 5s）
+    /// 时，才视为「新发生的吊销事件」。旧版缓存缺失时默认 0。
+    #[serde(default)]
+    baseline_revoked_before: i64,
+    /// 【APC6 任务1.2】本机刚刚成功激活的 Unix 秒时间戳（15 秒保护期内
+    /// 后台轮询一律禁止清除本地授权，避开主从复制延迟的旧状态）。
+    #[serde(default)]
+    activated_at: i64,
     entitlement: EntitlementStatus,
 }
 
@@ -544,6 +554,8 @@ fn load_cache(data_dir: &Path) -> Option<CachedLicense> {
             max_seen_unix: 0,
             token_issued_at: 0,
             token_expires_at: 0,
+            baseline_revoked_before: 0,
+            activated_at: 0,
             entitlement: legacy.entitlement,
         };
         normalize_cache(&mut migrated);
@@ -1108,16 +1120,59 @@ async fn retry_after_secs(resp: reqwest::Response) -> i64 {
         .max(1)
 }
 
-/// 【APC4 任务1.3】isTokenUsable 四重秒级吊销判定（api-reference.md §7.1.1）：
-/// `valid` && `device_bound != false` && `issued_at >= revoked_before` &&
-/// `now < token_expires_at`。任一不满足即视为令牌已被吊销。
-/// 旧缓存无令牌元数据（token_expires_at == 0）时只做前三重判定，
-/// 到期仍由 `enforce_expiry` 兜底。
+/// 【APC6 任务1.2】15 秒新激活保护窗口：避开服务端主从复制延迟的旧状态，
+/// 重新激活后 15 秒内后台轮询一律禁止清除本地授权。
+pub const NEW_ACTIVATION_GRACE_SECS: i64 = 15;
+
+/// 【APC6 任务1.2】判断本地是否处于新激活保护窗口：
+/// 缓存缺失或 activated_at == 0 一律返回 false（非激活态 / 旧缓存无该字段）。
+fn in_new_activation_grace(cache: &CachedLicense) -> bool {
+    cache.activated_at > 0 && now_secs() - cache.activated_at < NEW_ACTIVATION_GRACE_SECS
+}
+
+/// 【APC6 任务1.1】规范化签发时间字段：兼容多种命名
+/// （issuedAt / issued_at / iat），并自动把毫秒时间戳（>10_000_000_000）
+/// 换算为 Unix 秒。输入为 None / 0 / 毫秒值 > 1e10 / 秒值直接返回。
+pub fn normalize_ts_millis_to_sec(v: Option<i64>) -> Option<i64> {
+    match v {
+        Some(n) if n <= 0 => None,
+        Some(n) if n > 10_000_000_000 => Some(n / 1000),
+        other => other,
+    }
+}
+
+/// 【APC6 任务1.1】令牌吊销条件（取代 is_token_usable 的 issued_at < revoked_before 直接比较）：
+/// 只有当服务端返回的 **最新** revoked_before 严格大于本地基线 `baseline_revoked_before`，
+/// 且大于 `issued_at + 5`（5 秒时钟偏差保护窗口）时，才判定为
+/// 「激活之后发生了新的吊销事件」。返回值 true 表示「发生了新吊销」。
+pub fn is_new_revocation(
+    status_revoked_before: Option<i64>,
+    baseline_revoked_before: i64,
+    issued_at: i64,
+) -> bool {
+    let Some(srv_rb) = status_revoked_before else {
+        return false; // 服务端未返回任何吊销基线（旧版服务端 / 未带 device_id），绝不主动判定吊销
+    };
+    if srv_rb <= baseline_revoked_before {
+        return false; // 未超过本地激活时刻已有的基线，不是新吊销
+    }
+    if issued_at <= 0 {
+        return true; // 旧缓存缺失 issued_at，但基线差距已扩大 → 视为新吊销
+    }
+    // 服务端新 revoked_before 必须严格晚于 issued_at + 5s 才是真吊销；
+    // 刚好命中 issued_at 的老基线（比如 reactivation 对齐后）不算新吊销。
+    srv_rb > issued_at + 5
+}
+
+/// 【APC4 任务1.3 / APC6 修订】isTokenUsable：保留 valid + device_bound +
+/// token_expires_at 三重判定；revoked_before 比较已升级为独立的
+/// `is_new_revocation` 调用（在 verify_remote / recheck_online 中显式触发）。
+/// 本函数仅回答「令牌本身是否自洽」——不处理吊销基线对齐逻辑。
 pub fn is_token_usable(
     valid: bool,
     device_bound: Option<bool>,
-    revoked_before: Option<i64>,
-    issued_at: i64,
+    _revoked_before: Option<i64>,
+    _issued_at: i64,
     token_expires_at: i64,
     server_time: Option<i64>,
 ) -> bool {
@@ -1125,9 +1180,6 @@ pub fn is_token_usable(
         return false;
     }
     if device_bound == Some(false) {
-        return false;
-    }
-    if issued_at < revoked_before.unwrap_or(0) {
         return false;
     }
     if token_expires_at <= 0 {
@@ -1165,7 +1217,10 @@ async fn fetch_status(
         .json()
         .await
         .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
-    // 【110.txt】GET /api/license/status 响应验签
+    // 【110.txt】GET /api/license/status 响应验签（仅在服务端返回了 signed 信封时执行）。
+    // 【APC6 任务1.2】若无 signed 信封但顶层 valid=true（扁平 JSON），
+    // 直接采信——这是《License 激活接口对接文档》第 2 节标准格式，
+    // 严禁因此报错或清除本地授权。
     if let Some(signed) = status.signed.as_ref() {
         let env: crate::core::ed25519_verify::SignedEnvelope =
             serde_json::from_value(signed.clone())
@@ -1183,9 +1238,9 @@ async fn fetch_status(
         )
         .map_err(|e| StatusError::Rejected(401, format!("signature_invalid: {e}")))?;
     } else {
-        crate::core::logger::warn(
+        crate::core::logger::info(
             crate::core::logger::MOD_PRO,
-            "GET /api/license/status 响应缺少 signed 信封",
+            "GET /api/license/status 返回扁平 JSON（无 signed 信封），直接采信",
         );
     }
     Ok(status)
@@ -1423,6 +1478,9 @@ pub async fn activate(
         data.sync_available,
         data.alpha,
     );
+    let now = now_secs();
+    let mut baseline_revoked_before: i64 = 0;
+    let mut final_issued_at = token_issued_at;
     match fetch_status(&base, &license_key, data_dir).await {
         Ok(s) if s.valid => {
             ent = map_entitlement(
@@ -1434,6 +1492,23 @@ pub async fn activate(
                 s.sync_available,
                 s.alpha,
             );
+            // 【APC6 任务1.1】关键对齐：把 issued_at 对齐为 max(server_time, revoked_before)，
+            // 再把 status.revoked_before 记为本机的 baseline_revoked_before。
+            // 这样下次 is_new_revocation 只有在 revoked_before 严格大于基线时
+            // 才会判定为真吊销——彻底根治「重激活后立即掉授权」。
+            if let Some(new_rb) = s.revoked_before {
+                baseline_revoked_before = new_rb;
+                // 旧 issued_at（或空值）对齐：至少等于 status.server_time；
+                // 若服务端有历史 revoked_before（例如曾解绑过），对齐到它 + 1s。
+                let align_from = s.server_time.unwrap_or(now).max(new_rb + 1);
+                if final_issued_at <= 0 || final_issued_at < align_from {
+                    final_issued_at = align_from;
+                }
+            } else if let Some(st) = s.server_time {
+                if final_issued_at <= 0 {
+                    final_issued_at = st;
+                }
+            }
         }
         Ok(_) => {}
         Err(StatusError::RateLimited(secs)) => {
@@ -1443,15 +1518,18 @@ pub async fn activate(
     }
 
     // 首次激活：授权中心信息（Key、邮箱、有效期）加密落盘并记为当天已同步
+    // 【APC6 任务1.2】新增 activated_at：15s 新激活保护期
     save_cache(
         data_dir,
         &CachedLicense {
             license: license_key.to_string(),
             email,
             synced_on: today_utc(),
-            max_seen_unix: now_secs(),
-            token_issued_at,
+            max_seen_unix: now,
+            token_issued_at: final_issued_at,
             token_expires_at,
+            baseline_revoked_before,
+            activated_at: now,
             entitlement: ent.clone(),
         },
     )?;
@@ -1488,6 +1566,8 @@ pub async fn verify_remote(
                     max_seen_unix: cache.max_seen_unix,
                     token_issued_at: cache.token_issued_at,
                     token_expires_at: cache.token_expires_at,
+                    baseline_revoked_before: cache.baseline_revoked_before,
+                    activated_at: cache.activated_at,
                     entitlement: ent.clone(),
                 },
             )?;
@@ -1505,8 +1585,28 @@ pub async fn verify_remote(
                 clear_cache(data_dir);
                 return Ok(EntitlementStatus::inactive());
             }
-            // 【APC4 任务1.3】四重秒级吊销判定：device_bound/revoked_before/
-            // tokenExpiresAt 任一不通过 → 立即清除本地授权（不再信任离线缓存）。
+            // 【APC6 任务1.1】吊销判定：三重条件全部成立才清本地
+            // 1) 不在 15 秒新激活保护窗口内
+            // 2) device_bound 明确返回 false
+            // 3) revoked_before 严格大于本地基线且晚于 issued_at + 5s
+            let grace = in_new_activation_grace(&cache);
+            let new_revoke = is_new_revocation(
+                s.revoked_before,
+                cache.baseline_revoked_before,
+                cache.token_issued_at.max(1),
+            );
+            if !grace && (s.device_bound == Some(false) || new_revoke) {
+                tracing::warn!(
+                    "license revoked per server (grace={}, device_bound={:?}, revoked_before={:?}, baseline={})",
+                    grace,
+                    s.device_bound,
+                    s.revoked_before,
+                    cache.baseline_revoked_before
+                );
+                clear_cache(data_dir);
+                return Ok(EntitlementStatus::inactive());
+            }
+            // 令牌本身自洽（valid + device_bound + token_expires_at）
             if !is_token_usable(
                 true,
                 s.device_bound,
@@ -1515,11 +1615,7 @@ pub async fn verify_remote(
                 cache.token_expires_at,
                 s.server_time,
             ) {
-                tracing::warn!(
-                    "license revoked per server (device_bound={:?}, revoked_before={:?})",
-                    s.device_bound,
-                    s.revoked_before
-                );
+                tracing::warn!("license token self-check failed after grace/ revocation gate");
                 clear_cache(data_dir);
                 return Ok(EntitlementStatus::inactive());
             }
@@ -1532,7 +1628,17 @@ pub async fn verify_remote(
                 s.sync_available,
                 s.alpha,
             );
-            // 同步成功：授权信息（含有效期）重新加密落盘，并记为当天已同步
+            // 同步成功：若服务端返回了新的 revoked_before（非吊销场景：比如只是
+            // 心跳等后台同步读到了更大的基线），顺势更新本地 baseline 保持对齐；
+            // 这样下次 is_new_revocation 对比更准确。
+            let mut new_baseline = cache.baseline_revoked_before;
+            if let Some(rb) = s
+                .revoked_before
+                .filter(|&rb| rb > cache.baseline_revoked_before)
+            {
+                new_baseline = rb;
+            }
+            // activated_at 不更新（仅 activate 时写入）
             save_cache(
                 data_dir,
                 &CachedLicense {
@@ -1542,6 +1648,8 @@ pub async fn verify_remote(
                     max_seen_unix: now_secs(),
                     token_issued_at: cache.token_issued_at,
                     token_expires_at: cache.token_expires_at,
+                    baseline_revoked_before: new_baseline,
+                    activated_at: cache.activated_at,
                     entitlement: ent.clone(),
                 },
             )?;
@@ -1555,11 +1663,20 @@ pub async fn verify_remote(
         }
         Err(StatusError::Rejected(code, message)) => {
             tracing::warn!("license rejected by server (HTTP {code}): {message}");
-            clear_cache(data_dir);
-            Ok(EntitlementStatus::inactive())
+            // 【APC6 任务1.2】Fail-Open 保护：旧缓存有 valid 授权时，Rejected
+            // （4xx）可能是服务端临时风控（例如短时间内请求过多）；只要
+            // 不是明确吊销/过期，保留本地授权让用户继续使用。
+            // 但若是 404/410/403 明确凭证无效（非限流），仍按原逻辑清除。
+            if matches!(code, 403 | 404 | 410) {
+                clear_cache(data_dir);
+                Ok(EntitlementStatus::inactive())
+            } else {
+                tracing::warn!("license Rejected HTTP {code}, fail-open keep local entitlement");
+                Ok(offline_status(&cache.entitlement))
+            }
         }
         Err(StatusError::Transient(e)) => {
-            tracing::warn!("license status unreachable, locking Pro: {e}");
+            tracing::debug!("license status transient, fail-open keep local: {e}");
             Ok(offline_status(&cache.entitlement))
         }
     }
@@ -1808,13 +1925,18 @@ pub async fn recheck_online(
             bail!("rate_limited:{secs}:activation_throttled")
         }
         Err(e @ StatusError::Transient(_)) => {
-            tracing::warn!("license recheck transient: {e:?}");
+            tracing::debug!("license recheck transient fail-open: {e:?}");
             return Ok((cache.entitlement.clone(), None));
         }
         Err(StatusError::Rejected(code, msg)) => {
-            tracing::warn!("license recheck rejected (HTTP {code}): {msg}");
-            clear_cache(data_dir);
-            return Ok((EntitlementStatus::inactive(), Some("expired".into())));
+            // 【APC6 任务1.2】Fail-Open：非 403/404/410 的 4xx 一律保留本地授权
+            if matches!(code, 403 | 404 | 410) {
+                tracing::warn!("license recheck rejected (HTTP {code}): {msg}");
+                clear_cache(data_dir);
+                return Ok((EntitlementStatus::inactive(), Some("expired".into())));
+            }
+            tracing::debug!("license recheck Rejected HTTP {code}, fail-open keep local");
+            return Ok((cache.entitlement.clone(), None));
         }
     };
 
@@ -1823,14 +1945,16 @@ pub async fn recheck_online(
         return Ok((EntitlementStatus::inactive(), Some("expired".into())));
     }
 
-    if !is_token_usable(
-        true,
-        s.device_bound,
+    // 【APC6 任务1.1 + 1.2】吊销三重判定：保护期内 / 非新吊销 / 非解绑 → 不杀本地
+    let grace = in_new_activation_grace(&cache);
+    let new_revoke = is_new_revocation(
         s.revoked_before,
-        cache.token_issued_at,
-        cache.token_expires_at,
-        s.server_time,
-    ) {
+        cache.baseline_revoked_before,
+        cache.token_issued_at.max(1),
+    );
+    let should_revoke = !grace && (s.device_bound == Some(false) || new_revoke);
+
+    if should_revoke {
         clear_cache(data_dir);
         let unbound = s.device_bound == Some(false);
         let alpha = s.alpha || cache.entitlement.alpha;
@@ -1853,6 +1977,13 @@ pub async fn recheck_online(
         s.sync_available,
         s.alpha,
     );
+    let mut new_baseline = cache.baseline_revoked_before;
+    if let Some(rb) = s
+        .revoked_before
+        .filter(|&rb| rb > cache.baseline_revoked_before)
+    {
+        new_baseline = rb;
+    }
     save_cache(
         data_dir,
         &CachedLicense {
@@ -1862,6 +1993,8 @@ pub async fn recheck_online(
             max_seen_unix: now_secs(),
             token_issued_at: cache.token_issued_at,
             token_expires_at: cache.token_expires_at,
+            baseline_revoked_before: new_baseline,
+            activated_at: cache.activated_at,
             entitlement: ent.clone(),
         },
     )?;
@@ -1968,6 +2101,8 @@ mod tests {
             max_seen_unix: now + CLOCK_ROLLBACK_TOLERANCE + 60,
             token_issued_at: now,
             token_expires_at: now + 86_400,
+            baseline_revoked_before: 0,
+            activated_at: 0,
             entitlement: trial(exp),
         };
         normalize_cache(&mut cache);
@@ -2126,5 +2261,72 @@ mod tests {
         assert!(unbind_blocked_reason(Some("pro"), true).is_some());
         assert!(unbind_blocked_reason(Some("team"), false).is_none());
         assert!(unbind_blocked_reason(Some("pro"), false).is_none());
+    }
+
+    // ---------- APC6 任务1.1 重激活防掉授权 回归测试 ----------
+
+    /// 【APC6 任务1.1】重激活后，服务端返回的 revoked_before 若**等于**
+    /// baseline（激活时刻已有），不得被判定为新吊销。
+    #[test]
+    fn apc6_reactivation_not_mistaken_as_new_revocation() {
+        // baseline 和服务端返回一样 → 老基线，不是新吊销
+        assert!(!is_new_revocation(Some(5000), 5000, 5000));
+        // baseline 大于服务端返回 → 服务端回退了，不是新吊销
+        assert!(!is_new_revocation(Some(3000), 5000, 5000));
+        // 服务端新 revoked_before 早于 issued_at+5s 窗口 → 不是本次激活之后的事件
+        assert!(!is_new_revocation(Some(4999), 0, 5000));
+        assert!(!is_new_revocation(Some(5004), 0, 5000));
+        // 服务端新 revoked_before 晚于 issued_at+5s → 真新吊销
+        assert!(is_new_revocation(Some(5006), 0, 5000));
+        // issued_at+5s 等于 server revoked_before → 仍在保护窗口内，不算新吊销
+        assert!(!is_new_revocation(Some(5005), 0, 5000));
+        // 无服务端返回 → 绝不主动判定吊销
+        assert!(!is_new_revocation(None, 5000, 5000));
+    }
+
+    /// 【APC6 任务1.1】issued_at 为 0 时无法对比，且服务端有新基线 → 视为吊销
+    #[test]
+    fn apc6_zero_issued_at_with_growing_baseline_is_revocation() {
+        assert!(is_new_revocation(Some(3000), 1000, 0));
+        assert!(!is_new_revocation(Some(1000), 1000, 0));
+    }
+
+    /// 【APC6 任务1.2】15 秒激活保护窗口
+    #[test]
+    fn apc6_new_activation_grace_window() {
+        // 模拟 CachedLicense.activated_at 刚刚写入
+        let mut cache = CachedLicense {
+            license: "k".into(),
+            email: String::new(),
+            synced_on: String::new(),
+            max_seen_unix: 0,
+            token_issued_at: 0,
+            token_expires_at: 0,
+            baseline_revoked_before: 0,
+            activated_at: now_secs(),
+            entitlement: EntitlementStatus::inactive(),
+        };
+        assert!(in_new_activation_grace(&cache));
+        // activated_at = 0（旧缓存 / 未激活）→ 不在保护期
+        cache.activated_at = 0;
+        assert!(!in_new_activation_grace(&cache));
+        // 老激活（60 秒前）→ 保护期已过
+        cache.activated_at = now_secs() - 60;
+        assert!(!in_new_activation_grace(&cache));
+    }
+
+    /// 【APC6 任务1.1】时间戳规范化：毫秒自动转换为秒
+    #[test]
+    fn apc6_normalize_ts_handles_millis() {
+        assert_eq!(
+            normalize_ts_millis_to_sec(Some(1_700_000_000_000)),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            normalize_ts_millis_to_sec(Some(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+        assert_eq!(normalize_ts_millis_to_sec(Some(0)), None);
+        assert_eq!(normalize_ts_millis_to_sec(None), None);
     }
 }
