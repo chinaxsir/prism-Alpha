@@ -132,9 +132,6 @@ export default function Settings() {
   // 【APP-12 任务2.2/2.3】Go Lan 配置弹窗与 Pro 授权详情弹窗开关
   const [goLanModalOpen, setGoLanModalOpen] = useState(false);
   const [proManageOpen, setProManageOpen] = useState(false);
-  // 【APC4 任务1.2】解绑本机：二次点击确认 + 429 冷却倒计时
-  const [unbindArmed, setUnbindArmed] = useState(false);
-  const [unbindCooldown, setUnbindCooldown] = useState(0);
   // 【APP6 任务1.2】运行日志弹窗
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   // 【APP58 任务2.2】软件版本：运行时从 Tauri 读取当前真实版本，杜绝写死漂移
@@ -157,39 +154,6 @@ export default function Settings() {
   }, []);
   const proUnlocked = useProStore((s) => s.unlocked);
   const entitlement = useProStore((s) => s.entitlement);
-  const deactivateDevice = useProStore((s) => s.deactivateDevice);
-  useEffect(() => {
-    if (unbindCooldown <= 0) return;
-    const id = setInterval(
-      () => setUnbindCooldown((s) => (s > 0 ? s - 1 : 0)),
-      1000,
-    );
-    return () => clearInterval(id);
-  }, [unbindCooldown]);
-  const handleUnbind = async () => {
-    if (unbindCooldown > 0) return;
-    if (!unbindArmed) {
-      setUnbindArmed(true);
-      return;
-    }
-    setUnbindArmed(false);
-    try {
-      await deactivateDevice();
-      toast.success(t("pro.removedToast"));
-    } catch (e) {
-      const raw = String(e);
-      const m = raw.match(/rate_limited:(\d+)/);
-      if (m) {
-        const secs = Number(m[1]);
-        setUnbindCooldown(secs);
-        toast.error(
-          t("pro.unbindRateLimited", { mins: Math.ceil(secs / 60) }),
-        );
-      } else {
-        toast.error(raw.replace(/^Error:\s*/, ""));
-      }
-    }
-  };
   // 【APP-13 任务4】到期胶囊：永久/买断版直接显示「永久有效」，
   // 订阅版显示到期时间，日期本身作为可点击入口打开授权信息弹窗
   const permanent =
@@ -834,41 +798,7 @@ export default function Settings() {
         </button>
       )}
 
-      {/* 【APC4 任务1.2】解绑本机（反激活）：试用/Alpha 不展示；正式 Pro/买断
-          需二次点击确认，429 时按 retry_after 倒计时禁用按钮 */}
-      {proUnlocked &&
-        !entitlement.alpha &&
-        entitlement.plan !== "free" && (
-          <div className="flex items-center justify-end gap-2 -mt-1">
-            {unbindArmed && (
-              <button
-                type="button"
-                onClick={() => setUnbindArmed(false)}
-                className="rounded-lg px-3 py-1.5 text-xs text-text-muted hover:text-text"
-              >
-                {t("common.cancel")}
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => void handleUnbind()}
-              disabled={unbindCooldown > 0}
-              className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                unbindArmed
-                  ? "border-latency-bad/40 bg-latency-bad/10 text-latency-bad"
-                  : "border-border text-text-muted hover:border-latency-bad/40 hover:text-latency-bad"
-              }`}
-            >
-              {unbindCooldown > 0
-                ? t("pro.unbindRateLimited", {
-                    mins: Math.ceil(unbindCooldown / 60),
-                  })
-                : unbindArmed
-                  ? t("pro.unbindArmed")
-                  : t("pro.unbindDevice")}
-            </button>
-          </div>
-        )}
+      {/* 【APC5 任务2.1】反激活移除设置页入口，仅保留授权信息弹窗内单步按钮 */}
 
       <ActivateProModal
         open={showActivate}

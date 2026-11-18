@@ -94,6 +94,31 @@ function useSmoothSpeed(target: number, active: boolean): number {
   return display;
 }
 
+/// 【APC5 任务3】后端 VPN 权限未授予错误特征列表（iOS NEVPNManager / Android
+/// VpnService 拒绝 / 取消系统「添加 VPN 配置」弹窗时返回）。命中任一即视为
+/// 「用户主动拒绝系统权限」，不再展示内核错误堆栈，改渲染商业级友好引导。
+const VPN_PERMISSION_DENIED_HINTS = [
+  "permission denied",
+  "NEVPNErrorDomain",
+  "code=5",
+  "configuration is invalid",
+  "configuration read write failed",
+  "user denied",
+  "canceled",
+  "cancelled",
+  "not allowed",
+  "VPN 权限",
+  "VPN permission",
+];
+
+function isVpnPermissionDeniedError(msg: string | null | undefined): boolean {
+  if (!msg) return false;
+  const lower = msg.toLowerCase();
+  return VPN_PERMISSION_DENIED_HINTS.some((h) =>
+    lower.includes(h.toLowerCase()),
+  );
+}
+
 export default function Dashboard() {
   const { t, resolved: lang } = useTranslation();
   const status = useCoreStore((s) => s.status);
@@ -634,8 +659,10 @@ export default function Dashboard() {
   };
 
   return (
-    // 【v0.4.18 任务3】移动端统一 gap-2.5，桌面端 gap-3.5；pb-4 预留底部导航安全区。
-    <div className="flex h-full min-h-0 flex-col gap-2.5 md:gap-3.5 pb-4">
+    // 【APC5 任务1】全视口自适应：外层 justify-between + min-h-full 消除底部留白；
+    // 顶部标题/模式栏/A卡/B卡 shrink-0，波形卡 flex-1 吸收剩余高度，
+    // 底部三联卡由 justify-between 推到底部导航栏上沿。
+    <div className="flex-1 flex flex-col justify-between gap-3 md:gap-4 min-h-full pb-2 md:pb-3">
       {/* 第一层：标题 + 出站模式分段控制器 */}
       <h1 className="text-[22px] font-bold tracking-tight shrink-0 pt-1">{t("dashboard.title")}</h1>
       <div className="shrink-0">
@@ -749,8 +776,20 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 启动/停止错误提示 */}
-      {errorMsg && (
+      {/* 【APC5 任务3】启动错误提示：命中 VPN 权限拒绝特征时，
+          渲染商业级友好引导（代替生硬的内核错误堆栈）；
+          其他类型错误仍用 translateBackendMessage 原样翻译 */}
+      {errorMsg && isVpnPermissionDeniedError(errorMsg) && (
+        <div className="rounded-xl p-4 text-sm bg-accent/5 text-text border border-accent/30 shrink-0">
+          <div className="font-semibold mb-1">
+            {t("dashboard.vpnPermissionTitle")}
+          </div>
+          <div className="text-xs leading-relaxed text-text-muted">
+            {t("dashboard.vpnPermissionBody")}
+          </div>
+        </div>
+      )}
+      {errorMsg && !isVpnPermissionDeniedError(errorMsg) && (
         <div className="rounded-xl p-4 text-sm bg-red-500/10 text-red-700 dark:text-red-300 border border-red-500/30 shrink-0">
           <div className="font-semibold mb-1">{t("dashboard.errorTitle")}</div>
           <div className="text-xs break-all text-red-700/90 dark:text-red-200">
@@ -759,21 +798,24 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* 第三层：实时速率监控 + 双轨流量波形图大卡片 */}
-      <TrafficWaveformCard
-        down={smoothDown}
-        up={smoothUp}
-        downSeries={downSeries}
-        upSeries={upSeries}
-        peakDown={peakDown}
-        peakUp={peakUp}
-        running={running}
-        t={t}
-      />
+      {/* 第三层：实时速率监控 + 双轨流量波形图大卡片
+          【APC5】flex-1 让它弹性吸收中部所有剩余高度 */}
+      <div className="flex-1 min-h-[148px] md:min-h-[210px]">
+        <TrafficWaveformCard
+          down={smoothDown}
+          up={smoothUp}
+          downSeries={downSeries}
+          upSeries={upSeries}
+          peakDown={peakDown}
+          peakUp={peakUp}
+          running={running}
+          t={t}
+        />
+      </div>
 
       {/* 第四层：Go AIM / Go Lan / Go Cus Pro 引擎卡片
           移动端单列舒展，Mac 端等高三级列矩阵 */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 md:gap-3.5 shrink-0">
+      <div className="grid grid-cols-1 gap-2.5 md:grid-cols-3 md:gap-3.5">
         <EngineCard
           icon={<Crosshair size={16} className="text-surge-green" />}
           tone="text-surge-green"
@@ -1066,7 +1108,7 @@ function TrafficWaveformCard({
   const showPulse = running && (lastDown > 0 || lastUp > 0);
 
   return (
-    <div className="card-sheen rounded-2xl p-3 md:p-4 border border-border bg-surface-card shrink-0">
+    <div className="card-sheen h-full flex flex-col justify-between rounded-2xl p-3 md:p-4 border border-border bg-surface-card">
       {/* 顶部：左右严格对称 2 等分网格，中间细分隔线 */}
       <div className="grid grid-cols-2 gap-3 pb-2.5 md:pb-3 border-b border-border">
         {/* 左栏：下载 */}
@@ -1110,8 +1152,9 @@ function TrafficWaveformCard({
         </div>
       </div>
 
-      {/* 下部：波形画布（360×76 像素坐标系，preserveAspectRatio=none 拉伸铺满） */}
-      <div className="relative mt-2 md:mt-2.5 h-[60px] md:h-24 w-full overflow-hidden rounded-xl bg-surface/40">
+      {/* 下部：波形画布（360×76 像素坐标系，preserveAspectRatio=none 拉伸铺满）
+          【APC5】flex-1 吸收卡片剩余高度，min-h 保底防极端窗口过小 */}
+      <div className="relative flex-1 min-h-[76px] md:min-h-[120px] mt-2.5 w-full overflow-hidden rounded-xl bg-surface/40">
         <svg
           viewBox={`0 0 ${W} ${H}`}
           preserveAspectRatio="none"

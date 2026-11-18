@@ -8,6 +8,9 @@ const zh: Record<string, string> = {
   "dashboard.pickerFailed": "切换节点失败：{error}",
   "dashboard.runModeLabel": "运行模式 · {mode}",
   "dashboard.errorTitle": "操作失败",
+  "dashboard.vpnPermissionTitle": "需要启用 VPN 配置权限",
+  "dashboard.vpnPermissionBody":
+    "首次连接需要系统授权添加 VPN 配置。请再次点击「启动」，并在系统弹窗中选择「允许」以开启网络加速。",
   "dashboard.proBannerDesc":
     "激活授权解锁 AI/流媒体智选、回家内网直通与脚本覆写引擎",
   "dashboard.proEngines": "Pro 智联引擎",
@@ -50,6 +53,9 @@ const en: Record<string, string> = {
   "dashboard.pickerFailed": "Failed to switch node: {error}",
   "dashboard.runModeLabel": "Mode · {mode}",
   "dashboard.errorTitle": "Operation Failed",
+  "dashboard.vpnPermissionTitle": "VPN Configuration Permission Required",
+  "dashboard.vpnPermissionBody":
+    "System authorization is required to add a VPN configuration on first use. Please tap 'Start' again and select 'Allow' in the system prompt.",
   "dashboard.proBannerDesc":
     "Activate to unlock Go AIM, Go Lan home network and the Go Cus rewrite engine",
   "dashboard.proEngines": "Pro Engines",

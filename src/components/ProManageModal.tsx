@@ -121,6 +121,9 @@ export default function ProManageModal({ open, onClose }: Props) {
     getDeviceId()
       .then(setDeviceId)
       .catch((e) => console.error("get device id failed:", e));
+    // 【APC5 任务2.2】打开弹窗时静默刷新：确保 used_seats 是服务端最新值，
+    // 彻底消灭 "? / 3" Bug；刷新失败（断网/429）静默忽略，不打扰当前弹窗。
+    void refreshPro().catch(() => undefined);
   }, [open]);
 
   const copyDeviceId = async () => {
@@ -170,27 +173,24 @@ export default function ProManageModal({ open, onClose }: Props) {
   // 【APC4 任务1.2】反向激活：必须二次确认后才发起服务端解绑；
   // 429 按 retry_after 提示冷却时间，失败绝不清除本地授权。
   const [deactivating, setDeactivating] = useState(false);
+  // 【APC5 任务2.1】单步反激活：移除 window.confirm，点击即刻生效。
+  // 后端 deactivate_license_device 是串行等待（先 POST /deactivate-app 成功再清本地），
+  // 失败（断网/403/429）时后端保留 Pro，前端展示具体错误文案。
   const handleDeactivate = async () => {
-    if (
-      !window.confirm(
-        t("pro.removeConfirm"),
-      )
-    ) {
-      return;
-    }
+    if (deactivating) return;
     setDeactivating(true);
     try {
       await deactivateDevice();
       toast.success(t("pro.removedToast"));
       onClose();
     } catch (e) {
-      const raw = String(e);
+      const raw = String(e).replace(/^Error:\s*/, "");
       const m = raw.match(/rate_limited:(\d+)/);
       if (m) {
         const mins = Math.ceil(Number(m[1]) / 60);
         toast.error(t("pro.unbindRateLimited", { mins }));
       } else {
-        toast.error(raw.replace(/^Error:\s*/, ""));
+        toast.error(raw);
       }
     } finally {
       setDeactivating(false);
@@ -319,7 +319,7 @@ export default function ProManageModal({ open, onClose }: Props) {
             <DetailRow
               icon={<Smartphone size={16} className="text-gray-400" />}
               title={t("pro.seats")}
-              value={`${entitlement.usedSeats ?? "?"} / ${entitlement.maxSeats}`}
+              value={`${Math.max(1, entitlement.usedSeats ?? 1)} / ${entitlement.maxSeats}`}
             />
           )}
           <DetailRow

@@ -497,7 +497,7 @@ export default function App() {
       )}
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <main className="w-full max-w-full flex-1 overflow-y-auto overflow-x-hidden box-border px-4 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+        <main className="w-full max-w-full flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden box-border px-4 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
           {/* APP-5 任务1：全局常驻横幅已移除。到期/解绑提示仅在激活 Pro 弹窗
               与设置 → PRISM PRO 激活区内展示，平时界面保持清爽。 */}
           <Routes>
