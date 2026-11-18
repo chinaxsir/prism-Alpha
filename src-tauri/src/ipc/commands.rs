@@ -3655,6 +3655,61 @@ pub async fn deactivate_pro(
     Ok(next)
 }
 
+/// 【APC4 任务1.2】解绑本机（反激活）：先调用 `POST /api/license/deactivate-app`
+/// 释放服务端席位，成功（200/404）后才清除本地授权；失败保留本地状态。
+/// 试用版 / Alpha 内测版由 `license::deactivate_device` 前置拦截。
+#[tauri::command]
+pub async fn deactivate_license_device(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EntitlementStatus, String> {
+    let settings = state.settings.read().clone();
+    let next = crate::core::license::deactivate_device(&state.data_dir, &settings)
+        .await
+        .map_err(|e| sanitize_err(&e.to_string()))?;
+
+    state.apply_entitlement(next.clone());
+    crate::core::app_control::disable_pro_switches(state.inner());
+    crate::core::app_control::persist_revoke_reason(
+        &state.data_dir,
+        crate::core::app_control::REVOKE_DEACTIVATED,
+    );
+    crate::core::app_control::emit_license_revoked(
+        &app,
+        crate::core::app_control::REVOKE_DEACTIVATED,
+        Some(&next),
+    );
+    // 重要日志：解绑会释放付费席位，必须留痕
+    crate::core::logger::info(
+        crate::core::logger::MOD_PRO,
+        "[重要] 用户在本机主动解绑授权设备，服务端席位已释放，Pro 开关已全部关闭",
+    );
+    Ok(next)
+}
+
+/// 【APC4 任务1.3】前台 60s / 切回前台的授权在线复核。
+/// 本地未激活时直接返回当前状态；网络故障保持现有授权（不降级）。
+#[tauri::command]
+pub async fn poll_license_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EntitlementStatus, String> {
+    if crate::core::license::get_saved_license_key(&state.data_dir).is_none() {
+        return Ok(state.entitlement.read().clone());
+    }
+    let settings = state.settings.read().clone();
+    let (ent, reason) = crate::core::license::recheck_online(&state.data_dir, &settings)
+        .await
+        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.apply_entitlement(ent.clone());
+    if let Some(reason) = reason {
+        crate::core::app_control::persist_revoke_reason(&state.data_dir, &reason);
+        crate::core::app_control::disable_pro_switches(state.inner());
+        crate::core::app_control::emit_license_revoked(&app, &reason, Some(&ent));
+    }
+    Ok(ent)
+}
+
 /// 授权到期收口函数：启动加载 / 每 10 秒巡检 / 手动校验任一路径检测到到期后
 /// 统一调用——强制关闭全部 Pro 专属功能、清理运行态、按新配置重载内核，
 /// 并向前端广播 expired 与专门的 `pro://expired` 通知。

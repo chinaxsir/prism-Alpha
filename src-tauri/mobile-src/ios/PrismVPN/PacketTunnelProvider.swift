@@ -1111,10 +1111,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 NEIPv4Route(destinationAddress: epIP, subnetMask: "255.255.255.255")
             )
         }
-        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29"] {
+        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29", "180.76.76.76", "114.114.114.114"] {
             excluded.append(
                 NEIPv4Route(destinationAddress: upstreamDNS, subnetMask: "255.255.255.255")
             )
+        }
+        // 【APC4 任务1.4】规则/直连模式：CN 直连 CIDR 在 L3 层直接绕开 utun
+        // （与 sing-box route_exclude_address / 内核规则分流双保险）；
+        // 全局代理模式不排除，保证「所有流量出境」的用户预期。
+        if currentOutboundMode() != "global" {
+            for cidrStr in cnDirectCIDRs {
+                guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
+                excluded.append(
+                    NEIPv4Route(
+                        destinationAddress: parsed.networkAddress,
+                        subnetMask: parsed.subnetMask
+                    )
+                )
+            }
+            writeExtLog("INFO", "[GoLan-Ext] 🇨🇳 CN 直连网段已写入 excludedRoutes (\(cnDirectCIDRs.count))")
         }
         ipv4.excludedRoutes = excluded
         let label = desired.isEmpty ? "🔒 恢复隧道" : "⚡ On-Demand 直连"
@@ -1248,6 +1263,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
               let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
         else { return nil }
         return values.contentModificationDate
+    }
+
+    /// 【APC4 任务1.4】当前出站模式：读取共享配置 experimental.clash_api.default_mode。
+    /// 缺省/读取失败一律按 rule 处理（与内核默认值一致）；仅 global 不裁剪 CN 网段。
+    private func currentOutboundMode() -> String {
+        guard let url = sharedConfigFileURL(),
+              let data = try? Data(contentsOf: url),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let experimental = root["experimental"] as? [String: Any],
+              let clash = experimental["clash_api"] as? [String: Any],
+              let mode = clash["default_mode"] as? String,
+              !mode.isEmpty
+        else { return "rule" }
+        return mode.lowercased()
     }
 
     /// 当前绑定的物理网卡（配置热重载时沿用已生效的绑定，不做重新探测）
@@ -1506,10 +1535,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 223.6.6.6、119.29.29.29 备）以 /32 写入 excludedRoutes：iOS 内核
         // 强制这些 UDP 53 报文绕开 utun，从当前活跃物理网卡直接发出，
         // **永远不可能回环**，与 NEDNSSettings 中的虚拟地址 172.19.0.2 解耦。
-        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29"] {
+        for upstreamDNS in ["223.5.5.5", "223.6.6.6", "119.29.29.29", "180.76.76.76", "114.114.114.114"] {
             excluded.append(
                 NEIPv4Route(destinationAddress: upstreamDNS, subnetMask: "255.255.255.255")
             )
+        }
+        // 【APC4 任务1.4】规则/直连模式：CN 直连 CIDR 在 L3 层直接绕开 utun
+        // （与 sing-box route_exclude_address / 内核规则分流双保险）；
+        // 全局代理模式不排除，保证「所有流量出境」的用户预期。
+        if currentOutboundMode() != "global" {
+            for cidrStr in cnDirectCIDRs {
+                guard let parsed = parseIPv4Prefix(cidrStr), parsed.prefix > 0 else { continue }
+                excluded.append(
+                    NEIPv4Route(
+                        destinationAddress: parsed.networkAddress,
+                        subnetMask: parsed.subnetMask
+                    )
+                )
+            }
+            writeExtLog("INFO", "[GoLan-Ext] 🇨🇳 CN 直连网段已写入 excludedRoutes (\(cnDirectCIDRs.count))")
         }
         ipv4.excludedRoutes = excluded
         if !excluded.isEmpty {

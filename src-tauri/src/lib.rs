@@ -113,6 +113,8 @@ pub fn run() {
             // 【APP81 任务1.1】启动即后台预热节点域名 DoH 缓存，
             // 让首次「启动内核」的同步 DoH 直接命中 3600s 缓存。
             core::config_builder::warm_node_host_cache(&data_dir);
+            // 【APC4 任务1.5】载入持久化节点域名解析缓存（跨重启 0ms 命中）
+            core::go_lan::init_node_dns_cache(&data_dir);
 
             // 【APP52 任务2】常驻后台遥测：600ms 采样 + telemetry://tick，
             // 切换页面/系统后台/停启 VPN 都不中断（仅运行中真实探测）。
@@ -301,6 +303,8 @@ pub fn run() {
             ipc::commands::get_device_id,
             ipc::commands::refresh_entitlement,
             ipc::commands::deactivate_pro,
+            ipc::commands::deactivate_license_device,
+            ipc::commands::poll_license_status,
             ipc::commands::submit_receipt,
             ipc::commands::get_connections,
             ipc::commands::close_connection,

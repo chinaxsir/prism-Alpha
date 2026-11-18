@@ -593,6 +593,26 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     "223.64.0.0/11",
 ];
 
+/// `route_exclude_address` 只接受公网 IPv4 CIDR：私网 / 回环 / 链路本地 /
+/// 组播段绝不排除，否则会把局域网与本机流量错误地踢出 TUN。
+fn is_public_ipv4_cidr(cidr: &str) -> bool {
+    let Some(ip) = cidr
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+    else {
+        return false;
+    };
+    let [a, b, ..] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || a >= 224)
+}
+
 /// 【APP72 任务3.2】常见海外站点域名后缀：DNS 走 dns-remote（经主代理出境），
 /// 避免国内 DNS 污染导致「域名正确但 IP 被投毒 → 直连失败」。大陆站点由更
 /// 靠前的 CN 后缀 / geosite 规则命中 dns-direct，不受影响。
@@ -1896,6 +1916,27 @@ pub fn build(
                 obj.remove("interface_name");
             } else {
                 obj.insert("interface_name".into(), json!("prism-tun"));
+            }
+            // 【APC4 任务1.4】国内直连网段预置为排除路由（等价 iOS
+            // NEIPv4Route.include 裁剪）：规则/直连模式下 CN CIDR 与国内
+            // DNS 在 L3 层就绕过 TUN，不再「先全量进 TUN 再分流」。
+            // 全局代理模式不做排除（用户明确要求全部出境）。
+            if settings.outbound_mode != OutboundMode::Global {
+                let mut exclude: Vec<String> = CN_DIRECT_CIDRS
+                    .iter()
+                    .filter(|c| is_public_ipv4_cidr(c))
+                    .map(|c| (*c).to_string())
+                    .collect();
+                for dns in [
+                    "223.5.5.5/32",
+                    "223.6.6.6/32",
+                    "119.29.29.29/32",
+                    "180.76.76.76/32",
+                    "114.114.114.114/32",
+                ] {
+                    exclude.push(dns.to_string());
+                }
+                obj.insert("route_exclude_address".into(), json!(exclude));
             }
         }
         inbounds.push(tun);
@@ -6177,6 +6218,21 @@ rules:
         }
     }
 
+    /// 【APC4 任务1.4】route_exclude_address 公网过滤：私网/回环/链路本地/
+    /// 组播一律拒绝，避免把局域网流量踢出 TUN。
+    #[test]
+    fn apc4_route_exclude_only_public_ipv4() {
+        assert!(is_public_ipv4_cidr("8.129.0.0/16"));
+        assert!(is_public_ipv4_cidr("223.5.5.5/32"));
+        assert!(!is_public_ipv4_cidr("10.0.0.0/8"));
+        assert!(!is_public_ipv4_cidr("172.16.0.0/12"));
+        assert!(!is_public_ipv4_cidr("192.168.10.0/24"));
+        assert!(!is_public_ipv4_cidr("127.0.0.1/32"));
+        assert!(!is_public_ipv4_cidr("169.254.0.0/16"));
+        assert!(!is_public_ipv4_cidr("224.0.0.0/4"));
+        assert!(!is_public_ipv4_cidr("not-a-cidr"));
+    }
+
     /// APP70 测试5：6 项禁改红线（MTU / stack / DNS 上游 / 节点协议 /
     /// Go Lan 网段 / AIM 探针）自动校验。
     #[test]
@@ -6241,6 +6297,19 @@ rules:
         }
         assert!(CN_DIRECT_DOMAIN_SUFFIXES.contains(&"taobao.com"));
         assert!(CN_DIRECT_DOMAIN_SUFFIXES.contains(&"cn"));
+        // 【APC4】规则模式：tun 必须下发 route_exclude_address（CN CIDR + 国内 DNS），
+        // 且只允许公网段（私网/回环绝不能出现在排除列表）
+        let excludes = tun["route_exclude_address"]
+            .as_array()
+            .expect("route_exclude_address 缺失");
+        assert!(excludes.iter().any(|v| v.as_str() == Some("223.5.5.5/32")));
+        assert!(excludes.iter().any(|v| v.as_str() == Some("8.129.0.0/16")));
+        assert!(
+            excludes
+                .iter()
+                .all(|v| is_public_ipv4_cidr(v.as_str().unwrap_or(""))),
+            "route_exclude_address 混入非公网段"
+        );
         // 6) AIM 探针规则仍固定 4 条且居首（并发/探测逻辑未改动）
         let rules = built.config["route"]["rules"].as_array().unwrap();
         for slot in 0..4 {

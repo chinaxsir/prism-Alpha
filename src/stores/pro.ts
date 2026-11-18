@@ -3,9 +3,10 @@ import { create } from "zustand";
 import { useCoreStore } from "@/stores/core";
 import {
   activatePro,
-  deactivatePro,
+  deactivateLicenseDevice,
   getEntitlement,
   getRevokeReason,
+  pollLicenseStatus,
   refreshEntitlement,
   type Entitlement,
 } from "@/api/ipc";
@@ -17,6 +18,7 @@ export type RevokeReason =
   | "expired"
   | "alpha_unbound"
   | "alpha_expired"
+  | "deactivated"
   | null;
 
 const INACTIVE: Entitlement = {
@@ -76,7 +78,10 @@ interface ProState {
   /** email 必填：服务端强制 License Key + 注册邮箱联合校验 */
   activate: (licenseKey: string, email?: string) => Promise<boolean>;
   refresh: () => Promise<void>;
-  deactivate: () => Promise<void>;
+  /** 【APC4】解绑本机（反激活）：失败时保留本地授权，绝不乐观清空 */
+  deactivateDevice: () => Promise<void>;
+  /** 【APC4】前台 60s 在线复核；断网/429 静默保持当前授权 */
+  pollStatus: () => Promise<void>;
   /** 本地到期检查：到点立即锁定 UI 并同步后端终止 Pro 功能 */
   checkExpiry: () => Promise<void>;
 }
@@ -195,10 +200,10 @@ export const useProStore = create<ProState>((set, get) => ({
     }
   },
 
-  deactivate: async () => {
-    // 【APP28 任务3】0ms 乐观失效：先本地置 inactive 并同步关闭 Go AIM /
-    // Go Lan / Go Cus 的启用标志，弹窗与 Toast 由调用方立即完成；后端本地
-    // 清理完成后返回真实状态，再以权威值收口（事件通知同样会到达）。
+  deactivateDevice: async () => {
+    // 【APC4】必须先服务端解绑成功（200/404）才允许清本地授权；
+    // 网络失败 / 403 / 429 直接抛出，保留 Pro 与 Pro 开关，避免误清。
+    const e = await deactivateLicenseDevice();
     const core = useCoreStore.getState();
     if (core.goAimStatus) {
       core.setGoAimStatus({
@@ -213,15 +218,32 @@ export const useProStore = create<ProState>((set, get) => ({
     if (core.goCusSettings) {
       core.setGoCusSettings({ ...core.goCusSettings, enabled: false });
     }
-    writeProCache(false);
+    writeProCache(unlockedOf(e));
     set({
-      entitlement: INACTIVE,
-      unlocked: false,
-      revokeReason: null,
+      entitlement: e,
+      unlocked: unlockedOf(e),
+      revokeReason: "deactivated",
       error: null,
     });
-    const e = await deactivatePro();
-    writeProCache(unlockedOf(e));
-    set({ entitlement: e, unlocked: unlockedOf(e), error: null });
+  },
+
+  pollStatus: async () => {
+    // 【APC4】60s 在线复核：只有后端确认剥夺（解绑/到期）才落锁定；
+    // 异常（断网 / 429）静默忽略，绝不影响当前可用授权。
+    try {
+      const before = get().unlocked;
+      const e = await pollLicenseStatus();
+      const unlocked = unlockedOf(e);
+      if (before && !unlocked) {
+        const reason = (await getRevokeReason()) ?? "expired";
+        writeProCache(false);
+        set({ entitlement: e, unlocked: false, revokeReason: reason });
+      } else {
+        writeProCache(unlocked);
+        set({ entitlement: e, unlocked });
+      }
+    } catch {
+      /* 静默：下一轮 60s 再试 */
+    }
   },
 }));

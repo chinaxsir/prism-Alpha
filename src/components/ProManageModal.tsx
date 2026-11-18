@@ -102,7 +102,7 @@ export default function ProManageModal({ open, onClose }: Props) {
   const entitlement = useProStore((s) => s.entitlement);
   const proBusy = useProStore((s) => s.busy);
   const refreshPro = useProStore((s) => s.refresh);
-  const deactivatePro = useProStore((s) => s.deactivate);
+  const deactivateDevice = useProStore((s) => s.deactivateDevice);
   const [deviceId, setDeviceId] = useState<string | null>(null);
 
   // 【APP-4 任务2】剩余天数：订阅版在到期时间旁展示
@@ -167,13 +167,34 @@ export default function ProManageModal({ open, onClose }: Props) {
     }
   };
 
-  // 【APP28 任务3】反向激活：零二次确认、零等待——点击瞬间前端乐观置 Pro
-  // 失效（store 内同步关闭 Go AIM / Go Lan / Go Cus 开关），立即关闭弹窗并
-  // Toast；后端本地清理同步完成，服务端解绑在后台异步执行，无需等待网络。
-  const handleDeactivate = () => {
-    toast.success(t("pro.removedToast"));
-    onClose();
-    void deactivatePro().catch((e) => toast.error(String(e)));
+  // 【APC4 任务1.2】反向激活：必须二次确认后才发起服务端解绑；
+  // 429 按 retry_after 提示冷却时间，失败绝不清除本地授权。
+  const [deactivating, setDeactivating] = useState(false);
+  const handleDeactivate = async () => {
+    if (
+      !window.confirm(
+        t("pro.removeConfirm"),
+      )
+    ) {
+      return;
+    }
+    setDeactivating(true);
+    try {
+      await deactivateDevice();
+      toast.success(t("pro.removedToast"));
+      onClose();
+    } catch (e) {
+      const raw = String(e);
+      const m = raw.match(/rate_limited:(\d+)/);
+      if (m) {
+        const mins = Math.ceil(Number(m[1]) / 60);
+        toast.error(t("pro.unbindRateLimited", { mins }));
+      } else {
+        toast.error(raw.replace(/^Error:\s*/, ""));
+      }
+    } finally {
+      setDeactivating(false);
+    }
   };
 
   if (!open) return null;
@@ -327,9 +348,10 @@ export default function ProManageModal({ open, onClose }: Props) {
           ) : (
             <button
               onClick={handleDeactivate}
-              className="flex-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-400 transition-colors hover:bg-latency-bad/20 hover:text-latency-bad"
+              disabled={deactivating}
+              className="flex-1 rounded-lg bg-surface-hover px-3 py-2 text-xs text-gray-400 transition-colors hover:bg-latency-bad/20 hover:text-latency-bad disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {t("pro.remove")}
+              {deactivating ? t("common.processing") : t("pro.remove")}
             </button>
           )}
         </div>

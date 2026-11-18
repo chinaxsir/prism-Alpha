@@ -177,7 +177,11 @@ pub fn load_revoke_reason(data_dir: &std::path::Path) -> Option<String> {
     let reason = v.get("reason")?.as_str()?.to_string();
     if matches!(
         reason.as_str(),
-        REVOKE_UNBOUND | REVOKE_EXPIRED | REVOKE_ALPHA_UNBOUND | REVOKE_ALPHA_EXPIRED
+        REVOKE_UNBOUND
+            | REVOKE_EXPIRED
+            | REVOKE_ALPHA_UNBOUND
+            | REVOKE_ALPHA_EXPIRED
+            | REVOKE_DEACTIVATED
     ) {
         Some(reason)
     } else {
@@ -226,6 +230,28 @@ fn decide_revoke(runtime: &RuntimePerception) -> Option<&'static str> {
     None
 }
 
+/// 【APC4 任务4】买断版本范围判定（纯函数，便于单测）：
+/// 仅买断方案（buyout/team）有意义；`version_in_scope` 显式给出时直接采信，
+/// 缺失时对比 current_major / included_major，字段任一缺失一律视为在范围内。
+fn buyout_out_of_scope(runtime: &RuntimePerception) -> bool {
+    if !matches!(runtime.plan.as_deref(), Some("buyout") | Some("team")) {
+        return false;
+    }
+    if let Some(v) = runtime.version_in_scope {
+        return !v;
+    }
+    let current = runtime.current_major.or_else(app_major);
+    match (current, runtime.included_major) {
+        (Some(cur), Some(inc)) => cur > inc,
+        _ => false,
+    }
+}
+
+/// 编译期 APP 主版本号（Cargo.toml version）
+fn app_major() -> Option<u32> {
+    env!("CARGO_PKG_VERSION").split('.').next()?.parse().ok()
+}
+
 /// 根据权威 runtime 执行授权级熔断 + 买断版本范围降级
 /// （client-runtime-perception.md §3 与 client-buyout-version-management.md §4 合并入口）。
 /// 返回 Some((revoked, message)) 表示发生了授权级动作；买断超出范围（不剥夺授权，
@@ -242,14 +268,7 @@ pub fn apply_runtime(
 
     // ---------- 买断超出版本范围（不剥夺授权，只弹升级引导）----------
     // 客户端兜底：若服务端没给 version_in_scope，则对比 current_major vs included_major
-    let plan_is_buyout = matches!(runtime.plan.as_deref(), Some("buyout") | Some("team"));
-    let in_scope = runtime.version_in_scope.unwrap_or_else(|| {
-        match (runtime.current_major, runtime.included_major) {
-            (Some(cur), Some(inc)) => cur <= inc,
-            _ => true, // 服务端没给 → 视为在范围内
-        }
-    });
-    let buyout_upgrade_hint = plan_is_buyout && !in_scope;
+    let buyout_upgrade_hint = buyout_out_of_scope(runtime);
 
     if buyout_upgrade_hint {
         // 买断超出范围：Pro 功能仍可用，但弹一次升级引导；绝不剥夺授权。
@@ -335,6 +354,8 @@ pub const REVOKE_EXPIRED: &str = "expired";
 pub const REVOKE_ALPHA_UNBOUND: &str = "alpha_unbound";
 /// 【APC 任务5】Alpha 内测授权到期
 pub const REVOKE_ALPHA_EXPIRED: &str = "alpha_expired";
+/// 【APC4 任务1.2】用户在本机主动解绑设备（反激活）
+pub const REVOKE_DEACTIVATED: &str = "deactivated";
 
 /// 原因 → (中文, 英文) 提示文案。前端按 reason 精准渲染，禁止复用同一句。
 pub fn revoke_message(reason: &str) -> (&'static str, &'static str) {
@@ -352,6 +373,11 @@ pub fn revoke_message(reason: &str) -> (&'static str, &'static str) {
         (
             "当前设备已在官网控制台解除绑定，Go AIM / Go Lan / Go Cus 与连接监控等 Pro 功能已自动停止。请前往「设置 → Prism Pro」重新激活。",
             "This device has been unbound from your account. Pro features (Go AIM / Go Lan / Go Cus / Connections) have been stopped. Please re-activate in Settings → Prism Pro.",
+        )
+    } else if reason == REVOKE_DEACTIVATED {
+        (
+            "本机授权已解绑，席位已释放，Pro 功能已自动停止。可在其他设备登录使用，或在本机重新激活。",
+            "This device has been deactivated and its seat released. Pro features have been stopped. You can activate on another device or re-activate here.",
         )
     } else {
         (
@@ -432,20 +458,43 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
     state.apply_entitlement(ent);
 }
 
-/// 关闭所有 Pro 专属开关（Go AIM / Go Lan / Go Cus）
-fn disable_pro_switches(state: &AppState) {
+/// 关闭所有 Pro 专属开关（Go AIM / Go Lan / Go Cus）并持久化，
+/// 保证解绑/到期后重启不会被磁盘上的旧开关重新打开。
+pub(crate) fn disable_pro_switches(state: &AppState) {
     let mut settings = state.settings.read().clone();
     settings.go_aim_enabled = false;
     let _ = state.save_settings(settings);
 
     let mut lan = state.go_lan.read().clone();
     lan.enabled = false;
+    let _ = crate::core::go_lan::save(&state.data_dir, &lan);
     *state.go_lan.write() = lan;
     let mut cus = state.go_cus.read().clone();
     cus.enabled = false;
+    let _ = crate::core::go_cus::save(&state.data_dir, &cus);
     *state.go_cus.write() = cus;
 
     *state.aim_locked_node.write() = None;
+}
+
+/// 【APC4 任务1.3】广播 `license://revoked`（新事件）并兼容旧 `pro://revoked`。
+/// 60s 在线复核 / activate 后状态变化统一走这里。
+pub(crate) fn emit_license_revoked(
+    app: &AppHandle,
+    reason: &str,
+    entitlement: Option<&EntitlementStatus>,
+) {
+    let (zh, en) = revoke_message(reason);
+    let _ = app.emit(
+        "license://revoked",
+        &serde_json::json!({
+            "reason": reason,
+            "zh": zh,
+            "en": en,
+            "entitlement": entitlement,
+        }),
+    );
+    emit_revoked(app, reason, zh, en, entitlement);
 }
 
 // ---------------------------------------------------------------- 设备信息
@@ -1097,6 +1146,28 @@ mod tests {
         );
         let (zh, _) = revoke_message(REVOKE_ALPHA_UNBOUND);
         assert!(zh.contains("Alpha"), "Alpha 解绑必须使用内测专用文案");
+    }
+
+    /// 【APC4 任务4】买断版本范围三态：显式 true/false 优先，
+    /// 缺失时才对比主版本；再缺字段一律视为在范围内，绝不误弹升级。
+    #[test]
+    fn apc4_buyout_scope_three_states() {
+        let mk = |scope, cur, inc| RuntimePerception {
+            plan: Some("team".into()),
+            version_in_scope: scope,
+            current_major: cur,
+            included_major: inc,
+            ..Default::default()
+        };
+        assert!(!buyout_out_of_scope(&mk(Some(true), Some(99), Some(4))));
+        assert!(buyout_out_of_scope(&mk(Some(false), Some(3), Some(4))));
+        assert!(buyout_out_of_scope(&mk(None, Some(5), Some(4))));
+        assert!(!buyout_out_of_scope(&mk(None, Some(4), Some(4))));
+        assert!(!buyout_out_of_scope(&mk(None, None, None)));
+        // 非买断方案永不触发升级引导
+        let mut pro = mk(Some(false), Some(9), Some(1));
+        pro.plan = Some("pro".into());
+        assert!(!buyout_out_of_scope(&pro));
     }
 
     /// 【APC 任务2】check 与 heartbeat 必须命中不同接口

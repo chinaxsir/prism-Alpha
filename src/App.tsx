@@ -281,8 +281,26 @@ export default function App() {
             ? reason
             : reason === "alpha_expired"
               ? "alpha_expired"
-              : "expired"
+              : reason === "deactivated"
+                ? "deactivated"
+                : "expired"
         );
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 【APC4 任务1.3】新事件 `license://revoked`：与 pro://revoked 同时发出，
+  // 这里只同步权威 entitlement（原因横幅仍由上面的事件统一处理）。
+  useEffect(() => {
+    const unlisten = listen<{
+      reason?: string;
+      entitlement?: Entitlement;
+    }>("license://revoked", (event) => {
+      if (event.payload?.entitlement) {
+        useProStore.getState().setEntitlement(event.payload.entitlement);
+      }
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -404,6 +422,25 @@ export default function App() {
       document.removeEventListener("visibilitychange", onWake);
     };
   }, [appVisible, refreshRuntime]);
+
+  // 【APC4 任务1.3】授权在线复核：前台每 60s 一次 + 切回前台立即补拉。
+  // 断网 / 429 由 store 静默忽略，绝不因一次失败清掉已激活授权。
+  useEffect(() => {
+    if (!appVisible) return;
+    const poll = () => void useProStore.getState().pollStatus();
+    poll();
+    const id = window.setInterval(poll, 60_000);
+    const onWake = () => {
+      if (document.visibilityState === "visible") poll();
+    };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
+    };
+  }, [appVisible]);
 
   // 系统 VPN 被撤销（Android onRevoke：用户在系统设置关闭 / 其他 VPN 抢占）
   // → 停止内核并对齐前端状态

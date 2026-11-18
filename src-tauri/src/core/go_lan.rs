@@ -1615,16 +1615,80 @@ const NODE_HOST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// 也不重演更早版本 5.7s 的启动阻塞。
 /// 【v0.4.16 任务2】节点主机预解析最长等待：原 1200ms 在移动端叠加到启动路径
 /// 会导致 >12s 拉起；收窄到 600ms（国内 DoH 通常 100~300ms 内返回）。
-const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
+/// 【APC4 任务1.5】进一步收窄到 350ms：未命中持久化缓存的域名最多阻塞
+/// 350ms，其余交给内核 dns-direct 兜底（cache 文件已覆盖绝大多数启动）。
+const NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(350);
 /// 后台预热不参与启动关键路径，可等待更完整的解析结果以提高缓存命中率。
 const NODE_HOST_WARMUP_WAIT: std::time::Duration = std::time::Duration::from_millis(2600);
 
-fn node_host_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+/// 【APC4 任务1.5】节点域名解析缓存持久化：`data_dir/node_dns_cache.json`
+/// （Unix 秒时间戳），App 启动时载入，跨重启 0ms 命中，TTL 仍为 3600s。
+static NODE_DNS_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn node_dns_cache_path() -> Option<std::path::PathBuf> {
+    NODE_DNS_CACHE_DIR
+        .get()
+        .map(|dir| dir.join("node_dns_cache.json"))
+}
+
+fn node_host_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>
+{
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+        std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// App 启动时调用一次：登记 data_dir 并把磁盘缓存载入内存。
+pub(crate) fn init_node_dns_cache(data_dir: &std::path::Path) {
+    let _ = NODE_DNS_CACHE_DIR.set(data_dir.to_path_buf());
+    let Some(path) = node_dns_cache_path() else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(map) = v.get("entries").and_then(|e| e.as_object()) else {
+        return;
+    };
+    let Ok(mut cache) = node_host_cache().lock() else {
+        return;
+    };
+    let now = crate::core::license::now_secs();
+    for (host, entry) in map {
+        let Some(ip) = entry.get("ip").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let at = entry.get("at").and_then(|t| t.as_i64()).unwrap_or(0);
+        // 已过期或时间戳异常（时钟回拨）的直接丢弃
+        if at > 0 && at <= now && now - at < NODE_HOST_CACHE_TTL.as_secs() as i64 {
+            cache.insert(host.clone(), (ip.to_string(), at));
+        }
+    }
+}
+
+/// 把内存缓存整体落盘（best-effort，失败不影响解析）。
+fn persist_node_dns_cache() {
+    let Some(path) = node_dns_cache_path() else {
+        return;
+    };
+    let Ok(cache) = node_host_cache().lock() else {
+        return;
+    };
+    let entries: serde_json::Map<String, serde_json::Value> = cache
+        .iter()
+        .map(|(host, (ip, at))| (host.clone(), serde_json::json!({ "ip": ip, "at": at })))
+        .collect();
+    let body = serde_json::json!({
+        "entries": entries,
+        "saved_at": crate::core::license::now_secs(),
+    });
+    if let Ok(raw) = serde_json::to_vec(&body) {
+        let _ = crate::core::store::atomic_write(&path, &raw);
+    }
 }
 
 /// 【APP79 任务3.1】后台预热节点域名 DoH 缓存（不阻塞调用方）。
@@ -1653,13 +1717,15 @@ pub(crate) fn get_cached_node_hosts_ipv4(
     let Ok(mut cache) = node_host_cache().lock() else {
         return out;
     };
+    let now = crate::core::license::now_secs();
     for host in hosts {
         let key = host.trim().to_ascii_lowercase();
         if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
             continue;
         }
         if let Some((ip, at)) = cache.get(&key) {
-            if at.elapsed() < NODE_HOST_CACHE_TTL {
+            let fresh = *at > 0 && *at <= now && now - *at < NODE_HOST_CACHE_TTL.as_secs() as i64;
+            if fresh {
                 out.insert(key, ip.clone());
                 continue;
             }
@@ -1758,8 +1824,9 @@ fn doh_resolve_node_hosts_ipv4_with_wait(
             continue;
         }
         if let Ok(mut c) = node_host_cache().lock() {
-            c.insert(host.clone(), (ip.clone(), std::time::Instant::now()));
+            c.insert(host.clone(), (ip.clone(), crate::core::license::now_secs()));
         }
+        persist_node_dns_cache();
         out.insert(host, ip);
     }
     out
@@ -4391,9 +4458,13 @@ mod tests {
         let src = include_str!("go_lan.rs");
         assert!(
             src.contains(
-                "NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(600)"
+                "NODE_HOST_BUILD_WAIT: std::time::Duration = std::time::Duration::from_millis(350)"
             ),
-            "构建期解析阻塞上限必须锁定 600ms（移动端启动 <12s）"
+            "构建期解析阻塞上限必须锁定 350ms（APC4 启动收窄）"
+        );
+        assert!(
+            src.contains("node_dns_cache.json"),
+            "节点域名解析缓存必须持久化到 data_dir/node_dns_cache.json"
         );
         assert!(
             src.contains("pub(crate) fn doh_resolve_node_hosts_ipv4("),

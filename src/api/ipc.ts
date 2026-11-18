@@ -208,10 +208,15 @@ export const activatePro = (code: string, email: string) =>
   invoke<Entitlement>("activate_pro", { code, email });
 export const getEntitlement = () =>
   invoke<Entitlement>("get_entitlement");
-/** 最近一次授权剥夺原因：unbound / expired / alpha_unbound / alpha_expired / null */
+/** 最近一次授权剥夺原因：unbound / expired / alpha_unbound / alpha_expired / deactivated / null */
 export const getRevokeReason = () =>
   invoke<
-    "unbound" | "expired" | "alpha_unbound" | "alpha_expired" | null
+    | "unbound"
+    | "expired"
+    | "alpha_unbound"
+    | "alpha_expired"
+    | "deactivated"
+    | null
   >("get_revoke_reason");
 /** 读取本机设备 ID（激活绑定与设置页展示用） */
 export const getDeviceId = () => invoke<string>("get_device_id");
@@ -219,6 +224,12 @@ export const refreshEntitlement = () =>
   invoke<Entitlement>("refresh_entitlement");
 export const deactivatePro = () =>
   invoke<Entitlement>("deactivate_pro");
+/** 【APC4】解绑本机（反激活）：先释放服务端席位，成功后才清本地授权 */
+export const deactivateLicenseDevice = () =>
+  invoke<Entitlement>("deactivate_license_device");
+/** 【APC4】前台 60s / 切回前台的授权在线复核（断网保持现有授权） */
+export const pollLicenseStatus = () =>
+  invoke<Entitlement>("poll_license_status");
 export const submitReceipt = (
   store: "apple" | "google",
   receipt: unknown,

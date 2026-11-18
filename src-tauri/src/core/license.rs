@@ -182,14 +182,14 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// 读取/首次生成设备 ID（每安装实例唯一，落盘 device.json）。
 ///
-/// 【APC 任务6】身份生成策略（必须严格遵守，否则所有老用户会被解绑）：
+/// 【APC4 任务1.1】身份生成策略：
 /// - **向后兼容铁律**：如果 device.json 已存在且含 `id` 字段，
 ///   **无论它是旧版 UUID v4 还是旧版 SHA-256 硬件指纹**，直接返回；
 ///   绝不重新生成——老用户在服务端 devices 表里绑定的就是这枚 ID。
-/// - **首次安装（device.json 不存在）**：生成随机 UUID v4 并做 SHA-256，
-///   得到 64 位小写 hex 落盘。**严禁采集任何硬件标识**（MachineGuid /
-///   IOPlatformUUID / ANDROID_ID / identifierForVendor / MAC 等），
-///   避免设备指纹合规风险与跨版本漂移。
+/// - **首次安装（device.json 不存在）**：按平台采集系统级特征源
+///   （Windows `MachineGuid` / macOS `IOPlatformUUID` / Linux `/etc/machine-id`；
+///   iOS / Android 无系统级稳定源，使用首次启动随机 UUID 持久化兜底），
+///   做 SHA-256 取 64 位小写 hex 落盘。只上报哈希，绝不泄露原始标识。
 /// - **全 APP 统一铁律**：activate / check / heartbeat / 订阅同步 /
 ///   设置页「设备 ID」展示，必须 100% 调用同一个 `device_id(data_dir)`。
 ///   任何绕过本函数直接生成 UUID 的路径都是 bug。
@@ -203,17 +203,191 @@ pub fn device_id(data_dir: &Path) -> Result<String> {
         return Ok(id.to_string());
     }
 
-    let raw_uuid = uuid::Uuid::new_v4().to_string();
-    let hex = hex_lower(&Sha256::digest(raw_uuid.as_bytes()));
+    let (seed, source) = match hardware_seed() {
+        Some(raw) => (raw, "hardware-sha256"),
+        None => (uuid::Uuid::new_v4().to_string(), "random-uuid-v4"),
+    };
+    let hex = hex_lower(&Sha256::digest(seed.as_bytes()));
     std::fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({
             "id": hex,
-            "source": "random-uuid-v4",
+            "source": source,
             "created_at": now_secs(),
         }))?,
     )?;
     Ok(hex)
+}
+
+/// 平台系统级稳定标识原始值（仅本机读取，绝不直接上报）。
+/// 移动端（iOS / tvOS / Android）无跨重装稳定的系统级公开 API，
+/// 返回 None → 由 device.json 持久化 UUID 兜底（卸载重装后仍读同一文件）。
+fn hardware_seed() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        return parse_reg_value(&text, "MachineGuid");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        return text
+            .lines()
+            .find(|l| l.contains("IOPlatformUUID"))
+            .and_then(|l| l.split('=').nth(1))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(raw) = std::fs::read_to_string(p) {
+                let v = raw.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        return None;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 解析 `reg query` 输出中的 `名称    REG_SZ    值` 行
+#[cfg(target_os = "windows")]
+fn parse_reg_value(text: &str, name: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.contains(name))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// 授权接口平台枚举（api-license-activate.md §7）：
+/// `macos` / `ios` / `android` / `windows` / `linux`。
+fn license_platform() -> &'static str {
+    #[cfg(target_os = "ios")]
+    {
+        "ios"
+    }
+    #[cfg(target_os = "android")]
+    {
+        "android"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "windows"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux"
+    }
+    #[cfg(not(any(
+        target_os = "ios",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux"
+    )))]
+    {
+        "web"
+    }
+}
+
+/// 系统版本展示串（≤40 字符），与 platform 一起展示为「macOS · 14.5」。
+fn os_version_string() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !v.is_empty() {
+                return format!("macOS {v}");
+            }
+        }
+        "macOS".into()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut name = "Windows".to_string();
+        let mut ver = String::new();
+        for (key, slot) in [("ProductName", 0usize), ("DisplayVersion", 1usize)] {
+            if let Ok(out) = std::process::Command::new("reg")
+                .args([
+                    "query",
+                    r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                    "/v",
+                    key,
+                ])
+                .output()
+                && let Some(v) = parse_reg_value(&String::from_utf8_lossy(&out.stdout), key)
+            {
+                if slot == 0 {
+                    name = v;
+                } else {
+                    ver = v;
+                }
+            }
+        }
+        if ver.is_empty() {
+            name
+        } else {
+            format!("{name} {ver}")
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(raw) = std::fs::read_to_string("/etc/os-release") {
+            if let Some(v) = raw
+                .lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"'))
+            {
+                return v.to_string();
+            }
+        }
+        "Linux".into()
+    }
+    #[cfg(target_os = "ios")]
+    {
+        "iOS".into()
+    }
+    #[cfg(target_os = "android")]
+    {
+        "Android".into()
+    }
+    #[cfg(not(any(
+        target_os = "ios",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux"
+    )))]
+    {
+        std::env::consts::OS.to_string()
+    }
 }
 
 /// 跨进程唯一安装 ID（36 字符标准 UUID v4）——首次启动时生成并落盘
@@ -273,6 +447,13 @@ struct CachedLicense {
     /// 旧版缓存缺失时默认 0，首次读取自动补写为当前时间。
     #[serde(default)]
     max_seen_unix: i64,
+    /// 【APC4 任务1.3】本地激活令牌签发时间（Unix 秒）。
+    /// isTokenUsable 用它对比服务端 revoked_before；旧缓存缺失时按激活时间兜底。
+    #[serde(default)]
+    token_issued_at: i64,
+    /// 【APC4 任务1.3】本地激活令牌过期时间（Unix 秒，默认 24h）。
+    #[serde(default)]
+    token_expires_at: i64,
     entitlement: EntitlementStatus,
 }
 
@@ -361,6 +542,8 @@ fn load_cache(data_dir: &Path) -> Option<CachedLicense> {
             email: String::new(),
             synced_on: String::new(),
             max_seen_unix: 0,
+            token_issued_at: 0,
+            token_expires_at: 0,
             entitlement: legacy.entitlement,
         };
         normalize_cache(&mut migrated);
@@ -718,12 +901,21 @@ pub(crate) async fn post_with_fallback(url: &str, body: &Value) -> Result<reqwes
     .await
 }
 
-/// GET 带兜底重试（query: license_key）
-async fn get_with_fallback(url: &str, license_key: &str) -> Result<reqwest::Response> {
+/// GET 带兜底重试（query: license_key + 可选 device_id）
+async fn get_with_fallback(
+    url: &str,
+    license_key: &str,
+    device_id: Option<&str>,
+) -> Result<reqwest::Response> {
     send_with_v4_fallback(|c| {
-        c.get(url)
+        let mut req = c
+            .get(url)
             .query(&[("license_key", license_key)])
-            .header("X-Request-Source", REQUEST_SOURCE)
+            .header("X-Request-Source", REQUEST_SOURCE);
+        if let Some(id) = device_id.filter(|s| !s.trim().is_empty()) {
+            req = req.query(&[("device_id", id)]);
+        }
+        req
     })
     .await
 }
@@ -767,6 +959,20 @@ struct StatusResponse {
     used_seats: Option<u32>,
     #[serde(default)]
     sync_available: bool,
+    /// 【APC4 任务1.3】买断锁定的大版本号（非买断为 null）。
+    /// 买断范围判定以前端 runtime（/app/check）为准，此处仅按文档解析透传。
+    #[allow(dead_code)]
+    #[serde(default)]
+    included_major: Option<u32>,
+    /// 该时间之前签发的令牌全部作废（Unix 秒；0 = 从未吊销）
+    #[serde(default)]
+    revoked_before: Option<i64>,
+    /// 仅当请求带 device_id 时返回；false = 本机已被解绑
+    #[serde(default)]
+    device_bound: Option<bool>,
+    /// 服务端当前 Unix 秒，用于校正客户端时钟偏差
+    #[serde(default)]
+    server_time: Option<i64>,
     /// 【APP48】Alpha 内测授权标记（/license/status 同步返回）
     #[serde(default)]
     alpha: bool,
@@ -902,15 +1108,46 @@ async fn retry_after_secs(resp: reqwest::Response) -> i64 {
         .max(1)
 }
 
+/// 【APC4 任务1.3】isTokenUsable 四重秒级吊销判定（api-reference.md §7.1.1）：
+/// `valid` && `device_bound != false` && `issued_at >= revoked_before` &&
+/// `now < token_expires_at`。任一不满足即视为令牌已被吊销。
+/// 旧缓存无令牌元数据（token_expires_at == 0）时只做前三重判定，
+/// 到期仍由 `enforce_expiry` 兜底。
+pub fn is_token_usable(
+    valid: bool,
+    device_bound: Option<bool>,
+    revoked_before: Option<i64>,
+    issued_at: i64,
+    token_expires_at: i64,
+    server_time: Option<i64>,
+) -> bool {
+    if !valid {
+        return false;
+    }
+    if device_bound == Some(false) {
+        return false;
+    }
+    if issued_at < revoked_before.unwrap_or(0) {
+        return false;
+    }
+    if token_expires_at <= 0 {
+        return true;
+    }
+    server_time.unwrap_or_else(now_secs) < token_expires_at
+}
+
 /// GET /api/license/status：200 返回状态体，其余按 StatusError 分类
 async fn fetch_status(
     base: &str,
     license_key: &str,
     data_dir: &Path,
 ) -> std::result::Result<StatusResponse, StatusError> {
+    // 【APC4 任务1.3】必须携带 device_id，服务端才会返回 device_bound
+    let device = device_id(data_dir).ok();
     let resp = get_with_fallback(
         &format!("{base}{}", crate::obf!("/api/license/status")),
         license_key,
+        device.as_deref(),
     )
     .await
     .map_err(|e| StatusError::Transient(sanitize_license_error(&e.to_string())))?;
@@ -1092,6 +1329,9 @@ pub async fn activate(
         "email": email,
         "device_id": device_id_str,
         "device_name": device_name(),
+        // 【APC4 任务1.1】显式上报平台与系统版本（面板设备类型展示的可靠来源）
+        "platform": license_platform(),
+        "os_version": os_version_string(),
     });
     let resp = post_with_fallback(
         &format!("{base}{}", crate::obf!("/api/license/activate")),
@@ -1137,6 +1377,10 @@ pub async fn activate(
     }
 
     // 【110.txt】激活响应签名信封验签（服务端新旧协议兼容：无 token 时记录 warn 继续）
+    // 【APC4 任务1.3】验签通过后持久化令牌 issuedAt / tokenExpiresAt，
+    // 供 60s 在线复核的 isTokenUsable 与 revoked_before 对比。
+    let mut token_issued_at = now_secs();
+    let mut token_expires_at = token_issued_at + 86_400;
     if let Some(env) = data.token.as_ref() {
         let now = crate::core::ed25519_verify::unix_now();
         match crate::core::ed25519_verify::verify(
@@ -1147,7 +1391,12 @@ pub async fn activate(
             Some("activation"),
             now,
         ) {
-            Ok(_claims) => {}
+            Ok(claims) => {
+                if let Some(iat) = claims.issued_at {
+                    token_issued_at = iat;
+                }
+                token_expires_at = claims.token_expires_at.unwrap_or(env.token_expires_at);
+            }
             Err(e) => {
                 crate::core::logger::warn(
                     crate::core::logger::MOD_PRO,
@@ -1201,6 +1450,8 @@ pub async fn activate(
             email,
             synced_on: today_utc(),
             max_seen_unix: now_secs(),
+            token_issued_at,
+            token_expires_at,
             entitlement: ent.clone(),
         },
     )?;
@@ -1235,6 +1486,8 @@ pub async fn verify_remote(
                     email: cache.email,
                     synced_on: cache.synced_on,
                     max_seen_unix: cache.max_seen_unix,
+                    token_issued_at: cache.token_issued_at,
+                    token_expires_at: cache.token_expires_at,
                     entitlement: ent.clone(),
                 },
             )?;
@@ -1249,6 +1502,24 @@ pub async fn verify_remote(
             // 服务端明确判定凭证无效（停用/删除）→ 清除缓存
             if !s.valid {
                 tracing::warn!("license invalid per server (status={})", s.status);
+                clear_cache(data_dir);
+                return Ok(EntitlementStatus::inactive());
+            }
+            // 【APC4 任务1.3】四重秒级吊销判定：device_bound/revoked_before/
+            // tokenExpiresAt 任一不通过 → 立即清除本地授权（不再信任离线缓存）。
+            if !is_token_usable(
+                true,
+                s.device_bound,
+                s.revoked_before,
+                cache.token_issued_at,
+                cache.token_expires_at,
+                s.server_time,
+            ) {
+                tracing::warn!(
+                    "license revoked per server (device_bound={:?}, revoked_before={:?})",
+                    s.device_bound,
+                    s.revoked_before
+                );
                 clear_cache(data_dir);
                 return Ok(EntitlementStatus::inactive());
             }
@@ -1269,6 +1540,8 @@ pub async fn verify_remote(
                     email: cache.email,
                     synced_on: today_utc(),
                     max_seen_unix: now_secs(),
+                    token_issued_at: cache.token_issued_at,
+                    token_expires_at: cache.token_expires_at,
                     entitlement: ent.clone(),
                 },
             )?;
@@ -1381,10 +1654,14 @@ impl ReleaseBinding {
         })
     }
 
-    /// POST /api/license/deactivate：best-effort，断网/404 静默返回 false
+    /// POST /api/license/deactivate-app：best-effort，断网/404 静默返回 false
     pub async fn notify(&self) -> bool {
         let result = post_with_fallback(
-            &format!("{}{}", self.base, crate::obf!("/api/license/deactivate")),
+            &format!(
+                "{}{}",
+                self.base,
+                crate::obf!("/api/license/deactivate-app")
+            ),
             &serde_json::json!({
                 "license_key": self.license_key,
                 "email": self.email,
@@ -1417,6 +1694,178 @@ pub fn deactivate(data_dir: &Path) -> EntitlementStatus {
     clear_cache(data_dir);
     let _ = std::fs::remove_file(data_dir.join("sync_links.json"));
     EntitlementStatus::inactive()
+}
+
+/// 【APC4 任务1.2】反激活前置规则（纯函数，可单测）：None 表示允许自助解绑。
+/// 试用版（`plan=free`）与 Alpha 内测版一律禁止（api-license-activate.md §1.1）。
+pub fn unbind_blocked_reason(plan: Option<&str>, alpha: bool) -> Option<&'static str> {
+    if alpha {
+        Some("Alpha 内测授权不支持自行解绑，请提交工单联系管理员解绑")
+    } else if plan == Some("free") {
+        Some("试用版授权不支持自行解绑设备，如需处理请联系管理员")
+    } else {
+        None
+    }
+}
+
+/// 【APC4 任务1.2】终端自助反向激活 `POST /api/license/deactivate-app`。
+///
+/// 与旧 `deactivate()` 的区别：先联网确认服务端解绑成功（200 或 404 幂等），
+/// 再清除本地令牌/授权缓存；网络失败或 403 一律保留本地授权，绝不误清。
+/// 错误文本约定：
+/// - 前置拦截 / 403：直接返回中文文案；
+/// - 429：`rate_limited:{secs}:activation_throttled`（前端倒计时禁用按钮）。
+pub async fn deactivate_device(
+    data_dir: &Path,
+    settings: &UserSettings,
+) -> Result<EntitlementStatus> {
+    let cache =
+        load_cache(data_dir).ok_or_else(|| anyhow::anyhow!("本机尚未激活授权，无需解绑设备"))?;
+    if let Some(msg) =
+        unbind_blocked_reason(cache.entitlement.plan.as_deref(), cache.entitlement.alpha)
+    {
+        bail!("{msg}");
+    }
+    let license_key = cache.license.trim().to_string();
+    let email = cache.email.trim().to_lowercase();
+    if license_key.is_empty() || email.is_empty() {
+        bail!("本地授权信息不完整，请重新激活后再试");
+    }
+    let device_id_str = device_id(data_dir)?;
+
+    let resp = post_with_fallback(
+        &format!(
+            "{}{}",
+            server_base(settings),
+            crate::obf!("/api/license/deactivate-app")
+        ),
+        &serde_json::json!({
+            "license_key": license_key,
+            "email": email,
+            "device_id": device_id_str,
+        }),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", sanitize_license_error(&e.to_string())))?;
+
+    let http = resp.status().as_u16();
+    match http {
+        // 200 解绑成功；404 device_not_found 视为已解绑（幂等）
+        200 | 404 => {}
+        429 => {
+            let secs = retry_after_secs(resp).await;
+            bail!("rate_limited:{secs}:activation_throttled");
+        }
+        403 => {
+            let (machine, _) = extract_error_detail(http, resp).await;
+            let msg = match machine.as_str() {
+                "trial_unbind_not_allowed" => {
+                    "试用授权不允许自行解绑（防止换机绕过限制），请联系管理员处理"
+                }
+                "alpha_unbind_not_allowed" => {
+                    "Alpha 内测授权不支持自助解绑，请提交工单联系管理员解绑"
+                }
+                "unbind_not_allowed" => "该授权已过期、已停用或已回收，无法自助解绑",
+                _ => "当前授权不支持自助解绑，请联系管理员处理",
+            };
+            bail!("{msg}");
+        }
+        _ => {
+            let (_, server_msg) = extract_error_detail(http, resp).await;
+            bail!(
+                "解绑失败（HTTP {http}）{}",
+                if server_msg.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{server_msg}")
+                }
+            );
+        }
+    }
+
+    // 服务端席位已释放：立即清除本地令牌 / 授权缓存 / 订阅同步基线
+    let next = deactivate(data_dir);
+    let _ = std::fs::remove_file(data_dir.join("runtime_cache.json"));
+    Ok(next)
+}
+
+/// 【APC4 任务1.3】前台 60s / 切回前台的在线复核入口：
+/// 返回 `(授权状态, 剥夺原因)`；原因非 None 时调用方必须清理 Pro 功能并
+/// 广播 `license://revoked`。与 `verify_remote` 的区别：显式区分「解绑 /
+/// Alpha 解绑 / 到期」，且不做当日缓存短路（60s 轮询必须实时联网）。
+pub async fn recheck_online(
+    data_dir: &Path,
+    settings: &UserSettings,
+) -> Result<(EntitlementStatus, Option<String>)> {
+    let Some(cache) = load_cache(data_dir) else {
+        return Ok((EntitlementStatus::inactive(), None));
+    };
+    let base = server_base(settings);
+    let s = match fetch_status(&base, &cache.license, data_dir).await {
+        Ok(s) => s,
+        // 429 透传（前端不展示，静默等待下一轮）；瞬态故障保持现有本地授权
+        Err(StatusError::RateLimited(secs)) => {
+            bail!("rate_limited:{secs}:activation_throttled")
+        }
+        Err(e @ StatusError::Transient(_)) => {
+            tracing::warn!("license recheck transient: {e:?}");
+            return Ok((cache.entitlement.clone(), None));
+        }
+        Err(StatusError::Rejected(code, msg)) => {
+            tracing::warn!("license recheck rejected (HTTP {code}): {msg}");
+            clear_cache(data_dir);
+            return Ok((EntitlementStatus::inactive(), Some("expired".into())));
+        }
+    };
+
+    if !s.valid {
+        clear_cache(data_dir);
+        return Ok((EntitlementStatus::inactive(), Some("expired".into())));
+    }
+
+    if !is_token_usable(
+        true,
+        s.device_bound,
+        s.revoked_before,
+        cache.token_issued_at,
+        cache.token_expires_at,
+        s.server_time,
+    ) {
+        clear_cache(data_dir);
+        let unbound = s.device_bound == Some(false);
+        let alpha = s.alpha || cache.entitlement.alpha;
+        let reason = if unbound {
+            if alpha { "alpha_unbound" } else { "unbound" }
+        } else if s.status == "expired" {
+            if alpha { "alpha_expired" } else { "expired" }
+        } else {
+            "expired"
+        };
+        return Ok((EntitlementStatus::inactive(), Some(reason.into())));
+    }
+
+    let ent = map_entitlement(
+        &s.plan,
+        &s.status,
+        s.expires_at.as_deref().and_then(parse_expires_at),
+        s.max_seats,
+        s.used_seats,
+        s.sync_available,
+        s.alpha,
+    );
+    save_cache(
+        data_dir,
+        &CachedLicense {
+            license: cache.license,
+            email: cache.email,
+            synced_on: today_utc(),
+            max_seen_unix: now_secs(),
+            token_issued_at: cache.token_issued_at,
+            token_expires_at: cache.token_expires_at,
+            entitlement: ent.clone(),
+        },
+    )?;
+    Ok((ent, None))
 }
 
 /// 本地已激活的 License Key（app-control 心跳上报用；未激活返回 None）
@@ -1517,6 +1966,8 @@ mod tests {
             synced_on: String::new(),
             // 高水位线远超前于当前系统时间 → 判定为人为回拨
             max_seen_unix: now + CLOCK_ROLLBACK_TOLERANCE + 60,
+            token_issued_at: now,
+            token_expires_at: now + 86_400,
             entitlement: trial(exp),
         };
         normalize_cache(&mut cache);
@@ -1571,10 +2022,10 @@ mod tests {
         assert_ne!(license_ref("askc-ldp2-m4vt-zsbu"), "02d716abf16c817c");
     }
 
-    /// 【APC 任务6】首次安装必须生成随机 UUID → SHA-256（64 位 hex），
-    /// 二次读取必须复用同一 ID；且 device.json 严禁写任何硬件指纹字段。
+    /// 【APC4 任务1.1】首次安装按平台采集硬件/系统级特征源并 SHA-256；
+    /// 落盘仅保存哈希与来源，绝不保存原始硬件标识；二次读取必须复用同一 ID。
     #[test]
-    fn appc_device_id_is_random_not_hardware() {
+    fn apc4_device_id_is_stable_and_hashed() {
         let dir =
             std::env::temp_dir().join(format!("prism-device-id-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -1590,20 +2041,90 @@ mod tests {
 
         let raw = std::fs::read_to_string(dir.join("device.json")).expect("device.json");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
-        assert_eq!(
-            v.get("source").and_then(|s| s.as_str()),
-            Some("random-uuid-v4")
+        let source = v
+            .get("source")
+            .and_then(|s| s.as_str())
+            .expect("source 字段");
+        assert!(
+            matches!(source, "hardware-sha256" | "random-uuid-v4"),
+            "来源只能是硬件哈希或持久化随机兜底"
         );
-        assert!(v.get("fingerprint_fp").is_none(), "严禁再落盘任何硬件指纹");
-
-        // 不同安装实例必须得到不同身份
-        let dir2 =
-            std::env::temp_dir().join(format!("prism-device-id-test2-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir2).expect("create temp dir 2");
-        let other = device_id(&dir2).expect("device id 2");
-        assert_ne!(first, other, "随机身份不得跨安装复用");
+        // 原始硬件标识绝不落盘（只允许 64 位哈希）
+        let lower = raw.to_lowercase();
+        for banned in [
+            "machineguid",
+            "ioplatformuuid",
+            "serialnumber",
+            "android_id",
+        ] {
+            assert!(!lower.contains(banned), "严禁落盘原始硬件标识：{banned}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 【APC4 任务1.3】isTokenUsable 四重判定：valid / device_bound /
+    /// revoked_before / tokenExpiresAt 任一不满足都必须判为不可用。
+    #[test]
+    fn apc4_is_token_usable_four_way_check() {
+        let issued = 1_000_000_i64;
+        let exp = issued + 86_400;
+        // 基线：全部满足
+        assert!(is_token_usable(
+            true,
+            Some(true),
+            Some(0),
+            issued,
+            exp,
+            Some(issued + 60)
+        ));
+        // 1) valid=false
+        assert!(!is_token_usable(
+            false,
+            Some(true),
+            Some(0),
+            issued,
+            exp,
+            None
+        ));
+        // 2) device_bound=false（管理后台解绑）
+        assert!(!is_token_usable(
+            true,
+            Some(false),
+            Some(0),
+            issued,
+            exp,
+            None
+        ));
+        // 3) 令牌早于吊销时间
+        assert!(!is_token_usable(
+            true,
+            Some(true),
+            Some(issued + 1),
+            issued,
+            exp,
+            None
+        ));
+        // 4) 令牌自身过期（以服务端时间校正）
+        assert!(!is_token_usable(
+            true,
+            Some(true),
+            Some(0),
+            issued,
+            exp,
+            Some(exp)
+        ));
+        // 旧缓存无令牌元数据：只做前三重判定
+        assert!(is_token_usable(true, None, None, 0, 0, Some(exp + 1)));
+    }
+
+    /// 【APC4 任务1.2】试用版与 Alpha 内测版必须在本地前置拦截，
+    /// 只有正式 Pro / 买断允许自助反激活。
+    #[test]
+    fn apc4_unbind_blocked_for_trial_and_alpha() {
+        assert!(unbind_blocked_reason(Some("free"), false).is_some());
+        assert!(unbind_blocked_reason(Some("pro"), true).is_some());
+        assert!(unbind_blocked_reason(Some("team"), false).is_none());
+        assert!(unbind_blocked_reason(Some("pro"), false).is_none());
     }
 }
