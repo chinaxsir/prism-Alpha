@@ -145,6 +145,9 @@ pub fn run() {
                         // 状态可能随时间跨过有效期，按文件内容刷新内存态
                         state.apply_entitlement(cache);
                     }
+                    // 【APC8 任务2】启动即静默续期：令牌剩余 < 6h 时换新，
+                    // 避免「订阅仍有效但本地令牌过期」误清授权。
+                    core::license::ensure_token_fresh(&data_dir, &settings).await;
                     core::sync_links::reconcile(&handle).await;
                     // 【APP6 任务3】启动校验 Pro 有效后：本地订阅为空或距上次
                     // 全量同步超过 24h 时，自动拉取云端订阅并刷新全部节点

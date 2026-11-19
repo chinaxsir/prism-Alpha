@@ -102,7 +102,6 @@ export default function ProManageModal({ open, onClose }: Props) {
   const entitlement = useProStore((s) => s.entitlement);
   const proBusy = useProStore((s) => s.busy);
   const refreshPro = useProStore((s) => s.refresh);
-  const syncSeats = useProStore((s) => s.syncSeats);
   const deactivateDevice = useProStore((s) => s.deactivateDevice);
   const [deviceId, setDeviceId] = useState<string | null>(null);
 
@@ -124,10 +123,9 @@ export default function ProManageModal({ open, onClose }: Props) {
       .catch((e) => console.error("get device id failed:", e));
     // 【APC5 任务2.2】打开弹窗时静默刷新：确保 used_seats 是服务端最新值，
     // 彻底消灭 "? / 3" Bug；刷新失败（断网/429）静默忽略，不打扰当前弹窗。
+    // 【APC8 任务6】refreshPro 内部已链式刷新席位，删除重复的 syncSeats()：
+    // 同一时刻两次 /api/license/status 会放大 429 概率并造成席位显示竞争。
     void refreshPro().catch(() => undefined);
-    // 【ACP7 任务2】打开授权信息弹窗的同一时机，额外拉取 /api/license/status
-    // 的最新 used_seats / max_seats（只改席位，不影响授权有效性）
-    void syncSeats();
   }, [open]);
 
   const copyDeviceId = async () => {

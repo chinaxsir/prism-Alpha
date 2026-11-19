@@ -248,6 +248,30 @@ pub fn verify(
         if actual != expected {
             return Err(VerifyError::KindMismatch(actual.into(), expected.into()));
         }
+        // 【APC8 任务5】按 kind 强制身份字段必须存在：
+        // 防止下发方签一个「不带 installId / licenseRef / deviceId」的通用包，
+        // 被跨设备复用。缺失即视为不合格，而不是「有才比」。
+        match expected {
+            "app_policy" if claims.install_id.is_none() => {
+                return Err(VerifyError::InstallIdMismatch(
+                    "<missing>".into(),
+                    install_id.into(),
+                ));
+            }
+            "sync_links" if claims.license_ref.is_none() => {
+                return Err(VerifyError::LicenseRefMismatch(
+                    "<missing>".into(),
+                    license_ref.unwrap_or("").into(),
+                ));
+            }
+            "activation" if claims.device_id.is_none() => {
+                return Err(VerifyError::DeviceIdMismatch(
+                    "<missing>".into(),
+                    device_id.into(),
+                ));
+            }
+            _ => {}
+        }
     }
 
     crate::core::logger::info(

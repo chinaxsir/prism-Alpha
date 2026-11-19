@@ -16,6 +16,33 @@ interface Props {
 /** 单帧最大解码尺寸：移动端摄像头 1080p 原图解码太慢，缩到 640 足够识别 */
 const MAX_DECODE_EDGE = 640;
 
+/** 【APC8 任务1】四类可区分相机失败：决定文案与是否可重试 */
+export type CameraFailure =
+  | "permission_denied"
+  | "no_camera"
+  | "insecure_context"
+  | "start_failed";
+
+/** 把 getUserMedia 的 DOMException 归一化为四类，避免只显示一串英文错误 */
+function classifyCameraFailure(e: unknown): CameraFailure {
+  const name = (e as { name?: string } | null)?.name ?? "";
+  if (
+    name === "NotAllowedError" ||
+    name === "SecurityError" ||
+    name === "PermissionDeniedError"
+  ) {
+    return "permission_denied";
+  }
+  if (
+    name === "NotFoundError" ||
+    name === "DevicesNotFoundError" ||
+    name === "OverconstrainedError"
+  ) {
+    return "no_camera";
+  }
+  return "start_failed";
+}
+
 /**
  * 【ACP7 任务1】二维码扫码导入弹窗：双引擎
  * 1. 摄像头实时扫描（getUserMedia + requestAnimationFrame + jsQR）
@@ -32,8 +59,13 @@ export default function QrScannerModal({ open, onClose, onImported }: Props) {
   const rafRef = useRef<number | null>(null);
   const handledRef = useRef(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  /** 防止「前台恢复」与「首次打开」并发申请同一路摄像头 */
+  const startingRef = useRef(false);
+  /** 前台恢复时复用同一次取流逻辑 */
+  const restartRef = useRef<(() => void) | null>(null);
 
-  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraError, setCameraError] = useState<CameraFailure | null>(null);
+  const [cameraErrorDetail, setCameraErrorDetail] = useState("");
   const [starting, setStarting] = useState(true);
   const [importing, setImporting] = useState(false);
 
@@ -118,14 +150,28 @@ export default function QrScannerModal({ open, onClose, onImported }: Props) {
     handledRef.current = false;
     setImporting(false);
     setCameraError(null);
+    setCameraErrorDetail("");
     setStarting(true);
 
     let cancelled = false;
     const start = async () => {
+      if (cancelled || startingRef.current) return;
+      startingRef.current = true;
+      setStarting(true);
+      setCameraError(null);
+      setCameraErrorDetail("");
       try {
+        // 【APC8 任务1】四类失败的前置判定：非安全上下文 / 无 mediaDevices
+        if (!window.isSecureContext) {
+          setCameraError("insecure_context");
+          setStarting(false);
+          return;
+        }
         const media = navigator.mediaDevices;
         if (!media?.getUserMedia) {
-          throw new Error("getUserMedia unavailable");
+          setCameraError("no_camera");
+          setStarting(false);
+          return;
         }
         const stream = await media.getUserMedia({
           audio: false,
@@ -145,24 +191,44 @@ export default function QrScannerModal({ open, onClose, onImported }: Props) {
         rafRef.current = requestAnimationFrame(scanFrame);
       } catch (e) {
         if (cancelled) return;
-        const name = (e as { name?: string })?.name ?? "";
-        setCameraError(
-          name === "NotAllowedError" || name === "SecurityError"
-            ? t("sub.scanCameraDenied")
-            : t("sub.scanCameraFailed", { error: String(e) }),
-        );
+        const kind = classifyCameraFailure(e);
+        setCameraError(kind);
+        setCameraErrorDetail(kind === "start_failed" ? String(e) : "");
         setStarting(false);
+      } finally {
+        startingRef.current = false;
       }
+    };
+    restartRef.current = () => {
+      void start();
     };
     void start();
 
     return () => {
       cancelled = true;
+      restartRef.current = null;
+      startingRef.current = false;
       stopCamera();
     };
     // scanFrame / t 变化不重启摄像头：仅在弹窗开关时执行
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // 【APC8 任务1】用户去系统设置授权后切回前台（或锁屏恢复）时自动重新取流
+  useEffect(() => {
+    if (!open) return;
+    const resume = () => {
+      if (document.visibilityState !== "visible") return;
+      if (handledRef.current || streamRef.current || importing) return;
+      restartRef.current?.();
+    };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
+    return () => {
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("focus", resume);
+    };
+  }, [open, importing]);
 
   /** 图片导入引擎 */
   const handlePickImage = useCallback(
@@ -247,8 +313,22 @@ export default function QrScannerModal({ open, onClose, onImported }: Props) {
               </div>
             )}
             {cameraError && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-6 text-center text-[12px] leading-relaxed text-white/90">
-                {cameraError}
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80 p-6 text-center text-[12px] leading-relaxed text-white/90">
+                <span>
+                  {cameraError === "permission_denied" && t("sub.scanCameraDenied")}
+                  {cameraError === "no_camera" && t("sub.scanNoCamera")}
+                  {cameraError === "insecure_context" && t("sub.scanInsecure")}
+                  {cameraError === "start_failed" &&
+                    t("sub.scanCameraFailed", { error: cameraErrorDetail })}
+                </span>
+                {cameraError !== "insecure_context" && (
+                  <button
+                    onClick={() => restartRef.current?.()}
+                    className="rounded-lg bg-white/15 px-3 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-white/25"
+                  >
+                    {t("sub.scanRetry")}
+                  </button>
+                )}
               </div>
             )}
             {importing && (

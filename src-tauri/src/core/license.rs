@@ -89,10 +89,23 @@ impl EntitlementStatus {
         }
     }
 
-    /// 是否可使用 Pro：仅服务端联网校验有效时解锁。
-    /// offline（断网）/ expired / revoked / inactive 一律锁定。
+    /// 【APC8 任务4】方案维度二次校验：只有明确付费/内测方案才允许 Pro。
+    /// plan 缺失（旧缓存）按 status 兼容，避免老用户被误锁；
+    /// 明确 free/basic/none/空串一律不解锁。
+    pub fn plan_allows_pro(&self) -> bool {
+        match self.plan.as_deref() {
+            None => true,
+            Some(plan) => !matches!(
+                plan.trim().to_ascii_lowercase().as_str(),
+                "free" | "basic" | "none" | ""
+            ),
+        }
+    }
+
+    /// 是否可使用 Pro：联网校验有效（status=active）且方案允许。
+    /// offline（断网超宽限）/ expired / revoked / inactive / free 一律锁定。
     pub fn is_unlocked(&self) -> bool {
-        self.status == "active"
+        self.status == "active" && self.plan_allows_pro()
     }
 }
 
@@ -108,8 +121,10 @@ pub fn now_unix() -> i64 {
     now_secs()
 }
 
-/// 系统时间回拨容忍阈值（秒）：超过 3 分钟视为人为改时间作弊
-pub const CLOCK_ROLLBACK_TOLERANCE: i64 = 180;
+/// 系统时间回拨容忍阈值（秒）：超过 5 分钟视为人为改时间作弊。
+/// 【APC8 任务6】与 `ed25519_verify::check_clock_rollback`（110.txt 规定 5 分钟）
+/// 及 10s 授权巡检统一为同一阈值，避免缓存 180s / 启动 300s 两套规则互相打脸。
+pub const CLOCK_ROLLBACK_TOLERANCE: i64 = 300;
 
 /// 统一到期判定：买断版（plan=team）永久有效；其余存在 expires_at 时，
 /// 只要 `now >= expires_at` 即视为已过期（与是否联网、当天是否已校验无关）。
@@ -452,7 +467,7 @@ struct CachedLicense {
     /// max(status.server_time, status.revoked_before)，避免老 revoke 记录误杀新激活。
     #[serde(default)]
     token_issued_at: i64,
-    /// 本地激活令牌过期时间（Unix 秒，默认 24h）。
+    /// 本地激活令牌过期时间（Unix 秒；0 = 服务端未下发令牌，视为无令牌）
     #[serde(default)]
     token_expires_at: i64,
     /// 【APC6 任务1.1】激活时刻服务端已有的历史吊销基线（revoked_before）。
@@ -591,7 +606,7 @@ pub fn cached_entitlement(data_dir: &Path) -> EntitlementStatus {
 pub fn cached_entitlement_opt(data_dir: &Path) -> Option<EntitlementStatus> {
     load_cache(data_dir).map(|mut c| {
         if matches!(c.entitlement.status.as_str(), "grace" | "offline") {
-            c.entitlement = offline_status(&c.entitlement);
+            c.entitlement = offline_status(&c);
         }
         c.entitlement
     })
@@ -1325,14 +1340,24 @@ fn map_entitlement(
 ) -> EntitlementStatus {
     let expired =
         server_status == "expired" || expires_at.map(|exp| exp <= now_secs()).unwrap_or(false);
-    let status = if expired { "expired" } else { "active" };
+    // 【APC8 任务4】Free 是基础方案：可正常使用免费功能，但绝不解锁 Pro。
+    // 旧实现把 free 也映射成 active，导致同一用户在不同刷新路径下权益跳变。
+    let status = if expired {
+        "expired"
+    } else if plan.trim().eq_ignore_ascii_case("free") {
+        "inactive"
+    } else {
+        "active"
+    };
     // 【ACP7 任务2】席位展示兜底：Alpha 内测恒为 1/1；正式授权 max 缺失按 1，
     // used 缺失按 1（绝不显示空值导致前端渲染成「? / ?」）。
     let (max_seats, used_seats) = if alpha {
         (Some(1), Some(1))
     } else {
         let max = max_seats.or(Some(1));
-        let used = used_seats.or(Some(1)).map(|u| max.map(|m| u.min(m)).unwrap_or(u));
+        let used = used_seats
+            .or(Some(1))
+            .map(|u| max.map(|m| u.min(m)).unwrap_or(u));
         (max, used)
     };
     EntitlementStatus {
@@ -1501,8 +1526,11 @@ pub async fn activate(
     // 【110.txt】激活响应签名信封验签（服务端新旧协议兼容：无 token 时记录 warn 继续）
     // 【APC4 任务1.3】验签通过后持久化令牌 issuedAt / tokenExpiresAt，
     // 供 60s 在线复核的 isTokenUsable 与 revoked_before 对比。
+    // 【APC8 任务2】旧协议未返回签名令牌时严禁伪造 24h 本地有效期：
+    // token_expires_at = 0 表示「无令牌」，is_token_usable 直接放行，
+    // 避免激活满一天后被本地编造的到期时间误清有效授权。
     let mut token_issued_at = now_secs();
-    let mut token_expires_at = token_issued_at + 86_400;
+    let mut token_expires_at = 0;
     if let Some(env) = data.token.as_ref() {
         let now = crate::core::ed25519_verify::unix_now();
         match crate::core::ed25519_verify::verify(
@@ -1615,7 +1643,7 @@ pub async fn verify_remote(
     settings: &UserSettings,
     force: bool,
 ) -> Result<EntitlementStatus> {
-    let Some(cache) = load_cache(data_dir) else {
+    let Some(mut cache) = load_cache(data_dir) else {
         return Ok(EntitlementStatus::inactive());
     };
 
@@ -1673,7 +1701,10 @@ pub async fn verify_remote(
                 clear_cache(data_dir);
                 return Ok(EntitlementStatus::inactive());
             }
-            // 令牌本身自洽（valid + device_bound + token_expires_at）
+            // 【APC8 任务2】令牌过期不再直接清授权：先静默续期。
+            // 订阅是否有效以 status 的 valid / device_bound / revoked_before 为准；
+            // 只有服务端明确拒绝续期（401/403/404/410）才清除本地授权，
+            // 网络/限流/5xx 一律保留现状，杜绝「令牌到期 = 付费用户掉授权」。
             if !is_token_usable(
                 true,
                 s.device_bound,
@@ -1682,9 +1713,22 @@ pub async fn verify_remote(
                 cache.token_expires_at,
                 s.server_time,
             ) {
-                tracing::warn!("license token self-check failed after grace/ revocation gate");
-                clear_cache(data_dir);
-                return Ok(EntitlementStatus::inactive());
+                match refresh_token(data_dir, settings, true).await {
+                    Ok(_) => {
+                        // 续期成功后重新加载，避免用旧令牌字段覆盖新令牌
+                        if let Some(fresh) = load_cache(data_dir) {
+                            cache = fresh;
+                        }
+                    }
+                    Err(RefreshError::Rejected(code, msg)) => {
+                        tracing::warn!("license refresh rejected (HTTP {code}): {msg}");
+                        clear_cache(data_dir);
+                        return Ok(EntitlementStatus::inactive());
+                    }
+                    Err(e) => {
+                        tracing::warn!("license token refresh failed, keep local entitlement: {e}");
+                    }
+                }
             }
             let ent = map_entitlement(
                 &s.plan,
@@ -1739,12 +1783,12 @@ pub async fn verify_remote(
                 Ok(EntitlementStatus::inactive())
             } else {
                 tracing::warn!("license Rejected HTTP {code}, fail-open keep local entitlement");
-                Ok(offline_status(&cache.entitlement))
+                Ok(offline_status(&cache))
             }
         }
         Err(StatusError::Transient(e)) => {
             tracing::debug!("license status transient, fail-open keep local: {e}");
-            Ok(offline_status(&cache.entitlement))
+            Ok(offline_status(&cache))
         }
     }
 }
@@ -1756,6 +1800,237 @@ pub async fn verify_remote_forced(
     settings: &UserSettings,
 ) -> Result<EntitlementStatus> {
     verify_remote(data_dir, settings, true).await
+}
+
+// ---------------- 【APC8 任务2】静默令牌续期 ----------------
+
+/// 令牌续期窗口：剩余有效期不足 6 小时即续期（110.txt 协议）。
+pub(crate) const TOKEN_REFRESH_WINDOW_SECS: i64 = 6 * 3600;
+
+/// `POST /api/license/refresh` 请求体（与 status 的凭据口径一致）
+#[derive(Serialize)]
+struct RefreshRequest<'a> {
+    license_key: &'a str,
+    device_id: &'a str,
+}
+
+/// `POST /api/license/refresh` 成功响应（与 activate 同构，token 必返回）
+#[derive(Deserialize)]
+struct RefreshResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    plan: String,
+    #[serde(default)]
+    max_seats: Option<u32>,
+    #[serde(default)]
+    used_seats: Option<u32>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    sync_available: bool,
+    #[serde(default)]
+    alpha: bool,
+    #[serde(default)]
+    token: Option<crate::core::ed25519_verify::SignedEnvelope>,
+}
+
+/// 续期失败分类：决定调用方「清授权」还是「保留现状」
+#[derive(Debug)]
+pub enum RefreshError {
+    /// 服务端明确拒绝续期（401/403/404/410）：调用方应清除本地授权
+    Rejected(u16, String),
+    /// 429 限流：保留现状，下一轮再试
+    RateLimited(i64),
+    /// 网络不可达 / 5xx / 响应解析失败：保留现状
+    Transient(String),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshError::Rejected(code, msg) => {
+                write!(f, "refresh rejected (HTTP {code}): {msg}")
+            }
+            RefreshError::RateLimited(secs) => write!(f, "refresh rate limited ({secs}s)"),
+            RefreshError::Transient(msg) => write!(f, "refresh transient: {msg}"),
+        }
+    }
+}
+
+/// 按 license_ref 隔离的单飞集合：同一授权绝不并发续期
+static REFRESH_IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+struct RefreshFlightGuard(String);
+
+impl Drop for RefreshFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = REFRESH_IN_FLIGHT.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// 占用续期名额；同 license_ref 已有在途请求时返回 None（调用方直接跳过）。
+fn begin_refresh_flight(license_ref: &str) -> Option<RefreshFlightGuard> {
+    let mut guard = REFRESH_IN_FLIGHT.lock().ok()?;
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    if !set.insert(license_ref.to_string()) {
+        return None;
+    }
+    Some(RefreshFlightGuard(license_ref.to_string()))
+}
+
+/// 令牌是否需要续期：0 表示无令牌（不续期），仅剩余不足窗口才需要。
+pub(crate) fn token_needs_refresh(token_expires_at: i64, now: i64) -> bool {
+    token_expires_at > 0 && token_expires_at - now < TOKEN_REFRESH_WINDOW_SECS
+}
+
+/// 【APC8 任务2】静默续期签名令牌。
+///
+/// - `force == false`：仅当剩余有效期 < 6 小时才请求（启动 / 心跳 / 校验共用）；
+/// - `force == true`：本地令牌已过期或自检失败时立即请求；
+/// - 严格验签（deviceId / installId / licenseRef / kind / 时间窗）全部通过后
+///   才原子替换缓存；网络失败、限流、5xx 一律保留现状。
+pub async fn refresh_token(
+    data_dir: &Path,
+    settings: &UserSettings,
+    force: bool,
+) -> std::result::Result<Option<EntitlementStatus>, RefreshError> {
+    let Some(cache) = load_cache(data_dir) else {
+        return Ok(None);
+    };
+    if cache.license.trim().is_empty() {
+        return Ok(None);
+    }
+    let now = now_secs();
+    if !force && !token_needs_refresh(cache.token_expires_at, now) {
+        return Ok(None);
+    }
+    // 单飞：本次占用不到名额说明已有并发续期，直接跳过（避免重复消耗限流配额）
+    let Some(_flight) = begin_refresh_flight(&license_ref(&cache.license)) else {
+        return Ok(None);
+    };
+
+    let device_id_str = device_id(data_dir).map_err(|e| RefreshError::Transient(e.to_string()))?;
+    let install_id =
+        get_or_create_install_id(data_dir).map_err(|e| RefreshError::Transient(e.to_string()))?;
+    let body = serde_json::to_value(RefreshRequest {
+        license_key: &cache.license,
+        device_id: &device_id_str,
+    })
+    .map_err(|e| RefreshError::Transient(e.to_string()))?;
+
+    let resp = post_with_fallback(
+        &format!(
+            "{}{}",
+            api_base(settings),
+            crate::obf!("/api/license/refresh")
+        ),
+        &body,
+    )
+    .await
+    .map_err(|e| RefreshError::Transient(sanitize_license_error(&e.to_string())))?;
+
+    let code = resp.status().as_u16();
+    if code == 429 {
+        return Err(RefreshError::RateLimited(retry_after_secs(resp).await));
+    }
+    if !resp.status().is_success() {
+        let msg = error_message(resp).await;
+        if matches!(code, 401 | 403 | 404 | 410) {
+            return Err(RefreshError::Rejected(code, msg));
+        }
+        return Err(RefreshError::Transient(format!("HTTP {code}: {msg}")));
+    }
+
+    let data: RefreshResponse = resp
+        .json()
+        .await
+        .map_err(|e| RefreshError::Transient(sanitize_license_error(&e.to_string())))?;
+    if !data.ok {
+        return Err(RefreshError::Transient(
+            "服务端未确认续期（ok=false）".into(),
+        ));
+    }
+    let Some(env) = data.token.as_ref() else {
+        // 缺令牌说明服务端仍是旧协议：保持现状，绝不清除本地授权
+        return Err(RefreshError::Transient("续期响应缺少签名令牌".into()));
+    };
+
+    // 严格验签：kind 属于令牌族，deviceId / installId / licenseRef 全部强制一致
+    let claim_ref = license_ref(&cache.license);
+    let claims = match crate::core::ed25519_verify::verify(
+        env,
+        &device_id_str,
+        &install_id,
+        Some(&claim_ref),
+        Some("activation"),
+        now,
+    ) {
+        Ok(c) => c,
+        Err(_) => crate::core::ed25519_verify::verify(
+            env,
+            &device_id_str,
+            &install_id,
+            Some(&claim_ref),
+            Some("refresh"),
+            now,
+        )
+        .map_err(|e| RefreshError::Rejected(403, format!("signature_invalid: {e}")))?,
+    };
+
+    let issued_at = claims.issued_at.unwrap_or(now);
+    let token_expires_at = claims.token_expires_at.unwrap_or(env.token_expires_at);
+
+    // 只更新令牌与（有则更新）权益，不改 plan 为空的旧缓存态
+    let ent = if data.plan.trim().is_empty() {
+        cache.entitlement.clone()
+    } else {
+        map_entitlement(
+            &data.plan,
+            "",
+            data.expires_at.as_deref().and_then(parse_expires_at),
+            data.max_seats,
+            data.used_seats,
+            data.sync_available,
+            data.alpha,
+        )
+    };
+
+    save_cache(
+        data_dir,
+        &CachedLicense {
+            license: cache.license,
+            email: cache.email,
+            // 续期不代表完成当日状态同步，保留 synced_on 让 daily_sync 照常执行
+            synced_on: cache.synced_on,
+            max_seen_unix: now,
+            token_issued_at: issued_at,
+            token_expires_at,
+            baseline_revoked_before: cache.baseline_revoked_before,
+            activated_at: cache.activated_at,
+            entitlement: ent.clone(),
+        },
+    )
+    .map_err(|e| RefreshError::Transient(e.to_string()))?;
+
+    tracing::info!(
+        "license token refreshed (issued_at={issued_at}, token_expires_at={token_expires_at})"
+    );
+    Ok(Some(ent))
+}
+
+/// 非强制续期入口：仅在剩余 < 6h 时请求，任何失败只记日志、不影响既有授权。
+pub async fn ensure_token_fresh(data_dir: &Path, settings: &UserSettings) {
+    match refresh_token(data_dir, settings, false).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {}
+        Err(e) => tracing::debug!("license token refresh skipped: {e}"),
+    }
 }
 
 /// 【ACP7 任务2】只同步席位数据（used_seats / max_seats）：
@@ -1820,20 +2095,32 @@ pub async fn daily_sync(data_dir: &Path, settings: &UserSettings) -> Option<Enti
     }
 }
 
-/// 断网/服务不可达时的授权状态：按用户策略从本地加密文件读取——
-/// 缓存授权仍有效（active/grace 且未过期）则继续可用（status=active）；
+/// 断网/服务不可达时的授权状态：从本地加密文件读取并施加离线宽限——
+/// 最近一次成功联网校验起 2 小时内保持 active（Pro 可用），
+/// 超出宽限仅保留免费功能（status=offline，Pro 锁定）；
 /// 缓存有效期已过则锁定为 expired。恢复联网后每日同步自动以服务端结果修正。
-fn offline_status(prev: &EntitlementStatus) -> EntitlementStatus {
-    let expired = prev
-        .expires_at
-        .map(|exp| exp <= now_secs())
-        .unwrap_or(false);
-    let mut next = prev.clone();
-    if expired {
+///
+/// 【APC8 任务3】旧实现把 offline 一律映射回 active，导致断网可长期使用 Pro。
+pub(crate) const OFFLINE_GRACE_SECS: i64 = 2 * 3600;
+
+fn offline_status(cache: &CachedLicense) -> EntitlementStatus {
+    let now = now_secs();
+    let mut next = cache.entitlement.clone();
+    if is_expired(&next, now) {
         next.status = "expired".into();
-    } else if matches!(next.status.as_str(), "grace" | "offline") {
-        next.status = "active".into();
+        return next;
     }
+    // max_seen_unix = 最近一次成功联网校验时间；0 视为未知，按已超宽限处理
+    let offline_for = if cache.max_seen_unix > 0 {
+        now - cache.max_seen_unix
+    } else {
+        i64::MAX
+    };
+    next.status = if offline_for <= OFFLINE_GRACE_SECS {
+        "active".into()
+    } else {
+        "offline".into()
+    };
     next
 }
 
@@ -2131,12 +2418,73 @@ mod tests {
             expires_at: Some(expires_at),
             source: Some("code".into()),
             last_verified_at: 0,
-            plan: Some("free".into()),
+            // 【APC8 任务4】测试基线使用付费方案；Free 方案由专门用例验证「不解锁 Pro」
+            plan: Some("pro".into()),
             max_seats: Some(1),
             used_seats: Some(1),
             sync_available: false,
             alpha: false,
         }
+    }
+
+    /// 【APC8 任务2】续期窗口：剩余 < 6h 才触发，无令牌（0）永不触发
+    #[test]
+    fn token_refresh_window_is_six_hours_and_ignores_missing_token() {
+        let now = 1_800_000_000;
+        // 剩余 6h 整：边界外（不续期）
+        assert!(!token_needs_refresh(now + TOKEN_REFRESH_WINDOW_SECS, now));
+        // 剩余 6h - 1s：进入窗口
+        assert!(token_needs_refresh(
+            now + TOKEN_REFRESH_WINDOW_SECS - 1,
+            now
+        ));
+        // 已过期仍需要续期尝试
+        assert!(token_needs_refresh(now - 1, now));
+        // 旧协议无令牌：绝不续期、也绝不清授权
+        assert!(!token_needs_refresh(0, now));
+        assert!(is_token_usable(true, None, None, now, 0, None));
+    }
+
+    /// 【APC8 任务3】离线宽限：2 小时内保持 Pro，超出仅免费功能
+    #[test]
+    fn offline_grace_locks_pro_after_two_hours() {
+        let now = now_secs();
+        let mut cache = CachedLicense {
+            license: "PRISM-TEST".into(),
+            email: "a@b.c".into(),
+            synced_on: String::new(),
+            max_seen_unix: now - 60,
+            token_issued_at: now - 60,
+            token_expires_at: 0,
+            baseline_revoked_before: 0,
+            activated_at: now - 60,
+            entitlement: trial(now + 86_400),
+        };
+        assert_eq!(offline_status(&cache).status, "active");
+        // 宽限边界内仍放行
+        cache.max_seen_unix = now - OFFLINE_GRACE_SECS;
+        assert_eq!(offline_status(&cache).status, "active");
+        // 超出 1s：Pro 锁定，仅免费功能
+        cache.max_seen_unix = now - OFFLINE_GRACE_SECS - 1;
+        assert_eq!(offline_status(&cache).status, "offline");
+        // 订阅本身到期优先于宽限
+        cache.max_seen_unix = now - 60;
+        cache.entitlement = trial(now - 1);
+        assert_eq!(offline_status(&cache).status, "expired");
+    }
+
+    /// 【APC8 任务4】Free 方案即使 status=active 也绝不解锁 Pro
+    #[test]
+    fn free_plan_never_unlocks_pro() {
+        let mut ent = trial(now_secs() + 3600);
+        ent.status = "active".into();
+        ent.plan = Some("free".into());
+        assert!(!ent.plan_allows_pro());
+        assert!(!ent.is_unlocked());
+        ent.plan = Some("PRO".into());
+        assert!(ent.is_unlocked());
+        ent.plan = None;
+        assert!(ent.is_unlocked());
     }
 
     #[test]

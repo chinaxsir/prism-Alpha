@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- 【APC8 任务1】扫码入库：WebView getUserMedia 需要 CAMERA 运行时权限；
+         wry 的 RustWebChromeClient.onPermissionRequest 会弹出系统授权框并 grant -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 

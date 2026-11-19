@@ -217,6 +217,7 @@ const zh: Record<string, string> = {
   "logs.probing": "检测中...",
   "logs.probeRunning": "正在通过 go-lan-home 隧道探测内网目标...",
   "toast.autoSynced": "云端订阅已自动同步：{ok}/{fail} 个订阅节点更新成功",
+  "toast.buyoutUpgrade": "您的买断授权覆盖至 v{included}，当前版本 v{major}：Pro 高级功能受限，基础功能继续可用。如需新版本特性请前往官网续费",
 
   // ---- 标题栏 ----
   "titlebar.minimize": "最小化",
@@ -591,6 +592,7 @@ const en: Record<string, string> = {
   "logs.probing": "Testing...",
   "logs.probeRunning": "Probing home LAN via go-lan-home tunnel...",
   "toast.autoSynced": "Cloud subscriptions auto-synced: {ok}/{fail} updated",
+  "toast.buyoutUpgrade": "Your buyout covers up to v{included}; this build is v{major}. Pro features are limited while core features stay available. Visit our site to unlock newer major versions.",
 
   // ---- Title bar ----
   "titlebar.minimize": "Minimize",

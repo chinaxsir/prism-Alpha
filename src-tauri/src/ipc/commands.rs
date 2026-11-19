@@ -4110,6 +4110,8 @@ pub async fn refresh_entitlement(
     // 【ACP7 任务2】校验按钮同时刷新席位实时值（只改 seats，不动授权状态）
     if ent.is_unlocked() {
         let settings = state.settings.read().clone();
+        // 【APC8 任务2】「立即校验」同时做静默续期（剩余 <6h 才真正请求）
+        crate::core::license::ensure_token_fresh(&state.data_dir, &settings).await;
         if let Some(seats) =
             crate::core::license::refresh_seats_only(&state.data_dir, &settings).await
         {

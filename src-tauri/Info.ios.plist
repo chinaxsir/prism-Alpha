@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 【APC8 任务1】扫码导入：WKWebView getUserMedia 需要相机用途说明，
+	     缺失该键会在首次调用摄像头时直接失败且无法弹授权框 -->
+	<key>NSCameraUsageDescription</key>
+	<string>用于扫描订阅或节点二维码以快速导入节点配置 / Scan QR codes to import subscription or node settings</string>
+</dict>
+</plist>

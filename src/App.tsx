@@ -307,6 +307,25 @@ export default function App() {
     };
   }, []);
 
+  // 【APC8 任务4】买断超出版本范围：Pro 受限 + 升级引导。
+  // 后端已按目标主版本去重，这里只负责提示，不再重复弹。
+  useEffect(() => {
+    const unlisten = listen<{ current_major?: number; included_major?: number }>(
+      "buyout://upgrade",
+      (event) => {
+        toast.info(
+          t("toast.buyoutUpgrade", {
+            included: event.payload?.included_major ?? 0,
+            major: event.payload?.current_major ?? 0,
+          }),
+        );
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
   // 监听内核状态广播：订阅增删改/设置变更触发的 restart_core
   // 对前端透明，重启成功或失败转 Error 都能即时对齐，无需轮询
   useEffect(() => {

@@ -83,6 +83,44 @@ pub struct ControlResponse {
     /// APP-7 新增：权威授权态感知（缺字段时旧版兼容不降级）
     #[serde(default)]
     pub runtime: Option<RuntimePerception>,
+    /// 【APC8 任务5】app_policy 签名信封：存在时 runtime 只认验签后的 payload，
+    /// 未签名的同名字段一律不采信（防止中间人改写解绑/版本范围）。
+    #[serde(default)]
+    pub signed: Option<crate::core::ed25519_verify::SignedEnvelope>,
+}
+
+/// 【APC8 任务5】把 app_policy 签名 payload 收敛为权威 runtime。
+///
+/// 规则：
+/// - 数值/布尔字段只从签名 payload 读取；
+/// - `expires_at` 是字符串类型，仅当未签名字段的解析结果与签名里的
+///   Unix 秒**完全一致**时才透传，否则丢弃（不接受无签名背书的字符串）；
+/// - `device_bound` / `version_in_scope` / `alpha` 只从 payload 的扩展字段读取。
+fn policy_runtime(
+    payload: &crate::core::ed25519_verify::TokenPayload,
+    unsigned: Option<&RuntimePerception>,
+) -> RuntimePerception {
+    let extra = &payload.extra;
+    let expires_at = match payload.expires_at {
+        Some(signed_exp) => unsigned
+            .and_then(|u| u.expires_at.clone())
+            .filter(|s| crate::core::license::parse_expires_at(s) == Some(signed_exp)),
+        None => None,
+    };
+    RuntimePerception {
+        plan: payload.plan.clone(),
+        subscription_active: payload.subscription_active,
+        expires_at,
+        max_seats: payload.max_seats,
+        device_bound: extra.get("device_bound").and_then(|v| v.as_bool()),
+        included_major: payload.included_major,
+        current_major: payload.current_major,
+        version_in_scope: extra.get("version_in_scope").and_then(|v| v.as_bool()),
+        alpha: extra
+            .get("alpha")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 /// 当前阻断状态（存于 AppState.control_block）
@@ -271,10 +309,11 @@ pub fn apply_runtime(
     let buyout_upgrade_hint = buyout_out_of_scope(runtime);
 
     if buyout_upgrade_hint {
-        // 买断超出范围：Pro 功能仍可用，但弹一次升级引导；绝不剥夺授权。
+        // 【APC8 任务4】买断超出版本范围：基础功能与 VPN 继续可用，
+        // 但 Pro 高级功能受限（关闭 Pro 专属开关），并按主版本一次性弹升级引导。
+        // 绝不剥夺授权，也不停止内核。
+        disable_pro_switches(state);
         emit_buyout_upgrade(app, runtime);
-        // 买断用户可能同时有解绑/订阅状态（罕见但可能），但版本范围超出是独立信号，
-        // 只弹引导不降级，让 apply_runtime 继续按下面逻辑处理真正的剥夺。
     }
 
     let Some(reason) = decide_revoke(runtime) else {
@@ -315,8 +354,12 @@ pub fn apply_runtime(
     Some((true, zh.to_string()))
 }
 
-/// 广播 `buyout://upgrade`：买断用户超出版本范围时弹升级引导横幅；
-/// 与 revoked 互斥（版本超出不等于授权剥夺），基础 VPN + Pro 功能全部继续可用。
+/// 已提示过的目标主版本（`upgrade_shown_for_v{major}` 的内存版）：
+/// 5 分钟心跳会反复带回同一 runtime，必须去重，禁止每次心跳都弹。
+static BUYOUT_UPGRADE_SHOWN: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+/// 广播 `buyout://upgrade`：买断用户超出版本范围时提示一次；
+/// 与 revoked 互斥（版本超出不等于授权剥夺），基础 VPN 继续可用、Pro 受限。
 pub fn emit_buyout_upgrade(app: &AppHandle, runtime: &RuntimePerception) {
     let major = runtime.current_major.unwrap_or_else(|| {
         env!("CARGO_PKG_VERSION")
@@ -325,12 +368,22 @@ pub fn emit_buyout_upgrade(app: &AppHandle, runtime: &RuntimePerception) {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     });
+    // 同一目标主版本只提示一次（跨重启不去重，但绝不按心跳频率重复）
+    {
+        let Ok(mut shown) = BUYOUT_UPGRADE_SHOWN.lock() else {
+            return;
+        };
+        if *shown == Some(major) {
+            return;
+        }
+        *shown = Some(major);
+    }
     let included = runtime.included_major.unwrap_or(0);
     let zh = format!(
-        "您的 Prism 买断授权可覆盖至主版本 v{included}，当前 APP 已升级到 v{major}。Pro 功能继续可用，如需使用后续新版高级特性请前往官网续费。"
+        "您的 Prism 买断授权可覆盖至主版本 v{included}，当前 APP 已升级到 v{major}。Pro 高级功能受限，基础功能继续可用；如需使用后续新版高级特性请前往官网续费。"
     );
     let en = format!(
-        "Your buyout covers up to v{included}. You are running v{major}. Pro features remain available. Visit our site to unlock future major versions."
+        "Your buyout covers up to v{included}. You are running v{major}. Pro features are limited while core features stay available. Visit our site to unlock future major versions."
     );
     let _ = app.emit(
         "buyout://upgrade",
@@ -454,6 +507,9 @@ fn sync_entitlement_from_runtime(state: &AppState, runtime: &RuntimePerception) 
         ent.status = "inactive".into();
         // Free 不含云端同步权益
         ent.sync_available = false;
+        // 【APC8 任务4】方案回落到 Free 时同步关闭 Pro 专属开关，
+        // 避免磁盘上的旧开关在下次启动时被重新打开。幂等：已关闭时不重复写盘。
+        disable_pro_switches(state);
     } else if !ent.status.eq_ignore_ascii_case("active") {
         ent.status = "active".into();
     }
@@ -488,18 +544,30 @@ pub(crate) fn merge_runtime_seats(
 /// 关闭所有 Pro 专属开关（Go AIM / Go Lan / Go Cus）并持久化，
 /// 保证解绑/到期后重启不会被磁盘上的旧开关重新打开。
 pub(crate) fn disable_pro_switches(state: &AppState) {
-    let mut settings = state.settings.read().clone();
-    settings.go_aim_enabled = false;
-    let _ = state.save_settings(settings);
+    // 幂等：仅在确有开关处于开启状态时写盘。
+    // Free 方案每次心跳都会走到这里，无条件写盘会造成配置抖动与无谓 IO。
+    let aim_on = state.settings.read().go_aim_enabled;
+    if aim_on {
+        let mut settings = state.settings.read().clone();
+        settings.go_aim_enabled = false;
+        let _ = state.save_settings(settings);
+    }
 
-    let mut lan = state.go_lan.read().clone();
-    lan.enabled = false;
-    let _ = crate::core::go_lan::save(&state.data_dir, &lan);
-    *state.go_lan.write() = lan;
-    let mut cus = state.go_cus.read().clone();
-    cus.enabled = false;
-    let _ = crate::core::go_cus::save(&state.data_dir, &cus);
-    *state.go_cus.write() = cus;
+    let lan_on = state.go_lan.read().enabled;
+    if lan_on {
+        let mut lan = state.go_lan.read().clone();
+        lan.enabled = false;
+        let _ = crate::core::go_lan::save(&state.data_dir, &lan);
+        *state.go_lan.write() = lan;
+    }
+
+    let cus_on = state.go_cus.read().enabled;
+    if cus_on {
+        let mut cus = state.go_cus.read().clone();
+        cus.enabled = false;
+        let _ = crate::core::go_cus::save(&state.data_dir, &cus);
+        *state.go_cus.write() = cus;
+    }
 
     *state.aim_locked_node.write() = None;
 }
@@ -522,6 +590,18 @@ pub(crate) fn emit_license_revoked(
         }),
     );
     emit_revoked(app, reason, zh, en, entitlement);
+}
+
+/// 【APC8 任务3】控制接口返回 401/403：服务端已判定授权失效。
+/// 清除本地授权、关闭 Pro 依赖开关并广播撤销；保留免费功能与内核运行
+/// （管控级阻断仍只由 `allowed=false` 触发，二者不可混用）。
+async fn revoke_on_control_denied(app: &AppHandle, state: &AppState) {
+    tracing::warn!("app-control denied (401/403): clearing local license");
+    license::clear_cache(&state.data_dir);
+    disable_pro_switches(state);
+    let ent = EntitlementStatus::inactive();
+    state.apply_entitlement(ent.clone());
+    emit_license_revoked(app, "unauthorized", Some(&ent));
 }
 
 // ---------------------------------------------------------------- 设备信息
@@ -776,8 +856,8 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState, kind: ReportK
         os_version,
         app_version: env!("CARGO_PKG_VERSION").into(),
         license_key: super::license::get_saved_license_key(&state.data_dir),
-        install_id,
-        device_id: device_id_str,
+        install_id: install_id.clone(),
+        device_id: device_id_str.clone(),
     };
 
     // 专用客户端：绕过系统/内核代理直连上报（心跳必须走最短路径，且避免
@@ -803,7 +883,13 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState, kind: ReportK
     let parsed: Option<ControlResponse> = match resp {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
         Ok(r) => {
-            warn!("app-control: {:?} returned HTTP {}", kind, r.status());
+            let code = r.status().as_u16();
+            warn!("app-control: {:?} returned HTTP {}", kind, code);
+            // 【APC8 任务3】401/403 = 服务端明确撤销授权：清本地授权 + 关闭 Pro 开关。
+            // 不影响免费功能，也不停止内核运行（管控级阻断仍只由 allowed=false 触发）。
+            if matches!(code, 401 | 403) {
+                revoke_on_control_denied(app, state).await;
+            }
             return;
         }
         Err(e) => {
@@ -817,8 +903,30 @@ pub(crate) async fn report_once(app: &AppHandle, state: &AppState, kind: ReportK
     // 成功拿到可解析响应（无论 allowed 与否）才刷新成功时间
     LAST_SUCCESS_UNIX.store(license::now_secs(), Ordering::Release);
 
-    // 1. 授权级熔断（runtime 存在时执行；缺字段时旧版兼容不降级）
-    if let Some(runtime) = resp.runtime.as_ref() {
+    // 【APC8 任务2】网络恢复/定时心跳顺带做一次静默续期（内部按 <6h 与单飞节流）
+    license::ensure_token_fresh(&state.data_dir, &settings).await;
+
+    // 1. 授权级熔断：优先使用 app_policy 签名 payload（【APC8 任务5】）。
+    //    有 signed 但验签失败时**绝不回落到未签名字段**，本轮 runtime 直接忽略。
+    let effective_runtime: Option<RuntimePerception> = match resp.signed.as_ref() {
+        Some(env) => match crate::core::ed25519_verify::verify(
+            env,
+            &device_id_str,
+            &install_id,
+            None,
+            Some("app_policy"),
+            license::now_secs(),
+        ) {
+            Ok(payload) => Some(policy_runtime(&payload, resp.runtime.as_ref())),
+            Err(e) => {
+                warn!("app_policy 验签失败，忽略本次 runtime（不采信未签名字段）: {e}");
+                None
+            }
+        },
+        // 旧服务端未下发签名信封：保留按未签名 runtime 的兼容行为
+        None => resp.runtime.clone(),
+    };
+    if let Some(runtime) = effective_runtime.as_ref() {
         apply_runtime(app, state, &state.data_dir, runtime);
     }
 
