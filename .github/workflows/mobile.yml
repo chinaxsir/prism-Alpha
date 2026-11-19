@@ -475,6 +475,28 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # 【APC8 任务7】预装 3 个 iOS Rust target（带重试与退避）：
+      # RUSTUP_USE_CURL=1 规避 rustup 默认 reqwest 在 macOS Runner 上的
+      # HTTP/2 stream error 断流；5 次退避重试抵御 Rust CDN 瞬时波动。
+      # target 已安装时 tauri ios init 会直接跳过下载。
+      - name: Pre-install iOS Rust targets (with retry)
+        env:
+          RUSTUP_USE_CURL: "1"
+        run: |
+          for target in aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim; do
+            for i in 1 2 3 4 5; do
+              echo "Installing $target (attempt $i/5)..."
+              if rustup target add "$target"; then
+                break
+              fi
+              if [ "$i" -eq 5 ]; then
+                echo "Failed to install $target after 5 attempts"
+                exit 1
+              fi
+              sleep $((i * 5))
+            done
+          done
+
       - name: Init iOS project
         run: npx tauri ios init
 
