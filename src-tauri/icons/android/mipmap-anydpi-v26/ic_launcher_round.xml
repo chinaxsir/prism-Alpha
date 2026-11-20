@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 【APC9 任务1】圆形遮罩启动器专用自适应图标：
+     与 ic_launcher.xml 共用前景/背景/单色层，系统按圆形 mask 裁切；
+     前景主体已收敛到 108dp 画布中央 66dp 安全区内，圆mask下不裁切。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+  <background android:drawable="@mipmap/ic_launcher_background"/>
+  <monochrome android:drawable="@mipmap/ic_launcher_monochrome"/>
+</adaptive-icon>

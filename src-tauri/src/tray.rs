@@ -35,6 +35,17 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_main_window(tray.app_handle());
             }
         });
+    // 【APC9 任务3】macOS 菜单栏必须用 Template 剪影图标（黑色 + alpha）：
+    // 系统按菜单栏明暗自动反色，44x44 = 22pt@2x 保证 Retina 清晰；
+    // 直接复用窗口图标（满幅渐变底）会被渲染成一块彩色方块。
+    #[cfg(target_os = "macos")]
+    {
+        let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray-template.png"
+        ))?;
+        builder = builder.icon(tray_icon).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
