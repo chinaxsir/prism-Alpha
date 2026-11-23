@@ -570,26 +570,17 @@ pub(crate) const CN_DIRECT_CIDRS: &[&str] = &[
     "106.12.0.0/14",
     // UCloud 上海
     "106.75.0.0/16",
-    // 【APP72 任务3.2】大陆运营商/宽带大网段：覆盖家庭宽带与移动网络的
-    // CDN 回源地址（仅 China 注册段，不含海外段），让「域名未命中但 IP
-    // 属于大陆」的请求也能直连而不是绕行海外节点。
+    // 【v0.4.26 / ACP10 任务3】仅保留确认为中国大陆归属的窄段（前缀长度 >= 11）。
+    // 原 APP72 中的 10 个超大 APNIC 段（110/7、112/6、116/6、120/6、124/7、
+    // 182/8、183/8、218/7、221/8、222/8）包含大量日/韩/新/港/澳/澳/印/台海外 IP，
+    // 导致海外访问被 L3 excludedRoutes 与 route.rules 误判直连而超时，现已全部剔除。
     "14.112.0.0/12",
     "58.144.0.0/16",
     "203.209.0.0/16",
-    "110.0.0.0/7",
-    "112.0.0.0/6",
-    "116.0.0.0/6",
-    "120.0.0.0/6",
-    "124.0.0.0/7",
-    "182.0.0.0/8",
-    "183.0.0.0/8",
     "202.96.0.0/12",
     "210.21.0.0/16",
     "211.136.0.0/13",
-    "218.0.0.0/7",
     "219.128.0.0/11",
-    "221.0.0.0/8",
-    "222.0.0.0/8",
     "223.64.0.0/11",
 ];
 
@@ -1944,10 +1935,10 @@ pub fn build(
 
     // 5. DNS（1.11 legacy 格式：servers 用 address；1.12 的 type/server 尚未支持）
     //
-    // dns-remote 用国内可达的阿里 DoH 直连：原先的 https://1.1.1.1/dns-query 在国内
-    // 直连 TCP/443 被墙（kernel.log 实证：dial tcp 1.1.1.1:443: i/o timeout），
-    // 所有非 CN 域名解析全部失败，节点服务器为域名的节点必然拨号超时。
-    // UDP 53 的 8.8.8.8 同样不可用（污染 + 不可达）。
+    // dns-remote 统一 https://8.8.8.8/dns-query（DoH 443，经主代理出境）：
+    // 直连 1.1.1.1 曾被墙（dial tcp 1.1.1.1:443: i/o timeout），UDP 53 的
+    // 8.8.8.8 会被封禁 53 端口的机场阻断，且 1.1.1.1 会被 Cloudflare Worker
+    // 节点的边缘策略直接拒绝；Google DoH 443 三者皆可规避。
     // geosite cn 覆盖国内域名（含 .com），".cn" 后缀规则仅作兜底。
     // IPv6 关闭时 ipv4_only：不返回 AAAA，避免 TUN/代理链路下的 v6 泄漏与连接失败。
 
@@ -2015,16 +2006,24 @@ pub fn build(
         ],
         "server": "dns-local"
     }));
+    // 【v0.4.26 / ACP10 任务2.3】恢复海外核心域名 DNS 走 dns-remote（DoH 443
+    // 经主代理出境），避免国内 DNS 污染导致「域名正确但 IP 被投毒 → 直连失败」。
+    // 大陆域名 / 局域网 / direct 模式规则在上方，命中优先级不受影响。
+    dns_rules.push(json!({
+        "domain_suffix": PROXY_DOMAIN_SUFFIXES,
+        "server": "dns-remote"
+    }));
+    dns_rules.push(json!({
+        "domain_keyword": PROXY_DOMAIN_KEYWORDS,
+        "server": "dns-remote"
+    }));
     dns_rules.push(json!({ "geosite": ["cn"], "server": "dns-direct" }));
     // 【APP70 任务2.1】SVCB/HTTPS 拦截已升级为无条件规则（见下方 index 1），
     // 此处不再按 block_quic 追加重复规则。
     dns_rules.push(json!({ "clash_mode": "global", "server": "dns-remote" }));
-    // 【APP76 任务1.1】规则模式 / Direct 模式下所有普通域名统一交由
-    // `dns.final = dns-direct`（udp://223.5.5.5，53 端口）极速返回，
-    // 不再把 PROXY_DOMAIN_SUFFIXES / PROXY_DOMAIN_KEYWORDS 发往 dns-remote
-    // （机场若封禁 53 端口则全部海外域名等待 7.5 秒后 IN A: EOF 失败）。
-    // Safari/TUN 侧已开启 sniff + sniff_override_destination，会从 TLS
-    // ClientHello 嗅探出真实域名并覆写目标，交由 route.rules 走代理节点。
+    // 【v0.4.26 / ACP10 任务2.3】普通域名默认走 dns-remote（DoH 443 经主代理），
+    // 国内域名由上方显式规则命中 dns-direct；_dns.resolver.arpa 与 SVCB/HTTPS
+    // 在 index 0/1 快速拦截。
     // 【APP60 任务3.1】_dns.resolver.arpa 是系统加密 DNS 发现查询，VPN
     // 场景下无意义，固定在 index 0 快速拦截。
     dns_rules.insert(
@@ -2054,14 +2053,13 @@ pub fn build(
         .filter(|addr| addr.parse::<std::net::Ipv4Addr>().is_ok())
         .unwrap_or_else(|| "223.5.5.5".to_string());
     let mut dns_servers = vec![
-        // 【APP76 任务1.1】dns-remote 改为 HTTPS DoH 443 规避机场 53 端口封禁：
-        // 原先 tcp://8.8.8.8（53 端口）在被机场封禁时所有命中的域名等待 7.5 秒后
-        // 全部以 IN A: EOF 失败，Safari 因拿不到 IP 根本无法发起连接。DoH 走
-        // HTTPS 443 端口经主代理出境，彻底绕过 53 端口封堵。
+        // 【v0.4.26 / ACP10 任务2.2】dns-remote 使用 Google DoH 443 经主代理出境：
+        // Cloudflare 官方安全策略禁止 CF Worker 代理节点出站访问 1.1.1.1（连接直接被边缘拒绝），
+        // 统一改为 https://8.8.8.8/dns-query，规避 53 端口封堵的同时完全兼容 Cloudflare Worker 节点。
         if let Some(main_tag) = &main_group_tag {
             json!({
                 "tag": "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
+                "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
@@ -2069,7 +2067,7 @@ pub fn build(
         } else {
             json!({
                 "tag": "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
+                "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": "direct",
                 "strategy": "ipv4_only",
@@ -2081,20 +2079,22 @@ pub fn build(
             "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 【APP66 任务5.2】dns-direct 主用阿里 UDP 223.5.5.5，且**禁止设置
-        // `detour: "direct"`**：显式 direct detour 会让 DNS 查询绕回 TUN 栈，
-        // 形成「解析 DNS 需要先出 TUN、出 TUN 又需要先解析 DNS」的自回环。
-        // 不写 detour 时 sing-box 直接走默认出站的底层 UDP 通路，10ms 内直答。
+        // 【v0.4.26 / ACP10 任务2.1】dns-direct / dns-direct-backup 显式声明
+        // `detour: "direct"`：在 sing-box 1.11 中，不写 detour 会默认走
+        // route.final（即 Proxy 节点）。当所选节点断连或超时时，所有走
+        // dns-direct 的查询会被送进死亡节点形成死锁；加上 detour: "direct"
+        // 并配合顶部 `223.5.5.5/32、119.29.29.29/32 -> direct` 路由旁路与
+        // iOS excludedRoutes，可确保节点挂死时国内 DNS 仍毫秒级直出。
         json!({
             "tag": "dns-direct",
             "address": "udp://223.5.5.5",
+            "detour": "direct",
             "strategy": "ipv4_only",
         }),
-        // 备用直连 DNS：腾讯 119.29.29.29（UDP 53），阿里 DNS 被运营商
-        // 劫持/静默丢弃时兜底。两者在 iOS 侧均写入 excludedRoutes 直出。
         json!({
             "tag": "dns-direct-backup",
             "address": "udp://119.29.29.29",
+            "detour": "direct",
             "strategy": "ipv4_only",
         }),
         // 【APP64 任务2.2】iOS SVCB/HTTPS 查询拦截
@@ -2104,13 +2104,13 @@ pub fn build(
         }),
     ];
 
-    // Android DNS 清洗：同桌面 / iOS，统一 DoH 443 经主代理出境
+    // Android DNS 清洗：同桌面 / iOS，统一 Google DoH 443 经主代理出境
     #[cfg(target_os = "android")]
     {
         if let Some(main_tag) = &main_group_tag {
             dns_servers[0] = json!({
                 "tag": "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
+                "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": main_tag,
                 "strategy": "ipv4_only",
@@ -2123,11 +2123,9 @@ pub fn build(
     let dns = json!({
         "servers": dns_servers,
         "rules": dns_rules,
-        // 【APP65 任务2.3】final 固定 dns-direct（UDP 223.5.5.5 直出）：
-        // 本地 DNS 10ms 内必答，绝不因远端节点封禁 DNS/DoH 超时而报
-        // `dns: exchange failed ... IN A: EOF`；真实域名靠嗅探识别（不改写目标），
-        // 目标域名交给节点服务器在海外解析。
-        "final": "dns-direct",
+        // 【v0.4.26 / ACP10 任务2.3】普通域名默认走 dns-remote，
+        // 国内域名已由上方 CN 后缀 / geosite 规则显式命中 dns-direct。
+        "final": "dns-remote",
         // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
         // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路
         "independent_cache": true,
@@ -4002,8 +4000,8 @@ rules:
             .unwrap();
         assert_eq!(
             remote["address"].as_str(),
-            Some("https://1.1.1.1/dns-query"),
-            "dns-remote 锁定 DoH 443 经主选择器出境（v0.4.19 任务1.4 统一 1.1.1.1）"
+            Some("https://8.8.8.8/dns-query"),
+            "dns-remote 锁定 Cloudflare Worker 兼容的 Google DoH 443"
         );
         assert_eq!(
             remote["address_resolver"].as_str(),
@@ -5255,12 +5253,13 @@ rules:
             .iter()
             .find(|s| s["tag"] == "dns-direct")
             .expect("dns-direct server missing");
-        // 【APP66 任务5.2】节点域名直连 DNS 固定 UDP 223.5.5.5，且**不得**
-        // 带 detour: "direct"（显式 direct 会让 DNS 查询绕回 TUN 自回环）
+        // 【APP66 任务5.2 + v0.4.26 / ACP10】节点域名直连 DNS 固定 UDP
+        // 223.5.5.5，并显式 detour="direct"（确保节点挂死时仍本地直出）
         assert_eq!(direct["address"], "udp://223.5.5.5");
-        assert!(
-            direct.get("detour").is_none(),
-            "dns-direct 禁止设置 detour（APP66 任务5.2）"
+        assert_eq!(
+            direct["detour"].as_str(),
+            Some("direct"),
+            "dns-direct 必须显式 detour=direct（v0.4.26 / ACP10）"
         );
     }
 
@@ -5525,7 +5524,7 @@ rules:
     /// 2. 18 个真实节点 = 14 VLESS + 4 Trojan，全部生成出站；
     /// 3. VLESS(flow=xtls-rprx-vision) 与 Trojan 缺 fp 时默认 uTLS chrome；
     /// 4. 伪装 SNI 锁定原始域名，server 为域名或其预解析出的公网 IPv4；
-    /// 5. tun-in 开启嗅探改写 + dns.final=dns-direct（APP65 任务2.3）。
+    /// 5. tun-in 开启嗅探改写；dns.final=dns-remote（v0.4.26 / ACP10）。
     #[test]
     fn test_node11_base64_decode_and_build_config() {
         use base64::Engine as _;
@@ -5622,17 +5621,19 @@ rules:
         // 【APP74 任务1.4】tun-in 开启强改写
         assert_eq!(tun_in["sniff_override_destination"], true);
 
-        // DNS：final=dns-direct（UDP 223.5.5.5 直出）
-        assert_eq!(built.config["dns"]["final"], "dns-direct");
+        // 【v0.4.26 / ACP10】DNS：final=dns-remote（DoH 443 经主代理），国内域名
+        // 由显式规则直连解析。
+        assert_eq!(built.config["dns"]["final"], "dns-remote");
         let servers = built.config["dns"]["servers"].as_array().unwrap();
         let direct = servers
             .iter()
             .find(|s| s["tag"] == "dns-direct")
             .expect("dns-direct 缺失");
         assert_eq!(direct["address"], "udp://223.5.5.5");
-        assert!(
-            direct.get("detour").is_none(),
-            "dns-direct 禁止 detour（APP66 任务5.2）"
+        assert_eq!(
+            direct["detour"].as_str(),
+            Some("direct"),
+            "dns-direct 必须显式 detour=direct（v0.4.26 / ACP10）"
         );
         assert!(
             servers
@@ -5648,7 +5649,8 @@ rules:
     /// - 伪装 SNI（peer/sni 根域名 ≠ server 根域名）自动补 insecure=true
     /// - VLESS outbound 必须带 flow + packet_encoding=xudp
     /// - 每个代理节点严禁注入 domain_strategy（APP83：保留远端 DNS）
-    /// - DNS 对标 Karing：dns-remote=udp://8.8.8.8 + Proxy；final=dns-direct；
+    /// - DNS 对标 Karing + ACP10：dns-remote=https://8.8.8.8/dns-query + Proxy；
+    ///   dns-direct / backup 显式 detour=direct；final=dns-remote；
     ///   DNS 规则首条 outbound:any → dns-direct；含 clash_mode:direct/global
     /// - **严禁** 给未知 network（tcp/空）的节点写多余 transport 字段
     #[test]
@@ -5787,9 +5789,9 @@ rules:
             .iter()
             .find(|s| s["tag"].as_str() == Some("dns-remote"))
             .unwrap();
-        assert_eq!(remote["address"], "https://1.1.1.1/dns-query");
+        assert_eq!(remote["address"], "https://8.8.8.8/dns-query");
         assert_eq!(remote["detour"], "Proxy");
-        assert_eq!(dns["final"], "dns-direct", "dns.final 必须固定 dns-direct");
+        assert_eq!(dns["final"], "dns-remote", "dns.final 必须固定 dns-remote");
         let rules = dns["rules"].as_array().unwrap();
         assert!(
             rules.iter().any(|r| r["outbound"].as_str() == Some("any")
@@ -5853,9 +5855,10 @@ rules:
         );
     }
 
-    /// 【APP65 任务2.3】DNS 结构：dns-direct=223.5.5.5（detour=direct）+
-    /// 备用 dns-direct-backup=119.29.29.29（detour=direct），dns.final 固定
-    /// dns-direct，且 dns.rules 必须存在 {outbound: any, server: dns-direct}
+    /// 【v0.4.26 / ACP10 任务2】DNS 结构：dns-direct=223.5.5.5（detour=direct）+
+    /// 备用 dns-direct-backup=119.29.29.29（detour=direct），dns-remote 使用
+    /// https://8.8.8.8/dns-query，dns.final 固定 dns-remote，
+    /// 且 dns.rules 必须存在 {outbound: any, server: dns-direct}
     /// （所有出站的域名解析一律走直连 DNS，杜绝节点域名经代理解析死循环）。
     #[test]
     fn dns_direct_and_backup_present() {
@@ -5886,9 +5889,10 @@ rules:
             .find(|s| s["tag"].as_str() == Some("dns-direct"))
             .expect("dns-direct 服务器缺失");
         assert_eq!(direct["address"].as_str(), Some("udp://223.5.5.5"));
-        assert!(
-            direct.get("detour").is_none(),
-            "dns-direct 禁止 detour（APP66 任务5.2）"
+        assert_eq!(
+            direct["detour"].as_str(),
+            Some("direct"),
+            "dns-direct 必须显式 detour=direct（v0.4.26 / ACP10）"
         );
         let direct_backup = servers
             .iter()
@@ -5898,14 +5902,15 @@ rules:
             direct_backup["address"].as_str(),
             Some("udp://119.29.29.29")
         );
-        assert!(
-            direct_backup.get("detour").is_none(),
-            "dns-direct-backup 禁止 detour（APP66 任务5.2）"
+        assert_eq!(
+            direct_backup["detour"].as_str(),
+            Some("direct"),
+            "dns-direct-backup 必须显式 detour=direct（v0.4.26 / ACP10）"
         );
         assert_eq!(
             built.config["dns"]["final"].as_str(),
-            Some("dns-direct"),
-            "dns.final 必须固定 dns-direct"
+            Some("dns-remote"),
+            "dns.final 必须是 dns-remote（v0.4.26 / ACP10）"
         );
         // 【APP60 任务3.1】最顶部已改为 reject SVCB/HTTPS + _dns.resolver.arpa，
         // outbound:any 不再是 index 0
@@ -6269,7 +6274,7 @@ rules:
                 .map(|s| s["address"].as_str().unwrap_or("").to_string())
                 .unwrap_or_default()
         };
-        assert_eq!(addr("dns-remote"), "https://1.1.1.1/dns-query");
+        assert_eq!(addr("dns-remote"), "https://8.8.8.8/dns-query");
         assert_eq!(addr("dns-direct"), "udp://223.5.5.5");
         assert_eq!(addr("dns-direct-backup"), "udp://119.29.29.29");
         assert_eq!(addr("dns-local"), "223.5.5.5");
@@ -6430,6 +6435,30 @@ rules:
                 .collect::<Vec<_>>(),
             "大陆 ip_cidr 清单 Rust/Swift 必须 100% 一致"
         );
+        // 【v0.4.26 / ACP10 任务3】绝不允许 /6 /7 /8 超宽 APNIC 网段混入
+        // 大陆直连清单，否则日本 / 韩国 / 澳洲等海外 IP 会被误伤为直连。
+        const ACP10_REMOVED_CIDRS: &[&str] = &[
+            "110.0.0.0/7",
+            "112.0.0.0/6",
+            "116.0.0.0/6",
+            "120.0.0.0/6",
+            "124.0.0.0/7",
+            "182.0.0.0/8",
+            "183.0.0.0/8",
+            "218.0.0.0/7",
+            "221.0.0.0/8",
+            "222.0.0.0/8",
+        ];
+        for cidr in ACP10_REMOVED_CIDRS {
+            assert!(
+                !CN_DIRECT_CIDRS.contains(cidr),
+                "CN_DIRECT_CIDRS 不得包含误伤海外 IP 的超宽网段 {cidr}"
+            );
+            assert!(
+                !extract("cnDirectCIDRs").iter().any(|s| s == cidr),
+                "Swift cnDirectCIDRs 不得包含误伤海外 IP 的超宽网段 {cidr}"
+            );
+        }
         assert_eq!(
             extract("proxyDomainSuffixes"),
             PROXY_DOMAIN_SUFFIXES
@@ -6551,11 +6580,8 @@ rules:
             .iter()
             .position(|r| r["clash_mode"] == "global")
             .expect("dns.rules 缺少 clash_mode: global");
-        // 【APP76 任务1.1】规则模式下所有普通域名统一由 dns.final = dns-direct
-        // （udp://223.5.5.5）极速返回，不再将 PROXY_DOMAIN_SUFFIXES /
-        // PROXY_DOMAIN_KEYWORDS 发往 dns-remote（机场若封禁 53 端口则全部海外
-        // 域名等待 7.5 秒后 IN A: EOF 失败）。验证 dns.rules 中不再存在任何
-        // `openai.com / google.com / *.com → dns-remote` 的 domain_suffix 规则。
+        // 【v0.4.26 / ACP10 任务2.3】PROXY_DOMAIN 必须显式走 dns-remote，
+        // dns-remote 为 https://8.8.8.8/dns-query 经主代理出境。
         let has_proxy_domain_to_remote = dns_rules.iter().any(|r| {
             r["server"] == "dns-remote"
                 && r["domain_suffix"]
@@ -6563,14 +6589,14 @@ rules:
                     .is_some_and(|a| a.iter().any(|x| x == "openai.com" || x == "google.com"))
         });
         assert!(
-            !has_proxy_domain_to_remote,
-            "【APP76】dns.rules 严禁存在 PROXY_DOMAIN → dns-remote 的 domain_suffix 规则"
+            has_proxy_domain_to_remote,
+            "【v0.4.26 / ACP10】dns.rules 必须存在 PROXY_DOMAIN → dns-remote 的 domain_suffix 规则"
         );
         assert!(
             dns_any < dns_cn && dns_cn < dns_global,
             "DNS 分流顺序必须为：直连上游 → 大陆后缀 → global"
         );
-        assert_eq!(built.config["dns"]["final"].as_str(), Some("dns-direct"));
+        assert_eq!(built.config["dns"]["final"].as_str(), Some("dns-remote"));
 
         let to_u32 = |s: &str| -> u32 {
             let mut v = 0u32;
@@ -6593,7 +6619,9 @@ rules:
             "14.116.241.17",
             "203.209.255.199",
             "58.144.143.17",
-            "116.169.167.239",
+            // 【v0.4.26 / ACP10 任务3】116.0.0.0/6 已因误伤海外 IP 被移除，
+            // 改用保留的 219.128.0.0/11 验证大陆直连仍生效。
+            "219.129.74.1",
         ] {
             let ipv = to_u32(ip);
             assert!(
@@ -6601,6 +6629,65 @@ rules:
                 "{ip} 必须命中大陆直连网段"
             );
         }
+    }
+
+    /// 【v0.4.26 / ACP10 任务2】DNS 死锁与 Cloudflare Worker 兼容回归：
+    /// - dns-direct / dns-direct-backup 必须显式 detour=direct；
+    /// - dns-remote 必须是 https://8.8.8.8/dns-query；
+    /// - route.rules 中公共 DNS IP 只拦截 853，绝不能拦 443；
+    /// - dns.final 必须为 dns-remote。
+    #[test]
+    fn acp10_dns_deadlock_and_cloudflare_worker_compatibility() {
+        let yaml = r#"
+proxies:
+  - {name: HK1, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-256-gcm, password: pw}
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [HK1]}
+rules:
+  - MATCH,节点选择
+"#;
+        let built = build(
+            &[("https://sub.example".into(), "订阅1".into(), yaml.into())],
+            &[],
+            RunMode::Tun,
+            &UserSettings::default(),
+            &std::env::temp_dir().join("prism-cb-test-acp10-dns"),
+            &std::env::temp_dir().join("prism-cb-test-acp10-dns/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build must succeed");
+
+        let servers = built.config["dns"]["servers"].as_array().unwrap();
+        let server = |tag: &str| {
+            servers
+                .iter()
+                .find(|s| s["tag"].as_str() == Some(tag))
+                .unwrap_or_else(|| panic!("missing DNS server {tag}"))
+        };
+        assert_eq!(server("dns-remote")["address"], "https://8.8.8.8/dns-query");
+        assert_eq!(server("dns-direct")["detour"], "direct");
+        assert_eq!(server("dns-direct-backup")["detour"], "direct");
+        assert_eq!(built.config["dns"]["final"], "dns-remote");
+
+        let route_rules = built.config["route"]["rules"].as_array().unwrap();
+        let blocks_443 = route_rules.iter().any(|r| {
+            let ports = r["port"]
+                .as_array()
+                .and_then(|a| a.iter().map(|v| v.as_u64()).collect::<Option<Vec<_>>>());
+            let public_dns = r["ip_cidr"].as_array().is_some_and(|a| {
+                a.iter().any(|v| {
+                    matches!(
+                        v.as_str(),
+                        Some("8.8.8.8/32" | "8.8.4.4/32" | "1.1.1.1/32" | "1.0.0.1/32")
+                    )
+                })
+            });
+            public_dns && ports.is_some_and(|p| p.contains(&443))
+        });
+        assert!(!blocks_443, "公共 DNS IP 拦截规则只能拦 853，绝不能拦 443");
     }
 
     /// 【ACP7 任务1】本地手动节点（local://manual-nodes）：

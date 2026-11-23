@@ -7,6 +7,7 @@ import {
   getCoreStatus,
   getProxyGroups,
   getCachedProxies,
+  getSettings,
   testAllDelays,
   selectProxy,
   urlTest,
@@ -529,10 +530,12 @@ export default function Proxies() {
     if (current === name) return;
     setUserTouched(true);
     try {
+      // 【v0.4.26 / ACP10 任务4】只有用户亲手点击节点才会设置手动指定标记；
+      // 后端 select_node 是唯一持久化 true 的入口，前端仅同步已提交的设置。
       await selectProxy(mainSelectorRef.current, name);
       setCurrent(name);
-      // 【v0.4.25 任务4】手动指定即上锁：徽标立即点亮，后续测速/优选不会覆盖
-      setStoreSettings({ ...useCoreStore.getState().settings, userManuallySelectedNode: true });
+      // 手动指定由后端持久化，前端回读权威设置，徽标只跟随后端真值
+      setStoreSettings(await getSettings());
       await loadProxies();
     } catch (e) {
       console.error("select proxy failed:", e);
@@ -544,7 +547,7 @@ export default function Proxies() {
   const handleResetToAuto = async () => {
     try {
       await resetNodeSelectionToAuto();
-      setStoreSettings({ ...useCoreStore.getState().settings, userManuallySelectedNode: false });
+      setStoreSettings(await getSettings());
       setUserTouched(false);
       toast.success(t("proxies.autoRestored"));
       await loadProxies();
@@ -583,6 +586,13 @@ export default function Proxies() {
   const filtered = nodes.filter(
     (n) => !keywordLower || n.name.toLowerCase().includes(keywordLower),
   );
+
+  /// 【v0.4.26 / ACP10 任务4】手动指定节点已超时（温和提示，不自动切换）。
+  const pinnedNodeTimedOut = useMemo(() => {
+    if (!manualPinned || !current) return false;
+    const node = nodes.find((n) => n.name === current);
+    return node ? lastDelay(node) === 0 : false;
+  }, [manualPinned, current, nodes, failed, delays]);
 
   /// 【APP54 任务5】已测速节点数（实测 >0 或超时 0 都算已测，未测为 undefined）
   const testedCount = nodes.filter((n) => typeof lastDelay(n) === "number").length;
@@ -831,12 +841,22 @@ export default function Proxies() {
               </span>
               <button
                 type="button"
-                title={t("proxies.pinnedTip")}
+                title={pinnedNodeTimedOut ? t("proxies.pinnedTimeoutHint") : t("proxies.pinnedTip")}
                 onClick={handleResetToAuto}
-                className="shrink-0 rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:text-gray-200"
+                className={clsx(
+                  "shrink-0 rounded px-1.5 py-0.5 text-[10px] transition-colors",
+                  pinnedNodeTimedOut
+                    ? "bg-amber-500/20 text-amber-400 hover:text-amber-300"
+                    : "bg-glass text-gray-400 hover:text-gray-200",
+                )}
               >
                 {t("proxies.pinnedAuto")}
               </button>
+              {pinnedNodeTimedOut && (
+                <span className="min-w-0 truncate text-[10px] text-amber-400/90">
+                  {t("proxies.pinnedTimeoutHint")}
+                </span>
+              )}
             </>
           )}
           <span className="shrink-0">·</span>

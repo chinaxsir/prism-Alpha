@@ -46,6 +46,7 @@ const zh: Record<string, string> = {
   "proxies.pinned": "已指定",
   "proxies.pinnedAuto": "恢复自动",
   "proxies.pinnedTip": "当前节点由手动指定锁定，点击恢复自动选点",
+  "proxies.pinnedTimeoutHint": "当前手动指定节点已超时，可点此恢复自动选点",
   "proxies.autoRestored": "已恢复自动选点",
   "proxies.aimRecommended": "AIM 推荐",
   "proxies.err.resetAutoFailed": "恢复自动选点失败：{error}",
@@ -349,6 +350,8 @@ const en: Record<string, string> = {
   "proxies.pinnedAuto": "Auto",
   "proxies.pinnedTip":
     "The current node is pinned by manual selection. Tap to restore automatic selection.",
+  "proxies.pinnedTimeoutHint":
+    "The pinned node has timed out. You can switch nodes or restore automatic selection.",
   "proxies.autoRestored": "Automatic node selection restored",
   "proxies.aimRecommended": "AIM Recommended",
   "proxies.err.resetAutoFailed": "Failed to restore auto selection: {error}",

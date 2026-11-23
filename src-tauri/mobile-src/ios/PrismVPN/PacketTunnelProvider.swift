@@ -141,13 +141,12 @@ private let cnDirectCIDRs: [String] = [
     "81.68.0.0/14",
     "106.12.0.0/14",
     "106.75.0.0/16",
-    // 【APP72 任务3.2】大陆运营商/宽带大网段（与 Rust CN_DIRECT_CIDRS 同步）
+    // 【v0.4.26 / ACP10 任务3】仅保留确认归属中国大陆的窄段（前缀 >= 11，
+    // 已剔除 10 个误伤日韩新港澳台印等海外 IP 的超大 APNIC /6 /7 /8 段；
+    // 与 Rust CN_DIRECT_CIDRS 100% 同步）
     "14.112.0.0/12", "58.144.0.0/16", "203.209.0.0/16",
-    "110.0.0.0/7", "112.0.0.0/6", "116.0.0.0/6", "120.0.0.0/6",
-    "124.0.0.0/7", "182.0.0.0/8", "183.0.0.0/8",
     "202.96.0.0/12", "210.21.0.0/16", "211.136.0.0/13",
-    "218.0.0.0/7", "219.128.0.0/11", "221.0.0.0/8", "222.0.0.0/8",
-    "223.64.0.0/11"
+    "219.128.0.0/11", "223.64.0.0/11"
 ]
 
 /// 【APP72 任务3.2】常见海外站点后缀：DNS 走 dns-remote，避免污染 IP
@@ -2619,33 +2618,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         var dnsServers: [[String: Any]] = [
-            // 【APP76 任务1.1】dns-remote 改为 HTTPS DoH 443 规避机场 53 端口封禁：
-            // 原先 tcp://8.8.8.8（53 端口）在被机场封禁时所有命中的域名等待 7.5 秒后
-            // 全部以 IN A: EOF 失败，Safari 因拿不到 IP 根本无法发起连接。DoH 走
-            // HTTPS 443 端口经主代理出境，彻底绕过 53 端口封堵。
-            // 【v0.4.19 任务1.4】dns-remote 统一为 1.1.1.1 DoH，并显式声明
-            // address_resolver=dns-direct：DoH 服务端域名/IP 的引导解析必须
-            // 走本地直连 DNS，避免「解析 DoH 又需要 DoH」的自回环。
+            // 【v0.4.26 / ACP10 任务2.2】dns-remote 统一为 Google DoH（https://8.8.8.8/dns-query）：
+            // Cloudflare 安全策略禁止 CF Worker 节点出站访问 1.1.1.1（连接会被边缘直接拒绝），
+            // 改为 8.8.8.8 DoH 443 经主代理出境，规避 53 端口封堵且完全兼容 CF Worker 节点。
+            // 显式声明 address_resolver=dns-direct 避免自回环。
             [
                 "tag": "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
+                "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": mainProxyTag,
                 "strategy": "ipv4_only"
             ],
-            // 【APP66 任务5.2】dns-direct 主用阿里 UDP 223.5.5.5、
-            // dns-direct-backup 备用腾讯 UDP 119.29.29.29；两者都以 /32
-            // 写入 ipv4Settings.excludedRoutes，从物理网卡直出，绝不回环。
-            // **禁止 detour: "direct"**：显式 direct 会让查询绕回 TUN 栈，
-            // 形成「出 TUN 需要 DNS、DNS 又需要出 TUN」的自回环。
+            // 【v0.4.26 / ACP10 任务2.1】dns-direct / dns-direct-backup 必须显式指定
+            // `detour: "direct"`：在 sing-box 1.11 中不写 detour 会回落到 route.final
+            // （即 Proxy 节点），节点失效或超时时将引发全盘 DNS 死锁；配合
+            // ipv4Settings.excludedRoutes 与顶部 223.5.5.5/32、119.29.29.29/32 -> direct
+            // 旁路规则，从物理网卡直出不回环。
             [
                 "tag": "dns-direct",
                 "address": "udp://223.5.5.5",
+                "detour": "direct",
                 "strategy": "ipv4_only"
             ],
             [
                 "tag": "dns-direct-backup",
                 "address": "udp://119.29.29.29",
+                "detour": "direct",
                 "strategy": "ipv4_only"
             ]
         ]
@@ -2711,23 +2709,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "clash_mode": "global",
             "server": "dns-remote"
         ])
-        // 【APP76 任务1.1】规则模式 / Direct 模式下所有普通域名统一由
-        // `dns.final = dns-direct`（udp://223.5.5.5）极速返回，不再把
-        // PROXY_DOMAIN_SUFFIXES / PROXY_DOMAIN_KEYWORDS 发往 dns-remote
-        // （机场若封禁 53 端口则全部海外域名等待 7.5 秒后 IN A: EOF 失败）。
-        // Safari/TUN 侧已开启 sniff + sniff_override_destination，会从 TLS
-        // ClientHello 嗅探出真实域名并覆写目标，交由 route.rules 走代理节点。
-        // 已删除以下两条（与 Rust config_builder.rs 完全一致）：
-        //   dnsRules.append(["domain_suffix": proxyDomainSuffixes, "server": "dns-remote"])
-        //   dnsRules.append(["domain_keyword": proxyDomainKeywords, "server": "dns-remote"])
+        // 【v0.4.26 / ACP10 任务2.3】恢复海外核心域名 DNS 走 dns-remote：
+        // dns-remote 统一为 https://8.8.8.8/dns-query（DoH 443 经主代理），
+        // 彻底兼容 Cloudflare Worker 节点并规避机场封禁 53 端口。
+        dnsRules.append(["domain_suffix": proxyDomainSuffixes, "server": "dns-remote"])
+        dnsRules.append(["domain_keyword": proxyDomainKeywords, "server": "dns-remote"])
         root["dns"] = [
             "servers": dnsServers,
             "rules": dnsRules,
-            // 【APP65 任务2.3】final 固定 dns-direct（UDP 223.5.5.5 直出）：
-            // 本地 DNS 10ms 内必答，绝不因远端节点封禁 DNS/DoH 超时而
-            // 出现 `dns: exchange failed ... IN A: EOF`；真实域名由
-            // tun-in 的 sniff_override_destination 还原后交给节点服务器解析。
-            "final": "dns-direct",
+            // 【v0.4.26 / ACP10 任务2.3】普通域名默认 dns-remote；国内域名
+            // 已由上方 cnDirectDomainSuffixes / dns-local 规则显式直连解析。
+            "final": "dns-remote",
             "strategy": "ipv4_only",
             // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
             // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路

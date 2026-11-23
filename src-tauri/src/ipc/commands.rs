@@ -1451,6 +1451,12 @@ pub async fn select_proxy(
             }
         }
     }
+    // 【v0.4.26 / ACP10 任务4】手动选点持久化后广播权威设置，前端徽标
+    // 只跟随后端真值，避免默认首节点 / 自动纠偏被临时误标为已指定。
+    let _ = app.emit(
+        "settings://updated",
+        serde_json::to_value(state.settings.read().clone()).unwrap_or_default(),
+    );
     // 【APP37 任务3.2】用户手动切换节点绝不再中止 Go AIM 探测：
     // 探测循环只响应「Go AIM 开关关闭」与「VPN 停止」两个中止条件，
     // 自动选点/手动切点导致的 selected_node 变化不再误触中止锁。
@@ -3229,12 +3235,28 @@ pub(crate) fn purge_disabled_or_deleted_subscription_nodes(state: &AppState) {
             *locked = None;
         }
     }
-    // 3) 选中节点 / 手动指定节点失效 → 重置为当前第一个可用节点并落盘
+    // 【v0.4.26 / ACP10 任务4】选中节点 / 手动指定节点若已失效，重置为
+    // 当前可用节点中的第一个并落盘。新导入订阅或旧节点不存在时，必须重置
+    // user_manually_selected_node=false，避免默认首节点被误标为手动指定。
     let mut settings = state.settings.read().clone();
     let mut changed = false;
     let next_selected = fallback_selected_node(settings.selected_node.as_deref(), &valid_names);
     if next_selected != settings.selected_node {
         settings.selected_node = next_selected;
+        changed = true;
+        settings.user_manually_selected_node = false;
+        *state.user_manually_selected_node.write() = false;
+    }
+    // 即使名义上仍存在，只要订阅刷新后当前手动指定节点不在新节点集合中，
+    // 也必须解除手动锁定（防止订阅换节点后旧标签继续锁定默认首节点）。
+    if settings.user_manually_selected_node
+        && settings
+            .selected_node
+            .as_deref()
+            .is_some_and(|n| !valid.contains(n))
+    {
+        settings.user_manually_selected_node = false;
+        *state.user_manually_selected_node.write() = false;
         changed = true;
     }
     if let Some(pinned) = settings.go_aim_pinned_node.clone()
@@ -6294,6 +6316,50 @@ mod app51_tests {
             Some("香港01")
         );
         assert_eq!(fallback_selected_node(Some("任意"), &[]), None);
+    }
+
+    /// 【v0.4.26 / ACP10 任务4】只有 select_proxy 是手动指定 true 的入口。
+    /// 源码扫描确保导入订阅 / 默认首节点 / 自动纠偏 / 测速 / Go AIM 路径
+    /// 不会再误写 user_manually_selected_node=true。
+    #[test]
+    fn acp10_only_select_proxy_marks_manual_node() {
+        // 测试源码本身也含关键字，必须排除本测试函数，避免自指误报。
+        const SRC: &str = include_str!("commands.rs");
+        let code_before_test = SRC
+            .split("fn acp10_only_select_proxy_marks_manual_node()")
+            .next()
+            .unwrap_or(SRC);
+        let assignments: Vec<&str> = code_before_test
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .starts_with("settings.user_manually_selected_node = true")
+            })
+            .collect();
+        assert!(
+            assignments
+                .iter()
+                .all(|line| line.contains("settings.user_manually_selected_node = true")),
+            "仅允许 select_proxy 持久化手动指定状态，发现异常写法：{assignments:?}"
+        );
+        assert_eq!(
+            assignments.len(),
+            1,
+            "手动指定 true 只能有一个后端写入点，发现：{assignments:?}"
+        );
+
+        let select_proxy_start = SRC
+            .find("pub async fn select_proxy(")
+            .expect("select_proxy must exist");
+        let select_proxy_end = SRC[select_proxy_start..]
+            .find("\n}\n")
+            .map(|off| select_proxy_start + off)
+            .expect("select_proxy must end");
+        let select_proxy = &SRC[select_proxy_start..select_proxy_end];
+        assert!(
+            select_proxy.contains("settings.user_manually_selected_node = true;"),
+            "select_proxy 必须持久化手动指定状态"
+        );
     }
 }
 
