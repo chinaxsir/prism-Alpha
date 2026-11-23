@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import App from "./App";
 import "./styles/globals.css";
+import { currentUiLang } from "./utils/errorSanitizer";
 
 /** 【APP24 任务4.4】顶层防黑屏 ErrorBoundary：React 18 中任何子组件渲染
  *  期抛出未捕获异常会直接卸载整个 #root，屏幕变成纯黑背景色。此兜底
@@ -39,22 +40,22 @@ class RootErrorBoundary extends React.Component<
           }}
         >
           <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>
-            界面渲染出错 / Rendering error
+            {currentUiLang() === "zh" ? "界面遇到短暂异常" : "Temporary Interface Issue"}
           </div>
-          <pre
+          <div
             style={{
-              maxWidth: "100%",
-              maxHeight: 200,
-              overflow: "auto",
-              fontSize: 12,
-              color: "#f87171",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-all",
+              maxWidth: 420,
+              textAlign: "center",
+              fontSize: 13,
+              lineHeight: 1.7,
+              color: "#94a3b8",
               marginBottom: 16,
             }}
           >
-            {error.message}
-          </pre>
+            {currentUiLang() === "zh"
+              ? "界面渲染未能完成，请点击下方按钮重新加载。详细排查信息已记录至「运行日志」。"
+              : "The interface failed to finish rendering. Please reload below. Diagnostics have been written to Logs."}
+          </div>
           <button
             type="button"
             onClick={() => window.location.reload()}

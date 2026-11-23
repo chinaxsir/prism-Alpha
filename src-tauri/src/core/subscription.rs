@@ -1337,7 +1337,10 @@ pub fn merge_manual_nodes(
             .trim()
             .to_string();
         let name = if raw_name.is_empty() {
-            let server = node.get("server").and_then(|s| s.as_str()).unwrap_or("手动节点");
+            let server = node
+                .get("server")
+                .and_then(|s| s.as_str())
+                .unwrap_or("手动节点");
             let port = node.get("port").and_then(|p| p.as_u64()).unwrap_or(0);
             unique_node_name(&format!("{server}:{port}"), &nodes)
         } else {

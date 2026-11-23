@@ -12,11 +12,38 @@ use crate::core::kernel::{
 use crate::core::license::EntitlementStatus;
 use crate::core::state::{
     AppState, CoreStatus, OutboundMode, RunMode, UserSettings, pick_api_addr,
+    should_auto_select_node,
 };
+
+// 【v0.4.25 任务3.1】面向用户的业务错误码：附加在原始中文文案之后
+// （保留前端 toast 依赖的原文与 `rate_limited:` 前缀，只追加稳定标识）。
+pub const ERR_VPN_PERMISSION_DENIED: &str = "ERR_VPN_PERMISSION_DENIED";
+pub const ERR_NO_SUBSCRIPTION: &str = "ERR_NO_SUBSCRIPTION";
+pub const ERR_NO_VALID_NODES: &str = "ERR_NO_VALID_NODES";
+pub const ERR_KERNEL_START_TRANSIENT: &str = "ERR_KERNEL_START_TRANSIENT";
 
 /// 返回前端前的错误文本统一脱敏（抹除内核商标字样）
 fn sanitize_err(msg: &str) -> String {
     sanitize_kernel_error(msg)
+}
+
+/// 【v0.4.25 任务3.1】命令失败时把完整（脱敏）详情落入 Kernel 日志。
+/// 前端仍只收到 `sanitize_err` 后的简短文案，便于用户排障与服务端诊断。
+fn log_cmd_error(context: &str, raw: impl AsRef<str>) {
+    let detail = crate::core::logger::sanitize_error_detail(raw.as_ref());
+    crate::core::logger::error(
+        crate::core::logger::MOD_KERNEL,
+        format!("{context}: {detail}"),
+    );
+}
+
+/// 【v0.4.25 任务3.1】在原始中文文案末尾追加业务错误码（幂等）。
+fn with_code(msg: impl Into<String>, code: &str) -> String {
+    let mut msg = msg.into();
+    if !msg.contains(code) {
+        msg.push_str(&format!(" [{code}]"));
+    }
+    msg
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +136,7 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
         if matches!(current, CoreStatus::Starting | CoreStatus::Running) {
             return Ok(());
         }
+        log_cmd_error("内核状态切换失败（Starting）", e.to_string());
         return Err(sanitize_err(&e.to_string()));
     }
 
@@ -121,15 +149,17 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
 
     // 启动失败时统一回滚，避免半成品状态
     if let Err(e) = do_start(app, state).await {
+        log_cmd_error("启动内核失败", &e);
         let _ = do_stop(state).await;
         let _ = state.transition(CoreStatus::Error);
         return Err(e);
     }
 
     *state.started_at.write() = Some(std::time::Instant::now());
-    state
-        .transition(CoreStatus::Running)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.transition(CoreStatus::Running).map_err(|e| {
+        log_cmd_error("内核状态切换失败（Running）", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
     // 【APP52 任务4】[连接成功] 阶段三：内核已 Running，开始接管流量
     {
         let node = state
@@ -219,24 +249,34 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     {
         let granted = tauri::async_runtime::spawn_blocking(crate::platform::ensure_vpn_permission)
             .await
-            .map_err(|e| format!("VPN 授权检查任务异常退出: {e}"))?
-            .map_err(|e| sanitize_err(&e.to_string()))?;
+            .map_err(|e| {
+                let msg = format!("VPN 授权检查任务异常退出: {e}");
+                log_cmd_error("VPN 授权检查任务异常", &msg);
+                msg
+            })?
+            .map_err(|e| {
+                log_cmd_error("VPN 授权检查失败", e.to_string());
+                sanitize_err(&e.to_string())
+            })?;
         if !granted {
-            return Err(
-                "需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动".into(),
-            );
+            let msg = "需要系统 VPN 授权：请在弹出的系统对话框中点击「允许」，然后再次点击启动";
+            log_cmd_error("VPN 授权被拒绝", msg);
+            return Err(with_code(msg, ERR_VPN_PERMISSION_DENIED));
         }
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     if mode == RunMode::Tun && !crate::platform::has_elevated_privilege() {
-        return Err(
-            "TUN 模式需要管理员/root 权限：请完全退出 Prism 后以管理员身份重新运行（macOS/Linux 使用 sudo）"
-                .into(),
-        );
+        let msg = "TUN 模式需要管理员/root 权限：请完全退出 Prism 后以管理员身份重新运行（macOS/Linux 使用 sudo）";
+        log_cmd_error("TUN 权限拒绝", msg);
+        return Err(with_code(msg, ERR_VPN_PERMISSION_DENIED));
     }
 
     let work_dir = state.work_dir();
-    std::fs::create_dir_all(&work_dir).map_err(|e| format!("创建内核工作目录失败: {}", e))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| {
+        let msg = format!("创建内核工作目录失败: {}", e);
+        log_cmd_error("创建内核工作目录失败", &msg);
+        msg
+    })?;
 
     // 读取全部启用订阅的 profile（多订阅模型；旧版单 profile.yaml 自动兼容）
     let profiles = load_enabled_profiles(state);
@@ -262,19 +302,23 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
             // 自动补拉后不再读取 profiles：下方直接返回错误提示
         }
         let has_records = !crate::core::store::load_subscriptions(&state.data_dir).is_empty();
-        return Err(if has_records {
-            "订阅内容缺失（本地缓存不存在）：请在「订阅」页点击更新，成功后再启动内核".into()
+        let msg = if has_records {
+            "订阅内容缺失（本地缓存不存在）：请在「订阅」页点击更新，成功后再启动内核"
         } else {
-            "尚未导入订阅：请先在「订阅」页添加订阅".into()
-        });
+            "尚未导入订阅：请先在「订阅」页添加订阅"
+        };
+        log_cmd_error("启动前置检查失败（无可用订阅）", msg);
+        return Err(with_code(msg, ERR_NO_SUBSCRIPTION));
     }
 
     // 内核必须随安装包分发，任何平台都不运行时联网下载：
     // - 桌面：Tauri sidecar（bundle.externalBin）
     // - iOS/Android：c-archive 静态链接进主程序（ios-kernel，无二进制路径）
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    let binary_path = resolve_kernel_path(&work_dir).map_err(|_| {
-        "内核文件缺失（Prism 不会联网下载内核）：请重新安装 Prism；若被安全软件删除或隔离，请恢复后重试"
+    let binary_path = resolve_kernel_path(&work_dir).map_err(|e| {
+        let msg = "内核文件缺失（Prism 不会联网下载内核）：请重新安装 Prism；若被安全软件删除或隔离，请恢复后重试";
+        log_cmd_error("解析内核二进制失败", format!("{msg} ({e})"));
+        msg
     })?;
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let binary_path = std::path::PathBuf::new();
@@ -289,10 +333,12 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
             "127.0.0.1"
         };
         if !crate::core::state::is_port_free(listen_host, settings.mixed_port) {
-            return Err(format!(
+            let msg = format!(
                 "混合端口 {} 已被占用，请在“设置”中更换端口后重试",
                 settings.mixed_port
-            ));
+            );
+            log_cmd_error("混合端口预检失败", &msg);
+            return Err(msg);
         }
     }
 
@@ -321,7 +367,10 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         &go_lan_cfg,
         &go_cus_cfg,
     )
-    .map_err(|e| sanitize_err(&e.to_string()))?;
+    .map_err(|e| {
+        log_cmd_error("构建内核配置失败", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
 
     // 【APP43 任务2】构建后校验是否存在至少一个「真实叶子节点」：
     // 排除 direct/reject/block/dns/go-lan-* 内置/系统标签；订阅里全是
@@ -366,9 +415,9 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
             })
             .unwrap_or(0);
         if real_count == 0 {
-            return Err(
-                "当前订阅未解析到任何可连接的实际节点：可能是机场面板限流、订阅链接已失效，或返回了机场公告页。请在「订阅」页点击更新，成功后再启动内核。".into(),
-            );
+            let msg = "当前订阅未解析到任何可连接的实际节点：可能是机场面板限流、订阅链接已失效，或返回了机场公告页。请在「订阅」页点击更新，成功后再启动内核。";
+            log_cmd_error("配置校验失败（无有效节点）", msg);
+            return Err(with_code(msg, ERR_NO_VALID_NODES));
         }
     }
     for warning in &built.warnings {
@@ -471,7 +520,13 @@ async fn apply_prepared(
 
     let handle = KernelHandle::spawn(kernel_config, app.clone())
         .await
-        .map_err(|e| format!("内核启动失败: {}", sanitize_err(&e.to_string())))?;
+        .map_err(|e| {
+            log_cmd_error("内核进程启动失败", e.to_string());
+            with_code(
+                format!("内核启动失败: {}", sanitize_err(&e.to_string())),
+                ERR_KERNEL_START_TRANSIENT,
+            )
+        })?;
 
     *state.kernel_handle.write() = Some(Arc::new(handle));
 
@@ -641,31 +696,45 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
         return Err(block.message);
     }
     // 1. 准备新配置（不改变任何状态）
-    let prepared = prepare_start(app, state).await?;
+    let prepared = prepare_start(app, state).await.map_err(|e| {
+        log_cmd_error("重启内核准备失败", &e);
+        e
+    })?;
 
     // 2. sing-box check 静态校验
     let check_path = state.work_dir().join("config.precheck.json");
-    let bytes = serde_json::to_vec_pretty(&prepared.built.config)
-        .map_err(|e| format!("序列化预检配置失败: {e}"))?;
-    std::fs::write(&check_path, bytes).map_err(|e| format!("写入预检配置失败: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&prepared.built.config).map_err(|e| {
+        let msg = format!("序列化预检配置失败: {e}");
+        log_cmd_error("序列化预检配置失败", &msg);
+        msg
+    })?;
+    std::fs::write(&check_path, bytes).map_err(|e| {
+        let msg = format!("写入预检配置失败: {e}");
+        log_cmd_error("写入预检配置失败", &msg);
+        msg
+    })?;
     if let Err(e) = check_config(&prepared.binary_path, &state.work_dir(), &check_path).await {
         let _ = std::fs::remove_file(&check_path);
+        log_cmd_error("内核配置静态校验失败", e.to_string());
         return Err(sanitize_err(&e.to_string()));
     }
     let _ = std::fs::remove_file(&check_path);
 
     // 3. 停止旧内核
-    state
-        .transition(CoreStatus::Stopping)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.transition(CoreStatus::Stopping).map_err(|e| {
+        log_cmd_error("内核状态切换失败（Stopping）", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
     if let Err(e) = do_stop(state).await {
+        log_cmd_error("重启时停止旧内核失败", e.to_string());
         let _ = state.transition(CoreStatus::Error);
         return Err(sanitize_err(&e.to_string()));
     }
     *state.started_at.write() = None;
-    state
-        .transition(CoreStatus::Stopped)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.transition(CoreStatus::Stopped).map_err(|e| {
+        log_cmd_error("内核状态切换失败（Stopped）", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
 
     // 【APP57 任务2】重启会话：旧内核已停、统计已清零，通知前端立即重置
     let _ = app.emit(
@@ -674,18 +743,21 @@ pub(crate) async fn restart_core(app: &AppHandle, state: &AppState) -> Result<()
     );
 
     // 4. 应用已校验的配置启动新内核；失败仍转 Error 允许重试
-    state
-        .transition(CoreStatus::Starting)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.transition(CoreStatus::Starting).map_err(|e| {
+        log_cmd_error("内核状态切换失败（Starting/重启）", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
     if let Err(e) = apply_prepared(prepared, app, state).await {
+        log_cmd_error("重启内核时应用配置失败", &e);
         let _ = do_stop(state).await;
         let _ = state.transition(CoreStatus::Error);
         return Err(e);
     }
     *state.started_at.write() = Some(std::time::Instant::now());
-    state
-        .transition(CoreStatus::Running)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    state.transition(CoreStatus::Running).map_err(|e| {
+        log_cmd_error("内核状态切换失败（Running/重启）", e.to_string());
+        sanitize_err(&e.to_string())
+    })?;
     crate::core::license::set_local_mixed_port(state.settings.read().mixed_port);
 
     // 与 start_core 一致：重启后自动测速选点（APP26：同样受 Go AIM /
@@ -817,14 +889,15 @@ fn spawn_auto_select(app: AppHandle, api_addr: String, api_secret: String, group
             }
         }
         let api = KernelApi::new(&api_addr, &api_secret);
-        let data_dir = app.state::<AppState>().data_dir.clone();
-        match auto_select_fastest(&api, &group, &data_dir).await {
+        let st = app.state::<AppState>();
+        let data_dir = st.data_dir.clone();
+        match auto_select_fastest(&api, &group, &data_dir, &st).await {
             Ok(Some(best)) => {
                 tracing::info!("auto selected fastest node in [{group}]: {best}");
                 // 通知节点页刷新（当前选中项/延迟已变化）
                 let _ = app.emit("proxies://changed", ());
             }
-            Ok(None) => tracing::warn!("auto select: no alive leaf node in [{group}]"),
+            Ok(None) => tracing::info!("auto select: 无可用叶子节点或已保留用户指定节点 [{group}]"),
             Err(e) => tracing::warn!("auto select in [{group}] failed: {e}"),
         }
     });
@@ -839,6 +912,7 @@ async fn auto_select_fastest(
     api: &KernelApi,
     group: &str,
     data_dir: &std::path::Path,
+    state: &AppState,
 ) -> anyhow::Result<Option<String>> {
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
@@ -869,6 +943,11 @@ async fn auto_select_fastest(
             .filter(|n| map.get(n).map(|i| i.get("all").is_none()).unwrap_or(true))
             .collect();
         let best = crate::core::kernel::tcp_select_fastest(&candidates, &endpoints).await;
+        // 【v0.4.25 任务4】手动指定绝对锁：测速完成后若用户已手动指定且节点
+        // 仍可用，绝不切换，只记录保持日志。
+        if manual_lock_keeps_node(state, &candidates) {
+            return Ok(None);
+        }
         if let Some((name, _)) = &best {
             // 仅发送 1 次 PUT 切换，避免任何额外重启动作
             api.select_proxy(group, name).await?;
@@ -928,11 +1007,31 @@ async fn auto_select_fastest(
             .map(|(n, _)| n.clone())
             .or_else(|| real_leafs.first().cloned());
 
+        // 【v0.4.25 任务4】手动指定绝对锁：整组测速完成后，若用户已手动
+        // 指定且节点仍存在，绝不切换，只记录保持日志。
+        if manual_lock_keeps_node(state, &real_leafs) {
+            return Ok(None);
+        }
         if let Some(best) = &best {
             api.select_proxy(group, best).await?;
         }
         Ok(best)
     }
+}
+
+/// 【v0.4.25 任务4】自动测速择优切点前的绝对锁检查：
+/// 返回 true 表示必须保持用户指定节点（已写「[节点保持]」日志）。
+fn manual_lock_keeps_node(state: &AppState, available: &[String]) -> bool {
+    let settings = state.settings.read().clone();
+    if should_auto_select_node(&settings, available) {
+        return false;
+    }
+    let current = settings.selected_node.unwrap_or_default();
+    crate::core::logger::info(
+        crate::core::logger::MOD_NODE,
+        &format!("[节点保持] 已保留用户指定节点「{current}」，未自动切换"),
+    );
+    true
 }
 
 /// 解析 sing-box 二进制位置，优先级：
@@ -1347,6 +1446,7 @@ pub async fn select_proxy(
             settings.selected_node = Some(name.clone());
             settings.user_manually_selected_node = true;
             if let Err(e) = state.save_settings(settings) {
+                log_cmd_error("保存用户选中节点失败", e.to_string());
                 tracing::error!("save selected_node failed: {e}");
             }
         }
@@ -1413,6 +1513,7 @@ pub async fn select_proxy(
         let inner = state.inner();
         let _ = do_stop(inner).await;
         if let Err(e) = start_core_inner(&app, inner).await {
+            log_cmd_error("选点后重建内核失败", &e);
             tracing::error!("vpn reload 失败: {e}");
         }
     }
@@ -1426,6 +1527,7 @@ pub async fn select_proxy(
         if settings.go_aim_pinned_node.as_deref() != Some(name.as_str()) {
             settings.go_aim_pinned_node = Some(name.clone());
             if let Err(e) = state.save_settings(settings.clone()) {
+                log_cmd_error("保存 Go AIM 手动指定节点失败", e.to_string());
                 tracing::error!("save go_aim_pinned_node failed: {e}");
             }
             *state.aim_locked_node.write() = Some(name.clone());
@@ -1447,6 +1549,31 @@ pub async fn select_proxy(
     Ok(())
 }
 
+/// 【v0.4.25 任务4】解除「用户手动指定节点」绝对锁，回到自动选点模式：
+/// - `user_manually_selected_node = false`（允许自动测速/Go AIM 覆盖）；
+/// - `go_aim_pinned_node = None`（清除 Go AIM 手动指定）；
+/// - `selected_node` 保留，界面继续展示当前节点，由下一次自动择优覆盖落盘。
+#[tauri::command]
+pub async fn reset_node_selection_to_auto(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut settings = state.settings.read().clone();
+    settings.user_manually_selected_node = false;
+    settings.go_aim_pinned_node = None;
+    *state.user_manually_selected_node.write() = false;
+    if let Err(e) = state.save_settings(settings) {
+        log_cmd_error("重置节点为自动选择失败", e.to_string());
+        return Err(format!("保存设置失败: {}", sanitize_err(&e.to_string())));
+    }
+    crate::core::logger::info(
+        crate::core::logger::MOD_NODE,
+        "已解除用户指定节点锁，恢复自动选点模式",
+    );
+    let _ = app.emit("proxies://changed", ());
+    Ok(())
+}
+
 /// 下载订阅并写入 profile.yaml。
 /// 兼容两种返回：Clash YAML 明文、base64 包裹的内容。
 /// 【APP42 任务2.1】name 为可选的用户自定义备注名。
@@ -1457,10 +1584,18 @@ pub async fn update_subscription(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    refresh_subscription(&app, &state, &url).await?;
+    refresh_subscription(&app, &state, &url)
+        .await
+        .map_err(|e| {
+            log_cmd_error("更新订阅失败", &e);
+            e
+        })?;
     if let Some(n) = name.as_deref() {
-        crate::core::store::set_subscription_name(&state.data_dir, &url, Some(n))
-            .map_err(|e| format!("保存订阅备注名失败: {e}"))?;
+        crate::core::store::set_subscription_name(&state.data_dir, &url, Some(n)).map_err(|e| {
+            let msg = format!("保存订阅备注名失败: {e}");
+            log_cmd_error("保存订阅备注名失败", &msg);
+            msg
+        })?;
     }
     // Pro/买断：静默上报云端（其他设备下次对账时拉取）
     // 【ACP7 任务1】本地手动节点订阅永不参与云端同步
@@ -1489,7 +1624,8 @@ pub async fn update_all_subscriptions(
         .map(|r| r.url)
         .collect();
     if urls.is_empty() {
-        return Err("暂无可更新的订阅".to_string());
+        log_cmd_error("批量更新订阅失败（无订阅）", "暂无可更新的订阅");
+        return Err(with_code("暂无可更新的订阅", ERR_NO_SUBSCRIPTION));
     }
     let mut ok = 0usize;
     let mut last_err = String::new();
@@ -1497,6 +1633,7 @@ pub async fn update_all_subscriptions(
         match refresh_subscription(&app, &state, url).await {
             Ok(()) => ok += 1,
             Err(e) => {
+                log_cmd_error(&format!("批量更新订阅失败: {url}"), &e);
                 tracing::warn!("[SubUpdateAll] 更新失败 {url}: {e}");
                 last_err = e;
             }
@@ -1505,6 +1642,7 @@ pub async fn update_all_subscriptions(
     use tauri::Emitter;
     let _ = app.emit("subscriptions://changed", ());
     if ok == 0 {
+        log_cmd_error("全部订阅更新失败", &last_err);
         Err(format!("全部更新失败：{last_err}"))
     } else {
         Ok(())
@@ -1725,7 +1863,10 @@ fn normalize_import_payload(raw: &str) -> String {
     for prefix in ["shadowrocket://add/", "clash://install-config?url="] {
         if let Some(rest) = text.strip_prefix(prefix) {
             let decoded = percent_decode(rest);
-            let candidate = decoded.strip_prefix("sub://").unwrap_or(&decoded).to_string();
+            let candidate = decoded
+                .strip_prefix("sub://")
+                .unwrap_or(&decoded)
+                .to_string();
             text = if candidate.starts_with("http://") || candidate.starts_with("https://") {
                 candidate
             } else if let Some(url) = base64_decode_text(&candidate) {
@@ -1841,12 +1982,16 @@ fn parse_import_nodes(text: &str) -> Result<Vec<serde_json::Value>, String> {
     let mut seen = std::collections::HashSet::new();
     for node in nodes.iter_mut() {
         let base = crate::core::uri_parser::fix_utf8_mojibake(
-            node.get("name").and_then(|n| n.as_str()).unwrap_or_default(),
+            node.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default(),
         );
         let base = if base.is_empty() {
             format!(
                 "{}:{}",
-                node.get("server").and_then(|s| s.as_str()).unwrap_or("节点"),
+                node.get("server")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("节点"),
                 node.get("port").and_then(|p| p.as_u64()).unwrap_or(0)
             )
         } else {
@@ -1893,7 +2038,11 @@ fn build_manual_node(input: ManualNodeInput) -> Result<serde_json::Value, String
         .unwrap_or_else(|| "tcp".into());
     let tls = input.tls.unwrap_or(false);
     let skip_cert_verify = input.skip_cert_verify.unwrap_or(false);
-    let sni = input.sni.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let sni = input
+        .sni
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let mut node = serde_json::json!({
         "name": name,
@@ -1903,23 +2052,27 @@ fn build_manual_node(input: ManualNodeInput) -> Result<serde_json::Value, String
     });
     match protocol.as_str() {
         "ss" => {
-            node["cipher"] = serde_json::json!(input
-                .cipher
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("aes-256-gcm"));
+            node["cipher"] = serde_json::json!(
+                input
+                    .cipher
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("aes-256-gcm")
+            );
             node["password"] = serde_json::json!(required(&input.password, "密码")?);
         }
         "vmess" => {
             node["uuid"] = serde_json::json!(required(&input.uuid, "UUID")?);
             node["alterId"] = serde_json::json!(input.alter_id.unwrap_or(0));
-            node["cipher"] = serde_json::json!(input
-                .cipher
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("auto"));
+            node["cipher"] = serde_json::json!(
+                input
+                    .cipher
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("auto")
+            );
             node["tls"] = serde_json::json!(tls);
         }
         "vless" => {
@@ -1935,12 +2088,22 @@ fn build_manual_node(input: ManualNodeInput) -> Result<serde_json::Value, String
         }
         "socks5" | "socks" => {
             node["type"] = serde_json::json!("socks5");
-            if let Some(user) = input.password.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(user) = input
+                .password
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 node["password"] = serde_json::json!(user);
             }
         }
         "http" => {
-            if let Some(user) = input.password.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(user) = input
+                .password
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 node["password"] = serde_json::json!(user);
             }
         }
@@ -1965,7 +2128,12 @@ fn build_manual_node(input: ManualNodeInput) -> Result<serde_json::Value, String
                 .filter(|s| !s.is_empty())
                 .unwrap_or("/");
             let mut ws = serde_json::json!({ "path": path });
-            if let Some(host) = input.ws_host.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(host) = input
+                .ws_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 ws["headers"] = serde_json::json!({ "Host": host });
             }
             node["ws-opts"] = ws;
@@ -1991,8 +2159,7 @@ async fn finalize_manual_import(
     nodes: Vec<serde_json::Value>,
     display_name: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    let (touched, total) =
-        crate::core::subscription::merge_manual_nodes(&state.data_dir, nodes)?;
+    let (touched, total) = crate::core::subscription::merge_manual_nodes(&state.data_dir, nodes)?;
     crate::core::store::upsert_subscription(
         &state.data_dir,
         crate::core::subscription::MANUAL_SUB_URL,
@@ -2095,12 +2262,10 @@ pub async fn import_qr_or_text_payload(
         tauri::async_runtime::spawn(async move {
             crate::core::sync_links::push_link(&app2, &url2, name2).await;
         });
-        let node_count = std::fs::read_to_string(crate::core::store::profile_path(
-            &state.data_dir,
-            &url,
-        ))
-        .map(|t| subscription_real_node_count(&t))
-        .unwrap_or(0);
+        let node_count =
+            std::fs::read_to_string(crate::core::store::profile_path(&state.data_dir, &url))
+                .map(|t| subscription_real_node_count(&t))
+                .unwrap_or(0);
         return Ok(ImportOutcome {
             kind: "subscription".into(),
             node_count,
@@ -3316,11 +3481,13 @@ async fn run_all_delays(
         }
     }
 
-    // 【APP81 任务2.1】启动择优不读旧手动锁；手动点击「测速」仍尊重用户选点。
+    // 【v0.4.25 任务4】手动指定绝对锁：按本次实测节点列表统一判定。
+    // 启动择优（startup_optimization）同样受锁约束，绝不再绕过用户手动指定。
     let best = lowest_latency_node(&all);
-    let manually_locked = *state.user_manually_selected_node.read() && !startup_optimization;
+    let available: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
+    let auto_allowed = should_auto_select_node(&state.settings.read().clone(), &available);
     if let Some((best_name, best_delay)) = best.clone()
-        && (!manually_locked || startup_optimization)
+        && auto_allowed
     {
         let mut settings = state.settings.read().clone();
         let selection_changed = settings.selected_node.as_deref() != Some(best_name.as_str())
@@ -3358,6 +3525,19 @@ async fn run_all_delays(
             } else {
                 format!("全量测速完成，自动选择最低延迟节点「{best_name}」({best_delay}ms)")
             },
+        );
+    } else if !auto_allowed {
+        let current = state
+            .settings
+            .read()
+            .selected_node
+            .clone()
+            .unwrap_or_default();
+        crate::core::logger::info(
+            crate::core::logger::MOD_NODE,
+            &format!(
+                "[节点保持] 已保留用户指定节点「{current}」，未自动切换（全量测速完成，共 {total} 个节点）"
+            ),
         );
     } else {
         crate::core::logger::info(
@@ -3443,7 +3623,9 @@ pub async fn test_cached_proxies(
     }
     // 【APP52 任务1】测速结果持久化 + 自动选最低延迟节点（用户未手动指定时）
     state.record_node_delays(all_delays.iter().cloned());
-    if !*state.user_manually_selected_node.read()
+    // 【v0.4.25 任务4】统一走手动指定绝对锁判定
+    let available: Vec<String> = all_delays.iter().map(|(n, _)| n.clone()).collect();
+    if should_auto_select_node(&state.settings.read().clone(), &available)
         && let Some((best, _)) = all_delays
             .iter()
             .filter(|(_, d)| *d > 0)
@@ -4083,9 +4265,7 @@ pub async fn get_device_id(state: State<'_, AppState>) -> Result<String, String>
 /// 【ACP7 任务2】只同步席位（used_seats / max_seats）实时值：
 /// 授权信息弹窗打开 / 「校验」按钮点击时调用，绝不修改授权有效性。
 #[tauri::command]
-pub async fn sync_license_seats(
-    state: State<'_, AppState>,
-) -> Result<EntitlementStatus, String> {
+pub async fn sync_license_seats(state: State<'_, AppState>) -> Result<EntitlementStatus, String> {
     let settings = state.settings.read().clone();
     match crate::core::license::refresh_seats_only(&state.data_dir, &settings).await {
         Some(ent) => {
@@ -5718,14 +5898,18 @@ pub fn is_vpn_actually_running(state: &AppState) -> bool {
 
 // ============================== Go Cus（Pro） ==============================
 
-/// 读取覆写引擎配置
+/// 读取覆写引擎配置（附实时命中统计）
 #[tauri::command]
 pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     if !state.is_pro_active() {
         return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let cus = state.go_cus.read().clone();
-    serde_json::to_value(cus).map_err(|e| sanitize_err(&e.to_string()))
+    let mut value = serde_json::to_value(cus).map_err(|e| sanitize_err(&e.to_string()))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("hits".into(), crate::core::go_cus::hits_snapshot());
+    }
+    Ok(value)
 }
 
 /// 保存覆写引擎基础设置（enabled / mitm / dns / hosts）；运行中重建生效
@@ -5739,11 +5923,21 @@ pub async fn save_go_cus_settings(
         return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
     }
     let cus: crate::core::go_cus::GoCusSettings =
-        serde_json::from_value(settings).map_err(|e| format!("配置格式错误: {e}"))?;
-    crate::core::go_cus::save(&state.data_dir, &cus)?;
+        serde_json::from_value(settings).map_err(|e| {
+            let msg = format!("配置格式错误: {e}");
+            log_cmd_error("解析 Go Cus 配置失败", &msg);
+            msg
+        })?;
+    crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
+        log_cmd_error("保存 Go Cus 配置失败", &e);
+        e
+    })?;
     *state.go_cus.write() = cus.clone();
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        restart_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("Go Cus 配置生效重启内核失败", &e);
+            e
+        })?;
     }
     // 【APP-11 任务3】广播 Go Cus 最新配置，仪表盘/代理页开关实时同步
     let _ = app.emit(
@@ -5769,13 +5963,25 @@ pub async fn import_go_cus_module(
         return Err("请输入模块链接或粘贴模块内容".into());
     }
     let raw = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        crate::core::go_cus::fetch_module_text(trimmed).await?
+        crate::core::go_cus::fetch_module_text(trimmed)
+            .await
+            .map_err(|e| {
+                log_cmd_error("下载 Go Cus 模块失败", &e);
+                e
+            })?
     } else {
         trimmed.to_string()
     };
     let mut cus = state.go_cus.read().clone();
-    let module = crate::core::go_cus::upsert_module(&mut cus, trimmed, &raw, name.as_deref())?;
-    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    let module = crate::core::go_cus::upsert_module(&mut cus, trimmed, &raw, name.as_deref())
+        .map_err(|e| {
+            log_cmd_error("解析 Go Cus 模块失败", &e);
+            e
+        })?;
+    crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
+        log_cmd_error("保存 Go Cus 模块失败", &e);
+        e
+    })?;
     *state.go_cus.write() = cus.clone();
     // 【APP6 任务1】[GoCus] 模块日志：模块加载数量
     crate::core::logger::info(
@@ -5794,12 +6000,18 @@ pub async fn import_go_cus_module(
         changed = true;
     }
     if changed {
-        crate::core::go_cus::save(&state.data_dir, &cus)?;
+        crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
+            log_cmd_error("保存 Go Cus 引擎开关失败", &e);
+            e
+        })?;
         *state.go_cus.write() = cus;
     }
     crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        restart_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("导入 Go Cus 模块后重启内核失败", &e);
+            e
+        })?;
     }
     serde_json::to_value(module).map_err(|e| sanitize_err(&e.to_string()))
 }
@@ -5820,10 +6032,16 @@ pub async fn toggle_go_cus_module(
         return Err("模块不存在".into());
     };
     module.enabled = enabled;
-    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
+        log_cmd_error("保存 Go Cus 模块开关失败", &e);
+        e
+    })?;
     *state.go_cus.write() = cus;
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        restart_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("切换 Go Cus 模块后重启内核失败", &e);
+            e
+        })?;
     }
     Ok(())
 }
@@ -5844,12 +6062,43 @@ pub async fn delete_go_cus_module(
     if cus.modules.len() == before {
         return Err("模块不存在".into());
     }
-    crate::core::go_cus::save(&state.data_dir, &cus)?;
+    crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
+        log_cmd_error("删除 Go Cus 模块时保存配置失败", &e);
+        e
+    })?;
     *state.go_cus.write() = cus;
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        restart_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("删除 Go Cus 模块后重启内核失败", &e);
+            e
+        })?;
     }
     Ok(())
+}
+
+/// 测试运行脚本（沙盒内执行一次，返回 $done 的值；不污染真实规则的熔断状态）
+#[tauri::command]
+pub async fn test_go_cus_script(
+    script: String,
+    request: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+    }
+    if script.trim().is_empty() {
+        return Err("请输入脚本内容".into());
+    }
+    let data_dir = state.data_dir.clone();
+    // 脚本执行是 CPU 密集且无 IO 等待，放到阻塞线程池避免卡住异步运行时
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::go_cus_script::test_script(&data_dir, &script, request).map_err(|e| {
+            log_cmd_error("Go Cus 脚本测试运行失败", &e);
+            e
+        })
+    })
+    .await
+    .map_err(|e| sanitize_err(&e.to_string()))?
 }
 
 /// 生成/读取 Root CA 并确保分发服务运行（返回指纹 + 安装 URL）

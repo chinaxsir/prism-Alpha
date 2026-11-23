@@ -6,18 +6,43 @@ import type {
   RuntimeSnapshot,
   UserSettings,
 } from "@/stores/core";
+import { currentUiLang, sanitizeUiErrorText } from "@/utils/errorSanitizer";
 
 /** 内核报错脱敏：界面任何路径都不得出现内核商标字样（统一显示为「内核」） */
 export const sanitizeKernelText = (msg: string): string =>
   msg.replace(/sing-?box|libbox/gi, "内核");
 
+/** 需要原样透传给业务层解析的错误码（Pro 激活 / 限流 / VPN 权限引导） */
+const PRESERVE_ERROR_RE =
+  /(rate_limited:|err_code:|err_raw:|invalid_key\b|email_mismatch\b|seat_limit_reached\b|activation_failed\b|activation_throttled\b|license_expired\b|license_blocked\b|alpha_device_bound\b|server_error\b)/i;
+const PRESERVE_HINTS = [
+  "nevnperrordomain",
+  "permission denied",
+  "user denied",
+  "vpn 权限",
+  "vpn permission",
+  "vpnservice",
+  "configuration read write failed",
+];
+
 /**
  * 统一 invoke 包装：后端返回的错误消息脱敏后再抛给调用方，
  * 兜底防止底层内核自带的报错文本直接漏到界面。
+ * 业务错误码与 VPN 权限引导保留原文，交给页面做精准映射；
+ * 其余疑似技术堆栈由 sanitizeUiError 统一替换为商业文案。
  */
 const invoke = <T,>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
   tauriInvoke<T>(cmd, args).catch((e) => {
-    throw typeof e === "string" ? sanitizeKernelText(e) : e;
+    if (typeof e !== "string") throw e;
+    const cleaned = sanitizeKernelText(e);
+    const lower = cleaned.toLowerCase();
+    if (
+      PRESERVE_ERROR_RE.test(cleaned) ||
+      PRESERVE_HINTS.some((hint) => lower.includes(hint))
+    ) {
+      throw cleaned;
+    }
+    throw sanitizeUiErrorText(cleaned, currentUiLang());
   });
 
 export const startCore = () => invoke<void>("start_core");
@@ -692,6 +717,14 @@ export interface CusModule {
   enabled: boolean;
   stats: CusModuleStats;
   updatedAt: number;
+  /** v0.4.25：模块累计命中次数（旧后端可能缺失） */
+  hits?: number;
+}
+
+export interface GoCusHits {
+  modules?: Record<string, number>;
+  rules?: Record<string, number>;
+  total?: number;
 }
 
 export interface GoCusSettings {
@@ -701,6 +734,8 @@ export interface GoCusSettings {
   hostOverrides: Array<[string, string]>;
   modules: CusModule[];
   caInstalled: boolean;
+  /** v0.4.25：命中统计（旧后端可能缺失） */
+  hits?: GoCusHits;
 }
 
 export const getGoCusSettings = () => invoke<GoCusSettings>("get_go_cus_settings");
@@ -712,6 +747,37 @@ export const toggleGoCusModule = (id: string, enabled: boolean) =>
   invoke<void>("toggle_go_cus_module", { id, enabled });
 export const deleteGoCusModule = (id: string) =>
   invoke<void>("delete_go_cus_module", { id });
+
+export interface GoCusScriptTestRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+export interface GoCusScriptTestResponse {
+  status?: number;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+export interface GoCusScriptTestResult {
+  ok: boolean;
+  request?: GoCusScriptTestRequest;
+  response?: GoCusScriptTestResponse;
+  log?: string[];
+  error?: string;
+}
+
+/** v0.4.25：脚本测试运行（后端未就绪时会返回命令不存在错误，由页面提示） */
+export const testGoCusScript = (
+  script: string,
+  request: GoCusScriptTestRequest,
+) => invoke<GoCusScriptTestResult>("test_go_cus_script", { script, request });
+
+/** v0.4.25：清除手动指定节点，恢复自动选点 */
+export const resetNodeSelectionToAuto = () =>
+  invoke<void>("reset_node_selection_to_auto");
 
 export interface CaInfo {
   fingerprint: string;

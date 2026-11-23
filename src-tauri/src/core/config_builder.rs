@@ -4392,6 +4392,7 @@ rules:
                 enabled: true,
                 stats: Default::default(),
                 updated_at: 0,
+                hits: 0,
             }],
             ..Default::default()
         };
@@ -6608,9 +6609,12 @@ rules:
     #[test]
     fn acp7_manual_nodes_join_all_groups_without_http() {
         use crate::core::subscription::{
-            is_local_subscription, manual_nodes_text, merge_manual_nodes, MANUAL_SUB_URL,
+            MANUAL_SUB_URL, is_local_subscription, manual_nodes_text, merge_manual_nodes,
         };
-        assert!(is_local_subscription(MANUAL_SUB_URL), "local:// 必须识别为本地订阅");
+        assert!(
+            is_local_subscription(MANUAL_SUB_URL),
+            "local:// 必须识别为本地订阅"
+        );
         assert!(!is_local_subscription("https://airport.example/sub"));
 
         let base = std::env::temp_dir().join("prism-cb-test-acp7-manual");
@@ -6667,7 +6671,10 @@ rules:
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             for name in ["手动A", "手动B"] {
-                assert!(members.contains(&name), "{group} 必须包含 {name}: {members:?}");
+                assert!(
+                    members.contains(&name),
+                    "{group} 必须包含 {name}: {members:?}"
+                );
             }
         }
         // GO-AIM-PROBE-0..3 四个探针组必须覆盖手动节点

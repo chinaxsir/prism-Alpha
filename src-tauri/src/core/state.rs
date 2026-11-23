@@ -171,6 +171,44 @@ impl Default for UserSettings {
     }
 }
 
+/// 【v0.4.25 任务4】节点手动指定绝对锁判定（纯函数）。
+///
+/// 决定此刻是否允许「自动测速择优 / Go AIM 自动锁点」覆盖用户当前选中的节点：
+/// - 用户从未手动指定（`user_manually_selected_node == false`）→ `true`；
+/// - 手动指定但 `selected_node` 为空 / 是「自动（等待测速）」等占位文案 /
+///   内置非代理出站（direct/block/...）/ 信息广告类假节点 → 视为没有有效
+///   手动指定，返回 `true`；
+/// - 手动指定且该节点仍存在于 `available_nodes` → `false`（绝对锁，禁止切换）；
+/// - 手动指定但节点已从订阅/内核消失 → `true`（允许自动选点兜底）。
+pub(crate) fn should_auto_select_node(settings: &UserSettings, available_nodes: &[String]) -> bool {
+    if !settings.user_manually_selected_node {
+        return true;
+    }
+    let Some(node) = settings
+        .selected_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return true;
+    };
+    if is_placeholder_node_name(node)
+        || super::config_builder::is_builtin_non_proxy_tag(node)
+        || super::config_builder::is_info_or_ad_node_name(node)
+    {
+        return true;
+    }
+    !available_nodes.iter().any(|n| n.trim() == node)
+}
+
+/// 尚未真正选中代理时 `selected_node` 可能写入的占位文案。
+fn is_placeholder_node_name(name: &str) -> bool {
+    matches!(
+        name,
+        "自动" | "自动（等待测速）" | "自动(等待测速)" | "等待测速" | "无"
+    )
+}
+
 // ---------------------------------------------------------------- 运行时统计
 // 内核 WebSocket 数据流（traffic / connections）在 events.rs 中被解析并写入
 // 下列结构；get_runtime_snapshot IPC 读取它们给前端展示实时曲线与分析。
@@ -1405,5 +1443,70 @@ mod app52_tests {
         assert_eq!(value["elapsedMs"], 321);
         assert!(value.get("details").is_none(), "None 字段不得序列化");
         assert!(value.get("progress").is_some(), "进度快照必须随事件下发");
+    }
+}
+
+#[cfg(test)]
+mod v0425_node_lock_tests {
+    use super::{UserSettings, should_auto_select_node};
+
+    fn manual(node: &str) -> UserSettings {
+        UserSettings {
+            selected_node: Some(node.to_string()),
+            user_manually_selected_node: true,
+            ..Default::default()
+        }
+    }
+
+    fn nodes(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 手动指定 + 节点仍在可用列表 → 绝对锁，禁止自动切换。
+    #[test]
+    fn test_manual_node_present_is_locked() {
+        let settings = manual("香港-01");
+        assert!(!should_auto_select_node(
+            &settings,
+            &nodes(&["香港-01", "日本-02"])
+        ));
+    }
+
+    /// 手动指定但节点已消失 → 允许自动选点兜底。
+    #[test]
+    fn test_manual_node_missing_allows_auto() {
+        let settings = manual("香港-01");
+        assert!(should_auto_select_node(&settings, &nodes(&["日本-02"])));
+    }
+
+    /// 从未手动指定 → 始终允许自动选点。
+    #[test]
+    fn test_never_manual_allows_auto() {
+        let settings = UserSettings {
+            selected_node: Some("香港-01".into()),
+            user_manually_selected_node: false,
+            ..Default::default()
+        };
+        assert!(should_auto_select_node(&settings, &nodes(&["香港-01"])));
+    }
+
+    /// selected_node 为空 / 占位文案 / 内置非代理出站 → 视为无有效手动指定。
+    #[test]
+    fn test_empty_or_placeholder_allows_auto() {
+        let empty = UserSettings {
+            selected_node: None,
+            user_manually_selected_node: true,
+            ..Default::default()
+        };
+        assert!(should_auto_select_node(&empty, &nodes(&["香港-01"])));
+
+        let placeholder = manual("自动（等待测速）");
+        assert!(should_auto_select_node(&placeholder, &nodes(&["香港-01"])));
+
+        let blank = manual("   ");
+        assert!(should_auto_select_node(&blank, &nodes(&["香港-01"])));
+
+        let builtin = manual("DIRECT");
+        assert!(should_auto_select_node(&builtin, &nodes(&["DIRECT"])));
     }
 }

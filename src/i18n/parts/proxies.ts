@@ -43,6 +43,12 @@ const zh: Record<string, string> = {
   "proxies.speedTesting": "测速中",
   "proxies.current": "当前：",
   "proxies.notSelected": "未选择",
+  "proxies.pinned": "已指定",
+  "proxies.pinnedAuto": "恢复自动",
+  "proxies.pinnedTip": "当前节点由手动指定锁定，点击恢复自动选点",
+  "proxies.autoRestored": "已恢复自动选点",
+  "proxies.aimRecommended": "AIM 推荐",
+  "proxies.err.resetAutoFailed": "恢复自动选点失败：{error}",
   "proxies.coreNotRunningPreview": "· 内核未运行（预览模式）",
   "proxies.nodeCount": "{count} 节点",
   // 【APP54 任务5】实时进度文案（位置 A / B 共用）
@@ -143,6 +149,9 @@ const zh: Record<string, string> = {
   "proxies.goCus.engineDesc":
     "覆写 / 改写 / MitM / 脚本 —— 兼容 Loon · Surge · QuantumultX 模块",
   "proxies.goCus.engineSwitch": "Go Cus 引擎总开关",
+  "proxies.goCus.metric.enabledModules": "已启用模块 {count}",
+  "proxies.goCus.metric.activeRules": "生效规则 {count}",
+  "proxies.goCus.metric.hitsToday": "今日处理 {count} 次",
   "proxies.goCus.importTitle": "导入模块",
   "proxies.goCus.importDesc":
     "支持 http(s) 模块链接，或直接粘贴模块内容（Loon / Surge / QX 格式）",
@@ -156,35 +165,91 @@ const zh: Record<string, string> = {
   "proxies.goCus.disableModule": "停用模块",
   "proxies.goCus.enableModule": "启用模块",
   "proxies.goCus.deleteModule": "删除模块",
+  "proxies.goCus.updateRemote": "更新",
+  "proxies.goCus.updatedRemote": "模块已更新",
+  "proxies.goCus.legacyHint": "已由系统内置能力接管，建议删除",
+  "proxies.goCus.legacyDelete": "删除",
+  "proxies.goCus.addNew": "+ 新建",
+  "proxies.goCus.save": "保存",
+  "proxies.goCus.cancel": "取消",
+  "proxies.goCus.hits": "命中 {count} 次",
+  "proxies.goCus.hostsLabel": "Host",
+  "proxies.goCus.overrideTitle": "覆写与自定义",
   "proxies.goCus.rewritesTitle": "改写规则（{count} 条）",
-  "proxies.goCus.fromModulesOnly": "来自已启用模块，仅展示",
   "proxies.goCus.noRewrites": "暂无改写规则",
   "proxies.goCus.noRewritesDesc":
     "启用包含 [URL Rewrite] 区段的模块后在此展示",
+  "proxies.goCus.rwFormTitle": "新建 URL 改写",
+  "proxies.goCus.rwPattern": "匹配正则",
+  "proxies.goCus.rwAction": "动作",
+  "proxies.goCus.rwTarget": "目标 URL / 头操作",
+  "proxies.goCus.rwTargetHint":
+    "302 / 307 填写跳转地址（支持 $1 捕获组）；header 动作填写 $(remove-Header-Name) 等头操作",
+  "proxies.goCus.rwSaved": "改写规则已保存",
   "proxies.goCus.mitmDesc":
     "开启后对下方主机名的 HTTPS 流量进行解密，供改写与脚本使用",
   "proxies.goCus.mitmSwitch": "MitM 总开关",
   "proxies.goCus.mitmHostsTitle": "MitM 主机名（{count} 个）",
   "proxies.goCus.noMitmHosts":
     "暂无 MitM 主机名（启用包含 [mitm] 区段的模块后在此展示）",
+  "proxies.goCus.mitmFormTitle": "新建 MitM 主机",
+  "proxies.goCus.mitmHostname": "主机名（多个用逗号分隔）",
+  "proxies.goCus.mitmSaved": "MitM 主机已保存",
   "proxies.goCus.caTitle": "CA 证书",
   "proxies.goCus.caGenerate": "生成 / 读取 CA",
   "proxies.goCus.caFingerprint": "SHA-256 指纹",
+  "proxies.goCus.caValidity": "有效期",
+  "proxies.goCus.caUnknown": "—",
+  "proxies.goCus.caStatus.none": "未生成",
+  "proxies.goCus.caStatus.pending": "已生成 · 待安装",
+  "proxies.goCus.caStatus.ready": "已就绪",
   "proxies.goCus.caInstallUrl": "安装链接",
   "proxies.goCus.installCopied": "安装链接已复制",
   "proxies.goCus.copyInstall": "复制安装链接",
   "proxies.goCus.caTrusted": "我已在系统安装并信任该证书",
   "proxies.goCus.caHint":
     "HTTPS 改写与脚本需安装 CA 并信任（iOS 需在 设置→通用→关于本机→证书信任设置 中开启完全信任）。",
+  "proxies.goCus.installCert": "安装证书",
+  "proxies.goCus.iosGuideToggle": "iOS 安装指引（3 步）",
+  "proxies.goCus.iosGuide1": "① 点击安装链接，允许下载描述文件",
+  "proxies.goCus.iosGuide2": "② 打开「设置」，在已下载描述文件中点击「安装」",
+  "proxies.goCus.iosGuide3":
+    "③ 进入「设置 → 通用 → 关于本机 → 证书信任设置」，开启完全信任",
+  "proxies.goCus.desktopHint":
+    "桌面端 / Android：在浏览器打开安装链接下载证书，按系统指引安装或导出 .cer / .pem。",
   "proxies.goCus.scriptsTitle": "脚本（{count} 个）",
   "proxies.goCus.noScripts": "暂无脚本",
   "proxies.goCus.noScriptsDesc":
     "启用包含 [Script] 区段或 script-* 改写的模块后在此展示",
   "proxies.goCus.scriptPathCopied": "脚本路径已复制",
   "proxies.goCus.clickToCopy": "点击复制：{path}",
-  "proxies.goCus.scriptAlphaNote":
-    "Alpha 版脚本已完成解析与展示，JS 执行器将在后续版本接入。",
+  "proxies.goCus.scriptFormTitle": "新建脚本",
+  "proxies.goCus.scriptName": "脚本名称",
+  "proxies.goCus.scriptPattern": "匹配正则",
+  "proxies.goCus.scriptCode": "JavaScript 代码",
+  "proxies.goCus.scriptTestUrl": "测试 URL",
+  "proxies.goCus.scriptTest": "测试运行",
+  "proxies.goCus.scriptTesting": "运行中…",
+  "proxies.goCus.scriptTestResult": "测试结果",
+  "proxies.goCus.scriptTestLog": "日志",
+  "proxies.goCus.scriptTestRequest": "请求",
+  "proxies.goCus.scriptTestResponse": "响应",
+  "proxies.goCus.scriptSaved": "脚本已保存",
+  "proxies.goCus.scriptInlineNote":
+    "脚本以内联形式保存在模块的 [Script] 区段中，执行能力取决于后端脚本引擎。",
+  "proxies.goCus.hostFormTitle": "新建 Host 映射",
+  "proxies.goCus.hostDomain": "本地域名（如 printer.lan）",
+  "proxies.goCus.hostValue": "目标地址（如 192.168.1.20）",
+  "proxies.goCus.hostSaved": "Host 映射已保存",
+  "proxies.goCus.hostDesc": "仅影响本地域名解析，不改变代理路由。",
   "proxies.goCus.err.emptySource": "请输入模块链接或直接粘贴模块内容",
+  "proxies.goCus.err.patternRequired": "请填写匹配正则",
+  "proxies.goCus.err.targetRequired": "该动作需要填写目标 URL / 头操作",
+  "proxies.goCus.err.patternComma": "匹配正则不能包含逗号、空格或等号",
+  "proxies.goCus.err.duplicate": "该规则已存在",
+  "proxies.goCus.err.hostRequired": "请填写主机名",
+  "proxies.goCus.err.scriptRequired": "请填写名称、匹配正则与脚本代码",
+  "proxies.goCus.err.hostInvalid": "请填写有效的域名与目标地址",
   "proxies.goCus.importSuccess": "模块「{name}」导入成功",
   "proxies.goCus.deleteConfirm": "确定删除模块「{name}」？该操作不可撤销。",
   "proxies.goCus.moduleDeleted": "模块已删除",
@@ -192,24 +257,21 @@ const zh: Record<string, string> = {
   "proxies.goCus.confirmDeleteAgain": "再点一次确认删除",
   "proxies.goCus.templateLibTitle": "✨ 官方精选一键模板库",
   "proxies.goCus.templateLibDesc":
-    "覆盖高频分流场景，一键导入即刻生效（导入后自动开启引擎，VPN 运行中自动热重载）",
+    "覆盖高频净化场景，一键导入即刻生效（导入后自动开启引擎，VPN 运行中自动热重载）",
   "proxies.goCus.templateImport": "导入",
   "proxies.goCus.templateAdded": "已添加",
-  "proxies.goCus.tpl.adblock.name": "🛡️ 去广告净化",
+  "proxies.goCus.tpl.adblock.name": "🛡️ 全网广告与开屏净化",
   "proxies.goCus.tpl.adblock.desc":
-    "屏蔽主流广告 / 统计 / 埋点域名（谷歌 / 百度 / 腾讯 / 字节 / 快手 / 友盟等 18 类）",
-  "proxies.goCus.tpl.ai.name": "🤖 AI 服务分流",
-  "proxies.goCus.tpl.ai.desc":
-    "OpenAI / Claude / Gemini / Copilot / Cursor 等 14 个 AI 服务走代理",
-  "proxies.goCus.tpl.media.name": "🎬 流媒体解锁",
-  "proxies.goCus.tpl.media.desc":
-    "Netflix / YouTube / Disney+ / TikTok / Spotify / Twitch 等 16 个平台走代理",
-  "proxies.goCus.tpl.cnDirect.name": "⚡ 国内直连加速",
-  "proxies.goCus.tpl.cnDirect.desc":
-    ".cn 域名与国内主流站点、Apple / 微软 CDN 共 16 条规则直连，不进代理",
-  "proxies.goCus.tpl.privacy.name": "🧹 隐私头净化",
+    "拦截常见广告 / 统计 / 埋点域名，并净化 App 开屏与广告配置请求",
+  "proxies.goCus.tpl.privacy.name": "🧹 隐私追踪与请求头净化",
   "proxies.goCus.tpl.privacy.desc":
-    "对主流站点删除 X-Forwarded-For 追踪请求头（当前仅 HTTP 明文生效）",
+    "对主流站点剥离 X-Forwarded-For 与 X-Client-Data 追踪请求头，并纳入 MitM 主机名",
+  "proxies.goCus.tpl.shortlink.name": "🔗 短链直达与跳转净化",
+  "proxies.goCus.tpl.shortlink.desc":
+    "还原短链真实目标（302 + $1 捕获组），清理 utm_* 等中间跳转页",
+  "proxies.goCus.tpl.host.name": "⚡ 自定义本地 Host 映射",
+  "proxies.goCus.tpl.host.desc":
+    "为局域网设备配置本地域名解析（如 printer.lan），仅影响本机 Host，不改变代理路由",
 
   // ---- 【APP71】Go AIM 双阶段看板 / 单节点详情 ----
   "proxies.aimBoard.start": "Go AIM 启动中…",
@@ -283,6 +345,13 @@ const en: Record<string, string> = {
   "proxies.speedTesting": "Testing",
   "proxies.current": "Current:",
   "proxies.notSelected": "None",
+  "proxies.pinned": "Pinned",
+  "proxies.pinnedAuto": "Auto",
+  "proxies.pinnedTip":
+    "The current node is pinned by manual selection. Tap to restore automatic selection.",
+  "proxies.autoRestored": "Automatic node selection restored",
+  "proxies.aimRecommended": "AIM Recommended",
+  "proxies.err.resetAutoFailed": "Failed to restore auto selection: {error}",
   "proxies.coreNotRunningPreview": "· Core not running (preview mode)",
   "proxies.nodeCount": "{count} nodes",
   // 【APP54 任务5】Live progress labels (position A / B)
@@ -392,6 +461,9 @@ const en: Record<string, string> = {
   "proxies.goCus.engineDesc":
     "Rewrite / redirect / MitM / scripts — compatible with Loon · Surge · QuantumultX modules",
   "proxies.goCus.engineSwitch": "Go Cus engine master switch",
+  "proxies.goCus.metric.enabledModules": "{count} modules enabled",
+  "proxies.goCus.metric.activeRules": "{count} active rules",
+  "proxies.goCus.metric.hitsToday": "{count} handled today",
   "proxies.goCus.importTitle": "Import Module",
   "proxies.goCus.importDesc":
     "Supports http(s) module links, or paste module content directly (Loon / Surge / QX format)",
@@ -405,20 +477,45 @@ const en: Record<string, string> = {
   "proxies.goCus.disableModule": "Disable module",
   "proxies.goCus.enableModule": "Enable module",
   "proxies.goCus.deleteModule": "Delete module",
+  "proxies.goCus.updateRemote": "Update",
+  "proxies.goCus.updatedRemote": "Module updated",
+  "proxies.goCus.legacyHint":
+    "Now handled by built-in capabilities; deletion is recommended",
+  "proxies.goCus.legacyDelete": "Delete",
+  "proxies.goCus.addNew": "+ Add",
+  "proxies.goCus.save": "Save",
+  "proxies.goCus.cancel": "Cancel",
+  "proxies.goCus.hits": "{count} hits",
+  "proxies.goCus.hostsLabel": "Host",
+  "proxies.goCus.overrideTitle": "Overrides & Custom",
   "proxies.goCus.rewritesTitle": "Rewrite Rules ({count})",
-  "proxies.goCus.fromModulesOnly": "From enabled modules, view only",
   "proxies.goCus.noRewrites": "No rewrite rules",
   "proxies.goCus.noRewritesDesc":
     "Enable modules containing an [URL Rewrite] section to display them here",
+  "proxies.goCus.rwFormTitle": "New URL Rewrite",
+  "proxies.goCus.rwPattern": "Match pattern (regex)",
+  "proxies.goCus.rwAction": "Action",
+  "proxies.goCus.rwTarget": "Target URL / header operation",
+  "proxies.goCus.rwTargetHint":
+    "For 302 / 307 enter the redirect target (supports $1 capture); for header actions enter $(remove-Header-Name)",
+  "proxies.goCus.rwSaved": "Rewrite rule saved",
   "proxies.goCus.mitmDesc":
     "When enabled, decrypts HTTPS traffic for the hostnames below for rewrites and scripts",
   "proxies.goCus.mitmSwitch": "MitM master switch",
   "proxies.goCus.mitmHostsTitle": "MitM Hostnames ({count})",
   "proxies.goCus.noMitmHosts":
     "No MitM hostnames (enable modules containing a [mitm] section to display them here)",
+  "proxies.goCus.mitmFormTitle": "New MitM Host",
+  "proxies.goCus.mitmHostname": "Hostnames (comma separated)",
+  "proxies.goCus.mitmSaved": "MitM host saved",
   "proxies.goCus.caTitle": "CA Certificate",
   "proxies.goCus.caGenerate": "Generate / Load CA",
   "proxies.goCus.caFingerprint": "SHA-256 Fingerprint",
+  "proxies.goCus.caValidity": "Validity",
+  "proxies.goCus.caUnknown": "—",
+  "proxies.goCus.caStatus.none": "Not generated",
+  "proxies.goCus.caStatus.pending": "Generated · Not installed",
+  "proxies.goCus.caStatus.ready": "Ready",
   "proxies.goCus.caInstallUrl": "Install Link",
   "proxies.goCus.installCopied": "Install link copied",
   "proxies.goCus.copyInstall": "Copy install link",
@@ -426,16 +523,55 @@ const en: Record<string, string> = {
     "I have installed and trusted this certificate on the system",
   "proxies.goCus.caHint":
     "HTTPS rewrites and scripts require the CA to be installed and trusted (on iOS enable full trust in Settings → General → About → Certificate Trust Settings).",
+  "proxies.goCus.installCert": "Install Certificate",
+  "proxies.goCus.iosGuideToggle": "iOS install guide (3 steps)",
+  "proxies.goCus.iosGuide1":
+    "① Tap the install link and allow the profile download",
+  "proxies.goCus.iosGuide2":
+    "② Open Settings and tap Install on the downloaded profile",
+  "proxies.goCus.iosGuide3":
+    "③ Go to Settings → General → About → Certificate Trust Settings and enable full trust",
+  "proxies.goCus.desktopHint":
+    "Desktop / Android: open the install link in a browser to download the certificate, then install it or export .cer / .pem following the system guide.",
   "proxies.goCus.scriptsTitle": "Scripts ({count})",
   "proxies.goCus.noScripts": "No scripts",
   "proxies.goCus.noScriptsDesc":
     "Enable modules containing a [Script] section or script-* rewrites to display them here",
   "proxies.goCus.scriptPathCopied": "Script path copied",
   "proxies.goCus.clickToCopy": "Click to copy: {path}",
-  "proxies.goCus.scriptAlphaNote":
-    "Alpha scripts are parsed and displayed; the JS runtime will be added in a later version.",
+  "proxies.goCus.scriptFormTitle": "New Script",
+  "proxies.goCus.scriptName": "Script name",
+  "proxies.goCus.scriptPattern": "Match pattern (regex)",
+  "proxies.goCus.scriptCode": "JavaScript code",
+  "proxies.goCus.scriptTestUrl": "Test URL",
+  "proxies.goCus.scriptTest": "Test run",
+  "proxies.goCus.scriptTesting": "Running…",
+  "proxies.goCus.scriptTestResult": "Test result",
+  "proxies.goCus.scriptTestLog": "Log",
+  "proxies.goCus.scriptTestRequest": "Request",
+  "proxies.goCus.scriptTestResponse": "Response",
+  "proxies.goCus.scriptSaved": "Script saved",
+  "proxies.goCus.scriptInlineNote":
+    "Scripts are stored inline in the module's [Script] section; execution depends on the backend script engine.",
+  "proxies.goCus.hostFormTitle": "New Host Mapping",
+  "proxies.goCus.hostDomain": "Local domain (e.g. printer.lan)",
+  "proxies.goCus.hostValue": "Target address (e.g. 192.168.1.20)",
+  "proxies.goCus.hostSaved": "Host mapping saved",
+  "proxies.goCus.hostDesc":
+    "Affects local domain resolution only; proxy routing stays unchanged.",
   "proxies.goCus.err.emptySource":
     "Please enter a module link or paste module content",
+  "proxies.goCus.err.patternRequired": "Please enter a match pattern",
+  "proxies.goCus.err.targetRequired":
+    "This action requires a target URL / header operation",
+  "proxies.goCus.err.patternComma":
+    "The match pattern cannot contain commas, spaces or equals signs",
+  "proxies.goCus.err.duplicate": "This rule already exists",
+  "proxies.goCus.err.hostRequired": "Please enter a hostname",
+  "proxies.goCus.err.scriptRequired":
+    "Please enter a name, match pattern and script code",
+  "proxies.goCus.err.hostInvalid":
+    "Please enter a valid domain and target address",
   "proxies.goCus.importSuccess": "Module \"{name}\" imported successfully",
   "proxies.goCus.deleteConfirm": "Delete module \"{name}\"? This cannot be undone.",
   "proxies.goCus.moduleDeleted": "Module deleted",
@@ -443,24 +579,21 @@ const en: Record<string, string> = {
   "proxies.goCus.confirmDeleteAgain": "Tap again to confirm",
   "proxies.goCus.templateLibTitle": "✨ Curated One-Click Templates",
   "proxies.goCus.templateLibDesc":
-    "High-frequency routing scenarios, one tap to import and apply (engine auto-enables; hot-reloads when VPN is running)",
+    "High-frequency cleanup scenarios, one tap to import and apply (engine auto-enables; hot-reloads when VPN is running)",
   "proxies.goCus.templateImport": "Add",
   "proxies.goCus.templateAdded": "Added",
-  "proxies.goCus.tpl.adblock.name": "AdBlock & Privacy Guard",
+  "proxies.goCus.tpl.adblock.name": "🛡️ Ad & Splash Cleanup",
   "proxies.goCus.tpl.adblock.desc":
-    "Block ads, popups & tracking domains",
-  "proxies.goCus.tpl.ai.name": "AI Services Routing",
-  "proxies.goCus.tpl.ai.desc":
-    "Route OpenAI, Claude & Gemini via Proxy",
-  "proxies.goCus.tpl.media.name": "Global Media Unlock",
-  "proxies.goCus.tpl.media.desc":
-    "Route Netflix, YouTube, Disney+ & TikTok",
-  "proxies.goCus.tpl.cnDirect.name": "CN & Apple CDN Direct",
-  "proxies.goCus.tpl.cnDirect.desc":
-    "Direct connection for domestic & Apple services",
-  "proxies.goCus.tpl.privacy.name": "HTTP Privacy Header",
+    "Block common ad / analytics / tracking domains and clean app splash ad requests",
+  "proxies.goCus.tpl.privacy.name": "🧹 Privacy & Header Cleanup",
   "proxies.goCus.tpl.privacy.desc":
-    "Strip tracking headers & protect privacy",
+    "Strip X-Forwarded-For and X-Client-Data tracking headers on major sites and include them in MitM",
+  "proxies.goCus.tpl.shortlink.name": "🔗 Short Link & Redirect Cleanup",
+  "proxies.goCus.tpl.shortlink.desc":
+    "Resolve short links to real targets (302 + $1 capture) and clean utm_* redirect pages",
+  "proxies.goCus.tpl.host.name": "⚡ Custom Local Host Mapping",
+  "proxies.goCus.tpl.host.desc":
+    "Map local domains for LAN devices (e.g. printer.lan); affects local host resolution only, not proxy routing",
 
   // ---- 【APP71】Go AIM dual-phase board / node detail ----
   "proxies.aimBoard.start": "Go AIM starting…",

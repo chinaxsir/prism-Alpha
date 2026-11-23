@@ -1438,6 +1438,32 @@ pub fn sanitize_sensitive(text: &str) -> String {
     out
 }
 
+/// 【v0.4.25 任务3.1】错误详情日志脱敏：在 `sanitize_sensitive`（WG/License
+/// 密钥）基础上，额外剔除 `token=` / `secret=` / `password=` 等键值、
+/// `Bearer` 令牌与邮箱地址，用于把完整失败原因写入 Kernel 日志而不泄漏凭据。
+pub fn sanitize_error_detail(text: &str) -> String {
+    let mut out = sanitize_sensitive(text);
+    // 键值型敏感字段：token / access_token / secret / password / api_key 等
+    if let Ok(re) = regex::Regex::new(
+        r#"(?i)(access[_\s-]?token|refresh[_\s-]?token|license[_\s-]?key|token|secret|password|api[_\s-]?key)("?\s*[:=]\s*"?)([^"\s&,;]+)"#,
+    ) {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| {
+                format!("{}{}***", &caps[1], &caps[2])
+            })
+            .into_owned();
+    }
+    // Bearer 令牌（含 JWT 等）
+    if let Ok(re) = regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+") {
+        out = re.replace_all(&out, "Bearer ***").into_owned();
+    }
+    // 邮箱地址
+    if let Ok(re) = regex::Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}") {
+        out = re.replace_all(&out, "<email>").into_owned();
+    }
+    out
+}
+
 /// 【APP57 任务3.2】安全截断：一律按 Unicode 字符边界截取，绝不按字节
 /// 索引（如 `&s[..n]`）切片，中文 / emoji 内容永不 panic。
 pub fn safe_truncate_str(s: &str, max_chars: usize) -> String {
@@ -2060,5 +2086,18 @@ mod tests {
         assert!(full.contains(&node_tag));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 【v0.4.25 任务3.1】错误详情脱敏：token/Bearer/邮箱/授权码均不得进入日志
+    #[test]
+    fn test_sanitize_error_detail_redacts_secrets() {
+        let raw = "start failed: token=abc123&next=1 Bearer eyJhbGciOi.abc.def \
+                   user=vip@example.com license_key=ABCD-1234-EFGH-5678";
+        let out = super::sanitize_error_detail(raw);
+        assert!(!out.contains("abc123"), "token 明文必须剔除: {out}");
+        assert!(!out.contains("eyJhbGciOi"), "Bearer 令牌必须剔除: {out}");
+        assert!(!out.contains("vip@example.com"), "邮箱必须剔除: {out}");
+        assert!(!out.contains("ABCD-1234"), "授权码必须剔除: {out}");
+        assert!(out.contains("start failed"), "非敏感上下文必须保留: {out}");
     }
 }

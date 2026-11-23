@@ -127,6 +127,8 @@ export interface UserSettings {
   autoUpdateSubsDaily?: boolean;
   /** 最近一次自动更新成功的日期戳（后端维护） */
   lastAutoUpdateSubsDate?: string;
+  /** v0.4.25：当前节点是否为用户手动指定（置顶后不再自动切换） */
+  userManuallySelectedNode?: boolean;
 }
 
 export interface TrafficPoint {

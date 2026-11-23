@@ -1085,20 +1085,18 @@ impl KernelApi {
                     })
                     .collect();
                 st.record_node_delays(delays);
-                // 【APP52 任务1】用户主动重测 = 回到自动选点模式
-                *st.user_manually_selected_node.write() = false;
-                let mut settings = st.settings.read().clone();
-                settings.user_manually_selected_node = false;
-                let _ = st.save_settings(settings);
             }
-            let (aim_on, manual) = {
+            // 【v0.4.25 任务4】手动指定绝对锁：统一按本次实测组成员判定，
+            // 不再无条件清零用户手动标记。
+            let (aim_on, auto_allowed) = {
                 let st = app.state::<crate::core::state::AppState>();
+                let settings = st.settings.read().clone();
                 (
-                    st.settings.read().go_aim_enabled,
-                    *st.user_manually_selected_node.read(),
+                    settings.go_aim_enabled,
+                    crate::core::state::should_auto_select_node(&settings, &members),
                 )
             };
-            if !aim_on && !manual {
+            if !aim_on && auto_allowed {
                 // 嵌套策略组（含 all 成员列表的项）不可选中，一并排除
                 let nested: std::collections::HashSet<String> = self
                     .get_proxies()

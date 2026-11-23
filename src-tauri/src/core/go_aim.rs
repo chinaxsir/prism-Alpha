@@ -28,7 +28,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use futures_util::StreamExt;
 
 use crate::core::logger::AimLogMeta;
-use crate::core::state::{AppState, CoreStatus};
+use crate::core::state::{AppState, CoreStatus, should_auto_select_node};
 
 /// 【APP78】当前 Go AIM 检测引擎版本号：统一递增至 10，启动时自动淘汰
 /// `< 10` 的旧缓存（Gemini 已改用 HTTP/1.1 专用客户端 + 有界流式读取 +
@@ -1274,9 +1274,13 @@ fn start_probe_inner(
                     "[go-aim] 全量真实探测完成，共 {count} 个节点参与评级，最优节点: {best}"
                 );
                 // [AIM-19] 最优节点
-                let (best_score, best_delay) = pick_best(&state.aim_results.read())
-                    .map(|r| (r.score, r.delay_ms))
-                    .unwrap_or((0, 0));
+                // 【v0.4.25 任务4】无论是否允许切换，都先把综合推荐写入指标缓存。
+                let best_result = pick_best(&state.aim_results.read());
+                if let Some(r) = &best_result {
+                    state.node_metrics.write().aim_best_node = Some(r.node_name.clone());
+                }
+                let (best_score, best_delay) =
+                    best_result.map(|r| (r.score, r.delay_ms)).unwrap_or((0, 0));
                 run.log(
                     19,
                     "INFO",
@@ -5073,6 +5077,13 @@ pub async fn apply_selection(app: &AppHandle, state: &AppState) -> Result<Option
         return Ok(None);
     }
 
+    // 【v0.4.25 任务4】始终保存综合推荐节点（即使用户手动指定导致不切换，
+    // 前端「综合推荐」仍需展示本轮检测结论）。
+    let best = pick_best(&results);
+    if let Some(best) = &best {
+        state.node_metrics.write().aim_best_node = Some(best.node_name.clone());
+    }
+
     // 手动指定：目标节点仍在存活结果中则直接锁定（评级照跑但不覆盖）
     let pinned = state.settings.read().go_aim_pinned_node.clone();
     let close_conns = state.settings.read().close_connections_on_switch;
@@ -5084,7 +5095,7 @@ pub async fn apply_selection(app: &AppHandle, state: &AppState) -> Result<Option
         return lock_node(app, state, res, close_conns).await.map(Some);
     }
 
-    let Some(best) = pick_best(&results) else {
+    let Some(best) = best else {
         tracing::warn!("[go-aim] 解锁池为空，保持当前节点不变");
         return Ok(None);
     };
@@ -5100,8 +5111,30 @@ async fn lock_node(
     best: &AimNodeResult,
     close_conns: bool,
 ) -> Result<String, String> {
+    // 【v0.4.25 任务4】始终保存综合推荐节点（含被手动锁阻止切换的场景）
+    state.node_metrics.write().aim_best_node = Some(best.node_name.clone());
+
     if state.aim_locked_node.read().as_deref() == Some(best.node_name.as_str()) {
         return Ok(best.node_name.clone());
+    }
+
+    let settings = state.settings.read().clone();
+    let current = settings.selected_node.clone().unwrap_or_default();
+    let switching = current != best.node_name;
+    // 【v0.4.25 任务4】手动指定绝对锁：目标节点与用户当前指定不同时，
+    // 若判定禁止自动选点则绝不 select_proxy / 改 selected_node，仅落日志。
+    if switching {
+        let available: Vec<String> = state.aim_results.read().keys().cloned().collect();
+        if !should_auto_select_node(&settings, &available) {
+            crate::core::logger::info(
+                crate::core::logger::MOD_GO_AIM,
+                &format!(
+                    "[GoAIM] 检测完成，综合推荐「{}」；因用户已手动指定「{}」，保持当前节点不变",
+                    best.node_name, current
+                ),
+            );
+            return Ok(best.node_name.clone());
+        }
     }
 
     let api = state.kernel_api();
@@ -5119,10 +5152,10 @@ async fn lock_node(
     // 【APP39 任务4】同步「当前节点」到全局状态与磁盘：
     // 仪表盘「当前节点」读的是 settings.selected_node，
     // 只切内核策略组不写它会导致界面长期停留在旧节点（如 电信-LAX-01）。
-    // 注意：go_aim_pinned_node（用户手动指定）绝不能被自动选点覆盖，
-    // 否则手动模式被永久抹掉（指定节点复活后也无法恢复）。
-    *state.user_manually_selected_node.write() = false;
-    {
+    // 【v0.4.25 任务4】仅在确实发生切换（should_auto_select_node == true）
+    // 时清零手动标记；锁定的就是用户已指定的节点时保留用户语义。
+    if switching {
+        *state.user_manually_selected_node.write() = false;
         let mut settings = state.settings.read().clone();
         settings.selected_node = Some(best.node_name.clone());
         settings.user_manually_selected_node = false;

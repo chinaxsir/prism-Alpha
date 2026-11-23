@@ -14,6 +14,7 @@ pub mod ed25519_verify;
 pub mod events;
 pub mod go_aim;
 pub mod go_cus;
+pub mod go_cus_script;
 pub mod go_lan;
 pub mod kernel;
 pub mod license;

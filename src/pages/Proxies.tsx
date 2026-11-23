@@ -13,6 +13,7 @@ import {
   getGoAimStatus,
   runGoAimProbe,
   exportSingleNodeReport,
+  resetNodeSelectionToAuto,
   type AimNodeResult,
   type GoAimStatus,
 } from "@/api/ipc";
@@ -22,6 +23,7 @@ import { toast } from "@/components/ui/Toast";
 import { delayClass, delayText, type Delay } from "@/utils/latency";
 import { formatStandardNodeAimReport } from "@/utils/aimReport";
 import { useTranslation } from "@/i18n";
+import { currentUiLang, sanitizeUiError } from "@/utils/errorSanitizer";
 import clsx from "clsx";
 
 interface DelaySample {
@@ -228,6 +230,9 @@ export default function Proxies() {
   const aimFinishedAt = useCoreStore((s) => s.aimFinishedAt);
   const storeAim = useCoreStore((s) => s.goAimStatus);
   const mergeNodeDelays = useCoreStore((s) => s.mergeNodeDelays);
+  // 【v0.4.25 任务4】用户手动指定节点锁定状态（驱动「已指定」徽标与「恢复自动」按钮）
+  const manualPinned = useCoreStore((s) => s.settings.userManuallySelectedNode === true);
+  const setStoreSettings = useCoreStore((s) => s.setSettings);
   // Go AIM 智能筛选/检测的 Pro 守卫（ipa-9）：未激活时锁定筛选与探测入口
   const proReady = useProStore((s) => s.ready);
   const proUnlocked = useProStore((s) => s.unlocked);
@@ -514,7 +519,7 @@ export default function Proxies() {
       await loadProxies();
     } catch (e) {
       console.error("all delays test failed:", e);
-      toast.error(t("proxies.err.testFailed", { error: String(e) }));
+      toast.error(t("proxies.err.testFailed", { error: sanitizeUiError(String(e), currentUiLang()).message }));
     } finally {
       setTesting(false);
     }
@@ -526,9 +531,30 @@ export default function Proxies() {
     try {
       await selectProxy(mainSelectorRef.current, name);
       setCurrent(name);
+      // 【v0.4.25 任务4】手动指定即上锁：徽标立即点亮，后续测速/优选不会覆盖
+      setStoreSettings({ ...useCoreStore.getState().settings, userManuallySelectedNode: true });
       await loadProxies();
     } catch (e) {
       console.error("select proxy failed:", e);
+      toast.error(sanitizeUiError(String(e), currentUiLang()).message);
+    }
+  };
+
+  /// 【v0.4.25 任务4】恢复自动选点：清除手动指定标记与 Go AIM 锁定节点
+  const handleResetToAuto = async () => {
+    try {
+      await resetNodeSelectionToAuto();
+      setStoreSettings({ ...useCoreStore.getState().settings, userManuallySelectedNode: false });
+      setUserTouched(false);
+      toast.success(t("proxies.autoRestored"));
+      await loadProxies();
+    } catch (e) {
+      console.error("reset node selection failed:", e);
+      toast.error(
+        t("proxies.err.resetAutoFailed", {
+          error: sanitizeUiError(String(e), currentUiLang()).message,
+        }),
+      );
     }
   };
 
@@ -796,6 +822,23 @@ export default function Proxies() {
           <span className="truncate font-bold text-[#007AFF] dark:text-[#0A84FF]">
             {current || t("proxies.notSelected")}
           </span>
+          {/* 【v0.4.25 任务4】手动指定锁定徽标 + 恢复自动按钮：锁定时自动测速
+              /Go AIM 优选一律不会覆盖用户选择 */}
+          {manualPinned && (
+            <>
+              <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-amber-500 ring-1 ring-amber-500/30">
+                {t("proxies.pinned")}
+              </span>
+              <button
+                type="button"
+                title={t("proxies.pinnedTip")}
+                onClick={handleResetToAuto}
+                className="shrink-0 rounded bg-glass px-1.5 py-0.5 text-[10px] text-gray-400 transition-colors hover:text-gray-200"
+              >
+                {t("proxies.pinnedAuto")}
+              </button>
+            </>
+          )}
           <span className="shrink-0">·</span>
           <span
             className={clsx(
@@ -960,6 +1003,12 @@ export default function Proxies() {
                   >
                     {node.name}
                   </span>
+                  {/* 【v0.4.25 任务4】AIM 本轮优选节点显示「AIM 推荐」徽章 */}
+                  {aimBestNode?.name === node.name && (
+                    <span className="shrink-0 rounded bg-[#24B414]/15 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-[#24B414] ring-1 ring-[#24B414]/30 dark:text-[#30D158]">
+                      {t("proxies.aimRecommended")}
+                    </span>
+                  )}
                   {/* 【APP75 任务3.3】PROXY_FAILED 显示「代理不可用」红标 */}
                   {proxyFailed && (
                     <span

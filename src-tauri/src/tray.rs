@@ -40,9 +40,8 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     // 直接复用窗口图标（满幅渐变底）会被渲染成一块彩色方块。
     #[cfg(target_os = "macos")]
     {
-        let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
-            "../icons/tray-template.png"
-        ))?;
+        let tray_icon =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
         builder = builder.icon(tray_icon).icon_as_template(true);
     }
     #[cfg(not(target_os = "macos"))]
