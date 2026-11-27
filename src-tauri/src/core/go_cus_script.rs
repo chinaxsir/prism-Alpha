@@ -129,13 +129,47 @@ pub fn run_script(
     }
 }
 
-/// 供命令层 / 前端「测试脚本」按钮调用：执行一次并返回 `$done` 的值。
+/// 供命令层 / 前端「测试脚本」按钮调用：执行一次并返回结构化结果
+/// `{ok, request, response, done, log, notifications, durationMs, error}`。
 /// 测试使用独立的脚本键，执行后立即复原，不污染真实规则的熔断状态。
-pub fn test_script(data_dir: &Path, script: &str, request_json: Value) -> Result<Value, String> {
+pub fn test_script(
+    data_dir: &Path,
+    script: &str,
+    request_json: Value,
+    response_json: Option<Value>,
+) -> Result<Value, String> {
     let id = format!("__test__{}", fnv1a(script.as_bytes()));
-    let run = run_script(data_dir, &id, script, &request_json, None)?;
+    let started = Instant::now();
+    let res = run_script(data_dir, &id, script, &request_json, response_json.as_ref());
     reset_circuit(&id);
-    Ok(run.done.unwrap_or(Value::Null))
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match res {
+        Ok(run) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("ok".into(), serde_json::json!(true));
+            obj.insert("durationMs".into(), serde_json::json!(duration_ms));
+            obj.insert("log".into(), serde_json::json!(run.logs));
+            if !run.notifications.is_empty() {
+                obj.insert("notifications".into(), serde_json::json!(run.notifications));
+            }
+            if let Some(done) = run.done {
+                if let Some(req) = done.get("request") {
+                    obj.insert("request".into(), req.clone());
+                }
+                if let Some(resp) = done.get("response") {
+                    obj.insert("response".into(), resp.clone());
+                }
+                obj.insert("done".into(), done);
+            }
+            Ok(Value::Object(obj))
+        }
+        Err(err) => Ok(serde_json::json!({
+            "ok": false,
+            "error": err,
+            "log": [],
+            "durationMs": duration_ms,
+        })),
+    }
 }
 
 fn record_failure(script_id: &str, message: &str) {
@@ -179,9 +213,9 @@ fn execute_inner(
     // boa 无宿主栈上限接口时由 recursion_limit 兜底
     let prelude = build_prelude(request, response, &kv);
     ctx.eval(Source::from_bytes(&prelude))
-        .map_err(|e| format!("沙盒初始化失败: {e:?}"))?;
+        .map_err(|e| format!("沙盒初始化失败: {e}"))?;
     ctx.eval(Source::from_bytes(code))
-        .map_err(|e| format!("脚本执行异常: {e:?}"))?;
+        .map_err(|e| format!("脚本执行异常: {e}"))?;
     let text = read_back(&mut ctx)?;
     let parsed: Value =
         serde_json::from_str(&text).map_err(|e| format!("脚本结果读取失败: {e}"))?;
@@ -445,6 +479,30 @@ mod tests {
         let err = run_script(&dir, id, "while (true) {}", &request, None);
         assert!(err.is_err());
         reset_circuit(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_script_returns_structured_payload_and_response_hook() {
+        let dir = temp_dir("test-api");
+        let req = json!({"url": "https://example.com/api", "method": "GET", "headers": {}, "body": ""});
+        let resp = json!({"status": 200, "headers": {}, "body": "{\"a\":1}"});
+        let code = r#"
+            console.log("testing", $request.url);
+            var obj = JSON.parse($response.body);
+            obj.b = 2;
+            $done({ response: { status: 200, body: JSON.stringify(obj) } });
+        "#;
+        let out = test_script(&dir, code, req.clone(), Some(resp)).expect("应返回结构化结果");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["log"][0], json!("testing https://example.com/api"));
+        assert_eq!(out["response"]["status"], json!(200));
+        assert!(out["response"]["body"].as_str().unwrap().contains("\"b\":2"));
+
+        let failed = test_script(&dir, "throw new Error('syntax oops');", req, None)
+            .expect("脚本错误应封装在 ok=false 结构中");
+        assert_eq!(failed["ok"], json!(false));
+        assert!(failed["error"].as_str().unwrap().contains("syntax oops"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

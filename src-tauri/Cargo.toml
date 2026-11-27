@@ -1,6 +1,6 @@
 [package]
 name = "prism-proxy"
-version = "0.4.26"
+version = "0.4.27"
 description = "Prism - A modern cross-platform proxy client"
 authors = ["Prism Team"]
 license = "GPL-3.0"
@@ -78,9 +78,9 @@ bytes = "1.5"
 # Go Cus：URL 改写规则匹配 + 自签名 Root CA（纯 Rust，ring 后端）
 regex = "1"
 rcgen = "0.13"
-# 【v0.4.25】Go Cus MitM：TLS 终止（复用依赖树中已有的 rustls 0.23）
+# 【v0.4.26】Go Cus MitM：TLS 终止（复用依赖树中已有的 rustls 0.23）
 tokio-rustls = "0.26"
-# 【v0.4.25】Go Cus 沙盒 JS 执行器：纯 Rust 引擎，无 C/ICU 依赖
+# 【v0.4.26】Go Cus 沙盒 JS 执行器：纯 Rust 引擎，无 C/ICU 依赖
 boa_engine = "0.20"
 time = { version = "0.3", default-features = false, features = ["std", "local-offset", "formatting", "macros"] }
 

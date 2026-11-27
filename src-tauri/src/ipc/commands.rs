@@ -5920,13 +5920,9 @@ pub fn is_vpn_actually_running(state: &AppState) -> bool {
 
 // ============================== Go Cus（Pro） ==============================
 
-/// 读取覆写引擎配置（附实时命中统计）
-#[tauri::command]
-pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    if !state.is_pro_active() {
-        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
-    }
-    let cus = state.go_cus.read().clone();
+fn go_cus_settings_payload(
+    cus: &crate::core::go_cus::GoCusSettings,
+) -> Result<serde_json::Value, String> {
     let mut value = serde_json::to_value(cus).map_err(|e| sanitize_err(&e.to_string()))?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("hits".into(), crate::core::go_cus::hits_snapshot());
@@ -5934,7 +5930,23 @@ pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_jso
     Ok(value)
 }
 
-/// 保存覆写引擎基础设置（enabled / mitm / dns / hosts）；运行中重建生效
+fn emit_go_cus_updated(app: &AppHandle, cus: &crate::core::go_cus::GoCusSettings) {
+    if let Ok(payload) = go_cus_settings_payload(cus) {
+        let _ = app.emit("go-cus://updated", payload);
+    }
+}
+
+/// 读取覆写引擎配置（附实时命中统计）
+#[tauri::command]
+pub async fn get_go_cus_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+    }
+    let cus = state.go_cus.read().clone();
+    go_cus_settings_payload(&cus)
+}
+
+/// 保存覆写引擎基础设置（enabled / mitm / dns / hosts / modules）；运行中重建生效
 #[tauri::command]
 pub async fn save_go_cus_settings(
     settings: serde_json::Value,
@@ -5955,17 +5967,16 @@ pub async fn save_go_cus_settings(
         e
     })?;
     *state.go_cus.write() = cus.clone();
+    // 若开启引擎/MitM 或新增改写/脚本规则，立即按需拉起本地边车（无活跃规则时静默跳过）
+    crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await.map_err(|e| {
             log_cmd_error("Go Cus 配置生效重启内核失败", &e);
             e
         })?;
     }
-    // 【APP-11 任务3】广播 Go Cus 最新配置，仪表盘/代理页开关实时同步
-    let _ = app.emit(
-        "go-cus://updated",
-        serde_json::to_value(&cus).unwrap_or_default(),
-    );
+    // 【APP-11 任务3】广播 Go Cus 最新配置（附实时 hits），仪表盘/代理页开关实时同步
+    emit_go_cus_updated(&app, &cus);
     Ok(())
 }
 
@@ -6000,6 +6011,10 @@ pub async fn import_go_cus_module(
             log_cmd_error("解析 Go Cus 模块失败", &e);
             e
         })?;
+    // 首个模块导入即自动启用引擎
+    if !cus.enabled {
+        cus.enabled = true;
+    }
     crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
         log_cmd_error("保存 Go Cus 模块失败", &e);
         e
@@ -6014,20 +6029,6 @@ pub async fn import_go_cus_module(
             cus.modules.len()
         ),
     );
-    // 首个模块导入即自动启用引擎并拉起边车
-    let mut cus = state.go_cus.read().clone();
-    let mut changed = false;
-    if !cus.enabled {
-        cus.enabled = true;
-        changed = true;
-    }
-    if changed {
-        crate::core::go_cus::save(&state.data_dir, &cus).map_err(|e| {
-            log_cmd_error("保存 Go Cus 引擎开关失败", &e);
-            e
-        })?;
-        *state.go_cus.write() = cus;
-    }
     crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await.map_err(|e| {
@@ -6035,6 +6036,7 @@ pub async fn import_go_cus_module(
             e
         })?;
     }
+    emit_go_cus_updated(&app, &cus);
     serde_json::to_value(module).map_err(|e| sanitize_err(&e.to_string()))
 }
 
@@ -6058,13 +6060,15 @@ pub async fn toggle_go_cus_module(
         log_cmd_error("保存 Go Cus 模块开关失败", &e);
         e
     })?;
-    *state.go_cus.write() = cus;
+    *state.go_cus.write() = cus.clone();
+    crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await.map_err(|e| {
             log_cmd_error("切换 Go Cus 模块后重启内核失败", &e);
             e
         })?;
     }
+    emit_go_cus_updated(&app, &cus);
     Ok(())
 }
 
@@ -6088,21 +6092,23 @@ pub async fn delete_go_cus_module(
         log_cmd_error("删除 Go Cus 模块时保存配置失败", &e);
         e
     })?;
-    *state.go_cus.write() = cus;
+    *state.go_cus.write() = cus.clone();
     if *state.status.read() == CoreStatus::Running {
         restart_core(&app, &state).await.map_err(|e| {
             log_cmd_error("删除 Go Cus 模块后重启内核失败", &e);
             e
         })?;
     }
+    emit_go_cus_updated(&app, &cus);
     Ok(())
 }
 
-/// 测试运行脚本（沙盒内执行一次，返回 $done 的值；不污染真实规则的熔断状态）
+/// 测试运行脚本（沙盒内执行一次，返回结构化结果；不污染真实规则的熔断状态）
 #[tauri::command]
 pub async fn test_go_cus_script(
     script: String,
     request: serde_json::Value,
+    response: Option<serde_json::Value>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     if !state.is_pro_active() {
@@ -6114,16 +6120,18 @@ pub async fn test_go_cus_script(
     let data_dir = state.data_dir.clone();
     // 脚本执行是 CPU 密集且无 IO 等待，放到阻塞线程池避免卡住异步运行时
     tauri::async_runtime::spawn_blocking(move || {
-        crate::core::go_cus_script::test_script(&data_dir, &script, request).map_err(|e| {
-            log_cmd_error("Go Cus 脚本测试运行失败", &e);
-            e
-        })
+        crate::core::go_cus_script::test_script(&data_dir, &script, request, response).map_err(
+            |e| {
+                log_cmd_error("Go Cus 脚本测试运行失败", &e);
+                e
+            },
+        )
     })
     .await
     .map_err(|e| sanitize_err(&e.to_string()))?
 }
 
-/// 生成/读取 Root CA 并确保分发服务运行（返回指纹 + 安装 URL）
+/// 生成/读取 Root CA 并确保分发服务运行（返回指纹 + 有效期 + 安装 URL）
 #[tauri::command]
 pub async fn generate_or_get_ca_url(
     app: AppHandle,
@@ -6134,6 +6142,34 @@ pub async fn generate_or_get_ca_url(
     }
     let info = crate::core::go_cus::generate_or_get_ca(&state, app)?;
     serde_json::to_value(info).map_err(|e| sanitize_err(&e.to_string()))
+}
+
+/// 只读查询本机 CA 状态（不存在时返回 null，不触发自动生成）
+#[tauri::command]
+pub async fn get_go_cus_ca_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+    }
+    let info = crate::core::go_cus::get_ca_status(&state, app)?;
+    serde_json::to_value(info).map_err(|e| sanitize_err(&e.to_string()))
+}
+
+/// 重置 Go Cus 运行期命中统计
+#[tauri::command]
+pub async fn reset_go_cus_hits(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !state.is_pro_active() {
+        return Err("Go Cus 是 Pro 专属功能，请先激活授权".into());
+    }
+    crate::core::go_cus::reset_hits();
+    let cus = state.go_cus.read().clone();
+    emit_go_cus_updated(&app, &cus);
+    Ok(())
 }
 
 // ============================== 全模块运行日志（APP6 任务1） ==============================

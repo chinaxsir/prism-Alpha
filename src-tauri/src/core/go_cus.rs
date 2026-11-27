@@ -173,14 +173,14 @@ pub fn save(data_dir: &std::path::Path, settings: &GoCusSettings) -> Result<(), 
 
 static HITS: Lazy<DashMap<String, AtomicU64>> = Lazy::new(DashMap::new);
 
-fn record_hit(module_id: &str, rule_index: usize) {
+fn record_hit(module_id: &str, kind: &str, rule_index: usize) {
     let bump = |key: String| {
         HITS.entry(key)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     };
     bump(module_id.to_string());
-    bump(format!("{module_id}#{rule_index}"));
+    bump(format!("{module_id}#{kind}:{rule_index}"));
 }
 
 fn module_hits(module_id: &str) -> u64 {
@@ -189,17 +189,18 @@ fn module_hits(module_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// 命中快照：`{"modules":{id:n},"rules":{"id#i":n},"total":n}`
+/// 命中快照：`{"modules":{id:n},"rules":{"id#rw:i":n},"total":n}`
+/// 注意：`total` 仅按模块维累加，避免同一命中同时记入模块与规则后翻倍。
 pub fn hits_snapshot() -> Value {
     let mut modules = Map::new();
     let mut rules = Map::new();
     let mut total: u64 = 0;
     for entry in HITS.iter() {
         let count = entry.value().load(Ordering::Relaxed);
-        total = total.saturating_add(count);
         if entry.key().contains('#') {
             rules.insert(entry.key().clone(), json!(count));
         } else {
+            total = total.saturating_add(count);
             modules.insert(entry.key().clone(), json!(count));
         }
     }
@@ -227,6 +228,8 @@ pub struct ParsedCusModule {
     pub hosts: Vec<(String, String)>,
     /// [General] dns-server 列表
     pub dns_servers: Vec<String>,
+    /// 内联脚本源码映射：`inline:<hash>` → JS 源码
+    pub inline_scripts: HashMap<String, String>,
 }
 
 impl ParsedCusModule {
@@ -263,12 +266,61 @@ fn section_name(line: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// 解析 `# --- inline script <id> begin ---` / `end` 标记
+fn parse_inline_marker(line: &str) -> Option<(String, bool)> {
+    let rest = line.strip_prefix('#')?.trim();
+    let rest = rest.strip_prefix("---")?.trim();
+    let rest = rest.strip_suffix("---")?.trim();
+    let lower = rest.to_ascii_lowercase();
+    let after = lower.strip_prefix("inline script ")?;
+    let raw_after = rest.get(14..)?.trim();
+    if after.ends_with(" begin") {
+        let id = raw_after[..raw_after.len().saturating_sub(6)].trim();
+        if !id.is_empty() {
+            return Some((id.to_string(), true));
+        }
+    } else if after.ends_with(" end") {
+        let id = raw_after[..raw_after.len().saturating_sub(4)].trim();
+        if !id.is_empty() {
+            return Some((id.to_string(), false));
+        }
+    }
+    None
+}
+
 /// 行式解析：Surge sgmodule / QuanX / Loon 通用状态机
 fn parse_line_based(raw: &str) -> ParsedCusModule {
     let mut out = ParsedCusModule::default();
     let mut section = String::new();
+    let mut inline_id: Option<String> = None;
+    let mut inline_buf: Vec<String> = Vec::new();
     for raw_line in raw.lines() {
         let line = raw_line.trim();
+        // 优先提取内联脚本注释块（`# --- inline script <hash> begin ---` ... `end ---`）
+        if let Some(ref active_id) = inline_id {
+            if let Some((marker_id, is_begin)) = parse_inline_marker(line) {
+                if !is_begin && marker_id.eq_ignore_ascii_case(active_id) {
+                    out.inline_scripts
+                        .insert(format!("inline:{active_id}"), inline_buf.join("\n"));
+                    inline_id = None;
+                    inline_buf.clear();
+                    continue;
+                }
+            }
+            let code_line = raw_line
+                .strip_prefix("# ")
+                .or_else(|| raw_line.strip_prefix('#'))
+                .unwrap_or(raw_line);
+            inline_buf.push(code_line.to_string());
+            continue;
+        }
+        if let Some((marker_id, is_begin)) = parse_inline_marker(line) {
+            if is_begin {
+                inline_id = Some(marker_id);
+                inline_buf.clear();
+                continue;
+            }
+        }
         if line.is_empty() {
             continue;
         }
@@ -609,6 +661,7 @@ fn parse_script_line(line: &str) -> Option<CusScriptRule> {
     let mut path = String::new();
     let mut requires_body = false;
     let mut cron = None;
+    let mut tag: Option<String> = None;
     let mut first_two: Vec<&str> = Vec::new();
     for kv in kv_text.split(',') {
         let kv = kv.trim();
@@ -624,6 +677,11 @@ fn parse_script_line(line: &str) -> Option<CusScriptRule> {
                 "script-path" | "path" => path = v.to_string(),
                 "requires-body" => requires_body = v == "1" || v.eq_ignore_ascii_case("true"),
                 "cron" => cron = Some(v.to_string()),
+                "tag" => {
+                    if !v.is_empty() {
+                        tag = Some(v.to_string());
+                    }
+                }
                 _ => {}
             }
         } else if first_two.len() < 2 {
@@ -644,7 +702,9 @@ fn parse_script_line(line: &str) -> Option<CusScriptRule> {
         return None;
     }
     Some(CusScriptRule {
-        name: name.unwrap_or_else(|| format!("script-{}", short_hash(&path))),
+        name: name
+            .or(tag)
+            .unwrap_or_else(|| format!("script-{}", short_hash(&path))),
         kind,
         pattern,
         script_path: path,
@@ -823,6 +883,7 @@ struct RuntimeScript {
 struct RuntimeModule {
     rewrites: Vec<RuntimeRewrite>,
     scripts: Vec<RuntimeScript>,
+    inline_scripts: HashMap<String, String>,
 }
 
 static MODULE_CACHE: Lazy<DashMap<u64, Arc<RuntimeModule>>> = Lazy::new(DashMap::new);
@@ -852,7 +913,11 @@ fn runtime_module(module: &CusModule) -> Arc<RuntimeModule> {
             rule,
         })
         .collect();
-    let runtime = Arc::new(RuntimeModule { rewrites, scripts });
+    let runtime = Arc::new(RuntimeModule {
+        rewrites,
+        scripts,
+        inline_scripts: parsed.inline_scripts,
+    });
     if MODULE_CACHE.len() > 64 {
         MODULE_CACHE.clear();
     }
@@ -1188,31 +1253,30 @@ fn parse_header_op_inner(inner: &str) -> Option<HeaderOp> {
         return None;
     }
     let lower = text.to_ascii_lowercase();
-    if let Some(name) = lower.strip_prefix("remove-") {
-        let name = name.trim();
+    if lower.starts_with("remove-") {
+        let name = text[7..].trim().to_ascii_lowercase();
         if name.is_empty() {
             return None;
         }
-        return Some(HeaderOp::Del(name.to_string()));
+        return Some(HeaderOp::Del(name));
     }
-    if let Some(rest) = lower.strip_prefix("add-") {
+    if lower.starts_with("add-") {
+        let rest = &text[4..];
         let (name, value) = rest.split_once(':')?;
-        let name = name.trim();
+        let name = name.trim().to_ascii_lowercase();
         if name.is_empty() {
             return None;
         }
-        return Some(HeaderOp::Add(name.to_string(), value.trim().to_string()));
+        return Some(HeaderOp::Add(name, value.trim().to_string()));
     }
-    if let Some(rest) = lower.strip_prefix("replace-") {
+    if lower.starts_with("replace-") {
+        let rest = &text[8..];
         let (name, value) = rest.split_once(':')?;
-        let name = name.trim();
+        let name = name.trim().to_ascii_lowercase();
         if name.is_empty() {
             return None;
         }
-        return Some(HeaderOp::Replace(
-            name.to_string(),
-            value.trim().to_string(),
-        ));
+        return Some(HeaderOp::Replace(name, value.trim().to_string()));
     }
     None
 }
@@ -1255,6 +1319,7 @@ struct MatchedScript {
     module_id: String,
     rule_index: usize,
     rule: CusScriptRule,
+    inline_code: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -1351,6 +1416,10 @@ fn match_rules(settings: &GoCusSettings, url: &str) -> MatchOutcome {
             let matched = MatchedScript {
                 module_id: module.id.clone(),
                 rule_index: idx,
+                inline_code: runtime
+                    .inline_scripts
+                    .get(script.rule.script_path.trim())
+                    .cloned(),
                 rule: script.rule.clone(),
             };
             if script.rule.kind.contains("response") {
@@ -1610,14 +1679,14 @@ async fn handle_sidecar_conn(
             let probe_url = format!("https://{target}/");
             if let Some(terminal) = match_rules(&settings, &probe_url).terminal {
                 if terminal.action.starts_with("reject") {
-                    record_hit(&terminal.module_id, terminal.rule_index);
+                    record_hit(&terminal.module_id, "rw", terminal.rule_index);
                     let resp = build_terminal_response(&terminal, &probe_url);
                     let _ = write_all(&mut stream, &resp).await;
                     return Ok(());
                 }
             }
             if settings.mitm_enabled && mitm_should_decrypt(&mitm_patterns(&settings), &host) {
-                return handle_mitm(app, stream, host, settings, data_dir).await;
+                return handle_mitm(app, stream, host, port, settings, data_dir).await;
             }
         }
         let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port))
@@ -1691,7 +1760,7 @@ async fn handle_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     // 终端动作优先：不读 body，直接返回合成响应
     if let Some(terminal) = &matched.terminal {
-        record_hit(&terminal.module_id, terminal.rule_index);
+        record_hit(&terminal.module_id, "rw", terminal.rule_index);
         let resp = build_terminal_response(terminal, url);
         return write_all(stream, &resp).await.map_err(|e| e.to_string());
     }
@@ -1709,7 +1778,7 @@ async fn handle_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             let ops = matched.request_header_ops();
             for (hit, _) in &matched.request_header_rules {
-                record_hit(&hit.module_id, hit.rule_index);
+                record_hit(&hit.module_id, "rw", hit.rule_index);
             }
             return raw_forward(stream, method, url, headers, Vec::new(), &ops).await;
         }
@@ -1801,7 +1870,12 @@ async fn raw_forward<S: AsyncRead + AsyncWrite + Unpin + Send>(
     for (k, v) in &out {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
-    head.push_str(&format!("Host: {host}\r\nConnection: close\r\n\r\n"));
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    head.push_str(&format!("Host: {host_header}\r\nConnection: close\r\n\r\n"));
     write_all(&mut upstream, head.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -1867,11 +1941,20 @@ fn script_key(script: &MatchedScript) -> String {
     format!("{}#{}", script.module_id, script.rule_index)
 }
 
-/// 加载脚本源码：http(s) 远程带内存缓存；本地路径限定在 data_dir 子树内
-async fn load_script_code(rule: &CusScriptRule, data_dir: &Path) -> Option<String> {
+/// 加载脚本源码：优先内联源码 `inline:<hash>`，其次 http(s) 远程带内存缓存，最后 data_dir 本地路径
+async fn load_script_code(
+    rule: &CusScriptRule,
+    inline_code: Option<&str>,
+    data_dir: &Path,
+) -> Option<String> {
     static SCRIPT_CACHE: Lazy<DashMap<String, String>> = Lazy::new(DashMap::new);
+    if let Some(code) = inline_code {
+        if !code.trim().is_empty() {
+            return Some(truncate_text(code, MAX_SCRIPT_SOURCE));
+        }
+    }
     let path = rule.script_path.trim();
-    if path.is_empty() {
+    if path.is_empty() || path.starts_with("inline:") {
         return None;
     }
     if path.starts_with("http://") || path.starts_with("https://") {
@@ -1966,34 +2049,44 @@ async fn forward_via_reqwest<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .collect();
     apply_header_ops(&mut out_headers, &matched.request_header_ops());
     for (hit, _) in &matched.request_header_rules {
-        record_hit(&hit.module_id, hit.rule_index);
+        record_hit(&hit.module_id, "rw", hit.rule_index);
     }
     let mut body = body;
 
-    // 请求脚本
+    // 请求脚本（放到阻塞线程池执行 boa_engine，不阻塞 tokio worker）
     if let Some(script) = &matched.request_script {
-        if let Some(code) = load_script_code(&script.rule, data_dir).await {
-            let req_value = request_value(&method, &url, &out_headers, &body);
-            match go_cus_script::run_script(data_dir, &script_key(script), &code, &req_value, None)
-            {
-                Ok(run) => {
-                    record_hit(&script.module_id, script.rule_index);
-                    if let Some(done) = run.done {
-                        if let Some(resp) = done.get("response") {
-                            return write_json_response(stream, resp).await;
-                        }
-                        if let Some(patch) = done.get("request") {
-                            apply_request_patch(
-                                patch,
-                                &mut method,
-                                &mut url,
-                                &mut out_headers,
-                                &mut body,
-                            );
+        if let Some(code) =
+            load_script_code(&script.rule, script.inline_code.as_deref(), data_dir).await
+        {
+            if go_cus_script::body_allowed(body.len()) {
+                let req_value = request_value(&method, &url, &out_headers, &body);
+                let data_dir_owned = data_dir.to_path_buf();
+                let key = script_key(script);
+                let run_res = tokio::task::spawn_blocking(move || {
+                    go_cus_script::run_script(&data_dir_owned, &key, &code, &req_value, None)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("脚本任务异常: {e}")));
+                match run_res {
+                    Ok(run) => {
+                        record_hit(&script.module_id, "sc", script.rule_index);
+                        if let Some(done) = run.done {
+                            if let Some(resp) = done.get("response") {
+                                return write_json_response(stream, resp).await;
+                            }
+                            if let Some(patch) = done.get("request") {
+                                apply_request_patch(
+                                    patch,
+                                    &mut method,
+                                    &mut url,
+                                    &mut out_headers,
+                                    &mut body,
+                                );
+                            }
                         }
                     }
+                    Err(e) => logger::warn(MOD_GO_CUS, format!("请求脚本已跳过: {e}")),
                 }
-                Err(e) => logger::warn(MOD_GO_CUS, format!("请求脚本已跳过: {e}")),
             }
         }
     }
@@ -2032,42 +2125,53 @@ async fn forward_via_reqwest<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     apply_header_ops(&mut resp_headers, &matched.response_header_ops());
     for (hit, _) in &matched.response_header_rules {
-        record_hit(&hit.module_id, hit.rule_index);
+        record_hit(&hit.module_id, "rw", hit.rule_index);
     }
 
     // 响应脚本
     if let Some(script) = &matched.response_script {
-        if let Some(code) = load_script_code(&script.rule, data_dir).await {
-            let req_value = request_value(&method, &url, &out_headers, &body);
-            let resp_value = json!({
-                "status": status,
-                "headers": headers_object(&resp_headers),
-                "body": String::from_utf8_lossy(&resp_body),
-            });
-            match go_cus_script::run_script(
-                data_dir,
-                &script_key(script),
-                &code,
-                &req_value,
-                Some(&resp_value),
-            ) {
-                Ok(run) => {
-                    record_hit(&script.module_id, script.rule_index);
-                    if let Some(done) = run.done {
-                        if let Some(resp) = done.get("response") {
-                            if let Some(s) = resp.get("status").and_then(Value::as_u64) {
-                                status = s as u16;
-                            }
-                            if let Some(h) = resp.get("headers").and_then(Value::as_object) {
-                                resp_headers = object_to_headers(h);
-                            }
-                            if let Some(b) = resp.get("body") {
-                                resp_body = value_to_bytes(b);
+        if let Some(code) =
+            load_script_code(&script.rule, script.inline_code.as_deref(), data_dir).await
+        {
+            if go_cus_script::body_allowed(resp_body.len()) {
+                let req_value = request_value(&method, &url, &out_headers, &body);
+                let resp_value = json!({
+                    "status": status,
+                    "headers": headers_object(&resp_headers),
+                    "body": String::from_utf8_lossy(&resp_body),
+                });
+                let data_dir_owned = data_dir.to_path_buf();
+                let key = script_key(script);
+                let run_res = tokio::task::spawn_blocking(move || {
+                    go_cus_script::run_script(
+                        &data_dir_owned,
+                        &key,
+                        &code,
+                        &req_value,
+                        Some(&resp_value),
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("脚本任务异常: {e}")));
+                match run_res {
+                    Ok(run) => {
+                        record_hit(&script.module_id, "sc", script.rule_index);
+                        if let Some(done) = run.done {
+                            if let Some(resp) = done.get("response") {
+                                if let Some(s) = resp.get("status").and_then(Value::as_u64) {
+                                    status = s as u16;
+                                }
+                                if let Some(h) = resp.get("headers").and_then(Value::as_object) {
+                                    resp_headers = object_to_headers(h);
+                                }
+                                if let Some(b) = resp.get("body") {
+                                    resp_body = value_to_bytes(b);
+                                }
                             }
                         }
                     }
+                    Err(e) => logger::warn(MOD_GO_CUS, format!("响应脚本已跳过: {e}")),
                 }
-                Err(e) => logger::warn(MOD_GO_CUS, format!("响应脚本已跳过: {e}")),
             }
         }
     }
@@ -2203,6 +2307,7 @@ async fn handle_mitm(
     app: tauri::AppHandle,
     mut stream: tokio::net::TcpStream,
     host: String,
+    port: u16,
     settings: GoCusSettings,
     data_dir: PathBuf,
 ) -> Result<(), String> {
@@ -2240,7 +2345,11 @@ async fn handle_mitm(
     } else {
         path
     };
-    let url = format!("https://{host}{path}");
+    let url = if port == 443 {
+        format!("https://{host}{path}")
+    } else {
+        format!("https://{host}:{port}{path}")
+    };
     handle_http(
         &mut tls, &method, &url, &headers, leftover, &settings, &data_dir, true,
     )
@@ -2252,9 +2361,41 @@ async fn handle_mitm(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaInfo {
+    pub exists: bool,
     pub fingerprint: String,
     pub install_url: String,
+    pub cert_url: String,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaMeta {
+    not_before: String,
+    not_after: String,
+}
+
+fn format_iso_date(dt: time::OffsetDateTime) -> String {
+    format!("{:04}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
+}
+
+fn read_or_infer_ca_validity(data_dir: &Path) -> (Option<String>, Option<String>) {
+    let meta_path = data_dir.join("go_cus_ca.meta.json");
+    if let Ok(text) = std::fs::read_to_string(&meta_path) {
+        if let Ok(meta) = serde_json::from_str::<CaMeta>(&text) {
+            return (Some(meta.not_before), Some(meta.not_after));
+        }
+    }
+    if let Ok(mtime) = std::fs::metadata(data_dir.join("go_cus_ca.crt")).and_then(|m| m.modified())
+    {
+        let dt = time::OffsetDateTime::from(mtime);
+        let nb = format_iso_date(dt - time::Duration::days(1));
+        let na = format_iso_date(dt + time::Duration::days(3650));
+        return (Some(nb), Some(na));
+    }
+    (None, None)
 }
 
 /// 读取或生成 CA 文件（返回 PEM），不启动分发服务
@@ -2270,7 +2411,41 @@ fn ensure_ca_files(data_dir: &Path) -> Result<(String, String), String> {
     let (crt, key) = generate_self_signed_ca().map_err(|e| format!("CA 生成失败: {e}"))?;
     std::fs::write(&crt_path, &crt).map_err(|e| e.to_string())?;
     std::fs::write(&key_path, &key).map_err(|e| e.to_string())?;
+    let now = time::OffsetDateTime::now_utc();
+    let meta = CaMeta {
+        not_before: format_iso_date(now - time::Duration::days(1)),
+        not_after: format_iso_date(now + time::Duration::days(3650)),
+    };
+    if let Ok(text) = serde_json::to_string_pretty(&meta) {
+        let _ = std::fs::write(data_dir.join("go_cus_ca.meta.json"), text);
+    }
     Ok((crt, key))
+}
+
+/// 只读查询本机 CA 状态（不存在时返回 Ok(None)，不主动生成）
+pub fn get_ca_status(
+    state: &crate::core::state::AppState,
+    app: tauri::AppHandle,
+) -> Result<Option<CaInfo>, String> {
+    let data_dir = state.data_dir.clone();
+    let crt_path = data_dir.join("go_cus_ca.crt");
+    let key_path = data_dir.join("go_cus_ca.key");
+    if !crt_path.exists() || !key_path.exists() {
+        return Ok(None);
+    }
+    let crt_pem = std::fs::read_to_string(&crt_path).map_err(|e| e.to_string())?;
+    let fingerprint = ca_fingerprint(&crt_pem)?;
+    let (not_before, not_after) = read_or_infer_ca_validity(&data_dir);
+    ensure_ca_service(app, crt_pem);
+    Ok(Some(CaInfo {
+        exists: true,
+        fingerprint,
+        install_url: format!("http://127.0.0.1:{CA_PORT}/prism-ca.mobileconfig"),
+        cert_url: format!("http://127.0.0.1:{CA_PORT}/prism-ca.crt"),
+        not_before,
+        not_after,
+        created: false,
+    }))
 }
 
 /// 生成或读取自签名 Root CA（rcgen/ring 纯 Rust），并确保 2082 分发服务运行
@@ -2282,10 +2457,15 @@ pub fn generate_or_get_ca(
     let existed = data_dir.join("go_cus_ca.crt").exists();
     let (crt_pem, _key_pem) = ensure_ca_files(&data_dir)?;
     let fingerprint = ca_fingerprint(&crt_pem)?;
+    let (not_before, not_after) = read_or_infer_ca_validity(&data_dir);
     ensure_ca_service(app, crt_pem);
     Ok(CaInfo {
+        exists: true,
         fingerprint,
         install_url: format!("http://127.0.0.1:{CA_PORT}/prism-ca.mobileconfig"),
+        cert_url: format!("http://127.0.0.1:{CA_PORT}/prism-ca.crt"),
+        not_before,
+        not_after,
         created: !existed,
     })
 }
@@ -2400,7 +2580,20 @@ pub fn build_mobileconfig(crt_pem: &str) -> Result<Vec<u8>, String> {
 
 static CA_SERVICE_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// 确保 CA 分发服务运行（127.0.0.1:2082）
+fn pem_to_der(crt_pem: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let b64: String = crt_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("证书 PEM 解析失败: {e}"))
+}
+
+/// 确保 CA 分发服务运行（127.0.0.1:2082）：同时提供 iOS/macOS .mobileconfig、
+/// Windows/Android/Linux .crt/.pem 以及浏览器引导页 `/`
 fn ensure_ca_service(_app: tauri::AppHandle, crt_pem: String) {
     if CA_SERVICE_STARTED.swap(true, Ordering::AcqRel) {
         return;
@@ -2408,14 +2601,51 @@ fn ensure_ca_service(_app: tauri::AppHandle, crt_pem: String) {
     let mobileconfig = match build_mobileconfig(&crt_pem) {
         Ok(data) => data,
         Err(e) => {
+            CA_SERVICE_STARTED.store(false, Ordering::Release);
             tracing::error!("[go-cus] mobileconfig 生成失败: {e}");
             return;
         }
     };
+    let cert_der = match pem_to_der(&crt_pem) {
+        Ok(der) => der,
+        Err(e) => {
+            CA_SERVICE_STARTED.store(false, Ordering::Release);
+            tracing::error!("[go-cus] CA DER 解码失败: {e}");
+            return;
+        }
+    };
+    let cert_pem_bytes = crt_pem.into_bytes();
+    let portal_html = br#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Prism Root CA</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#0b0d13;color:#f3f4f6;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;box-sizing:border-box}
+.card{max-width:420px;width:100%;background:#1c1c1e;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:24px}
+h1{font-size:18px;margin:0 0 8px}p{font-size:13px;color:#9ca3af;line-height:1.6;margin:0 0 18px}
+a.btn{display:block;text-align:center;text-decoration:none;border-radius:10px;padding:11px 14px;font-size:13px;font-weight:600;margin-bottom:10px}
+.primary{background:#0a84ff;color:#fff}.secondary{background:#2c2c2e;color:#e5e7eb}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Prism Root CA</h1>
+<p>Install this local Root CA only on your own device to enable Go Cus HTTPS rewrite and scripting.</p>
+<a class="btn primary" href="/prism-ca.mobileconfig">Install Profile (iOS / macOS)</a>
+<a class="btn secondary" href="/prism-ca.crt">Download Certificate (.crt - Windows / Android / Linux)</a>
+<a class="btn secondary" href="/prism-ca.pem">Download PEM (.pem)</a>
+</div>
+</body>
+</html>"#
+        .to_vec();
+
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", CA_PORT)).await {
             Ok(l) => l,
             Err(e) => {
+                CA_SERVICE_STARTED.store(false, Ordering::Release);
                 tracing::error!("[go-cus] CA 服务绑定 {CA_PORT} 失败: {e}");
                 return;
             }
@@ -2425,23 +2655,55 @@ fn ensure_ca_service(_app: tauri::AppHandle, crt_pem: String) {
             let Ok((mut stream, _)) = listener.accept().await else {
                 continue;
             };
-            let body = mobileconfig.clone();
+            let mc = mobileconfig.clone();
+            let der = cert_der.clone();
+            let pem = cert_pem_bytes.clone();
+            let html = portal_html.clone();
             tauri::async_runtime::spawn(async move {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf).await;
                 let head = String::from_utf8_lossy(&buf);
-                if head.starts_with("GET /prism-ca.mobileconfig") {
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-apple-aspen-config\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.write_all(&body).await;
-                } else {
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .await;
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, disposition, body): (&str, Option<&str>, &[u8]) = match path {
+                    "/prism-ca.mobileconfig" => (
+                        "application/x-apple-aspen-config",
+                        Some("attachment; filename=\"PrismRootCA.mobileconfig\""),
+                        &mc,
+                    ),
+                    "/prism-ca.crt" | "/prism-ca.cer" => (
+                        "application/x-x509-ca-cert",
+                        Some("attachment; filename=\"PrismRootCA.crt\""),
+                        &der,
+                    ),
+                    "/prism-ca.pem" => (
+                        "application/x-pem-file",
+                        Some("attachment; filename=\"PrismRootCA.pem\""),
+                        &pem,
+                    ),
+                    "/" | "/index.html" => ("text/html; charset=utf-8", None, &html),
+                    _ => {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                };
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n"
+                );
+                if let Some(disp) = disposition {
+                    resp.push_str(&format!("Content-Disposition: {disp}\r\n"));
                 }
+                resp.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ));
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.write_all(body).await;
             });
         }
     });
@@ -2710,9 +2972,17 @@ tracker.bad.com = 0.0.0.0
             parse_header_ops("$(add-X-Foo: bar)"),
             vec![HeaderOp::Add("x-foo".into(), "bar".into())]
         );
+        // 值大小写必须保留（如 Bearer Token / User-Agent）
         assert_eq!(
-            parse_header_ops("$(replace-X-Foo: baz)"),
-            vec![HeaderOp::Replace("x-foo".into(), "baz".into())]
+            parse_header_ops("$(add-Authorization: Bearer AbCdEf123)"),
+            vec![HeaderOp::Add(
+                "authorization".into(),
+                "Bearer AbCdEf123".into()
+            )]
+        );
+        assert_eq!(
+            parse_header_ops("$(replace-X-Foo: BazValue)"),
+            vec![HeaderOp::Replace("x-foo".into(), "BazValue".into())]
         );
         assert_eq!(
             parse_header_ops("header-add X-Foo: bar"),
@@ -2725,6 +2995,54 @@ tracker.bad.com = 0.0.0.0
         assert_eq!(
             parse_header_ops("header-replace X-Foo: v2"),
             vec![HeaderOp::Replace("x-foo".into(), "v2".into())]
+        );
+    }
+
+    #[test]
+    fn test_inline_script_parsing_and_matching() {
+        let raw = concat!(
+            "#!name=自定义脚本\n",
+            "[Script]\n",
+            "http-request, ^https://api\\.example\\.com/v1, script-path=inline:a1b2c3d4, tag=MyInline, requires-body=1\n",
+            "# --- inline script a1b2c3d4 begin ---\n",
+            "# console.log('hello');\n",
+            "# $done({ response: { status: 200, body: 'ok' } });\n",
+            "# --- inline script a1b2c3d4 end ---\n",
+        );
+        let parsed = parse_universal_module(raw);
+        assert_eq!(parsed.scripts.len(), 1);
+        assert_eq!(parsed.scripts[0].name, "MyInline");
+        assert_eq!(parsed.scripts[0].script_path, "inline:a1b2c3d4");
+        let code = parsed
+            .inline_scripts
+            .get("inline:a1b2c3d4")
+            .expect("应解析出内联脚本源码");
+        assert!(code.contains("console.log('hello')"));
+        assert!(code.contains("$done("));
+
+        let settings = GoCusSettings {
+            enabled: true,
+            modules: vec![CusModule {
+                id: "local-custom-scripts".into(),
+                name: "自定义脚本".into(),
+                desc: None,
+                source: "local://local-custom-scripts".into(),
+                raw_content: raw.into(),
+                enabled: true,
+                stats: parsed.stats(),
+                updated_at: 0,
+                hits: 0,
+            }],
+            ..Default::default()
+        };
+        let matched = match_rules(&settings, "https://api.example.com/v1/user");
+        let req_sc = matched.request_script.expect("应命中请求脚本");
+        assert!(
+            req_sc
+                .inline_code
+                .as_deref()
+                .unwrap_or("")
+                .contains("$done(")
         );
     }
 
@@ -2921,12 +3239,12 @@ tracker.bad.com = 0.0.0.0
     #[test]
     fn test_hits_snapshot_shape() {
         reset_hits();
-        record_hit("mod-x", 3);
-        record_hit("mod-x", 3);
+        record_hit("mod-x", "rw", 3);
+        record_hit("mod-x", "rw", 3);
         let snap = hits_snapshot();
         assert_eq!(snap["modules"]["mod-x"], json!(2));
-        assert_eq!(snap["rules"]["mod-x#3"], json!(2));
-        assert_eq!(snap["total"], json!(4));
+        assert_eq!(snap["rules"]["mod-x#rw:3"], json!(2));
+        assert_eq!(snap["total"], json!(2));
         reset_hits();
         assert_eq!(hits_snapshot()["total"], json!(0));
     }

@@ -765,24 +765,42 @@ export interface GoCusScriptTestResult {
   ok: boolean;
   request?: GoCusScriptTestRequest;
   response?: GoCusScriptTestResponse;
+  done?: unknown;
   log?: string[];
+  notifications?: Array<[string, string, string]>;
+  durationMs?: number;
   error?: string;
 }
 
-/** v0.4.25：脚本测试运行（后端未就绪时会返回命令不存在错误，由页面提示） */
+/** v0.4.25+：脚本沙盒测试运行（支持请求/响应钩子） */
 export const testGoCusScript = (
   script: string,
   request: GoCusScriptTestRequest,
-) => invoke<GoCusScriptTestResult>("test_go_cus_script", { script, request });
+  response?: GoCusScriptTestResponse | null,
+) =>
+  invoke<GoCusScriptTestResult>("test_go_cus_script", {
+    script,
+    request,
+    response: response ?? null,
+  });
 
 /** v0.4.25：清除手动指定节点，恢复自动选点 */
 export const resetNodeSelectionToAuto = () =>
   invoke<void>("reset_node_selection_to_auto");
 
 export interface CaInfo {
+  exists?: boolean;
   fingerprint: string;
   installUrl: string;
+  certUrl?: string;
+  notBefore?: string | null;
+  notAfter?: string | null;
   created: boolean;
 }
 
 export const generateOrGetCaUrl = () => invoke<CaInfo>("generate_or_get_ca_url");
+/** 只读查询本机 CA 状态（不存在时返回 null，不触发生成） */
+export const getGoCusCaStatus = () =>
+  invoke<CaInfo | null>("get_go_cus_ca_status");
+/** 重置 Go Cus 运行期命中统计 */
+export const resetGoCusHits = () => invoke<void>("reset_go_cus_hits");

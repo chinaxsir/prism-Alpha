@@ -343,6 +343,8 @@ pub fn run() {
             ipc::commands::delete_go_cus_module,
             ipc::commands::test_go_cus_script,
             ipc::commands::generate_or_get_ca_url,
+            ipc::commands::get_go_cus_ca_status,
+            ipc::commands::reset_go_cus_hits,
             ipc::commands::get_kernel_info,
             ipc::commands::ensure_kernel,
             ipc::commands::get_app_logs,
