@@ -17,7 +17,7 @@
  *  11. AppIcon 四角满铺校验（纯 Node 内置 PNG 解码，0 第三方依赖）
  */
 
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, delimiter } from 'node:path';
 import { execSync } from 'node:child_process';
@@ -613,8 +613,41 @@ function cargoCheck(label, target) {
     fail(`${label} cargo check 失败（存在编译错误，禁止提交）：${cmd}`);
   }
 }
-cargoCheck('本机', '');
-cargoCheck('iOS（aarch64-apple-ios）', 'aarch64-apple-ios');
+// 【v0.4.29】CI 中本预检早于 npm run build / Fetch geo databases 执行：
+// tauri::generate_context! 要求 frontendDist(../dist) 存在，kernel.rs 又
+// include_bytes! 内嵌 binaries/geoip.db / geosite.db，缺失即 3 个与源码
+// 无关的编译错误。仅为类型检查临时补齐占位文件，检查结束后只删除本脚本
+// 创建的占位，绝不覆盖/残留真实产物（真实构建仍由后续步骤 fetch 与 build）。
+const compilePlaceholders = [];
+function ensurePlaceholder(rel, content) {
+  const abs = resolve(ROOT, rel);
+  if (existsSync(abs)) return;
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, content);
+  compilePlaceholders.push(abs);
+}
+const distExisted = existsSync(resolve(ROOT, 'dist'));
+ensurePlaceholder('dist/index.html', '<!doctype html><title>placeholder</title>');
+ensurePlaceholder('src-tauri/binaries/geoip.db', '');
+ensurePlaceholder('src-tauri/binaries/geosite.db', '');
+// 本机（CI 为 macOS）check 时 tauri-build 会校验 externalBin 侧车存在
+try {
+  const hostTriple = /host:\s*(\S+)/.exec(execSync('rustc -vV', { encoding: 'utf8' }))?.[1];
+  if (hostTriple) {
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    ensurePlaceholder(`src-tauri/binaries/sing-box-${hostTriple}${ext}`, '');
+  }
+} catch { /* rustc 不可用时交由 cargoCheck 报错 */ }
+if (compilePlaceholders.length) {
+  console.log(`   （临时占位 ${compilePlaceholders.length} 个编译期依赖文件，检查后自动清理）`);
+}
+try {
+  cargoCheck('本机', '');
+  cargoCheck('iOS（aarch64-apple-ios）', 'aarch64-apple-ios');
+} finally {
+  for (const p of compilePlaceholders) rmSync(p, { force: true });
+  if (!distExisted) rmSync(resolve(ROOT, 'dist'), { recursive: true, force: true });
+}
 
 // ============================================================
 // 检查 10：【APP28 任务1】Swift 禁止触碰 WebView 内部视图树（黑屏防复发）
