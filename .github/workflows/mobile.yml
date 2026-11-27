@@ -766,6 +766,7 @@ jobs:
             if [ "$bin" = "$APP/$EXEC" ]; then
               codesign --force --sign - \
                 --entitlements "$PWD/src-tauri/TrollStore.entitlements.plist" \
+                --generate-entitlement-der \
                 "$bin"
             elif [ "$bin" = "$APP/PrismHelper" ]; then
               # helper 以 root 身份脱离沙盒执行 LSApplicationWorkspace
@@ -796,11 +797,12 @@ jobs:
           #   对「缺失」的 seal 不校验 —— 因此必须让它不存在。
           if [ -n "$APPEX" ] && [ -n "$APPEX_EXEC" ]; then
             chmod +x "$APPEX/$APPEX_EXEC"
-            # 只签二进制文件：entitlements 嵌入 LC_CODE_SIGNATURE，
+            # 只签二进制文件：entitlements 嵌入 LC_CODE_SIGNATURE（含 DER 槽位7），
             # TrollStore 安装时用 dumpEntitlementsFromBinaryAtPath 提取
             # 后保留重签，因此 CI 侧必须先把 entitlements 嵌好
             codesign --force --sign - \
               --entitlements "$PWD/src-tauri/gen/apple/PrismVPN/PrismVPN.entitlements.plist" \
+              --generate-entitlement-der \
               "$APPEX/$APPEX_EXEC"
             # 移除 xcodebuild / 历史步骤遗留的 seal，杜绝 stale CodeResources
             rm -rf "$APPEX/_CodeSignature"

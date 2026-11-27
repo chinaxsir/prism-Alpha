@@ -62,7 +62,9 @@ class PrismVpnService : VpnService() {
             }
 
             addRoutes(builder, options.optJSONArray("inet4_route_address"), "0.0.0.0", 0)
-            addRoutes(builder, options.optJSONArray("inet6_route_address"), "::", 0)
+            if (v6.length() > 0) {
+                addRoutes(builder, options.optJSONArray("inet6_route_address"), "::", 0)
+            }
             addExcludedRoutes(builder, options.optJSONArray("inet4_route_exclude_address"))
             addExcludedRoutes(builder, options.optJSONArray("inet6_route_exclude_address"))
 

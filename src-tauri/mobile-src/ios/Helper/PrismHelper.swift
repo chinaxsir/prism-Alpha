@@ -347,6 +347,8 @@ struct PrismHelperMain {
             runFixPerm(appBundlePath: bundlePath)
         case "killext":
             runKillExt()
+        case "resetne":
+            runResetNE(appBundlePath: bundlePath)
         default:
             runRegister(appBundlePath: bundlePath)
             runFixPerm(appBundlePath: bundlePath)
@@ -354,22 +356,56 @@ struct PrismHelperMain {
     }
 }
 
+/// 覆盖安装 / Code=12 自愈专用清场（不触碰主 App 注册，绝不触发 uicache 注销主进程）：
+/// 1. 确保插件数据容器在磁盘就绪且属主为 mobile(501:501)；
+/// 2. 仅对 PlugIns/PrismVPN.appex 调用 registerPlugin:（增量刷新新 UUID 路径，不卸载主 App）；
+/// 3. 清理残留的旧 PrismVPN、neagent 与 pkd 进程，迫使 launchd 按最新 LaunchServices
+///    路径拉起干净的插件宿主会话，根治 TrollStore 覆盖升级后 Code=12 且 hb=无。
+private func runResetNE(appBundlePath: String) {
+    let appexBundlePath = "\(appBundlePath)/PlugIns/PrismVPN.appex"
+    let pluginContainerPath = ensurePluginContainerOnDisk(pluginID: appexBundleID)
+    chown(pluginContainerPath, 501, 501)
+
+    var pluginOK = false
+    if FileManager.default.fileExists(atPath: appexBundlePath),
+       let wsClass = NSClassFromString("LSApplicationWorkspace"),
+       let defaultSel = NSSelectorFromString("defaultWorkspace") as Selector?,
+       let defaultMethod = class_getClassMethod(wsClass, defaultSel)
+    {
+        let getWS = unsafeBitCast(method_getImplementation(defaultMethod), to: DefaultWorkspaceFn.self)
+        if let wsUnmanaged = getWS(wsClass, defaultSel) {
+            let ws = wsUnmanaged.takeUnretainedValue()
+            let regPluginSel = NSSelectorFromString("registerPlugin:")
+            if let m = class_getInstanceMethod(wsClass, regPluginSel) {
+                let fn = unsafeBitCast(method_getImplementation(m), to: LSRegisterPluginFn.self)
+                let pluginURL = NSURL(fileURLWithPath: appexBundlePath)
+                pluginOK = fn(ws, regPluginSel, pluginURL).boolValue
+            }
+        }
+    }
+
+    let killed = killProcessesByNames(["PrismVPN", "neagent", "pkd"])
+    print("result=resetne plugin=\(pluginOK ? 1 : 0) killed=\(killed)")
+    fflush(stdout)
+}
+
 /// 杀掉后台驻留的旧版 PrismVPN 扩展进程（build 150 方案）：TrollStore
 /// 覆盖安装只杀主 App 不杀扩展，旧 PrismVPN 进程挂在 nesessionmanager
 /// 上但磁盘二进制已被新版覆盖，占住 VPN 会话导致新版 startTunnel 无法
 /// 被拉起（Code=12 且 hb=无）。
-/// iOS 无 Process/NSTask（macOS 专属）；libproc 的 proc_listallpids/
-/// proc_pidpath 又未全部暴露进 iOS Swift Darwin overlay（18.5 SDK 实证
-/// cannot find in scope），故运行时 dlsym 加载 libproc，按可执行文件名
-/// 匹配 PrismVPN 后 SIGKILL 清场。
 private func runKillExt() {
-    let target = "PrismVPN"
+    let killed = killProcessesByNames(["PrismVPN"])
+    print("result=killext killed=\(killed)")
+    fflush(stdout)
+}
+
+private func killProcessesByNames(_ targets: Set<String>) -> Int {
     let selfPid = getpid()
 
     guard let lib = dlopen("/usr/lib/system/libproc.dylib", RTLD_LAZY) else {
         print("result=killext err=dlopen")
         fflush(stdout)
-        return
+        return 0
     }
     typealias ListAllPidsFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
     typealias PidPathFn = @convention(c) (pid_t, UnsafeMutablePointer<CChar>?, UInt32) -> Int32
@@ -377,7 +413,7 @@ private func runKillExt() {
           let pathSym = dlsym(lib, "proc_pidpath") else {
         print("result=killext err=dlsym")
         fflush(stdout)
-        return
+        return 0
     }
     let listAllPids = unsafeBitCast(listSym, to: ListAllPidsFn.self)
     let pidPath = unsafeBitCast(pathSym, to: PidPathFn.self)
@@ -387,7 +423,7 @@ private func runKillExt() {
     guard total > 0 else {
         print("result=killext err=no-processes")
         fflush(stdout)
-        return
+        return 0
     }
     let cap = Int(total) + 16
     var pids = [pid_t](repeating: 0, count: cap)
@@ -407,11 +443,10 @@ private func runKillExt() {
         guard len > 0 else { continue }
         let execPath = String(cString: path)
         let execName = execPath.split(separator: "/").last.map(String.init) ?? ""
-        if execName == target, kill(pid, SIGKILL) == 0 {
+        if targets.contains(execName), kill(pid, SIGKILL) == 0 {
             killed += 1
-            NSLog("[PrismHelper] killext SIGKILL pid=\(pid) path=\(execPath)")
+            NSLog("[PrismHelper] SIGKILL \(execName) pid=\(pid) path=\(execPath)")
         }
     }
-    print("result=killext killed=\(killed)")
-    fflush(stdout)
+    return killed
 }

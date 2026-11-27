@@ -260,10 +260,19 @@ pub fn run() {
                 });
             }
 
-            // 系统托盘（仅桌面端；menu/tray API 在移动端被 cfg 移除）：
-            // macOS 顶部状态栏：实时网速 + 快捷切换节点/模式/Pro 引擎菜单
+            // 系统托盘与开机自启动路径自愈（仅桌面端；menu/tray API 在移动端被 cfg 移除）：
+            // macOS 顶部状态栏：实时网速 + 快捷切换节点/模式/Pro 引擎菜单；
+            // 若用户开启了开机自启动，启动时静默刷新一次可执行文件路径，防止覆盖安装或移动目录后失效。
             #[cfg(desktop)]
             {
+                let auto_start_enabled = app
+                    .state::<core::state::AppState>()
+                    .settings
+                    .read()
+                    .auto_start;
+                if auto_start_enabled && let Err(e) = crate::platform::set_auto_start(true) {
+                    tracing::warn!("refresh auto_start on launch failed: {e}");
+                }
                 crate::tray::init_tray(app.handle())?;
             }
             Ok(())

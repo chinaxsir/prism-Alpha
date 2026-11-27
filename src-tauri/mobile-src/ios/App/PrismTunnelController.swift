@@ -144,7 +144,9 @@ func prismIosVpnStart(_ config: UnsafePointer<CChar>) -> Int32 {
         let provisioning = PrismTunnelController.diagnoseProvisioning()
         let rtEnt = PrismTunnelController.runtimeEntitlementsSummary()
         let pkdReg = PrismTunnelController.diagnosePkdRegistration()
-        let full = "\(errorDesc)\n[诊断] build=\(buildId) app=\(Bundle.main.bundleIdentifier ?? "?") ext=\(extensionBundleIdentifier) group=\(groupOk ? "OK" : "nil") managers=\(PrismTunnelController.lastManagerCount) seal=\(sealOk) rtEnt=\(rtEnt) pkd=\(pkdReg) rootHelper=\(PrismTunnelController.rootHelperResult) selfHelper=\(PrismTunnelController.selfHelperResult) hb=\(PrismTunnelController.diagnoseExtensionHeartbeat()) extErr=\(PrismTunnelController.diagnoseExtensionError()) crash=\(PrismTunnelController.latestExtensionCrashSummary()) box=\(PrismTunnelController.diagnoseBoxLog()) static=\(staticCheck) devMode=\(devMode) provisioning=\(provisioning) lsReg=\(PrismTunnelController.lsRegisterResult) lsAppWS=\(PrismTunnelController.lsAppWorkspaceResult) PlugIns: \(diag) ; appex签名: \(sig) ; appex预检: \(preflight)\n[提示] hb= 扩展心跳最后阶段（无=没进 startTunnel，start-gotPath/openTun/tun-ok=对应阶段）；extErr= 扩展写出的精确错误；crash= 最新 PrismVPN/Jetsam 崩溃报告头部。selfHelper= 随包 PrismHelper 以 root 执行的结果；rootHelper= TrollStore 官方 uicache（u0=成功）"
+        // 关键判据前置（PlugIns / appex签名 / appex预检 / hb / extErr / selfHelper / pkd），
+        // 防止 logger 单条 2000 字符截断尾部核心字段
+        let full = "\(errorDesc)\n[诊断] build=\(buildId) app=\(Bundle.main.bundleIdentifier ?? "?") ext=\(extensionBundleIdentifier) group=\(groupOk ? "OK" : "nil") managers=\(PrismTunnelController.lastManagerCount) seal=\(sealOk) PlugIns: \(diag) ; appex签名: \(sig) ; appex预检: \(preflight) hb=\(PrismTunnelController.diagnoseExtensionHeartbeat()) extErr=\(PrismTunnelController.diagnoseExtensionError()) selfHelper=\(PrismTunnelController.selfHelperResult) rootHelper=\(PrismTunnelController.rootHelperResult) pkd=\(pkdReg) rtEnt=\(rtEnt) devMode=\(devMode) box=\(PrismTunnelController.diagnoseBoxLog()) crash=\(PrismTunnelController.latestExtensionCrashSummary()) static=\(staticCheck) provisioning=\(provisioning)"
         let path = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("prism_vpn_start_error.txt")
         NSLog("[PrismVPN] 写错误详情到 \(path): \(full)")
@@ -446,15 +448,17 @@ final class PrismTunnelController {
             .replacingOccurrences(of: "libbox", with: "内核", options: .caseInsensitive)
     }
 
-    /// 把 NSError 完整描述（domain/code/userInfo）输出，便于真机定位
+    /// 把 NSError 完整描述（domain/code/underlying）紧凑输出，避免多层嵌套重复撑爆 2000 字符上限
     static func describe(error: Error) -> String {
-        let ns = error as NSError
-        let userInfo = ns.userInfo.map { (k, v) -> String in
-            "\(k)=\(v)"
-        }.joined(separator: "; ")
-        return sanitizeKernelError(
-            "domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription) userInfo={\(userInfo)}"
-        )
+        var chain: [String] = []
+        var cur: NSError? = error as NSError
+        var depth = 0
+        while let ns = cur, depth < 4 {
+            chain.append("domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)")
+            cur = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        return sanitizeKernelError(chain.joined(separator: " <- "))
     }
 
     // MARK: - 扩展心跳/错误/崩溃诊断（build 145 方案）
@@ -530,13 +534,14 @@ final class PrismTunnelController {
     static func latestExtensionCrashSummary() -> String {
         let dirs = [
             "/private/var/mobile/Library/Logs/CrashReporter",
-            "/private/var/mobile/Library/Logs/CrashReporter/Retired"
+            "/private/var/mobile/Library/Logs/CrashReporter/Retired",
+            "/private/var/logs/CrashReporter"
         ]
         let fm = FileManager.default
         var latestFile: LatestLogFile?
         for dir in dirs {
             guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for item in items where item.contains("PrismVPN") || item.contains("JetsamEvent") {
+            for item in items where item.contains("PrismVPN") {
                 let full = "\(dir)/\(item)"
                 guard let attrs = try? fm.attributesOfItem(atPath: full),
                       let mtime = attrs[.modificationDate] as? Date
@@ -546,13 +551,30 @@ final class PrismTunnelController {
                 }
             }
         }
-        guard let file = latestFile else { return "无crash日志" }
+        // 仅在近期（24h 内）存在 Jetsam 报告且无专属 PrismVPN 崩溃日志时补充读取
+        if latestFile == nil {
+            let cutoff = Date().addingTimeInterval(-86400)
+            for dir in dirs {
+                guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+                for item in items where item.contains("JetsamEvent") {
+                    let full = "\(dir)/\(item)"
+                    guard let attrs = try? fm.attributesOfItem(atPath: full),
+                          let mtime = attrs[.modificationDate] as? Date,
+                          mtime >= cutoff
+                    else { continue }
+                    if latestFile == nil || mtime > (latestFile?.mtime ?? Date.distantPast) {
+                        latestFile = LatestLogFile(path: full, mtime: mtime)
+                    }
+                }
+            }
+        }
+        guard let file = latestFile else { return "无近期crash" }
         guard let content = try? String(contentsOfFile: file.path, encoding: .utf8) else {
             return "不可读:\((file.path as NSString).lastPathComponent)"
         }
         let name = (file.path as NSString).lastPathComponent
-        // 截取前 400 字符（含 bug_type / exception / termination / dyld 错误详情）
-        let head = String(content.prefix(400)).replacingOccurrences(of: "\n", with: " ")
+        // 截取前 240 字符（含 bug_type / exception / termination / dyld 错误详情）
+        let head = String(content.prefix(240)).replacingOccurrences(of: "\n", with: " ")
         return "\(name):\(head)"
     }
 
@@ -1026,37 +1048,36 @@ final class PrismTunnelController {
         let appexBid = extensionBundleIdentifier
         let mainBid = Bundle.main.bundleIdentifier ?? "com.prism.proxy"
 
-        // 1. LS 层：直接对 appex bundleID 取 proxy——若 LS 认识该 plugin，
-        //    proxy 非 nil 且 pluginIdentity 存在（等价于主 App plugins 数组
-        //    里有它，但绕开 plugins 属性的桥接问题）
+        // 1. LS 层：优先用 LSPlugInKitProxy.pluginKitProxyForIdentifier: 查询扩展真实注册记录，
+        //    同时读取主 App LSApplicationProxy.plugInKitPlugins 数量（iOS 16 真实 selector）
         var lsPlug = "类未找到"
-        if let wsClass = NSClassFromString("LSApplicationProxy") {
-            let cls = wsClass as AnyObject
+        var plugCount = -1
+        if let appProxyCls = NSClassFromString("LSApplicationProxy") {
+            let cls = appProxyCls as AnyObject
             let proxySel = NSSelectorFromString("applicationProxyForIdentifier:")
-            if cls.responds(to: proxySel) {
-                let appexProxy = cls.perform(proxySel, with: appexBid)?
-                    .takeUnretainedValue()
-                let mainProxy = cls.perform(proxySel, with: mainBid)?
-                    .takeUnretainedValue()
-                // 主 App plugins 数组（NSArray 桥接可能失败，仅报数量）
-                var plugCount = -1
-                if let mp = mainProxy {
-                    let pluginsSel = NSSelectorFromString("plugins")
-                    if mp.responds(to: pluginsSel),
-                       let arr = mp.perform(pluginsSel)?.takeUnretainedValue() {
-                        plugCount = (arr as? NSArray)?.count ?? -1
-                    }
+            if cls.responds(to: proxySel),
+               let mp = cls.perform(proxySel, with: mainBid)?.takeUnretainedValue() {
+                let pkSel = NSSelectorFromString("plugInKitPlugins")
+                if mp.responds(to: pkSel),
+                   let arr = mp.perform(pkSel)?.takeUnretainedValue() as? NSArray {
+                    plugCount = arr.count
                 }
-                if appexProxy == nil {
-                    lsPlug = "appex无proxy"
+            }
+        }
+        if let pkProxyCls = NSClassFromString("LSPlugInKitProxy") {
+            let cls = pkProxyCls as AnyObject
+            let sel = NSSelectorFromString("pluginKitProxyForIdentifier:")
+            if cls.responds(to: sel) {
+                if let pkProxy = cls.perform(sel, with: appexBid)?.takeUnretainedValue() {
+                    let uuidSel = NSSelectorFromString("pluginUUID")
+                    let hasUUID = pkProxy.responds(to: uuidSel)
+                        && pkProxy.perform(uuidSel)?.takeUnretainedValue() != nil
+                    lsPlug = "已注册(uuid=\(hasUUID ? "有" : "无"),count=\(plugCount))"
                 } else {
-                    let piSel = NSSelectorFromString("pluginIdentity")
-                    let hasPI = appexProxy!.responds(to: piSel)
-                        && appexProxy!.perform(piSel)?.takeUnretainedValue() != nil
-                    lsPlug = "\(hasPI ? "pluginIdentity有" : "pluginIdentity无")(count=\(plugCount))"
+                    lsPlug = "未注册(count=\(plugCount))"
                 }
             } else {
-                lsPlug = "proxy选择器不可用"
+                lsPlug = "selector不可用(count=\(plugCount))"
             }
         }
         parts.append("lsPlug=\(lsPlug)")
@@ -1473,6 +1494,10 @@ final class PrismTunnelController {
     static let kPendingRestartKey = "prism_pending_restart_after_upgrade"
     /// 上一次进入连接状态记录（用于判断升级前隧道是否在使用中）
     private static let kWasConnectedKey = "prism_tunnel_was_connected"
+    /// 覆盖升级 / Code=12 自愈后需要对既有 NETunnelProviderManager 执行一次
+    /// isEnabled=false->true 会话重绑（迫使 nesessionmanagerd 丢弃指向旧 UUID
+    /// Bundle 的失效 NESMVPNSession 并重绑新版 PrismVPN.appex）
+    static let kNeedsSessionRebindKey = "prism_needs_session_rebind"
 
     /// 计算当前安装指纹。
     /// 仅比较版本号/build 无法感知「同 build 重签覆盖」或 TrollStore 覆盖重装，
@@ -1522,14 +1547,15 @@ final class PrismTunnelController {
         guard last != fingerprint else { return false }
 
         defaults.set(fingerprint, forKey: kUpgradeFingerprintKey)
-        // 同步旧键，保持既有清理路径（preCleanAndSyncVersion）行为一致
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         defaults.set(build, forKey: "prism_last_build_version")
+        // 标记下次启动 VPN 时对既有配置做一次会话重绑，消除覆盖安装后 Code=12
+        defaults.set(true, forKey: kNeedsSessionRebindKey)
         NSLog("[PrismVPN] 升级指纹变化 \(last ?? "无") -> \(fingerprint)，执行启动自愈")
 
-        // 1. 杀掉驻留的旧版 PrismVPN 扩展进程：不做这步，系统里运行的
-        //    仍是旧 appex，新版主 App 无法与它共享配置版本
-        killStaleExtensionProcess()
+        // 1. 增量注册新版 appex 路径并重启残留的旧版 PrismVPN / neagent / pkd 进程
+        //    （不触碰主 App LS 注册，绝不触发 uicache 注销主进程）
+        resetNetworkExtensionDaemons()
 
         // 2. 升级前隧道处于连接状态 → 标记待自动重启，由 Rust 在启动
         //    流程末尾重建隧道（用户无需手动点「连接」）
@@ -1540,7 +1566,7 @@ final class PrismTunnelController {
         return true
     }
 
-    /// 调用随包 PrismHelper killext（killall -9 PrismVPN）
+    /// 调用随包 PrismHelper killext（仅杀残留 PrismVPN 扩展进程）
     static func killStaleExtensionProcess() {
         let helperPath = Bundle.main.bundleURL
             .appendingPathComponent("PrismHelper").path
@@ -1552,6 +1578,31 @@ final class PrismTunnelController {
             path: helperPath, args: ["killext"],
             asRoot: true, captureOutput: false)
         NSLog("[PrismVPN] killext spawn=\(spawnTool.spawn) exit=\(spawnTool.exit) sig=\(spawnTool.termsig)")
+    }
+
+    /// 调用随包 PrismHelper resetne：确保插件容器存在 + 增量 registerPlugin: +
+    /// 清理旧 PrismVPN / neagent / pkd 进程，使 launchd 重新绑定当前 Bundle UUID
+    static func resetNetworkExtensionDaemons() {
+        let helperPath = Bundle.main.bundleURL
+            .appendingPathComponent("PrismHelper").path
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: helperPath)
+        guard FileManager.default.isExecutableFile(atPath: helperPath) else {
+            selfHelperResult = "resetne:helper缺失"
+            NSLog("[PrismVPN] resetne 失败：PrismHelper 不存在或不可执行")
+            return
+        }
+        let spawnTool = runSpawnTool(
+            path: helperPath,
+            args: ["resetne", Bundle.main.bundlePath],
+            asRoot: true,
+            captureOutput: true
+        )
+        let out = spawnTool.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " | ")
+        let sigNote = spawnTool.termsig != 0 ? " sig=\(spawnTool.termsig)" : ""
+        selfHelperResult = "resetne:s\(spawnTool.spawn)/u\(spawnTool.exit)\(sigNote)[\(out.prefix(160))]"
+        NSLog("[PrismVPN] \(selfHelperResult)")
     }
 
     // MARK: - 随包 root helper（PrismHelper）强扭注册
@@ -1819,25 +1870,19 @@ final class PrismTunnelController {
                 }
                 stale.append(manager)
             }
-            if let matched = matched {
-                // 【build 169 方案】版本变化（TrollStore 覆盖安装）：只调用
-                // 一次 PrismHelper killext 清理驻留的旧版扩展进程。严禁
-                // stopVPNTunnel → isEnabled=false → save → enable → save
-                // 连续双写——旧扩展进程仍驻留内存时极易卡死
-                // nesessionmanagerd（build 168 真机实证：首启必报 Code=12
-                // 且 hb=无），也绝不调用 rootHelper uicache
+            if matched != nil {
                 let current = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
                 let last = UserDefaults.standard.string(forKey: "prism_last_build_version")
                 if last != current {
                     UserDefaults.standard.set(current, forKey: "prism_last_build_version")
-                    NSLog("[PrismVPN] 检测到覆盖安装 \(last ?? "无") -> \(current)：killext 清理驻留旧版扩展进程")
-                    PrismTunnelController.killStaleExtensionProcess()
+                    UserDefaults.standard.set(true, forKey: PrismTunnelController.kNeedsSessionRebindKey)
+                    NSLog("[PrismVPN] 检测到覆盖安装 \(last ?? "无") -> \(current)：执行 resetne 清理旧扩展会话")
+                    PrismTunnelController.resetNetworkExtensionDaemons()
                 }
-                // 保持 isEnabled=true，单次 save 同步当前 App 版本号/签名
-                // 时间戳（消除"需要更新"红色提示）
-                NSLog("[PrismVPN] 匹配配置已存在，跳过清理，直接 save 同步版本号")
-                group.enter()
-                matched.saveToPreferences { _ in group.leave() }
+                // 不再在此处额外调用 matched.saveToPreferences：紧随其后的
+                // configureSaveAndStart 会做唯一一次权威 save + load，避免毫秒内
+                // 双重 save 导致 nesessionmanagerd 会话竞争引发 Code=12
+                NSLog("[PrismVPN] 匹配配置已存在，交由 configureSaveAndStart 单次保存同步")
             } else {
                 for manager in stale {
                     NSLog("[PrismVPN] 无匹配配置，仅清理旧签名残留: \(String(describing: (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier))")
@@ -1849,12 +1894,11 @@ final class PrismTunnelController {
         }
     }
 
-    /// 失败出口：Code=12 且扩展无心跳时执行一次性自愈——killext 杀掉
-    /// 卡死的旧驻留扩展进程，reload 会话句柄后 1.0s 重试一次启动；
-    /// 其余错误直接交回上层。
-    /// 【build 169 方案】任何路径都绝不删除已保存的 VPN 配置（误删 →
-    /// managers=0 → 反复授权弹窗；且新建配置首启必报 Code=12，删配置
-    /// 即形成「新建→报错→被删」死循环，build 168 真机实证）
+    /// 失败出口：Code=12 且扩展无心跳时执行一次性深度自愈——
+    /// 1) PrismHelper resetne 刷新插件注册并重启 PrismVPN / neagent / pkd；
+    /// 2) 置位 kNeedsSessionRebindKey，让既有 VPN 配置经过 isEnabled=false->true
+    ///    会话重绑（不删配置、零授权弹窗），迫使 nesessionmanagerd 丢弃失效会话；
+    /// 3) 0.8s 后自动重试一次启动；其余错误直接交回上层。
     private func recoverOrFinish(
         _ error: Error,
         configPath: String,
@@ -1862,28 +1906,20 @@ final class PrismTunnelController {
         completion: @escaping (Error?) -> Void
     ) {
         if PrismTunnelController.isVPNAppNotInstalled(error) {
-            // App 运行期严禁调用 rootHelper（uicache 会注销运行中的 App
-            // → 会话失效）。Code=14 仅记录诊断交回上层
-            NSLog("[PrismVPN] Code=14 插件未注册（App 运行期不调 uicache，交由用户重装/TrollStore 处理）")
+            NSLog("[PrismVPN] Code=14 插件未注册，尝试增量 registerPlugin 自愈")
+            PrismTunnelController.resetNetworkExtensionDaemons()
         }
-        // Code=12 且 hb=无：旧版 PrismVPN 进程驻留占住 nesessionmanager
-        // 会话的典型指纹，配置本身是好的——严禁删除；只杀卡死的旧扩展
-        // 进程，reload 后自动重试一次（code12SelfHealed 置位，仅一次，
-        // 再次失败直接交回上层，绝不循环）
         if !PrismTunnelController.code12SelfHealed,
            PrismTunnelController.isCode12WithNoHeartbeat(error)
         {
             PrismTunnelController.code12SelfHealed = true
-            NSLog("[PrismVPN] Code=12 且 hb=无：保留 VPN 配置，killext 清理旧扩展进程后自愈重试一次")
-            // 只调 PrismHelper killext（杀旧 PrismVPN 进程）；
-            // 绝不调用 uicache / rootHelper
-            PrismTunnelController.killStaleExtensionProcess()
-            // reload 刷新系统会话句柄（nesessionmanagerd 重新绑定），
-            // 1.0s 后重试启动
+            NSLog("[PrismVPN] Code=12 且 hb=无：执行 resetne + 会话重绑后自愈重试一次（保留 VPN 配置）")
+            PrismTunnelController.resetNetworkExtensionDaemons()
+            UserDefaults.standard.set(true, forKey: PrismTunnelController.kNeedsSessionRebindKey)
             NETunnelProviderManager.loadAllFromPreferences { managers, _ in
                 PrismTunnelController.lastManagerCount = managers?.count ?? 0
-                NSLog("[PrismVPN] 自愈 reload 完成（\(managers?.count ?? 0) 个配置全部保留），1.0s 后重试启动")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                NSLog("[PrismVPN] 自愈 reload 完成（\(managers?.count ?? 0) 个配置保留），0.8s 后重绑会话并重试")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                     self.startAttempt(
                         configPath: self.lastStartConfigPath.isEmpty ? configPath : self.lastStartConfigPath,
                         attemptsRemaining: attemptsRemaining,
@@ -1902,53 +1938,70 @@ final class PrismTunnelController {
         attemptsRemaining: Int,
         completion: @escaping (Error?) -> Void
     ) {
-        let proto = NETunnelProviderProtocol()
-        proto.providerBundleIdentifier = extensionBundleIdentifier
-        proto.serverAddress = managerServerTag
-        proto.disconnectOnSleep = false
-        // 只传路径（短），避开 NETunnelProviderManager
-        // providerConfiguration 512KB 限制
-        proto.providerConfiguration = ["config_path": configPath]
+        let isNewManager = (manager.protocolConfiguration == nil)
+        let needsRebind = !isNewManager
+            && UserDefaults.standard.bool(forKey: PrismTunnelController.kNeedsSessionRebindKey)
 
-        manager.protocolConfiguration = proto
-        manager.isEnabled = true
+        let applyAndLaunch: () -> Void = {
+            let proto = NETunnelProviderProtocol()
+            proto.providerBundleIdentifier = extensionBundleIdentifier
+            proto.serverAddress = managerServerTag
+            proto.disconnectOnSleep = false
+            proto.providerConfiguration = ["config_path": configPath]
 
-        manager.saveToPreferences { saveError in
-            if let saveError = saveError {
-                NSLog("[PrismVPN] saveToPreferences 失败: \(PrismTunnelController.describe(error: saveError))")
-                self.recoverOrFinish(
-                    saveError, configPath: configPath,
-                    attemptsRemaining: attemptsRemaining, completion: completion
-                )
-                return
-            }
-            NSLog("[PrismVPN] saveToPreferences 成功, extBundleId=\(extensionBundleIdentifier)")
+            manager.protocolConfiguration = proto
+            manager.isEnabled = true
 
-            // 【build 169 方案·关键】新建或修改配置 saveToPreferences 成功
-            // 后，必须重新 loadFromPreferences 从系统刷新会话句柄——
-            // nesessionmanagerd 完成会话绑定前直接 startVPNTunnel 必报
-            // Code=12 且扩展进程根本不被拉起（hb=无）。loadFromPreferences
-            // 完成后再等 0.8s 确保绑定落定，随后直接在已绑定的 manager
-            // 上启动隧道（取代旧的「通知等待 + loadAllFromPreferences 重查」
-            // 链路——0.5s 兜底过短，build 168 真机实证首启必失败）
-            manager.loadFromPreferences { loadError in
-                if let loadError = loadError {
-                    NSLog("[PrismVPN] loadFromPreferences 失败: \(PrismTunnelController.describe(error: loadError))")
+            manager.saveToPreferences { saveError in
+                if let saveError = saveError {
+                    NSLog("[PrismVPN] saveToPreferences 失败: \(PrismTunnelController.describe(error: saveError))")
                     self.recoverOrFinish(
-                        loadError, configPath: configPath,
+                        saveError, configPath: configPath,
                         attemptsRemaining: attemptsRemaining, completion: completion
                     )
                     return
                 }
-                self.activeManager = manager
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    self.launchTunnelSession(
-                        manager: manager,
-                        attemptsRemaining: attemptsRemaining,
-                        completion: completion
-                    )
+                NSLog("[PrismVPN] saveToPreferences 成功, extBundleId=\(extensionBundleIdentifier), rebind=\(needsRebind)")
+
+                manager.loadFromPreferences { loadError in
+                    if let loadError = loadError {
+                        NSLog("[PrismVPN] loadFromPreferences 失败: \(PrismTunnelController.describe(error: loadError))")
+                        self.recoverOrFinish(
+                            loadError, configPath: configPath,
+                            attemptsRemaining: attemptsRemaining, completion: completion
+                        )
+                        return
+                    }
+                    UserDefaults.standard.set(false, forKey: PrismTunnelController.kNeedsSessionRebindKey)
+                    self.activeManager = manager
+                    let settleDelay: TimeInterval = (isNewManager || needsRebind) ? 0.8 : 0.4
+                    DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
+                        self.launchTunnelSession(
+                            manager: manager,
+                            attemptsRemaining: attemptsRemaining,
+                            completion: completion
+                        )
+                    }
                 }
             }
+        }
+
+        // 覆盖升级 / Code=12 自愈场景：先停旧连接并将 isEnabled 置 false 落盘 reload，
+        // 迫使 nesessionmanagerd 销毁指向旧 Bundle UUID 的僵死 NESMVPNSession，
+        // 0.4s 后再重新启用并启动（不删除配置，不触发二次系统 VPN 授权弹窗）
+        if needsRebind {
+            NSLog("[PrismVPN] 执行既有 VPN 配置会话重绑（disable -> save -> load -> enable）")
+            manager.connection.stopVPNTunnel()
+            manager.isEnabled = false
+            manager.saveToPreferences { _ in
+                manager.loadFromPreferences { _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        applyAndLaunch()
+                    }
+                }
+            }
+        } else {
+            applyAndLaunch()
         }
     }
 

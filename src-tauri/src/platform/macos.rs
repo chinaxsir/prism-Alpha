@@ -134,19 +134,26 @@ pub fn set_auto_start(enabled: bool) -> io::Result<()> {
     if enabled {
         std::fs::create_dir_all(&dir)?;
         let exe = std::env::current_exe()?;
+        let escaped_exe = exe
+            .to_string_lossy()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key><string>com.prism.proxy</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array><string>com.prism.proxy</string></array>
     <key>ProgramArguments</key>
     <array><string>{}</string></array>
     <key>RunAtLoad</key><true/>
 </dict>
 </plist>
 "#,
-            exe.display()
+            escaped_exe
         );
         std::fs::write(&plist_path, plist)?;
     } else if std::path::Path::new(&plist_path).exists() {

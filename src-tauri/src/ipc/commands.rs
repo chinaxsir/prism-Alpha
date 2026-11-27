@@ -147,9 +147,8 @@ async fn start_core_inner(app: &AppHandle, state: &AppState) -> Result<(), Strin
         serde_json::json!({ "reason": "start" }),
     );
 
-    // 启动失败时统一回滚，避免半成品状态
+    // 启动失败时统一回滚，避免半成品状态（do_start 内部已在精确失败点写入 log_cmd_error，此处不再重复记录同条错误）
     if let Err(e) = do_start(app, state).await {
-        log_cmd_error("启动内核失败", &e);
         let _ = do_stop(state).await;
         let _ = state.transition(CoreStatus::Error);
         return Err(e);
@@ -324,21 +323,39 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     let binary_path = std::path::PathBuf::new();
 
     // 端口预检，避免与本机其他代理内核冲突。
-    // 移动端 mixed 入站已移除（流量全走 TUN），无需检查混合端口。
+    // 移动端 mixed 入站由扩展/进程内接管，无需桌面级端口冲突预检；
+    // 桌面端热重启（restart_core）期间旧内核尚未停机仍持有原 mixed_port，
+    // 若目标端口正是本进程当前运行的 mixed-in 端口则放行，避免自咬报错。
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        let listen_host = if settings.allow_lan {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        };
-        if !crate::core::state::is_port_free(listen_host, settings.mixed_port) {
-            let msg = format!(
-                "混合端口 {} 已被占用，请在“设置”中更换端口后重试",
-                settings.mixed_port
-            );
-            log_cmd_error("混合端口预检失败", &msg);
-            return Err(msg);
+        let own_running_port: Option<u16> = state
+            .kernel_handle
+            .read()
+            .as_ref()
+            .and_then(|h| h.config.runtime_config.get("inbounds"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("mixed-in"))
+            })
+            .and_then(|i| i.get("listen_port"))
+            .and_then(|p| p.as_u64())
+            .map(|p| p as u16);
+
+        if own_running_port != Some(settings.mixed_port) {
+            let listen_host = if settings.allow_lan {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            };
+            if !crate::core::state::is_port_free(listen_host, settings.mixed_port) {
+                let msg = format!(
+                    "混合端口 {} 已被占用，请在“设置”中更换端口后重试",
+                    settings.mixed_port
+                );
+                log_cmd_error("混合端口预检失败", &msg);
+                return Err(msg);
+            }
         }
     }
 
@@ -951,6 +968,9 @@ async fn auto_select_fastest(
         if let Some((name, _)) = &best {
             // 仅发送 1 次 PUT 切换，避免任何额外重启动作
             api.select_proxy(group, name).await?;
+            if state.settings.read().close_connections_on_switch {
+                let _ = api.close_all_connections().await;
+            }
         }
         return Ok(best.map(|(name, _)| name));
     }
@@ -1014,6 +1034,9 @@ async fn auto_select_fastest(
         }
         if let Some(best) = &best {
             api.select_proxy(group, best).await?;
+            if state.settings.read().close_connections_on_switch {
+                let _ = api.close_all_connections().await;
+            }
         }
         Ok(best)
     }
@@ -1102,8 +1125,13 @@ pub async fn stop_core(app: AppHandle, state: State<'_, AppState>) -> Result<(),
 
 /// 停止/退出时统一调用：回收 TUN 守卫 → 停内核 → 清系统代理
 pub(crate) async fn do_stop(state: &AppState) -> anyhow::Result<()> {
-    // 【APP6 任务1】[Kernel] 模块日志：VPN 停止
-    crate::core::logger::info(crate::core::logger::MOD_KERNEL, "正在停止 VPN 内核...");
+    let had_running_resources =
+        state.kernel_handle.read().is_some() || state.tun_guard.read().is_some();
+    if had_running_resources {
+        // 【APP6 任务1】[Kernel] 模块日志：仅在真实持有内核/TUN 句柄时记录停止日志，
+        // 避免启动前置校验或拉起失败回滚时产生误导性的「正在停止 VPN 内核...」
+        crate::core::logger::info(crate::core::logger::MOD_KERNEL, "正在停止 VPN 内核...");
+    }
     // 1. 关闭 TUN 守卫（手动路由/DNS 回滚，通常为 None）
     // 先在独立语句完成 write()，避免临时写守卫跨越 await（parking_lot 守卫 !Send）
     let tun_taken = state.tun_guard.write().take();
@@ -2981,8 +3009,11 @@ pub async fn auto_update_subscriptions_daily(app: AppHandle) {
     if !enabled {
         return;
     }
-    let today = (crate::core::license::now_unix().max(0) / 86_400) as u64;
-    if last_day.parse::<u64>().ok() == Some(today) {
+    // 统一按北京时间自然日 YYYY-MM-DD 判定「每天一次」，同时兼容旧版 UTC 天数格式
+    let bj_now = crate::core::logger::beijing_now_string();
+    let today_date = bj_now.get(..10).unwrap_or("0000-00-00").to_string();
+    let legacy_epoch_day = ((crate::core::license::now_unix().max(0) / 86_400) as u64).to_string();
+    if last_day == today_date || last_day == legacy_epoch_day {
         return;
     }
     let urls: Vec<String> = crate::core::store::load_subscriptions(&state.data_dir)
@@ -2994,20 +3025,39 @@ pub async fn auto_update_subscriptions_daily(app: AppHandle) {
         return;
     }
     tracing::info!("[AutoUpdate] 每日自动更新 {} 条订阅", urls.len());
+    let mut succeeded = 0usize;
     for url in &urls {
-        if let Err(e) = refresh_subscription(&app, &state, url).await {
-            tracing::warn!("[AutoUpdate] 更新失败 {url}: {e}");
+        match refresh_subscription(&app, &state, url).await {
+            Ok(_) => succeeded += 1,
+            Err(e) => tracing::warn!("[AutoUpdate] 更新失败 {url}: {e}"),
         }
     }
-    // 无论个别订阅失败与否都记录当天日期：失败走下次启动重试，
-    // 避免「某条订阅永久 404」导致每次启动都全量拉一轮。
-    let mut settings = state.settings.read().clone();
-    settings.last_auto_update_subs_date = today.to_string();
-    if let Err(e) = state.save_settings(settings) {
-        tracing::warn!("[AutoUpdate] 记录更新日期失败: {e}");
+    if succeeded > 0 {
+        // 至少有 1 条订阅成功拉取才记录今日已完成，避免冷启动 5s 时网络尚未就绪
+        // 导致全员失败却锁定整天不再更新
+        let mut settings = state.settings.read().clone();
+        settings.last_auto_update_subs_date = today_date.clone();
+        if let Err(e) = state.save_settings(settings) {
+            tracing::warn!("[AutoUpdate] 记录更新日期失败: {e}");
+        }
+        crate::core::logger::info(
+            crate::core::logger::MOD_SUB,
+            format!(
+                "每日自动更新订阅完成：成功 {succeeded}/{} 条（日期 {today_date}）",
+                urls.len()
+            ),
+        );
+        use tauri::Emitter;
+        let _ = app.emit("subscriptions://changed", ());
+    } else {
+        crate::core::logger::warn(
+            crate::core::logger::MOD_SUB,
+            format!(
+                "每日自动更新订阅暂未成功（0/{} 条），将在网络恢复或下次启动时重试",
+                urls.len()
+            ),
+        );
     }
-    use tauri::Emitter;
-    let _ = app.emit("subscriptions://changed", ());
 }
 
 /// 获取已保存的订阅记录（订阅页展示）
@@ -5216,6 +5266,10 @@ pub async fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if !(1024..=65535).contains(&settings.mixed_port) {
+        return Err("混合代理端口范围必须为 1024–65535".into());
+    }
+
     let prev = state.settings.read().clone();
 
     // 运行模式以 set_mode 为唯一入口（设置表单可能携带旧值，直接覆盖防止回退）
@@ -5226,9 +5280,11 @@ pub async fn save_settings(
     settings.go_aim_enabled = prev.go_aim_enabled;
     settings.go_aim_pinned_node = prev.go_aim_pinned_node.clone();
 
-    // 自启动立即生效
-    crate::platform::set_auto_start(settings.auto_start)
-        .map_err(|e| sanitize_err(&e.to_string()))?;
+    // 自启动立即生效（仅在变更时调用系统注册表 / LaunchAgent，避免每次改其他项重复写）
+    if prev.auto_start != settings.auto_start {
+        crate::platform::set_auto_start(settings.auto_start)
+            .map_err(|e| sanitize_err(&e.to_string()))?;
+    }
 
     // 落盘 settings.json，重启后恢复
     let next = settings.clone();
@@ -5236,20 +5292,59 @@ pub async fn save_settings(
         .save_settings(settings)
         .map_err(|e| format!("保存设置失败: {e}"))?;
 
-    // 影响入站/系统代理/出站结构的字段变更必须重建配置才能真实生效，
-    // 否则系统代理指向旧端口、内核监听旧端口，显示与实际脱节
-    // 【APP49 任务1】outbound_mode 不再触发重启：改走 Clash API PATCH 热切换
+    let is_running = *state.status.read() == CoreStatus::Running;
+
+    // 桌面端「设置系统代理」开关热生效：mixed-in 始终监听本地端口，无需重启内核，
+    // 直接备份/写入或恢复系统代理即可 0ms 无损切换（端口未变时）
+    if is_running
+        && *state.mode.read() == RunMode::SystemProxy
+        && prev.system_proxy != next.system_proxy
+        && prev.mixed_port == next.mixed_port
+    {
+        if next.system_proxy {
+            if state.proxy_backup.read().is_none()
+                && let Ok(backup) = crate::platform::get_system_proxy()
+            {
+                *state.proxy_backup.write() = Some(backup);
+            }
+            crate::platform::set_system_proxy("127.0.0.1", next.mixed_port)
+                .map_err(|e| format!("写入系统代理失败: {}", sanitize_err(&e.to_string())))?;
+        } else {
+            let backup = state.proxy_backup.write().take();
+            match backup {
+                Some(b) if b.enabled && !b.server.is_empty() => {
+                    if crate::platform::restore_system_proxy(&b).is_err() {
+                        let _ = crate::platform::clear_system_proxy();
+                    }
+                }
+                _ => {
+                    let _ = crate::platform::clear_system_proxy();
+                }
+            }
+        }
+    }
+
+    // 影响内核入站/DNS/路由结构的字段变更需要重载内核配置：
+    // - iOS 走 App Group 共享配置无感软重载（不销毁 NEPacketTunnel 会话）；
+    // - 其余平台执行 restart_core 重建配置并同步本地代理端口。
     let needs_restart = prev.mixed_port != next.mixed_port
         || prev.allow_lan != next.allow_lan
-        || prev.system_proxy != next.system_proxy
         || prev.ipv6 != next.ipv6
         || prev.block_quic != next.block_quic;
-    if needs_restart && *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+    if needs_restart && is_running {
+        #[cfg(target_os = "ios")]
+        {
+            hot_reload_mobile_config(&app, &state).await?;
+            crate::core::license::set_local_mixed_port(next.mixed_port);
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            restart_core(&app, &state).await?;
+        }
     }
     // 出站模式变化时热切换（与 set_outbound_mode 一致：内核不重启，
     // 仅按用户设置决定是否清理旧连接）
-    if prev.outbound_mode != next.outbound_mode && *state.status.read() == CoreStatus::Running {
+    if prev.outbound_mode != next.outbound_mode && is_running {
         let mode_str = match next.outbound_mode {
             crate::core::state::OutboundMode::Rule => "rule",
             crate::core::state::OutboundMode::Global => "global",
@@ -5259,6 +5354,13 @@ pub async fn save_settings(
         if api.patch_mode(mode_str).await.is_ok() && next.close_connections_on_switch {
             let _ = api.close_all_connections().await;
         }
+    }
+    // 用户在运行期重新开启「每天自动更新订阅」时，若今日尚未执行则立即后台补跑一次
+    if !prev.auto_update_subs_daily && next.auto_update_subs_daily {
+        let auto_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            auto_update_subscriptions_daily(auto_app).await;
+        });
     }
     // 【APP-11 任务3】保存后广播最新设置，前端所有页面（仪表盘/设置）实时同步
     let _ = app.emit(

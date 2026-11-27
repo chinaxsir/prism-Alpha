@@ -360,6 +360,11 @@ export const useCoreStore = create<CoreState>((set, get) => ({
     systemProxy: true,
     mode: "systemProxy",
     autoStart: false,
+    outboundMode: "rule",
+    ipv6: false,
+    blockQuic: false,
+    closeConnectionsOnSwitch: true,
+    autoUpdateSubsDaily: true,
   },
 
   setStatus: (status) => set({ status }),

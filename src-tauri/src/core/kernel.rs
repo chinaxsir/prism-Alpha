@@ -211,7 +211,7 @@ impl KernelHandle {
             tokio::task::spawn_blocking(move || crate::platform::ios::start_tunnel(&content))
                 .await
                 .map_err(|e| anyhow::anyhow!("VPN 启动任务异常退出: {e}"))?
-                .map_err(|e| anyhow::anyhow!("VPN 启动失败: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             tracing::info!("iOS packet tunnel extension start requested");
             (None, std::process::id())
         };
@@ -1321,7 +1321,9 @@ async fn auto_select_best_proxy(
         );
         let _ = api.select_proxy(&group, &pinned_node).await;
         let _ = api.select_proxy("GLOBAL", &pinned_node).await;
-        let _ = api.close_all_connections().await;
+        if state.settings.read().close_connections_on_switch {
+            let _ = api.close_all_connections().await;
+        }
         let _ = app_handle.emit("proxies://changed", serde_json::json!({}));
         return Ok(());
     }
@@ -1382,11 +1384,11 @@ async fn auto_select_best_proxy(
     if let Err(e) = api.select_proxy("GLOBAL", &node).await {
         tracing::debug!("GLOBAL 组同步选择失败（组不存在时忽略）: {e}");
     }
-    // 切换后清理全部旧连接：否则已建立的连接继续走旧节点（cache.db
-    // 已由扩展 sanitize 禁用并在启动时删除，无恢复问题；但运行中切换
-    // 必须主动清，与手动 select_proxy 命令行为一致——build 156）
-    if let Err(e) = api.close_all_connections().await {
-        tracing::warn!("自动选节点后清理旧连接失败: {e}");
+    // 按「切换策略时关闭连接」设置决定是否清理旧连接
+    if state.settings.read().close_connections_on_switch {
+        if let Err(e) = api.close_all_connections().await {
+            tracing::warn!("自动选节点后清理旧连接失败: {e}");
+        }
     }
     // 通知节点页刷新当前选中项（前端依赖该事件对齐当前节点）
     let _ = app_handle.emit("proxies://changed", serde_json::json!({}));

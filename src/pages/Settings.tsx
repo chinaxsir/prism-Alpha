@@ -116,7 +116,8 @@ export default function Settings() {
     outboundMode: "rule",
     ipv6: false,
     blockQuic: false,
-    closeConnectionsOnSwitch: false,
+    closeConnectionsOnSwitch: true,
+    autoUpdateSubsDaily: true,
     language: "system",
     theme: "system",
     ...useCoreStore.getState().settings,
@@ -613,7 +614,7 @@ export default function Settings() {
           icon={<RefreshCw size={16} className="text-gray-400" />}
           title={t("settings.closeConns")}
           desc={t("settings.closeConnsDesc")}
-          checked={form.closeConnectionsOnSwitch ?? false}
+          checked={form.closeConnectionsOnSwitch ?? true}
           onChange={(v) => patchPrefs({ closeConnectionsOnSwitch: v })}
         />
         {/* 【APP49 任务2.2】启动时自动更新全部订阅（每天一次，默认开启） */}

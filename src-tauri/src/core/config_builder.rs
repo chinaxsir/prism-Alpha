@@ -2052,6 +2052,11 @@ pub fn build(
     let dns_local_addr = cus_dns_override
         .filter(|addr| addr.parse::<std::net::Ipv4Addr>().is_ok())
         .unwrap_or_else(|| "223.5.5.5".to_string());
+    let dns_strategy = if settings.ipv6 {
+        "prefer_ipv4"
+    } else {
+        "ipv4_only"
+    };
     let mut dns_servers = vec![
         // 【v0.4.26 / ACP10 任务2.2】dns-remote 使用 Google DoH 443 经主代理出境：
         // Cloudflare 官方安全策略禁止 CF Worker 代理节点出站访问 1.1.1.1（连接直接被边缘拒绝），
@@ -2062,7 +2067,7 @@ pub fn build(
                 "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": main_tag,
-                "strategy": "ipv4_only",
+                "strategy": dns_strategy,
             })
         } else {
             json!({
@@ -2070,14 +2075,14 @@ pub fn build(
                 "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": "direct",
-                "strategy": "ipv4_only",
+                "strategy": dns_strategy,
             })
         },
         json!({
             "tag": "dns-local",
             "address": dns_local_addr,
             "detour": "direct",
-            "strategy": "ipv4_only",
+            "strategy": dns_strategy,
         }),
         // 【v0.4.26 / ACP10 任务2.1】dns-direct / dns-direct-backup 显式声明
         // `detour: "direct"`：在 sing-box 1.11 中，不写 detour 会默认走
@@ -2089,13 +2094,13 @@ pub fn build(
             "tag": "dns-direct",
             "address": "udp://223.5.5.5",
             "detour": "direct",
-            "strategy": "ipv4_only",
+            "strategy": dns_strategy,
         }),
         json!({
             "tag": "dns-direct-backup",
             "address": "udp://119.29.29.29",
             "detour": "direct",
-            "strategy": "ipv4_only",
+            "strategy": dns_strategy,
         }),
         // 【APP64 任务2.2】iOS SVCB/HTTPS 查询拦截
         json!({
@@ -2113,7 +2118,7 @@ pub fn build(
                 "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": main_tag,
-                "strategy": "ipv4_only",
+                "strategy": dns_strategy,
             });
         }
     }
@@ -2238,7 +2243,17 @@ pub fn build(
     final_rules.append(&mut route_rules);
     // —— 7. 全局（Global）模式 ——
     if !node_tags.is_empty() {
-        final_rules.push(json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
+        if settings.block_quic {
+            // 开启「阻止 QUIC」时，全局模式在此仅放行 TCP，让 UDP/443 继续落到下方
+            // QUIC 阻断规则后再由后续全局规则兜底非 443 UDP
+            final_rules.push(json!({
+                "clash_mode": "global",
+                "network": "tcp",
+                "outbound": "GLOBAL"
+            }));
+        } else {
+            final_rules.push(json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
+        }
     }
     // —— 8. 大陆高速直连（Rule 模式，不依赖 geosite.db） ——
     // 广告域名拦截 → 局域网主机名 → 国内域名（geosite cn）→ 内置大陆域名
@@ -2247,10 +2262,10 @@ pub fn build(
     // ① 广告拦截 → ② 私有域名直连 → ③ PROXY_DOMAIN 强制走 Proxy（必须在
     // geosite:cn 之前，防止 googleapis.com / google.com / chatgpt.com 等被
     // geosite=cn 里的 googleapis@cn 误配到 direct）→ ④ 大陆域名直连（域名
-    // 级：CN_DIRECT_DOMAIN_SUFFIXES + geosite:cn）→ ⑤ 非 CN 域名兜底走 Proxy
-    // （geolocation-!cn，域名级，必须在所有 IP 规则之前，防止污染 IP 命中
-    // geoip cn 被改道直连）→ ⑥ CN_DIRECT_CIDRS + geoip private + geoip cn
-    // （IP 规则兜底，仅对未命中域名的纯 IP 连接生效）。
+    // 级：CN_DIRECT_DOMAIN_SUFFIXES + geosite:cn）→ ⑤ 可选 QUIC 阻断（位于
+    // 大陆直连之后、geolocation-!cn 之前，确保海外 QUIC 不被前置域名规则吞掉）
+    // → ⑥ 非 CN 域名兜底走 Proxy（geolocation-!cn，域名级，必须在所有 IP 规则
+    // 之前）→ ⑦ CN_DIRECT_CIDRS + geoip private + geoip cn（IP 规则兜底）。
     let main_proxy_target = prism_proxy_tag
         .clone()
         .unwrap_or_else(|| rule_final.clone());
@@ -2259,21 +2274,45 @@ pub fn build(
     // ③ 【APP76 任务1.2】海外核心代理域名强制优先走 Proxy——放在大陆直连规则
     // 之前，彻底根除 safebrowsing.googleapis.com / chatgpt.com 等被 geosite:cn
     // 中的 googleapis@cn 误配到 direct 的问题。
+    // 开启 block_quic 时仅匹配 TCP，使 YouTube/Google 等 UDP/443 落入下方 QUIC 阻断。
     if main_proxy_target != "direct" {
-        final_rules.push(json!({
-            "domain_suffix": PROXY_DOMAIN_SUFFIXES,
-            "outbound": main_proxy_target.clone(),
-        }));
-        final_rules.push(json!({
-            "domain_keyword": PROXY_DOMAIN_KEYWORDS,
-            "outbound": main_proxy_target.clone(),
-        }));
+        if settings.block_quic {
+            final_rules.push(json!({
+                "domain_suffix": PROXY_DOMAIN_SUFFIXES,
+                "network": "tcp",
+                "outbound": main_proxy_target.clone(),
+            }));
+            final_rules.push(json!({
+                "domain_keyword": PROXY_DOMAIN_KEYWORDS,
+                "network": "tcp",
+                "outbound": main_proxy_target.clone(),
+            }));
+        } else {
+            final_rules.push(json!({
+                "domain_suffix": PROXY_DOMAIN_SUFFIXES,
+                "outbound": main_proxy_target.clone(),
+            }));
+            final_rules.push(json!({
+                "domain_keyword": PROXY_DOMAIN_KEYWORDS,
+                "outbound": main_proxy_target.clone(),
+            }));
+        }
     }
     // ④ 大陆域名直连
     final_rules.push(json!({ "domain_suffix": CN_DIRECT_DOMAIN_SUFFIXES, "outbound": "direct" }));
     // 桌面/Android 保留 geosite: cn（iOS 由上方内置名单兜底）
     final_rules.push(json!({ "geosite": "cn", "outbound": "direct" }));
-    // ⑤ 非大陆域名 → Proxy：域名级判定，零解析开销，必须在所有 IP 规则之前，
+    // ⑤ 可选 QUIC 阻断（block_quic=false 时全链路绝不生成）：
+    // 严格排在 go-lan、clash_mode: direct、大陆域名直连之后，且早于 geolocation-!cn，
+    // 确保国内直连 HTTP/3 不受影响的同时 100% 拦截海外代理流量的 QUIC/UDP443。
+    if settings.block_quic {
+        final_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
+        final_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
+        if !node_tags.is_empty() {
+            final_rules.push(json!({ "clash_mode": "global", "outbound": "GLOBAL" }));
+        }
+    }
+    // ⑥ 非大陆域名 → Proxy：域名级判定，零解析开销，必须在所有 IP 规则之前，
     // 否则被墙域名的污染 IP 会命中 geoip cn 被改道直连
     if main_proxy_target != "direct" {
         final_rules.push(json!({
@@ -2281,7 +2320,7 @@ pub fn build(
             "outbound": main_proxy_target.clone(),
         }));
     }
-    // ⑥ IP 规则兜底（全部排在域名规则之后，仅对未命中域名的纯 IP 连接生效）
+    // ⑦ IP 规则兜底（全部排在域名规则之后，仅对未命中域名的纯 IP 连接生效）
     final_rules.push(json!({ "ip_cidr": CN_DIRECT_CIDRS, "outbound": "direct" }));
     final_rules.push(json!({ "geoip": "private", "outbound": "direct" }));
     final_rules.push(json!({ "geoip": "cn", "outbound": "direct" }));
@@ -2297,13 +2336,6 @@ pub fn build(
             "ip_cidr": ["8.8.8.8/32", "8.8.4.4/32", "1.1.1.1/32", "1.0.0.1/32"],
             "outbound": main_tag,
         }));
-    }
-    // —— 9. 可选 QUIC 阻断（block_quic=false 时全链路绝不生成） ——
-    // 必须排在大陆直连、clash_mode: direct、go-lan 之后，只作用于后续
-    // 走代理的海外流量；关闭 sniff 时 protocol 无法识别，叠加 UDP/443 兜底。
-    if settings.block_quic {
-        final_rules.push(json!({ "protocol": "quic", "outbound": "block" }));
-        final_rules.push(json!({ "network": "udp", "port": 443, "outbound": "block" }));
     }
     // —— 10. route.final 兜底（见上方 final_tag） ——
     let route_rules = final_rules;
@@ -6777,6 +6809,154 @@ rules:
                 .unwrap_or_default();
             for name in ["手动A", "手动B"] {
                 assert!(members.contains(&name), "{tag} 必须包含 {name}");
+            }
+        }
+    }
+
+    /// 审计回归测试：本地入站（mixedPort / allowLan）与高级（ipv6 / blockQuic）全链路落地校验
+    #[test]
+    fn audit_local_inbound_and_advanced_settings_landed() {
+        // 1. 默认关闭 IPv6 / allowLan，自定义 mixedPort = 7890
+        let s_off = UserSettings {
+            mixed_port: 7890,
+            allow_lan: false,
+            ipv6: false,
+            block_quic: false,
+            ..UserSettings::default()
+        };
+        let built_off = build(
+            &app70_sub(),
+            &[],
+            RunMode::Tun,
+            &s_off,
+            &std::env::temp_dir().join("prism-audit-off"),
+            &std::env::temp_dir().join("prism-audit-off/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build s_off must succeed");
+
+        let inbounds_off = built_off.config["inbounds"].as_array().unwrap();
+        let mixed_off = inbounds_off
+            .iter()
+            .find(|i| i["tag"] == "mixed-in")
+            .expect("mixed-in must exist");
+        assert_eq!(mixed_off["listen"], "127.0.0.1");
+        assert_eq!(mixed_off["listen_port"], 7890);
+
+        let tun_off = inbounds_off
+            .iter()
+            .find(|i| i["type"] == "tun")
+            .expect("tun must exist");
+        assert_eq!(tun_off["address"], json!(["172.19.0.1/30"]));
+
+        for srv in built_off.config["dns"]["servers"].as_array().unwrap() {
+            if srv["tag"] != "dns-block" {
+                assert_eq!(
+                    srv["strategy"], "ipv4_only",
+                    "ipv6=false 时所有 DNS server 必须为 ipv4_only: {srv}"
+                );
+            }
+        }
+        assert_eq!(built_off.config["dns"]["strategy"], "ipv4_only");
+
+        // 2. 开启 allowLan + IPv6 + blockQuic
+        let s_on = UserSettings {
+            mixed_port: 10808,
+            allow_lan: true,
+            ipv6: true,
+            block_quic: true,
+            ..UserSettings::default()
+        };
+        let built_on = build(
+            &app70_sub(),
+            &[],
+            RunMode::Tun,
+            &s_on,
+            &std::env::temp_dir().join("prism-audit-on"),
+            &std::env::temp_dir().join("prism-audit-on/kernel"),
+            "127.0.0.1:9090",
+            "secret",
+            &crate::core::go_lan::GoLanSettings::default(),
+            &crate::core::go_cus::GoCusSettings::default(),
+        )
+        .expect("build s_on must succeed");
+
+        let inbounds_on = built_on.config["inbounds"].as_array().unwrap();
+        let mixed_on = inbounds_on
+            .iter()
+            .find(|i| i["tag"] == "mixed-in")
+            .expect("mixed-in must exist");
+        assert_eq!(mixed_on["listen"], "0.0.0.0");
+        assert_eq!(mixed_on["listen_port"], 10808);
+
+        let tun_on = inbounds_on
+            .iter()
+            .find(|i| i["type"] == "tun")
+            .expect("tun must exist");
+        assert_eq!(
+            tun_on["address"],
+            json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]),
+            "ipv6=true 时 TUN 必须接管 IPv6 地址"
+        );
+
+        let direct_on = built_on.config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "direct")
+            .expect("direct must exist");
+        assert!(
+            direct_on.get("domain_strategy").is_none(),
+            "ipv6=true 时 direct 出站不得锁死 ipv4_only"
+        );
+
+        for srv in built_on.config["dns"]["servers"].as_array().unwrap() {
+            if srv["tag"] != "dns-block" {
+                assert_eq!(
+                    srv["strategy"], "prefer_ipv4",
+                    "ipv6=true 时 DNS server 必须允许返回 AAAA (prefer_ipv4): {srv}"
+                );
+            }
+        }
+        assert_eq!(built_on.config["dns"]["strategy"], "prefer_ipv4");
+
+        // 3. 校验 blockQuic 在 PROXY_DOMAIN 与 geolocation-!cn 下的真实拦截顺序
+        let rules_on = built_on.config["route"]["rules"].as_array().unwrap();
+        let quic_idx = rules_on
+            .iter()
+            .position(|r| r["outbound"] == "block" && r["protocol"] == "quic")
+            .expect("quic block rule must exist");
+        let udp443_idx = rules_on
+            .iter()
+            .position(|r| r["outbound"] == "block" && r["network"] == "udp" && r["port"] == 443)
+            .expect("udp/443 block rule must exist");
+        let foreign_idx = rules_on
+            .iter()
+            .position(|r| r["geosite"] == "geolocation-!cn")
+            .expect("geolocation-!cn rule must exist");
+        assert!(
+            udp443_idx < foreign_idx,
+            "QUIC/UDP443 阻断必须位于 geolocation-!cn 之前，防止海外 QUIC 被提前转发到代理"
+        );
+        // 在 quic_idx 之前的 PROXY_DOMAIN / clash_mode:global 规则必须限定 network=tcp，不得吞掉 UDP/443
+        for r in &rules_on[..quic_idx] {
+            let is_proxy_domain = r["domain_suffix"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == "youtube.com"));
+            if is_proxy_domain {
+                assert_eq!(
+                    r["network"], "tcp",
+                    "block_quic=true 时前置 PROXY_DOMAIN 规则必须限定 tcp，放行 UDP/443 进入 QUIC 阻断"
+                );
+            }
+            if r["clash_mode"] == "global" {
+                assert_eq!(
+                    r["network"], "tcp",
+                    "block_quic=true 时前置 global 规则必须限定 tcp，放行 UDP/443 进入 QUIC 阻断"
+                );
             }
         }
     }

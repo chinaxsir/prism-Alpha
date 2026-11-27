@@ -1438,9 +1438,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         dnsSettings.matchDomains = [""]
         settings.dnsSettings = dnsSettings
 
-        var v4Addresses = prefixes(json["inet4_address"])
+        var v4Addresses = prefixes(json["inet4_address"]).filter { !$0.address.contains(":") }
         if v4Addresses.isEmpty {
-            v4Addresses = prefixes(json["address"])
+            v4Addresses = prefixes(json["address"]).filter { !$0.address.contains(":") }
         }
         if v4Addresses.isEmpty {
             v4Addresses = [Prefix(address: "172.19.0.1", prefix: 30)]
@@ -1569,7 +1569,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // 纯内存 gvisor 通道。
         settings.proxySettings = nil
 
-        let v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 }
+        var v6Addresses = prefixes(json["inet6_address"]).filter { !$0.address.isEmpty && $0.prefix > 0 && $0.address.contains(":") }
+        if v6Addresses.isEmpty {
+            v6Addresses = prefixes(json["address"]).filter { !$0.address.isEmpty && $0.prefix > 0 && $0.address.contains(":") }
+        }
         if !v6Addresses.isEmpty {
             let ipv6 = NEIPv6Settings(
                 addresses: v6Addresses.map(\.address),
@@ -2051,6 +2054,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return false
         }
 
+        // 读取设置页「高级 -> IPv6」开关状态（由 Rust config_builder 下发到 tun.address 与 dns.strategy）
+        let incomingDnsStrategy = ((root["dns"] as? [String: Any])?["strategy"] as? String) ?? "ipv4_only"
+        let incomingTunHasIPv6: Bool = {
+            guard let inbs = root["inbounds"] as? [[String: Any]] else { return false }
+            for inb in inbs where (inb["type"] as? String) == "tun" {
+                if let addrs = inb["address"] as? [String], addrs.contains(where: { $0.contains(":") }) {
+                    return true
+                }
+            }
+            return false
+        }()
+        let incomingIPv6Enabled = incomingTunHasIPv6 || incomingDnsStrategy != "ipv4_only"
+        let dnsStrategyValue = incomingIPv6Enabled ? "prefer_ipv4" : "ipv4_only"
+
         // 1. 修正 inbounds 中的 tun 配置
         if var inbounds = root["inbounds"] as? [[String: Any]] {
             for i in inbounds.indices {
@@ -2061,13 +2078,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // 下发，tun-in 不再自行改路由（auto_route=false）。
                     inbounds[i]["auto_route"] = false
                     // 【APP39 / APP64 任务3.1】tun-in 统一虚拟网卡地址与 gvisor 协议栈：
-                    // - stack="gvisor"：用户态协议栈直接从 utun fd 读写 IP 包，不依赖 iOS 内核
-                    //   Loopback 注入，彻底根除 `endpoint not connected` 导致下载为 0 的问题；
-                    // - address=["172.19.0.1/30"]：与 NEPacketTunnelNetworkSettings 的
-                    //   NEIPv4Settings 100% 对齐（系统路由、DNS 默认路由、tun 本地三者同一网段）；
-                    // - 移除旧字段 inet4_address 冲突（它是旧 sing-box 旧 API，新 sing-box 仅用 address）。
+                    // 开启 IPv6 时保留 fdfe:dcba:9876::1/126，由 openTun 同步配置 NEIPv6Settings。
                     inbounds[i].removeValue(forKey: "inet4_address")
-                    inbounds[i]["address"] = ["172.19.0.1/30"]
+                    inbounds[i]["address"] = incomingIPv6Enabled
+                        ? ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+                        : ["172.19.0.1/30"]
                     inbounds[i]["mtu"] = 1280
                     // 【APP80 任务1.2】栈 mixed → gvisor（恢复 v0.4.8 稳定参数）：
                     // mixed 栈在 iOS 上会走系统网络栈，扩展进程与系统代理配置
@@ -2185,11 +2200,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 blockOutboundTag = tag.isEmpty ? "block" : tag
             } else if t == "direct" {
                 hasDirectOutbound = true
-                // 【APP-11B 任务2】direct 出站强制 ipv4_only：iOS 16.5 NECP 沙盒下
-                // Go 默认创建 AF_INET6 双栈 UDP Socket 会被拒绝（EPERM），
-                // 锁定 ipv4_only 强制使用纯 IPv4 udp4 Socket，根治
-                // `listen outbound packet connection: operation not permitted`
-                outbounds[i]["domain_strategy"] = "ipv4_only"
+                // 未开启 IPv6 时锁定 ipv4_only 强制使用纯 IPv4 Socket；
+                // 用户显式开启 IPv6 时开放双栈（此时 openTun 已配置完整 NEIPv6Settings）
+                if incomingIPv6Enabled {
+                    outbounds[i].removeValue(forKey: "domain_strategy")
+                } else {
+                    outbounds[i]["domain_strategy"] = "ipv4_only"
+                }
             } else if t == "selector" && !tag.isEmpty {
                 if firstSelectorTag == nil {
                     firstSelectorTag = tag
@@ -2438,8 +2455,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         if !hasDirectOutbound {
-            // 【APP12 任务1.2】var→let：Swift 编译器警告"变量从未被修改"
-            let directObj: [String: Any] = ["type": "direct", "tag": "direct", "domain_strategy": "ipv4_only"]
+            let directObj: [String: Any] = incomingIPv6Enabled
+                ? ["type": "direct", "tag": "direct"]
+                : ["type": "direct", "tag": "direct", "domain_strategy": "ipv4_only"]
             outbounds.append(directObj)
         }
         if dnsOutboundTag == nil {
@@ -2627,7 +2645,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "address": "https://8.8.8.8/dns-query",
                 "address_resolver": "dns-direct",
                 "detour": mainProxyTag,
-                "strategy": "ipv4_only"
+                "strategy": dnsStrategyValue
             ],
             // 【v0.4.26 / ACP10 任务2.1】dns-direct / dns-direct-backup 必须显式指定
             // `detour: "direct"`：在 sing-box 1.11 中不写 detour 会回落到 route.final
@@ -2638,13 +2656,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "tag": "dns-direct",
                 "address": "udp://223.5.5.5",
                 "detour": "direct",
-                "strategy": "ipv4_only"
+                "strategy": dnsStrategyValue
             ],
             [
                 "tag": "dns-direct-backup",
                 "address": "udp://119.29.29.29",
                 "detour": "direct",
-                "strategy": "ipv4_only"
+                "strategy": dnsStrategyValue
             ]
         ]
         dnsServers.append(contentsOf: preservedDnsServers)
@@ -2720,7 +2738,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 【v0.4.26 / ACP10 任务2.3】普通域名默认 dns-remote；国内域名
             // 已由上方 cnDirectDomainSuffixes / dns-local 规则显式直连解析。
             "final": "dns-remote",
-            "strategy": "ipv4_only",
+            "strategy": dnsStrategyValue,
             // 【APP60 任务3.1】独立缓存：各 DNS 服务器的应答分开缓存，避免
             // dns-local / dns-remote 结果互相污染导致 IPv4 策略被旁路
             "independent_cache": true
