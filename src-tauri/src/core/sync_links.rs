@@ -113,9 +113,9 @@ async fn check_response(resp: reqwest::Response) -> Result<Value, SyncError> {
 /// GET /sync/links：拉取云端订阅链接列表
 async fn api_get_links(base: &str, key: &str, email: &str) -> Result<Vec<CloudLink>, SyncError> {
     let resp = license::send_with_v4_fallback(|c| {
-        c.get(&format!("{base}/api/sync/links"))
+        c.get(&format!("{base}{}", crate::obf!("/api/sync/links")))
             .query(&[("license_key", key), ("email", email)])
-            .header("X-Request-Source", "prism-app")
+            .header("X-Request-Source", crate::obf!("prism-app"))
     })
     .await
     .map_err(|e| SyncError::Transient(license::sanitize_license_error(&e.to_string())))?;
@@ -146,8 +146,8 @@ async fn api_put_link(
         body["name"] = Value::String(n.chars().take(100).collect());
     }
     let resp = license::send_with_v4_fallback(|c| {
-        c.put(&format!("{base}/api/sync/links"))
-            .header("X-Request-Source", "prism-app")
+        c.put(&format!("{base}{}", crate::obf!("/api/sync/links")))
+            .header("X-Request-Source", crate::obf!("prism-app"))
             .json(&body)
     })
     .await
@@ -167,8 +167,8 @@ async fn api_put_link(
 /// DELETE /sync/links：删除一条云端订阅链接（幂等）
 async fn api_delete_link(base: &str, key: &str, email: &str, url: &str) -> Result<(), SyncError> {
     let resp = license::send_with_v4_fallback(|c| {
-        c.delete(&format!("{base}/api/sync/links"))
-            .header("X-Request-Source", "prism-app")
+        c.delete(&format!("{base}{}", crate::obf!("/api/sync/links")))
+            .header("X-Request-Source", crate::obf!("prism-app"))
             .json(&serde_json::json!({
                 "license_key": key,
                 "email": email,

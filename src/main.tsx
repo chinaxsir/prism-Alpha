@@ -94,7 +94,8 @@ function installFrontendGuard() {
       const devtoolsCombo =
         key === "f12" ||
         ((e.ctrlKey || e.metaKey) && e.shiftKey && (key === "i" || key === "j" || key === "c")) ||
-        (e.metaKey && e.altKey && (key === "i" || key === "j" || key === "c"));
+        (e.metaKey && e.altKey && (key === "i" || key === "j" || key === "c" || key === "u")) ||
+        ((e.ctrlKey || e.metaKey) && (key === "u" || key === "s"));
       if (devtoolsCombo) {
         e.preventDefault();
         e.stopPropagation();

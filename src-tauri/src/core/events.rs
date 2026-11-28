@@ -108,7 +108,8 @@ fn spawn_stream(
     let api_secret = api_secret.to_string();
 
     tokio::spawn(async move {
-        // 断线自动重连
+        // 断线自动重连（指数退避 2s -> 4s -> 8s -> 10s，连接成功后重置，避免内核重启间隙高频空转）
+        let mut backoff_secs: u64 = 2;
         loop {
             // 构造带 Bearer 鉴权头的 WS 请求（clash_api 配置了 secret 时必须携带）
             let connect = async {
@@ -123,23 +124,27 @@ fn spawn_stream(
 
             match connect.await {
                 Ok((ws, _)) => {
+                    backoff_secs = 2;
                     tracing::info!("subscribed kernel stream: {}", path);
                     let (_, mut read) = ws.split();
 
                     while let Some(Ok(msg)) = read.next().await {
-                        if let Message::Text(text) = msg
-                            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-                        {
-                            // 前后台感知：后台（锁屏/切 App）时只维护累计总量，
-                            // 不做连接聚合、不向 WebView 发事件，主 App 静默零耗电；
-                            // 扩展内核仍在底层继续走流量，切回前台数据无缝续接
+                        if let Message::Text(text) = msg {
+                            // 前后台感知：后台（锁屏/切 App）时直接跳过 /memory 与 /traffic
+                            // 的 JSON 反序列化和事件推送，主 App 保持近零 CPU 耗电；
+                            // /connections 仍轻量维护累计总流量（store.rs 已做 15s/256KB 落盘节流）。
                             let foreground = app
                                 .state::<AppState>()
                                 .app_in_foreground
                                 .load(Ordering::Relaxed);
-                            apply_metrics(&app, path, &value, foreground);
-                            if foreground && app.emit(event_name, value).is_err() {
-                                tracing::debug!("emit {} failed (no listeners)", event_name);
+                            if !foreground && path != "/connections" {
+                                continue;
+                            }
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                                apply_metrics(&app, path, &value, foreground);
+                                if foreground && app.emit(event_name, value).is_err() {
+                                    tracing::debug!("emit {} failed (no listeners)", event_name);
+                                }
                             }
                         }
                     }
@@ -150,7 +155,8 @@ fn spawn_stream(
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(10);
         }
     })
 }

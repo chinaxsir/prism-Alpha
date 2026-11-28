@@ -165,20 +165,30 @@ pub fn run() {
                 ipc::commands::auto_update_subscriptions_daily(auto_update_handle).await;
             });
 
-            // 授权到期实时巡检（每 10 秒一次纯内存整数比较）：
-            // 无论是否联网，跨过 expires_at 立即终止全部 Pro 功能并通知前端；
-            // 同时维护进程内时钟高水位线，运行中被调回系统时间也立即熔断。
+            // 授权到期实时巡检（每 10 秒一次纯内存整数比较）+ 运行期反调试完整性复核（前台每 30 秒）：
+            // 无论是否联网，跨过 expires_at、时钟回拨或运行时被附加调试/注入，立即终止全部 Pro 功能并通知前端。
             let expiry_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut high_water = core::license::now_unix();
+                let mut tick: u32 = 0;
                 loop {
                     let now = core::license::now_unix();
                     let state = expiry_handle.state::<core::state::AppState>();
+                    let fg = state
+                        .app_in_foreground
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    tick = tick.wrapping_add(1);
+                    let compromised = if fg && tick % 3 == 0 {
+                        core::security::periodic_integrity_check()
+                    } else {
+                        core::security::is_compromised()
+                    };
                     let expired = {
                         let ent = state.entitlement.read();
                         // 仅 active 态触发一次收口，避免已锁定后每轮重复重启内核
                         ent.status == "active"
-                            && (core::license::is_expired(&ent, now)
+                            && (compromised
+                                || core::license::is_expired(&ent, now)
                                 || now + core::license::CLOCK_ROLLBACK_TOLERANCE < high_water)
                     };
                     if expired {
@@ -202,30 +212,37 @@ pub fn run() {
             // mtime）变化即清理驻留的旧版扩展进程——不清理则系统里运行的是
             // 旧 appex，UI 显示未连接而实际仍在代理。
             #[cfg(target_os = "ios")]
-            {
-                if platform::ios::upgrade_selfheal() {
-                    tracing::info!("[upgrade] 检测到覆盖升级，已清理驻留的旧版扩展进程");
+            let ios_upgraded = {
+                let changed = platform::ios::upgrade_selfheal();
+                if changed {
+                    tracing::info!("[upgrade] 检测到覆盖升级，已调度清理驻留的旧版扩展进程");
                 }
-            }
+                changed
+            };
+            #[cfg(not(target_os = "ios"))]
+            let ios_upgraded = false;
 
             // APP-5 任务3：强退重开自动认领后台仍在运行的隧道。
-            // 延迟 1s 启动，给 iOS 侧的覆盖升级自愈（杀旧扩展 + 删旧配置）
-            // 留出清理窗口，避免刚认领就被清理流程打断。
-            let reattach_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let state = reattach_handle.state::<core::state::AppState>();
-                if state
-                    .reattach_attempted
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
-                    return;
-                }
-                if core::kernel::try_reattach_running_kernel(&reattach_handle, state.inner()).await
-                {
-                    tracing::info!("[reattach] 后台隧道已认领，状态恢复为运行中");
-                }
-            });
+            // 覆盖升级首启时跳过认领，避免在异步 killext 尚未清理完旧版扩展前
+            // 误认领即将销毁的旧版本会话（改由下方 upgrade_handle 统一重建）。
+            if !ios_upgraded {
+                let reattach_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let state = reattach_handle.state::<core::state::AppState>();
+                    if state
+                        .reattach_attempted
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        return;
+                    }
+                    if core::kernel::try_reattach_running_kernel(&reattach_handle, state.inner())
+                        .await
+                    {
+                        tracing::info!("[reattach] 后台隧道已认领，状态恢复为运行中");
+                    }
+                });
+            }
 
             // APP-5 任务2：升级前隧道在使用中 → 清理完成后自动重建隧道，
             // 避免用户升级后看到「未连接」而误以为配置/订阅丢失
@@ -236,9 +253,10 @@ pub fn run() {
                     if !platform::ios::take_pending_restart() {
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    // 等待 350ms 延迟异步 killext 与系统进程回收完全落定
+                    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
                     let state = upgrade_handle.state::<core::state::AppState>();
-                    // 已被「强退重开认领」接管则不再重建（避免双启动）
+                    // 已被用户手动启动或认领则不再重复重建
                     if *state.status.read() != core::state::CoreStatus::Stopped {
                         return;
                     }

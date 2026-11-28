@@ -29,6 +29,7 @@ import Foundation
 import CoreServices
 import Security
 import ObjectiveC
+import Darwin
 
 private let mainBundleID = "com.prism.proxy"
 private let appexBundleID = "com.prism.proxy.PrismVPN"
@@ -356,97 +357,156 @@ struct PrismHelperMain {
     }
 }
 
-/// 覆盖安装 / Code=12 自愈专用清场（不触碰主 App 注册，绝不触发 uicache 注销主进程）：
-/// 1. 确保插件数据容器在磁盘就绪且属主为 mobile(501:501)；
-/// 2. 仅对 PlugIns/PrismVPN.appex 调用 registerPlugin:（增量刷新新 UUID 路径，不卸载主 App）；
-/// 3. 清理残留的旧 PrismVPN、neagent 与 pkd 进程，迫使 launchd 按最新 LaunchServices
-///    路径拉起干净的插件宿主会话，根治 TrollStore 覆盖升级后 Code=12 且 hb=无。
+/// 覆盖安装 / Code=12 清理专用（仅清理残留 PrismVPN 扩展进程，绝不触碰 LaunchServices）：
+/// 实证（build 143/144/169 & v0.4.28）：TrollStore 安装 IPA 时已由官方
+/// trollstorehelper uicache 完成最标准的 System App + _LSBundlePlugins 注册。
+/// 运行期对 appex 单独调用 LSApplicationWorkspace.registerPlugin: 会覆写并破坏
+/// 官方注册字典，导致 nesessionmanagerd 永久报 NEVPNConnectionErrorDomain Code=14
+/// ("The VPN app used by the VPN configuration is not installed")。
+/// 同时严禁杀 pkd（会打断 iOS 16+ WKWebView 导致黑屏）与 neagent（系统共享宿主）。
 private func runResetNE(appBundlePath: String) {
-    let appexBundlePath = "\(appBundlePath)/PlugIns/PrismVPN.appex"
-    let pluginContainerPath = ensurePluginContainerOnDisk(pluginID: appexBundleID)
-    chown(pluginContainerPath, 501, 501)
-
-    var pluginOK = false
-    if FileManager.default.fileExists(atPath: appexBundlePath),
-       let wsClass = NSClassFromString("LSApplicationWorkspace"),
-       let defaultSel = NSSelectorFromString("defaultWorkspace") as Selector?,
-       let defaultMethod = class_getClassMethod(wsClass, defaultSel)
-    {
-        let getWS = unsafeBitCast(method_getImplementation(defaultMethod), to: DefaultWorkspaceFn.self)
-        if let wsUnmanaged = getWS(wsClass, defaultSel) {
-            let ws = wsUnmanaged.takeUnretainedValue()
-            let regPluginSel = NSSelectorFromString("registerPlugin:")
-            if let m = class_getInstanceMethod(wsClass, regPluginSel) {
-                let fn = unsafeBitCast(method_getImplementation(m), to: LSRegisterPluginFn.self)
-                let pluginURL = NSURL(fileURLWithPath: appexBundlePath)
-                pluginOK = fn(ws, regPluginSel, pluginURL).boolValue
-            }
-        }
+    _ = appBundlePath
+    let report = killProcessesByNames(["PrismVPN"])
+    if report.err.isEmpty {
+        print("result=resetne via=\(report.via) killed=\(report.killed)")
+    } else {
+        print("result=resetne err=\(report.err) killed=\(report.killed)")
     }
-
-    let killed = killProcessesByNames(["PrismVPN", "neagent", "pkd"])
-    print("result=resetne plugin=\(pluginOK ? 1 : 0) killed=\(killed)")
     fflush(stdout)
 }
 
 /// 杀掉后台驻留的旧版 PrismVPN 扩展进程（build 150 方案）：TrollStore
 /// 覆盖安装只杀主 App 不杀扩展，旧 PrismVPN 进程挂在 nesessionmanager
 /// 上但磁盘二进制已被新版覆盖，占住 VPN 会话导致新版 startTunnel 无法
-/// 被拉起（Code=12 且 hb=无）。
+/// 被拉起（Code=12 且 hb=无）。仅清理 PrismVPN，绝不触碰 pkd/neagent/LS。
 private func runKillExt() {
-    let killed = killProcessesByNames(["PrismVPN"])
-    print("result=killext killed=\(killed)")
+    let report = killProcessesByNames(["PrismVPN"])
+    if report.err.isEmpty {
+        print("result=killext via=\(report.via) killed=\(report.killed)")
+    } else {
+        print("result=killext err=\(report.err) killed=\(report.killed)")
+    }
     fflush(stdout)
 }
 
-private func killProcessesByNames(_ targets: Set<String>) -> Int {
+private struct ProcKillReport {
+    let via: String
+    let killed: Int
+    let err: String
+}
+
+private func resolveProcSymbol(_ name: String) -> UnsafeMutableRawPointer? {
+    // 1. RTLD_DEFAULT (-2) 直接在 dyld shared cache 全局符号表查找
+    if let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2),
+       let sym = dlsym(rtldDefault, name)
+    {
+        return sym
+    }
+    // 2. 主进程全局句柄（iOS 16+ 实证可解析 libSystem 符号）
+    if let mainHandle = dlopen(nil, RTLD_LAZY),
+       let sym = dlsym(mainHandle, name)
+    {
+        return sym
+    }
+    // 3. 按真实 iOS dyld shared cache 路径依次探测（iOS 上不存在 /usr/lib/system/libproc.dylib）
+    let candidates = [
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/system/libsystem_kernel.dylib",
+        "/usr/lib/libproc.dylib",
+        "/usr/lib/system/libproc.dylib",
+    ]
+    for path in candidates {
+        if let handle = dlopen(path, RTLD_LAZY),
+           let sym = dlsym(handle, name)
+        {
+            return sym
+        }
+    }
+    return nil
+}
+
+private func killProcessesByNames(_ targets: Set<String>) -> ProcKillReport {
     let selfPid = getpid()
 
-    guard let lib = dlopen("/usr/lib/system/libproc.dylib", RTLD_LAZY) else {
-        print("result=killext err=dlopen")
-        fflush(stdout)
-        return 0
-    }
-    typealias ListAllPidsFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
-    typealias PidPathFn = @convention(c) (pid_t, UnsafeMutablePointer<CChar>?, UInt32) -> Int32
-    guard let listSym = dlsym(lib, "proc_listallpids"),
-          let pathSym = dlsym(lib, "proc_pidpath") else {
-        print("result=killext err=dlsym")
-        fflush(stdout)
-        return 0
-    }
-    let listAllPids = unsafeBitCast(listSym, to: ListAllPidsFn.self)
-    let pidPath = unsafeBitCast(pathSym, to: PidPathFn.self)
+    // 路径 A：proc_listallpids + proc_pidpath（经 RTLD_DEFAULT / libSystem.B.dylib 解析）
+    if let listSym = resolveProcSymbol("proc_listallpids"),
+       let pathSym = resolveProcSymbol("proc_pidpath")
+    {
+        typealias ListAllPidsFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
+        typealias PidPathFn = @convention(c) (pid_t, UnsafeMutablePointer<CChar>?, UInt32) -> Int32
+        let listAllPids = unsafeBitCast(listSym, to: ListAllPidsFn.self)
+        let pidPath = unsafeBitCast(pathSym, to: PidPathFn.self)
 
-    // 第一次调用取进程数，多留 16 个余量再取全表（防竞态遗漏）
-    let total = listAllPids(nil, 0)
-    guard total > 0 else {
-        print("result=killext err=no-processes")
-        fflush(stdout)
-        return 0
-    }
-    let cap = Int(total) + 16
-    var pids = [pid_t](repeating: 0, count: cap)
-    let bufBytes = Int32(cap * MemoryLayout<pid_t>.stride)
-    let count = pids.withUnsafeMutableBytes { raw -> Int32 in
-        listAllPids(raw.baseAddress, bufBytes)
+        let total = listAllPids(nil, 0)
+        guard total > 0 else {
+            return ProcKillReport(via: "libproc", killed: 0, err: "no-processes")
+        }
+        let cap = Int(total) + 32
+        var pids = [pid_t](repeating: 0, count: cap)
+        let bufBytes = Int32(cap * MemoryLayout<pid_t>.stride)
+        let count = pids.withUnsafeMutableBytes { raw -> Int32 in
+            listAllPids(raw.baseAddress, bufBytes)
+        }
+        var killed = 0
+        for i in 0..<max(Int(count), 0) {
+            let pid = pids[i]
+            guard pid > 0, pid != selfPid else { continue }
+            var path = [CChar](repeating: 0, count: 4096)
+            let len = path.withUnsafeMutableBufferPointer { buf -> Int32 in
+                pidPath(pid, buf.baseAddress, 4096)
+            }
+            guard len > 0 else { continue }
+            let execPath = String(cString: path)
+            let execName = execPath.split(separator: "/").last.map(String.init) ?? ""
+            if targets.contains(execName), kill(pid, SIGKILL) == 0 {
+                killed += 1
+                NSLog("[PrismHelper] SIGKILL \(execName) pid=\(pid) path=\(execPath)")
+            }
+        }
+        return ProcKillReport(via: "libproc", killed: killed, err: "")
     }
 
-    var killed = 0
-    for i in 0..<max(Int(count), 0) {
-        let pid = pids[i]
-        guard pid > 0, pid != selfPid else { continue }
-        var path = [CChar](repeating: 0, count: 4096)
-        let len = path.withUnsafeMutableBufferPointer { buf -> Int32 in
-            pidPath(pid, buf.baseAddress, 4096)
+    // 路径 B：XNU 内核底层 __proc_info 系统调用（位于 libsystem_kernel.dylib，iOS 15-18 全版本导出）
+    if let procInfoSym = resolveProcSymbol("__proc_info") {
+        typealias ProcInfoFn = @convention(c) (
+            Int32, Int32, UInt32, UInt64, UnsafeMutableRawPointer?, Int32
+        ) -> Int32
+        let procInfo = unsafeBitCast(procInfoSym, to: ProcInfoFn.self)
+        let callListPids: Int32 = 1   // PROC_INFO_CALL_LISTPIDS
+        let callPidInfo: Int32 = 2    // PROC_INFO_CALL_PIDINFO
+        let allPidsType: Int32 = 1    // PROC_ALL_PIDS
+        let flavorPidPath: UInt32 = 11 // PROC_PIDPATHINFO
+
+        let neededBytes = procInfo(callListPids, allPidsType, 0, 0, nil, 0)
+        guard neededBytes > 0 else {
+            return ProcKillReport(via: "proc_info", killed: 0, err: "no-processes")
         }
-        guard len > 0 else { continue }
-        let execPath = String(cString: path)
-        let execName = execPath.split(separator: "/").last.map(String.init) ?? ""
-        if targets.contains(execName), kill(pid, SIGKILL) == 0 {
-            killed += 1
-            NSLog("[PrismHelper] SIGKILL \(execName) pid=\(pid) path=\(execPath)")
+        let pidStride = MemoryLayout<pid_t>.stride
+        let cap = (Int(neededBytes) / pidStride) + 32
+        var pids = [pid_t](repeating: 0, count: cap)
+        let bufBytes = Int32(cap * pidStride)
+        let filledBytes = pids.withUnsafeMutableBytes { raw -> Int32 in
+            procInfo(callListPids, allPidsType, 0, 0, raw.baseAddress, bufBytes)
         }
+        let count = max(Int(filledBytes) / pidStride, 0)
+        var killed = 0
+        for i in 0..<count {
+            let pid = pids[i]
+            guard pid > 0, pid != selfPid else { continue }
+            var path = [CChar](repeating: 0, count: 4096)
+            let ret = path.withUnsafeMutableBytes { raw -> Int32 in
+                procInfo(callPidInfo, pid, flavorPidPath, 0, raw.baseAddress, 4096)
+            }
+            guard ret > 0 else { continue }
+            let execPath = String(cString: path)
+            let execName = execPath.split(separator: "/").last.map(String.init) ?? ""
+            if targets.contains(execName), kill(pid, SIGKILL) == 0 {
+                killed += 1
+                NSLog("[PrismHelper] SIGKILL(proc_info) \(execName) pid=\(pid) path=\(execPath)")
+            }
+        }
+        return ProcKillReport(via: "proc_info", killed: killed, err: "")
     }
-    return killed
+
+    return ProcKillReport(via: "none", killed: 0, err: "dlsym")
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { ShieldBan } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -8,9 +8,10 @@ import TitleBar from "@/components/TitleBar";
 import BottomNav from "@/components/BottomNav";
 import ToastViewport, { toast } from "@/components/ui/Toast";
 import Dashboard from "@/pages/Dashboard";
-import Subscription from "@/pages/Subscription";
-import Analytics from "@/pages/Analytics";
-import Settings from "@/pages/Settings";
+const Subscription = lazy(() => import("@/pages/Subscription"));
+const Analytics = lazy(() => import("@/pages/Analytics"));
+const Settings = lazy(() => import("@/pages/Settings"));
+const ProxiesHub = lazy(() => import("@/pages/ProxiesHub"));
 import {
   applyThemeToDom,
   ensureAimListenersRegistered,
@@ -43,7 +44,6 @@ import {
   type ProbeProgress,
 } from "@/api/ipc";
 import { isMobile } from "@/pro/gating";
-import ProxiesHub from "@/pages/ProxiesHub";
 
 export default function App() {
   const { t } = useTranslation();
@@ -519,16 +519,18 @@ export default function App() {
         <main className="w-full max-w-full flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden box-border px-4 pt-3 pb-[calc(4rem+env(safe-area-inset-bottom))] md:pt-[calc(1.5rem+env(safe-area-inset-top))] md:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
           {/* APP-5 任务1：全局常驻横幅已移除。到期/解绑提示仅在激活 Pro 弹窗
               与设置 → PRISM PRO 激活区内展示，平时界面保持清爽。 */}
-          <Routes>
-            <Route path="/" element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/proxies" element={<ProxiesHub />} />
-            <Route path="/subscription" element={<Subscription />} />
-            <Route path="/rules" element={<Navigate to="/proxies?tab=rules" replace />} />
-            <Route path="/connections" element={<Navigate to="/proxies?tab=connections" replace />} />
-            <Route path="/analytics" element={<Analytics />} />
-            <Route path="/settings" element={<Settings />} />
-          </Routes>
+          <Suspense fallback={<div className="flex-1" />}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/proxies" element={<ProxiesHub />} />
+              <Route path="/subscription" element={<Subscription />} />
+              <Route path="/rules" element={<Navigate to="/proxies?tab=rules" replace />} />
+              <Route path="/connections" element={<Navigate to="/proxies?tab=connections" replace />} />
+              <Route path="/analytics" element={<Analytics />} />
+              <Route path="/settings" element={<Settings />} />
+            </Routes>
+          </Suspense>
         </main>
       </div>
       <BottomNav />

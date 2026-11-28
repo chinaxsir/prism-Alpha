@@ -1328,18 +1328,49 @@ pub fn build(
             );
         }
         // 【APP40 任务2】iOS 扩展侧车：档案元数据（含 bypassOnLocalLan），
-        // 严禁写入内核 JSON（未知字段会触发 decode config FATAL）
+        // 严禁写入内核 JSON（未知字段会触发 decode config FATAL）。
+        // 同步写入 work_dir 与 iOS App Group 的 prism_work/，确保扩展进程
+        // 真正读到最新元数据（此前只写主 App 私有沙盒，扩展读不到）。
         let profiles_meta = crate::core::go_lan::profiles_metadata(go_lan_cfg);
         if !profiles_meta.is_empty() {
             let sidecar = work_dir.join("golan_profiles.json");
             match serde_json::to_string(&profiles_meta) {
                 Ok(text) => {
-                    if let Err(e) = std::fs::write(&sidecar, text) {
+                    if let Err(e) = crate::core::store::atomic_write(&sidecar, text.as_bytes()) {
                         warnings.push(format!("写入 golan_profiles.json 失败: {e}"));
+                    }
+                    #[cfg(target_os = "ios")]
+                    if let Some(group) = crate::platform::ios::app_group_dir() {
+                        let shared_work = std::path::Path::new(&group).join("prism_work");
+                        let _ = std::fs::create_dir_all(&shared_work);
+                        let _ = crate::core::store::atomic_write(
+                            &shared_work.join("golan_profiles.json"),
+                            text.as_bytes(),
+                        );
                     }
                 }
                 Err(e) => warnings.push(format!("序列化 golan_profiles.json 失败: {e}")),
             }
+        } else {
+            let _ = std::fs::remove_file(work_dir.join("golan_profiles.json"));
+            #[cfg(target_os = "ios")]
+            if let Some(group) = crate::platform::ios::app_group_dir() {
+                let _ = std::fs::remove_file(
+                    std::path::Path::new(&group)
+                        .join("prism_work")
+                        .join("golan_profiles.json"),
+                );
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(work_dir.join("golan_profiles.json"));
+        #[cfg(target_os = "ios")]
+        if let Some(group) = crate::platform::ios::app_group_dir() {
+            let _ = std::fs::remove_file(
+                std::path::Path::new(&group)
+                    .join("prism_work")
+                    .join("golan_profiles.json"),
+            );
         }
     }
     warnings.extend(lan_warnings);
@@ -2240,7 +2271,11 @@ pub fn build(
         "domain_suffix": [crate::obf!("prism.sarl")],
         "outbound": "direct"
     }));
-    final_rules.append(&mut route_rules);
+    // 【转发效率优化】仅对用户自定义 / Go Cus / 订阅规则块做严格相邻同类型规则合并
+    // （O(L) 前缀/后缀树与 IP Radix Trie），绝不触碰头部黄金固定规则（如 DNS 旁路与
+    // WG 服务端豁免），保持所有固定边界与 iOS 扩展去重契约 100% 一致。
+    let mut compacted_route_rules = compact_adjacent_route_rules(route_rules);
+    final_rules.append(&mut compacted_route_rules);
     // —— 7. 全局（Global）模式 ——
     if !node_tags.is_empty() {
         if settings.block_quic {
@@ -2338,9 +2373,7 @@ pub fn build(
         }));
     }
     // —— 10. route.final 兜底（见上方 final_tag） ——
-    let route_rules = final_rules;
-
-    let final_route_rules: Vec<serde_json::Value> = route_rules;
+    let final_route_rules: Vec<serde_json::Value> = final_rules;
 
     // 【APP-11B 任务3】清洗 urltest 畸形测速地址（订阅自带 url 可能带空格、
     // 非法域名，导致内核后台疯狂报错刷屏耗电），统一强制 Cloudflare 204 且
@@ -2496,6 +2529,69 @@ pub fn build(
 }
 
 // ---------------- 构建小助手 ----------------
+
+/// 合并严格相邻的同类型单一匹配器规则（仅当规则只含 `{matcher_key: [...], "outbound": "..."}`
+/// 两个字段且 `matcher_key` 与 `outbound` 均相同时才合并），100% 保持原规则先后顺序与语义。
+fn compact_adjacent_route_rules(rules: Vec<Value>) -> Vec<Value> {
+    const MERGEABLE_KEYS: [&str; 4] = ["domain", "domain_suffix", "domain_keyword", "ip_cidr"];
+
+    fn extract_mergeable(rule: &Value) -> Option<(&'static str, &str)> {
+        let obj = rule.as_object()?;
+        if obj.len() != 2 {
+            return None;
+        }
+        let outbound = obj.get("outbound")?.as_str()?;
+        for key in MERGEABLE_KEYS {
+            if let Some(arr) = obj.get(key).and_then(Value::as_array)
+                && !arr.is_empty()
+                && arr.iter().all(|v| v.is_string())
+            {
+                return Some((key, outbound));
+            }
+        }
+        None
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let merged = if let (Some(prev), Some((k_cur, ob_cur))) =
+            (out.last_mut(), extract_mergeable(&rule))
+        {
+            if let Some((k_prev, ob_prev)) = extract_mergeable(prev)
+                && k_prev == k_cur
+                && ob_prev == ob_cur
+            {
+                let mut seen: HashSet<String> = prev[k_prev]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if let (Some(dst), Some(src)) = (
+                    prev.get_mut(k_prev).and_then(Value::as_array_mut),
+                    rule.get(k_cur).and_then(Value::as_array),
+                ) {
+                    for item in src {
+                        if let Some(s) = item.as_str()
+                            && seen.insert(s.to_string())
+                        {
+                            dst.push(Value::String(s.to_string()));
+                        }
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !merged {
+            out.push(rule);
+        }
+    }
+    out
+}
 
 /// 【APP65 任务2.1】严格公网服务器 IPv4 校验：只接受真实公网地址。
 /// 排除 loopback / private / link-local / unspecified / broadcast，
@@ -6959,5 +7055,25 @@ rules:
                 );
             }
         }
+    }
+
+    #[test]
+    fn compact_adjacent_route_rules_preserves_order_and_merges_only_adjacent() {
+        let input = vec![
+            json!({ "domain_suffix": ["a.com"], "outbound": "Proxy" }),
+            json!({ "domain_suffix": ["b.com", "a.com"], "outbound": "Proxy" }),
+            json!({ "domain_suffix": ["cn.com"], "outbound": "direct" }),
+            json!({ "domain_suffix": ["c.com"], "outbound": "Proxy" }),
+            json!({ "domain_suffix": ["d.com"], "network": "tcp", "outbound": "Proxy" }),
+            json!({ "ip_cidr": ["1.1.1.1/32"], "outbound": "direct" }),
+            json!({ "ip_cidr": ["2.2.2.2/32"], "outbound": "direct" }),
+        ];
+        let out = compact_adjacent_route_rules(input);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], json!({ "domain_suffix": ["a.com", "b.com"], "outbound": "Proxy" }));
+        assert_eq!(out[1], json!({ "domain_suffix": ["cn.com"], "outbound": "direct" }));
+        assert_eq!(out[2], json!({ "domain_suffix": ["c.com"], "outbound": "Proxy" }));
+        assert_eq!(out[3], json!({ "domain_suffix": ["d.com"], "network": "tcp", "outbound": "Proxy" }));
+        assert_eq!(out[4], json!({ "ip_cidr": ["1.1.1.1/32", "2.2.2.2/32"], "outbound": "direct" }));
     }
 }

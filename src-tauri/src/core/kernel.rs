@@ -345,7 +345,11 @@ impl KernelHandle {
             let app = app_handle.clone();
             stream_tasks.push(tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let fg = app
+                        .state::<crate::core::state::AppState>()
+                        .app_in_foreground
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_secs(if fg { 2 } else { 10 })).await;
                     if crate::platform::ios::vpn_is_connected() {
                         continue;
                     }
@@ -868,6 +872,8 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 fn shared_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .no_proxy()
+            .tcp_nodelay(true)
             .connect_timeout(Duration::from_millis(800))
             .timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(30))
@@ -1408,16 +1414,42 @@ async fn run_node_failover(api: KernelApi, final_group: String, app_handle: AppH
     const FAIL_THRESHOLD: u8 = 2;
 
     let mut consecutive_failures: u8 = 0;
+    let mut last_today_bytes: u64 = 0;
     loop {
-        tokio::time::sleep(Duration::from_secs(45)).await;
-        // 内核已停止则退出：本次 handle 的事件流也被 abort，避免任务重复累积
-        let running = *app_handle
-            .state::<crate::core::state::AppState>()
-            .status
-            .read()
-            == crate::core::state::CoreStatus::Running;
+        let (fg, cur_today) = {
+            let st = app_handle.state::<crate::core::state::AppState>();
+            (
+                st.app_in_foreground
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                *st.today_bytes_cache.read(),
+            )
+        };
+        // 【低能耗优化】前台维持 45s 快速故障转移；退后台时若仍在传输流量延长至 90s，
+        // 锁屏完全静默（无流量增长）则拉长至 180s 且跳过蜂窝唤醒，显著降低待机功耗。
+        let sleep_secs = if fg {
+            45
+        } else if cur_today != last_today_bytes {
+            90
+        } else {
+            180
+        };
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        let (running, fg_after, now_today) = {
+            let st = app_handle.state::<crate::core::state::AppState>();
+            (
+                *st.status.read() == crate::core::state::CoreStatus::Running,
+                st.app_in_foreground
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                *st.today_bytes_cache.read(),
+            )
+        };
         if !running {
             break;
+        }
+        let idle_in_bg = !fg_after && now_today == last_today_bytes && consecutive_failures == 0;
+        last_today_bytes = now_today;
+        if idle_in_bg {
+            continue;
         }
         // 主组当前选中的节点
         let current = api.get_proxies().await.ok().and_then(|p| {

@@ -45,22 +45,37 @@ const PRO_CACHE_KEY = "prism_pro_active_cache";
 
 function readProCache(): boolean {
   try {
-    return localStorage.getItem(PRO_CACHE_KEY) === "1";
+    const raw = localStorage.getItem(PRO_CACHE_KEY);
+    if (!raw) return false;
+    if (raw === "1") return true;
+    const parsed = JSON.parse(raw) as { ok?: number; exp?: number | null };
+    if (parsed.ok !== 1) return false;
+    if (typeof parsed.exp === "number" && Date.now() >= parsed.exp * 1000) {
+      localStorage.removeItem(PRO_CACHE_KEY);
+      return false;
+    }
+    return true;
   } catch {
     return false;
   }
 }
 
-function writeProCache(unlocked: boolean) {
+function writeProCache(unlocked: boolean, expiresAt?: number | null) {
   try {
-    if (unlocked) localStorage.setItem(PRO_CACHE_KEY, "1");
-    else localStorage.removeItem(PRO_CACHE_KEY);
+    if (unlocked) {
+      localStorage.setItem(
+        PRO_CACHE_KEY,
+        JSON.stringify({ ok: 1, exp: expiresAt ?? null }),
+      );
+    } else {
+      localStorage.removeItem(PRO_CACHE_KEY);
+    }
   } catch {
     /* 隐私模式/配额写满：忽略，不影响主流程 */
   }
 }
 
-/** 前端本地到期巡检定时器（5 秒）；后端另有 10 秒巡检做最终收口 */
+/** 前端本地到期巡检定时器（15 秒，后台跳过）；后端另有 10 秒巡检做最终收口 */
 let expiryTimer: ReturnType<typeof setInterval> | null = null;
 
 interface ProState {
@@ -102,7 +117,7 @@ export const useProStore = create<ProState>((set, get) => ({
     try {
       const e = await getEntitlement();
       const unlocked = unlockedOf(e);
-      writeProCache(unlocked);
+      writeProCache(unlocked, e.expiresAt);
       set({ entitlement: e, unlocked, ready: true });
       // 重启后按落盘原因还原横幅：解绑 ≠ 到期，严禁统一显示成「已到期」
       if (!unlocked) {
@@ -118,11 +133,12 @@ export const useProStore = create<ProState>((set, get) => ({
       // 【APP43】异常兜底：保持原有（含本地镜像）授权态，绝不置 false
       set({ ready: true });
     }
-    // 前端本地双重定时器：每 5 秒比对一次到期时间（后端另有 10 秒巡检收口）
+    // 前端本地双重定时器：前台每 15 秒比对一次到期时间（后台跳过；后端另有 10 秒巡检收口）
     if (!expiryTimer) {
       expiryTimer = setInterval(() => {
+        if (document.visibilityState !== "visible") return;
         void useProStore.getState().checkExpiry();
-      }, 5000);
+      }, 15000);
     }
   },
 
@@ -151,7 +167,7 @@ export const useProStore = create<ProState>((set, get) => ({
 
   setEntitlement: (e) => {
     const unlocked = unlockedOf(e);
-    writeProCache(unlocked);
+    writeProCache(unlocked, e.expiresAt);
     set({
       entitlement: e,
       unlocked,
@@ -175,7 +191,7 @@ export const useProStore = create<ProState>((set, get) => ({
       // 服务端要求「License Key + 注册邮箱」联合校验（两者必填）；
       // 缺项时后端会在本地拦截并返回明确错误，不会发起无效请求。
       const e = await activatePro(licenseKey, email ?? "");
-      writeProCache(unlockedOf(e));
+      writeProCache(unlockedOf(e), e.expiresAt);
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
       return unlockedOf(e);
     } catch (err) {
@@ -195,7 +211,7 @@ export const useProStore = create<ProState>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const e = await refreshEntitlement();
-      writeProCache(unlockedOf(e));
+      writeProCache(unlockedOf(e), e.expiresAt);
       set({ entitlement: e, unlocked: unlockedOf(e), busy: false });
     } catch (err) {
       // 【APP43】刷新失败（超时/断网）：保留当前授权态，绝不清除 Pro

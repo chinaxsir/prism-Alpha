@@ -48,13 +48,11 @@ export default function Analytics() {
   const [hostQuery, setHostQuery] = useState("");
   const [ruleHost, setRuleHost] = useState<string | null>(null);
 
-  // 【APP66 任务4.2】分析页前台 1000ms 实时刷新：后端在 get_runtime_snapshot
-  // 中每 450ms 主动合并一次 /connections 增量（分流占比 + Top 主机流量），
-  // 本页停留期间每秒都能看到数字变化；后台/锁屏时定时器完全不工作。
+  // 复用 App.tsx 的全局 1000ms 运行时快照轮询（不再叠加第二套 1s 定时器），
+  // 仅在进入分析页与回前台瞬间立即补拉一次，零延迟且避免双倍 IPC 负载。
   const analyticsBusyRef = useRef(false);
   useEffect(() => {
     if (!running) return;
-    let timer: number | undefined;
     const tick = () => {
       if (document.visibilityState !== "visible" || analyticsBusyRef.current) return;
       analyticsBusyRef.current = true;
@@ -69,10 +67,8 @@ export default function Analytics() {
       if (document.visibilityState === "visible") tick();
     };
     tick();
-    timer = window.setInterval(tick, 1000);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      if (timer) window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [running]);

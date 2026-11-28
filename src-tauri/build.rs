@@ -94,18 +94,27 @@ fn main() {
 }
 
 /// 生成编译期字符串混淆密钥（`$OUT_DIR/obf_seed.rs`）。
-/// 由项目指纹（名称/版本/目标平台）经 FNV-1a 派生并扩展为 32 字节——
-/// 同一版本可复现、不同版本/平台密钥不同；源码侧仍是明文 `obf!("...")`。
+/// 融合包名、版本、目标平台、CI 运行熵（PRISM_OBF_SALT / GITHUB_RUN_ID /
+/// GITHUB_SHA）与构建纳秒时间戳经多轮 SplitMix64 派生 32 字节不可预测密钥；
+/// 源码侧仍是明文 `obf!("...")`，每次发布构建密文与密钥完全独立。
 fn generate_obf_seed() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+    let build_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let seed = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
-        std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+        std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+        std::env::var("PRISM_OBF_SALT").unwrap_or_default(),
+        std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+        std::env::var("GITHUB_SHA").unwrap_or_default(),
+        build_nanos,
     );
 
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (build_nanos as u64);
     for b in seed.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -113,11 +122,12 @@ fn generate_obf_seed() {
 
     let mut key = [0u8; 32];
     for (i, slot) in key.iter_mut().enumerate() {
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        *slot = (h >> 32) as u8;
+        h = h.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = h;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        *slot = ((z >> 24) as u8).wrapping_add((i as u8).wrapping_mul(37));
     }
 
     let src = format!(
@@ -126,4 +136,5 @@ fn generate_obf_seed() {
     );
     std::fs::write(out_dir.join("obf_seed.rs"), src).expect("write obf_seed.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PRISM_OBF_SALT");
 }

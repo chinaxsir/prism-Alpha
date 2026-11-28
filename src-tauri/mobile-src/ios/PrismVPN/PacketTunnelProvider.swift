@@ -601,10 +601,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeClashBase: String = ""
     private var activeClashSecret: String = ""
 
-    /// 【APP65 任务3.1】订阅热更新配置监视器：3s 轮询共享
-    /// prism_config.json 的 mtime，主 App 更新订阅后写入新配置即触发
-    /// 内核软重启，NEPacketTunnel 会话与 utun 保持不变。
+    /// 【APP65 任务3.1 / 低能耗优化】订阅热更新配置监视器：
+    /// 优先用 kqueue DispatchSource 监听共享目录写入事件（0 空闲唤醒 + 毫秒级热重载），
+    /// 辅以 30s 容差合并定时器兜底，将原 3s 高频轮询的 CPU 唤醒次数降低 90%。
     private var configWatchTimer: Timer?
+    private var configDirWatcher: DispatchSourceFileSystemObject?
+    private var pendingConfigReload: DispatchWorkItem?
     private var lastConfigMTime: Date?
 
     // MARK: - 生命周期
@@ -1203,18 +1205,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 无限增长占满扩展内存配额触发 Jetsam。
             self.trimExtLogIfNeeded()
         }
+        // 允许 iOS 电源管理合并定时器唤醒，降低待机能耗
+        t.tolerance = 10.0
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t
     }
 
-    /// 【APP65 任务3.1】订阅热更新监视：主 App 更新/导入订阅成功后会把新的
-    /// sing-box 配置写入共享 prism_config.json（Rust 侧 hot_reload_mobile_config），
-    /// 这里每 3s 比对一次 mtime，变化即在 vpnQueue 内软重启 Go 内核加载新节点。
-    /// 隧道会话与 utun 不销毁，UI 计时器不重置，用户无感。
-    private func startConfigWatchTimer() {
-        configWatchTimer?.invalidate()
-        lastConfigMTime = configFileModificationDate()
-        let t = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+    /// 检查共享配置文件 mtime 是否前进：统一串行派发至 vpnQueue（消除主线程定时器
+    /// 与 kqueue 回调对 lastConfigMTime / isReloadingForNetworkChange 的数据竞争），
+    /// 并做 250ms 去抖 + JSON 完整性校验，防止写入窗口内的半截文件触发内核重启。
+    private func checkConfigHotReload() {
+        vpnQueue.async { [weak self] in
             guard let self = self else { return }
             guard let latest = self.configFileModificationDate() else { return }
             guard let last = self.lastConfigMTime else {
@@ -1226,19 +1227,77 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.stateLock.lock()
             let running = (self.currentState == .running)
             self.stateLock.unlock()
-            guard running, !self.isReloadingForNetworkChange else { return }
-            self.vpnQueue.async { [weak self] in
+            guard running else { return }
+
+            self.pendingConfigReload?.cancel()
+            let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                guard !self.isReloadingForNetworkChange, self.activeWorkDir != nil else { return }
+                self.stateLock.lock()
+                let stillRunning = (self.currentState == .running)
+                self.stateLock.unlock()
+                guard stillRunning, !self.isReloadingForNetworkChange, self.activeWorkDir != nil else { return }
+                // 预校验配置文件完整性：确保是合法 JSON 且含 inbounds/outbounds，
+                // 绝不因损坏或未落盘完成的文本停掉正在工作的内核
+                guard let raw = try? self.loadRawConfigText(),
+                      let data = raw.data(using: .utf8),
+                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      obj["inbounds"] != nil,
+                      obj["outbounds"] != nil
+                else {
+                    self.writeExtLog("WARN", "📥 热重载配置文件校验未通过，保留当前内核会话")
+                    return
+                }
                 let phy = self.boundPhysicalInterface()
                 self.isReloadingForNetworkChange = true
-                self.writeExtLog("INFO", "📥 检测到订阅配置更新，软重启内核加载新节点（\(phy.name) \(phy.ipv4)）")
+                self.writeExtLog("INFO", "📥 检测到配置更新，软重启内核加载最新策略与节点（\(phy.name) \(phy.ipv4)）")
                 self.writeHeartbeat("config-reload")
                 self.restartKernelOnCurrentQueue(newPhy: phy)
                 self.refreshOnDemandBypassIfNeeded(phyName: phy.name, phyIPv4: phy.ipv4)
                 self.isReloadingForNetworkChange = false
             }
+            self.pendingConfigReload = work
+            self.vpnQueue.asyncAfter(deadline: .now() + 0.25, execute: work)
         }
+    }
+
+    /// 【APP65 任务3.1 / 低能耗优化】订阅热更新监视：
+    /// 1) kqueue 监听共享目录写入事件（事件驱动、零空转唤醒、毫秒级响应）；
+    /// 2) 30s 容差合并兜底定时器（tolerance=10s），防原子替换跨挂载漏事件。
+    private func startConfigWatchTimer() {
+        configWatchTimer?.invalidate()
+        configWatchTimer = nil
+        configDirWatcher?.cancel()
+        configDirWatcher = nil
+        vpnQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingConfigReload?.cancel()
+            self.pendingConfigReload = nil
+            self.lastConfigMTime = self.configFileModificationDate()
+        }
+
+        if let dirPath = sharedConfigFileURL()?.deletingLastPathComponent().path {
+            let fd = open(dirPath, O_EVTONLY)
+            if fd >= 0 {
+                let source = DispatchSource.makeFileSystemObjectSource(
+                    fileDescriptor: fd,
+                    eventMask: .write,
+                    queue: vpnQueue
+                )
+                source.setEventHandler { [weak self] in
+                    self?.checkConfigHotReload()
+                }
+                source.setCancelHandler {
+                    close(fd)
+                }
+                source.resume()
+                configDirWatcher = source
+            }
+        }
+
+        let t = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            self?.checkConfigHotReload()
+        }
+        t.tolerance = 10.0
         RunLoop.main.add(t, forMode: .common)
         configWatchTimer = t
     }
@@ -1306,7 +1365,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 【APP65 任务3.1】停止订阅热更新配置监视器
             self.configWatchTimer?.invalidate()
             self.configWatchTimer = nil
-            self.lastConfigMTime = nil
+            self.configDirWatcher?.cancel()
+            self.configDirWatcher = nil
+            self.vpnQueue.async {
+                self.pendingConfigReload?.cancel()
+                self.pendingConfigReload = nil
+                self.lastConfigMTime = nil
+            }
             // 【APP69 任务2】停止在途 Go Lan 握手探测（25 秒保活已移除），
             // 并取消待执行的基站切换软重启
             self.cancelPendingGoLanProbes()
@@ -2176,6 +2241,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         for i in outbounds.indices {
             let t = (outbounds[i]["type"] as? String) ?? ""
             let tag = (outbounds[i]["tag"] as? String) ?? ""
+            let srvLower = ((outbounds[i]["server"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let isLoopbackSidecar = tag == "go-cus-sidecar"
+                || srvLower == "127.0.0.1"
+                || srvLower == "::1"
+                || srvLower == "localhost"
             // 【APP21 任务2】先移除全部出站的网卡强绑字段，避免历史缓存里的
             // bind_interface / inet4_bind_address / routing_mark 触发
             // sendmsg: network is unreachable（log4 第 10 行）。
@@ -2186,10 +2258,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 沙盒内 sing-box DefaultInterfaceMonitor 无系统网卡枚举回调，
             // auto_detect_interface=true 会让所有 DNS 查询与出站连接在 0ms
             // 内直接报错（log11 图1 全部节点超时根因）。恢复为 direct /
-            // wireguard(go-lan-*) / 全部代理节点出站显式 bind_interface 到
-            // 当前活跃物理网卡；selector / urltest / block / dns 等功能性
-            // 分组出站不参与绑定。
+            // wireguard(go-lan-*) / 全部公网代理节点出站显式 bind_interface 到
+            // 当前活跃物理网卡；selector / urltest / block / dns 与本地回环
+            // 边车（go-cus-sidecar @ 127.0.0.1）绝不绑定物理网卡（否则回环不通）。
             if !physIfName.isEmpty,
+               !isLoopbackSidecar,
                t == "direct" || proxyOutboundTypes.contains(t)
             {
                 outbounds[i]["bind_interface"] = physIfName
@@ -2406,7 +2479,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                 }
             } else if proxyOutboundTypes.contains(t) {
-                if !tag.isEmpty {
+                if !tag.isEmpty,
+                   !isLoopbackSidecar,
+                   !tag.hasPrefix("go-lan"),
+                   !tag.hasPrefix("GO-AIM-PROBE")
+                {
                     allRealProxyTags.append(tag)
                 }
             }
@@ -2718,11 +2795,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "server": "dns-direct"
             ]
         ])
-        // 【APP70 任务2.1】仅在「阻止 QUIC」开启（Rust 已下发 quic → block）
-        // 时拦截 SVCB/HTTPS，避免浏览器取到 alpn="h3" 去撞已阻断的 QUIC。
-        if incomingQuicBlocked {
-            dnsRules.append(["query_type": ["SVCB", "HTTPS"], "action": "reject"])
-        }
+        // SVCB/HTTPS 查询已在 index 1 无条件拦截（与 Rust config_builder 同序），此处不再重复追加
+        _ = incomingQuicBlocked
         dnsRules.append([
             "clash_mode": "global",
             "server": "dns-remote"
@@ -2794,13 +2868,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let cidr = cleanCIDR(raw)
             guard !cidr.isEmpty else { return }
             let meta = goLanProfileMeta[tag]
-            let bypassEnabled = meta?.bypass ?? true
-            guard bypassEnabled else { return }
-            // 【v0.4.16 任务1】移除 crossSubnetProbe 同步 TCP 探测：该调用发生在
-            // sanitizeConfigForExtension 启动同步路径，65ms × N 个 CIDR 会显著拖慢
-            // 启动（>12s）并推高扩展进程内存。仅保留同子网纯数学判断，跨子网一律
-            // 走 go-lan 隧道（Rust 侧仍会在后台按需探测，不阻塞启动）。
-            let sameSubnet = goLanWifiIP.flatMap { ipv4InCidr($0, cidr) } ?? false
+            // 【APP45 任务1.1】与 Rust GoLanProfile 默认值对齐：未显式开启时默认 false，
+            // 防止外部 Wi-Fi 同网段冲突导致回家隧道被误判为局域网直连。
+            let bypassEnabled = meta?.bypass ?? false
+            let sameSubnet = bypassEnabled
+                && (goLanWifiIP.flatMap { ipv4InCidr($0, cidr) } ?? false)
             if sameSubnet {
                 if !onDemandBypassCidrs.contains(cidr) { onDemandBypassCidrs.append(cidr) }
                 var list = onDemandBypassByTag[tag] ?? []

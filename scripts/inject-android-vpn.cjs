@@ -112,6 +112,16 @@ function patchManifest() {
     fs.writeFileSync(file, text)
     console.log('[inject-android-vpn] FOREGROUND_SERVICE_SPECIAL_USE added')
   }
+  // 禁止 adb backup 导出应用私有目录（防止 license.dat / device.json 被离线提取）
+  if (!text.includes('android:allowBackup=')) {
+    text = text.replace(/<application\b/, '<application android:allowBackup="false"')
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] android:allowBackup="false" enforced')
+  } else if (/android:allowBackup\s*=\s*"true"/.test(text)) {
+    text = text.replace(/android:allowBackup\s*=\s*"true"/, 'android:allowBackup="false"')
+    fs.writeFileSync(file, text)
+    console.log('[inject-android-vpn] android:allowBackup switched to false')
+  }
 }
 patchManifest()
 

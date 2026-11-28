@@ -873,6 +873,7 @@ fn mitm_should_decrypt(patterns: &[String], host: &str) -> bool {
 struct RuntimeRewrite {
     rule: CusRewriteRule,
     re: Option<regex::Regex>,
+    header_ops: Vec<HeaderOp>,
 }
 
 struct RuntimeScript {
@@ -884,6 +885,7 @@ struct RuntimeModule {
     rewrites: Vec<RuntimeRewrite>,
     scripts: Vec<RuntimeScript>,
     inline_scripts: HashMap<String, String>,
+    mitm_hosts: Vec<String>,
 }
 
 static MODULE_CACHE: Lazy<DashMap<u64, Arc<RuntimeModule>>> = Lazy::new(DashMap::new);
@@ -897,9 +899,18 @@ fn runtime_module(module: &CusModule) -> Arc<RuntimeModule> {
     let rewrites = parsed
         .rewrites
         .into_iter()
-        .map(|rule| RuntimeRewrite {
-            re: regex::Regex::new(&rule.pattern).ok(),
-            rule,
+        .map(|rule| {
+            let header_ops = if matches!(rule.action.as_str(), "header-request" | "header-response")
+            {
+                parse_header_ops(rule.target.as_deref().unwrap_or(""))
+            } else {
+                Vec::new()
+            };
+            RuntimeRewrite {
+                re: regex::Regex::new(&rule.pattern).ok(),
+                header_ops,
+                rule,
+            }
         })
         .collect();
     let scripts = parsed
@@ -917,6 +928,7 @@ fn runtime_module(module: &CusModule) -> Arc<RuntimeModule> {
         rewrites,
         scripts,
         inline_scripts: parsed.inline_scripts,
+        mitm_hosts: parsed.mitm_hosts,
     });
     if MODULE_CACHE.len() > 64 {
         MODULE_CACHE.clear();
@@ -1201,17 +1213,21 @@ enum HeaderOp {
 /// 解析 `$(remove-X-Foo)` / `$(add-X-Foo: v)` / `$(replace-X-Foo: v)` 与
 /// Surge 风格 `header-add X-Foo: v` / `header-replace` / `header-del`
 fn parse_header_ops(spec: &str) -> Vec<HeaderOp> {
+    static RE_DOLLAR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_SURGE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let mut ops = Vec::new();
-    let dollar = regex::Regex::new(r"\$\(([^)]*)\)").expect("内置正则必然合法");
+    let dollar = RE_DOLLAR
+        .get_or_init(|| regex::Regex::new(r"\$\(([^)]*)\)").expect("内置正则必然合法"));
     for cap in dollar.captures_iter(spec) {
         if let Some(op) = parse_header_op_inner(cap.get(1).map(|m| m.as_str()).unwrap_or("")) {
             ops.push(op);
         }
     }
     // Surge 风格（不在 $() 内）
-    let rest = dollar.replace_all(spec, " ").to_string();
-    let surge =
-        regex::Regex::new(r"(?i)header-(add|replace|del)\s+([^,;]+)").expect("内置正则必然合法");
+    let rest = dollar.replace_all(spec, " ");
+    let surge = RE_SURGE.get_or_init(|| {
+        regex::Regex::new(r"(?i)header-(add|replace|del)\s+([^,;]+)").expect("内置正则必然合法")
+    });
     for cap in surge.captures_iter(&rest) {
         let kind = cap
             .get(1)
@@ -1391,15 +1407,13 @@ fn match_rules(settings: &GoCusSettings, url: &str) -> MatchOutcome {
                     }
                 }
                 "header-request" => {
-                    let ops = parse_header_ops(matched.target.as_deref().unwrap_or(""));
-                    if !ops.is_empty() {
-                        out.request_header_rules.push((matched, ops));
+                    if !rw.header_ops.is_empty() {
+                        out.request_header_rules.push((matched, rw.header_ops.clone()));
                     }
                 }
                 "header-response" => {
-                    let ops = parse_header_ops(matched.target.as_deref().unwrap_or(""));
-                    if !ops.is_empty() {
-                        out.response_header_rules.push((matched, ops));
+                    if !rw.header_ops.is_empty() {
+                        out.response_header_rules.push((matched, rw.header_ops.clone()));
                     }
                 }
                 _ => {}
@@ -1549,6 +1563,7 @@ async fn run_sidecar(app: tauri::AppHandle) -> Result<(), String> {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
+        let _ = stream.set_nodelay(true);
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let _ = handle_sidecar_conn(app, stream).await;
@@ -1692,6 +1707,7 @@ async fn handle_sidecar_conn(
         let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|e| format!("边车上游连接失败 {host}:{port}: {e}"))?;
+        let _ = upstream.set_nodelay(true);
         let _ = write_all(&mut stream, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
         return Ok(());
@@ -1717,13 +1733,13 @@ async fn handle_sidecar_conn(
     .await
 }
 
-/// 汇总全部启用模块的 MitM hostname 模式
+/// 汇总全部启用模块的 MitM hostname 模式（命中 RuntimeModule 缓存，零重复解析）
 fn mitm_patterns(settings: &GoCusSettings) -> Vec<String> {
     settings
         .modules
         .iter()
         .filter(|m| m.enabled)
-        .flat_map(|m| parse_universal_module(&m.raw_content).mitm_hosts)
+        .flat_map(|m| runtime_module(m).mitm_hosts.clone())
         .collect()
 }
 
@@ -1808,10 +1824,11 @@ async fn read_request_body<S: AsyncRead + Unpin>(
         body.truncate(len);
         return Ok(body);
     }
+    body.reserve(len - body.len());
+    let mut chunk = [0u8; 16384];
     while body.len() < len {
-        let want = (len - body.len()).min(65536);
-        let mut chunk = vec![0u8; want];
-        let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        let want = (len - body.len()).min(chunk.len());
+        let n = stream.read(&mut chunk[..want]).await.map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -1863,6 +1880,7 @@ async fn raw_forward<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| format!("边车上游连接失败 {host}:{port}: {e}"))?;
+    let _ = upstream.set_nodelay(true);
     let mut out = headers.to_vec();
     out.retain(|(k, _)| !is_hop_header(k));
     apply_header_ops(&mut out, ops);
@@ -1892,6 +1910,9 @@ fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()

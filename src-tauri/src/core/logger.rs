@@ -229,13 +229,18 @@ fn push_bounded(bucket: &mut VecDeque<LogEntry>, entry: LogEntry, cap: usize) {
     }
 }
 
-/// 【APP71 任务1.1】待落盘的 AIM JSONL 行（250ms 防抖批量追加）
-static AIM_PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+/// 【APP71 任务1.1】待落盘的 AIM JSONL 行（事件驱动 + 250ms 防抖批量追加；
+/// 空闲时阻塞在 Condvar 上，零 CPU 唤醒、零耗电）
+static AIM_PENDING: OnceLock<(Mutex<Vec<String>>, std::sync::Condvar)> = OnceLock::new();
 static AIM_WRITER_STARTED: OnceLock<()> = OnceLock::new();
 static AIM_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
+fn aim_pending_pair() -> &'static (Mutex<Vec<String>>, std::sync::Condvar) {
+    AIM_PENDING.get_or_init(|| (Mutex::new(Vec::new()), std::sync::Condvar::new()))
+}
+
 fn aim_pending() -> &'static Mutex<Vec<String>> {
-    AIM_PENDING.get_or_init(|| Mutex::new(Vec::new()))
+    &aim_pending_pair().0
 }
 
 /// APP 启动时初始化（lib.rs setup 调用）：绑定持久化文件路径
@@ -258,11 +263,23 @@ pub fn init(data_dir: &std::path::Path) {
         file_path: Some(data_dir.join(JSONL_FILE_NAME)),
         writes_since_check: 0,
     }));
-    // 【APP71 任务1.1】250ms 防抖刷盘线程：只服务 GoAIM 结构化日志，
-    // 与既有同步写入路径完全隔离，不影响其他模块。
+    // 【低能耗优化】事件驱动 250ms 防抖刷盘线程：无待写日志时休眠于 Condvar（0 唤醒/小时），
+    // 有 AIM 日志写入才唤醒并合并 250ms 内突发批量落盘。
     let _ = AIM_WRITER_STARTED.get_or_init(|| {
         std::thread::spawn(|| {
+            let (lock, cvar) = aim_pending_pair();
             loop {
+                {
+                    let Ok(mut pending) = lock.lock() else {
+                        break;
+                    };
+                    while pending.is_empty() {
+                        pending = match cvar.wait(pending) {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(AIM_FLUSH_DEBOUNCE_MS));
                 flush_aim_pending();
             }
@@ -322,33 +339,44 @@ fn push_entry(level: &str, module: &str, message: &str) {
     let entry = LogEntry::plain(0, now_timestamp(), level, module, message);
 
     let Some(mutex) = state() else { return };
-    let Ok(mut st) = mutex.lock() else { return };
-    let id = st.seq.fetch_add(1, Ordering::Relaxed);
-    let mut entry = entry;
-    entry.id = id;
-    // 【APP59 任务2.2】写入对应分类的独立环形队列；【APP71】GoAIM 桶 400 条，
-    // 其余分类维持 150 条，互不挤占。
-    let cap = bucket_capacity(module);
-    let bucket = st.buckets.entry(module).or_default();
-    push_bounded(bucket, entry.clone(), cap);
-    // 追加写磁盘（每 20 条做一次 512 KB 容量检查）
-    st.writes_since_check += 1;
-    if let Some(path) = st.file_path.clone() {
-        let need_truncate = st.writes_since_check >= 20
-            && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_FILE_BYTES;
+    let (file_path, need_truncate, line) = {
+        let Ok(mut st) = mutex.lock() else { return };
+        let id = st.seq.fetch_add(1, Ordering::Relaxed);
+        let mut entry = entry;
+        entry.id = id;
+        // 【APP59 任务2.2】写入对应分类的独立环形队列；【APP71】GoAIM 桶 400 条，
+        // 其余分类维持 150 条，互不挤占。
+        let cap = bucket_capacity(module);
+        let bucket = st.buckets.entry(module).or_default();
+        push_bounded(bucket, entry.clone(), cap);
+        // 追加写磁盘（每 20 条做一次 512 KB 容量检查）；释放全局锁后再执行文件 I/O
+        st.writes_since_check += 1;
+        let path = st.file_path.clone();
+        let need_truncate = if let Some(ref p) = path {
+            if st.writes_since_check >= 20 {
+                st.writes_since_check = 0;
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) > MAX_LOG_FILE_BYTES
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let line = path.as_ref().map(|_| {
+            serde_json::json!({
+                "category": entry.module,
+                "level": entry.level,
+                "timestamp": entry.timestamp,
+                "message": entry.message,
+            })
+            .to_string()
+        });
+        (path, need_truncate, line)
+    };
+    if let (Some(path), Some(line)) = (file_path, line) {
         if need_truncate {
-            st.writes_since_check = 0;
             truncate_log_file(&path);
         }
-        // 【APP59 任务2.2】结构化 JSONL：每行一个独立日志对象，
-        // 字段固定 category / level / timestamp / message
-        let line = serde_json::json!({
-            "category": entry.module,
-            "level": entry.level,
-            "timestamp": entry.timestamp,
-            "message": entry.message,
-        })
-        .to_string();
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -379,59 +407,67 @@ fn truncate_log_file(path: &std::path::Path) {
 /// 只用于 AIM 日志；不改变既有 `sanitize_sensitive` 行为。
 pub fn sanitize_aim_log_message(raw: &str) -> String {
     use regex::Regex;
+    static RE_UUID: OnceLock<Regex> = OnceLock::new();
+    static RE_AUTH: OnceLock<Regex> = OnceLock::new();
+    static RE_SECRET: OnceLock<Regex> = OnceLock::new();
+    static RE_URL: OnceLock<Regex> = OnceLock::new();
+
     let mut out = raw.to_string();
     // 1) UUID（节点 uuid / 订阅标识）
-    if let Ok(re) =
+    let re_uuid = RE_UUID.get_or_init(|| {
         Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
-    {
-        out = re
-            .replace_all(&out, |caps: &regex::Captures| {
-                let s = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                format!("{}****{}", &s[..4], &s[s.len() - 4..])
-            })
-            .into_owned();
-    }
+            .expect("valid uuid regex")
+    });
+    out = re_uuid
+        .replace_all(&out, |caps: &regex::Captures| {
+            let s = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            format!("{}****{}", &s[..4], &s[s.len() - 4..])
+        })
+        .into_owned();
     // 2) Authorization / Cookie 头
-    if let Ok(re) = Regex::new(r"(?i)\b(authorization|cookie)\b(\s*[:=]\s*)[^\r\n,;]+") {
-        out = re
-            .replace_all(&out, |caps: &regex::Captures| {
-                format!(
-                    "{}{}***",
-                    caps.get(1).map(|m| m.as_str()).unwrap_or(""),
-                    caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
-                )
-            })
-            .into_owned();
-    }
+    let re_auth = RE_AUTH.get_or_init(|| {
+        Regex::new(r"(?i)\b(authorization|cookie)\b(\s*[:=]\s*)[^\r\n,;]+")
+            .expect("valid auth regex")
+    });
+    out = re_auth
+        .replace_all(&out, |caps: &regex::Captures| {
+            format!(
+                "{}{}***",
+                caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+                caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
+            )
+        })
+        .into_owned();
     // 3) 节点口令 / 认证串
-    if let Ok(re) = Regex::new(
-        r#"(?i)\b(password|passwd|pwd|auth-str|auth_str|token)\b(\s*[:=]\s*"?)[^\s",}]+"#,
-    ) {
-        out = re
-            .replace_all(&out, |caps: &regex::Captures| {
-                format!(
-                    "{}{}***",
-                    caps.get(1).map(|m| m.as_str()).unwrap_or(""),
-                    caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
-                )
-            })
-            .into_owned();
-    }
+    let re_secret = RE_SECRET.get_or_init(|| {
+        Regex::new(r#"(?i)\b(password|passwd|pwd|auth-str|auth_str|token)\b(\s*[:=]\s*"?)[^\s",}]+"#)
+            .expect("valid secret regex")
+    });
+    out = re_secret
+        .replace_all(&out, |caps: &regex::Captures| {
+            format!(
+                "{}{}***",
+                caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+                caps.get(2).map(|m| m.as_str()).unwrap_or(": ")
+            )
+        })
+        .into_owned();
     // 4) 订阅 URL：仅保留 scheme + host（含查询串 / 超长 token 的 URL 一律折叠）
-    if let Ok(re) = Regex::new(r"(?i)\b(https?)://([^/\s:?#]+)([^\s]*)") {
-        out = re
-            .replace_all(&out, |caps: &regex::Captures| {
-                let scheme = caps.get(1).map(|m| m.as_str()).unwrap_or("https");
-                let host = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-                if rest.len() > 24 || rest.contains('?') {
-                    format!("{scheme}://{host}/***")
-                } else {
-                    format!("{scheme}://{host}{rest}")
-                }
-            })
-            .into_owned();
-    }
+    let re_url = RE_URL.get_or_init(|| {
+        Regex::new(r"(?i)\b(https?)://([^/\s:?#]+)([^\s]*)").expect("valid url regex")
+    });
+    out = re_url
+        .replace_all(&out, |caps: &regex::Captures| {
+            let scheme = caps.get(1).map(|m| m.as_str()).unwrap_or("https");
+            let host = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            if rest.len() > 24 || rest.contains('?') {
+                format!("{scheme}://{host}/***")
+            } else {
+                format!("{scheme}://{host}{rest}")
+            }
+        })
+        .into_owned();
     // 5) WireGuard 私钥 / License Key（复用导出脱敏规则）
     sanitize_sensitive(&out)
 }
@@ -520,9 +556,14 @@ pub fn log_aim(level: &str, meta: &AimLogMeta, message: &str) {
         }
     }
     let mut need_flush = false;
-    if let Ok(mut pending) = aim_pending().lock() {
+    let (lock, cvar) = aim_pending_pair();
+    if let Ok(mut pending) = lock.lock() {
+        let was_empty = pending.is_empty();
         pending.push(line.to_string());
         need_flush = pending.len() >= AIM_PENDING_MAX;
+        if was_empty && !need_flush {
+            cvar.notify_one();
+        }
     }
     if need_flush {
         flush_aim_pending();

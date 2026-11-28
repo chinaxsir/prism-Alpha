@@ -525,8 +525,8 @@ pub struct AppState {
     pub node_metrics: RwLock<PersistedNodeMetrics>,
     /// 当前 Pro 授权状态（启动时由 license 缓存恢复；后台校验后刷新）
     pub entitlement: RwLock<super::license::EntitlementStatus>,
-    /// entitlement 的会话签名（防内存篡改：status 被改写后签名校验失败）
-    pub entitlement_sign: RwLock<u64>,
+    /// entitlement 的会话签名（256-bit SHA-256 防内存篡改：任意授权字段被改写后签名校验立即失败）
+    pub entitlement_sign: RwLock<[u8; 32]>,
     /// 系统代理备份：启动时备份原设置，停止/切换时恢复，确保代理独占
     pub proxy_backup: RwLock<Option<crate::platform::ProxyBackup>>,
 
@@ -609,8 +609,11 @@ impl AppState {
         super::license::enforce_expiry(&mut entitlement, super::license::now_unix());
         let entitlement_sign = super::security::entitlement_signature(
             &entitlement.status,
+            entitlement.plan.as_deref(),
             entitlement.expires_at,
             entitlement.last_verified_at,
+            entitlement.sync_available,
+            entitlement.alpha,
         );
         // 【APP52 任务1】启动恢复节点测速/Go AIM 持久化缓存
         let node_metrics = load_node_metrics(&data_dir);
@@ -679,8 +682,11 @@ impl AppState {
         super::license::enforce_expiry(&mut next, super::license::now_unix());
         let sign = super::security::entitlement_signature(
             &next.status,
+            next.plan.as_deref(),
             next.expires_at,
             next.last_verified_at,
+            next.sync_available,
+            next.alpha,
         );
         // 两把锁顺序获取（禁止嵌套），避免与 is_pro_active 并发时死锁
         *self.entitlement.write() = next.clone();
@@ -690,24 +696,34 @@ impl AppState {
 
     /// 当前是否拥有有效 Pro 授权（所有 Pro 守卫的唯一入口）：
     /// 1. 运行环境未被判定受损（调试器附加 / 内存篡改）；
-    /// 2. 内存授权状态签名自洽（防内存修改器把 expired 改回 active）；
+    /// 2. 内存授权状态签名自洽（防内存修改器篡改任意字段）；
     /// 3. 状态为 active 且当前系统时间早于 expires_at（离线也生效）。
     pub fn is_pro_active(&self) -> bool {
         if super::security::is_compromised() {
             return false;
         }
         let now = super::license::now_unix();
-        let (status, expires_at, last_verified_at, unlocked) = {
+        let (status, plan, expires_at, last_verified_at, sync_available, alpha, unlocked) = {
             let ent = self.entitlement.read();
             (
                 ent.status.clone(),
+                ent.plan.clone(),
                 ent.expires_at,
                 ent.last_verified_at,
+                ent.sync_available,
+                ent.alpha,
                 ent.is_unlocked(),
             )
         };
         let sign = *self.entitlement_sign.read();
-        let expect = super::security::entitlement_signature(&status, expires_at, last_verified_at);
+        let expect = super::security::entitlement_signature(
+            &status,
+            plan.as_deref(),
+            expires_at,
+            last_verified_at,
+            sync_available,
+            alpha,
+        );
         if sign != expect {
             super::security::mark_compromised("entitlement signature mismatch");
             return false;

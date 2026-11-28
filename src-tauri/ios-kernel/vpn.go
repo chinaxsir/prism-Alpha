@@ -84,14 +84,18 @@ var (
 // 被扩展加载的那一刻；PrismVPNStart 覆盖「上次 Stop 后被其它代码改写过
 // GC 参数」的防御场景。
 func applyIosMemoryLimit() {
-	if runtime.GOOS != "ios" {
-		return
+	switch runtime.GOOS {
+	case "ios":
+		// 【APP58 任务1.3】省电与安全平衡：GC 85% + 36MiB 上限。APP57 的
+		// 40% / 26MiB 过于激进，频繁 GC 会持续占用 CPU 导致手机发热；
+		// 36 MiB 仍安全低于 iOS 50MiB Jetsam 硬红线。
+		debug.SetGCPercent(85)
+		debug.SetMemoryLimit(36 * 1024 * 1024) // 36 MiB < iOS 50MiB Jetsam 上限
+	case "android":
+		// Android 后台常驻内存软上限：兼顾高吞吐转发与低 LMK 强杀风险
+		debug.SetGCPercent(100)
+		debug.SetMemoryLimit(128 * 1024 * 1024)
 	}
-	// 【APP58 任务1.3】省电与安全平衡：GC 85% + 36MiB 上限。APP57 的
-	// 40% / 26MiB 过于激进，频繁 GC 会持续占用 CPU 导致手机发热；
-	// 36 MiB 仍安全低于 iOS 50MiB Jetsam 硬红线。
-	debug.SetGCPercent(85)
-	debug.SetMemoryLimit(36 * 1024 * 1024) // 36 MiB < iOS 50MiB Jetsam 上限
 }
 
 func init() {
@@ -178,9 +182,13 @@ func (e *vpnError) Error() string { return e.msg }
 func errVpn(msg string) error { return &vpnError{msg: msg} }
 
 var (
-	vpnLogMu sync.Mutex
-	vpnLogF  *os.File
+	vpnLogMu     sync.Mutex
+	vpnLogF      *os.File
+	vpnLogPath   string
+	vpnLogWrites uint32
 )
+
+const maxVpnLogBytes int64 = 512 * 1024
 
 func vpnSetupPaths(workDir string) error {
 	// 与 PrismKernelStart 保持一致
@@ -204,11 +212,19 @@ func vpnSetupPaths(workDir string) error {
 		TempPath:    workDir,
 	})
 
-	f, err := os.Create(filepath.Join(workDir, "kernel.log"))
+	logPath := filepath.Join(workDir, "kernel.log")
+	f, err := os.Create(logPath)
 	if err != nil {
 		return fmt.Errorf("open kernel log: %w", err)
 	}
+	vpnLogMu.Lock()
+	if vpnLogF != nil {
+		_ = vpnLogF.Close()
+	}
 	vpnLogF = f
+	vpnLogPath = logPath
+	vpnLogWrites = 0
+	vpnLogMu.Unlock()
 	return nil
 }
 
@@ -217,6 +233,14 @@ func vpnWriteLog(message string) {
 	defer vpnLogMu.Unlock()
 	if vpnLogF != nil {
 		_, _ = vpnLogF.WriteString(time.Now().Format("15:04:05") + " " + message + "\n")
+		vpnLogWrites++
+		if vpnLogWrites >= 200 {
+			vpnLogWrites = 0
+			if info, err := vpnLogF.Stat(); err == nil && info.Size() > maxVpnLogBytes {
+				_ = vpnLogF.Truncate(0)
+				_, _ = vpnLogF.Seek(0, 0)
+			}
+		}
 	}
 }
 

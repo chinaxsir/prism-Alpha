@@ -278,7 +278,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
     })?;
 
     // 读取全部启用订阅的 profile（多订阅模型；旧版单 profile.yaml 自动兼容）
-    let profiles = load_enabled_profiles(state);
+    let mut profiles = load_enabled_profiles(state);
     if profiles.is_empty() {
         // 空缓存兜底（ipa-8）：启用订阅存在但内容未拉取成功（云同步对账
         // 时网络抖动只建了保底记录）→ 启动前自动补拉一次，避免用户必须
@@ -286,6 +286,7 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
         // 仍在运行，refresh_subscription 会再次触发重启造成递归
         if *state.status.read() != CoreStatus::Running {
             let records = crate::core::store::load_subscriptions(&state.data_dir);
+            let mut fetched_any = false;
             for r in records.iter().filter(|r| r.enabled) {
                 let path = crate::core::store::profile_path(&state.data_dir, &r.url);
                 if !path.exists() {
@@ -293,13 +294,18 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
                     // Box::pin 打断 prepare_start → refresh_subscription →
                     // restart_core → prepare_start 的静态递归环（运行时已有
                     // status != Running 守卫，实际不会递归执行）
-                    if let Err(e) = Box::pin(refresh_subscription(app, state, &r.url)).await {
-                        tracing::warn!("启动前补拉失败（继续启动流程）：{e}");
+                    match Box::pin(refresh_subscription(app, state, &r.url)).await {
+                        Ok(()) => fetched_any = true,
+                        Err(e) => tracing::warn!("启动前补拉失败（继续启动流程）：{e}"),
                     }
                 }
             }
-            // 自动补拉后不再读取 profiles：下方直接返回错误提示
+            if fetched_any {
+                profiles = load_enabled_profiles(state);
+            }
         }
+    }
+    if profiles.is_empty() {
         let has_records = !crate::core::store::load_subscriptions(&state.data_dir).is_empty();
         let msg = if has_records {
             "订阅内容缺失（本地缓存不存在）：请在「订阅」页点击更新，成功后再启动内核"
@@ -408,12 +414,15 @@ async fn prepare_start(app: &AppHandle, state: &AppState) -> Result<PreparedStar
                         let Some(otype) = o.get("type").and_then(|v| v.as_str()) else {
                             return false;
                         };
-                        if matches!(otype, "direct" | "block" | "dns" | "oracle") {
+                        if matches!(
+                            otype,
+                            "direct" | "block" | "dns" | "oracle" | "selector" | "urltest"
+                        ) {
                             return false;
                         }
                         if tag.starts_with("go-lan")
-                            || tag.starts_with("go-lan-")
-                            || tag == "go-lan"
+                            || tag == crate::core::go_cus::SIDECAR_TAG
+                            || tag.starts_with("GO-AIM-PROBE-")
                         {
                             return false;
                         }
@@ -1539,15 +1548,13 @@ pub async fn select_proxy(
         }
     }
 
-    // 任何一个 selector 返回 404 → 重新构建 config.json + 重启内核
-    // （内核启动流程会自动把 selected_node 写入所有 selector 默认项）
+    // 任何一个 selector 返回 404 → 重载运行中配置以接纳新节点
+    // （iOS 走原子热重载不撕毁 NE 会话；桌面/Android 走标准状态机 restart_core，
+    // 根治原 do_stop + start_core_inner 在 Running 态直接短路导致内核被停掉却仍显示运行中的 bug）
     if had_404 && *state.status.read() == crate::core::state::CoreStatus::Running {
-        tracing::info!("触发 vpn reload 以接纳新节点 '{name}'");
-        // 先停再启（do_stop + start_core_inner）
-        let inner = state.inner();
-        let _ = do_stop(inner).await;
-        if let Err(e) = start_core_inner(&app, inner).await {
-            log_cmd_error("选点后重建内核失败", &e);
+        tracing::info!("触发内核重载以接纳新节点 '{name}'");
+        if let Err(e) = reload_running_core(&app, state.inner()).await {
+            log_cmd_error("选点后重载内核失败", &e);
             tracing::error!("vpn reload 失败: {e}");
         }
     }
@@ -1757,27 +1764,66 @@ pub(crate) async fn refresh_subscription(
         (*state.status.read() == CoreStatus::Running).then(|| state.settings.read().mixed_port);
     #[cfg(any(target_os = "ios", target_os = "android"))]
     let local_proxy: Option<u16> = None;
-    let (mut text, mut quota) = fetch_remote_text(&url, local_proxy, None).await?;
+    let (raw_text, mut quota) = fetch_remote_text(&url, local_proxy, None).await?;
 
-    // base64 包裹：明文不含 YAML/JSON 结构时尝试解码
-    text = prepare_subscription_payload(text)?;
+    // base64 包裹 / 六格式解析归一化：
+    // 若首拉内容无法识别或解析出 0 真实节点（且非机场明确提示），依次回退：
+    // 1) v2rayN UA 重试；
+    // 2) 若链接未显式携带 flag= 参数，追加 flag=clash 用纯净 Clash.Meta UA 重试一次
+    //    （兼容 V2Board / XBoard / SSPanel 按 flag 参数强制输出标准 Clash YAML）。
+    let text = match prepare_subscription_payload(raw_text) {
+        Ok(prepared) if subscription_has_usable_content(&prepared) => prepared,
+        first_outcome => {
+            let first_err_is_notice = matches!(&first_outcome, Err(e) if e.contains("机场提示："));
+            if first_err_is_notice {
+                return Err(first_outcome.unwrap_err());
+            }
+            let mut recovered: Option<(String, Option<crate::core::store::SubscriptionQuota>)> =
+                None;
 
-    // 【APP42 任务1.1】首拉解析出 0 个节点（典型：面板按 UA 下发不同格式）
-    // → 用 v2rayN UA 再重试一次，成功则改用重试结果
-    if subscription_real_node_count(&text) == 0 {
-        tracing::warn!("订阅首拉解析出 0 节点，使用 v2rayN UA 重试一次: {url}");
-        let (retry_text, retry_quota) =
-            fetch_remote_text(&url, local_proxy, Some(SUBSCRIPTION_RETRY_UA)).await?;
-        let retry_text = prepare_subscription_payload(retry_text)?;
-        if subscription_real_node_count(&retry_text) > 0 {
-            text = retry_text;
-            quota = retry_quota;
-            tracing::info!(
-                "v2rayN UA 重试成功，节点数 {}",
-                subscription_real_node_count(&text)
-            );
+            // 回退 1：v2rayN UA
+            tracing::warn!("订阅首拉未识别出有效节点，使用 v2rayN UA 重试: {url}");
+            if let Ok((retry_raw, retry_q)) =
+                fetch_remote_text(&url, local_proxy, Some(SUBSCRIPTION_RETRY_UA)).await
+                && let Ok(retry_prepared) = prepare_subscription_payload(retry_raw)
+                && subscription_has_usable_content(&retry_prepared)
+            {
+                tracing::info!(
+                    "v2rayN UA 重试成功，节点数 {}",
+                    subscription_real_node_count(&retry_prepared)
+                );
+                recovered = Some((retry_prepared, retry_q));
+            }
+
+            // 回退 2：追加 flag=clash 参数 + 纯净 Clash.Meta UA（适配 V2Board/XBoard/SSPanel）
+            if recovered.is_none() && !url.to_ascii_lowercase().contains("flag=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let flag_url = format!("{url}{sep}flag=clash");
+                tracing::warn!("订阅重试追加 flag=clash（Clash.Meta UA）: {url}");
+                if let Ok((flag_raw, flag_q)) =
+                    fetch_remote_text(&flag_url, local_proxy, Some(SUBSCRIPTION_UAS[0])).await
+                    && let Ok(flag_prepared) = prepare_subscription_payload(flag_raw)
+                    && subscription_has_usable_content(&flag_prepared)
+                {
+                    tracing::info!(
+                        "flag=clash 重试成功，节点数 {}",
+                        subscription_real_node_count(&flag_prepared)
+                    );
+                    recovered = Some((flag_prepared, flag_q));
+                }
+            }
+
+            match recovered {
+                Some((ok_text, ok_quota)) => {
+                    if ok_quota.is_some() {
+                        quota = ok_quota;
+                    }
+                    ok_text
+                }
+                None => first_outcome?,
+            }
         }
-    }
+    };
 
     // 落盘前校验：防止机场返回 HTML 错误页/限流提示等空内容覆盖本地可用订阅
     if let Err(e) = crate::core::config_builder::validate_subscription_text(&text) {
@@ -2347,11 +2393,11 @@ pub async fn add_manual_node_struct(
     })
 }
 
-/// 【APP65 任务3.1】移动端 VPN 运行中订阅 / 节点热生效：
-/// 1. 复用 prepare_start 完整重建 sing-box 配置（多订阅合并 + 规则 + DNS）；
+/// 【APP65 任务3.1】移动端 VPN 运行中配置热生效（原子写入）：
+/// 1. 复用 prepare_start 完整重建 sing-box 配置（多订阅合并 + 规则 + DNS + Go Lan + Go Cus）；
 /// 2. Clash API 地址与密钥沿用当前运行值，扩展软重启后主 App 无需重新同步；
-/// 3. 落盘 work_dir/config.json（诊断留档）与 App Group 共享目录
-///    prism_config.json（iOS 扩展下一次软重启直接读取）。
+/// 3. 原子落盘 work_dir/config.json（诊断留档）与 App Group 共享目录
+///    prism_config.json（杜绝 kqueue 监听到半截写入文件导致扩展崩溃）。
 #[cfg(target_os = "ios")]
 async fn hot_reload_mobile_config(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let mut prepared = prepare_start(app, state).await?;
@@ -2375,50 +2421,74 @@ async fn hot_reload_mobile_config(app: &AppHandle, state: &AppState) -> Result<(
     let bytes = serde_json::to_vec_pretty(&prepared.built.config)
         .map_err(|e| format!("序列化热重载配置失败: {e}"))?;
     let path = prepared.work_dir.join("config.json");
-    std::fs::write(&path, &bytes).map_err(|e| format!("写入热重载配置失败: {e}"))?;
-    #[cfg(target_os = "ios")]
+    crate::core::store::atomic_write(&path, &bytes)
+        .map_err(|e| format!("写入热重载配置失败: {e}"))?;
     if let Some(group) = crate::platform::ios::app_group_dir() {
         let shared = std::path::Path::new(&group).join("prism_config.json");
-        std::fs::write(&shared, &bytes)
+        crate::core::store::atomic_write(&shared, &bytes)
             .map_err(|e| format!("写入 App Group 热重载配置失败: {e}"))?;
-        tracing::info!("hot reload config written to {}", shared.display());
+        tracing::info!("hot reload config atomically written to {}", shared.display());
     }
     Ok(())
 }
 
-/// 【APP47 任务3.1】统计订阅内容实际节点数（用于双 UA 择优）。
-/// 机场面板常按 UA 下发不同节点集：v2rayNG UA 拿到的是完整 base64 URI 列表，
-/// Clash.Meta UA 有时只拿到精简 YAML。两个 UA 并发拉取后按节点数取更多者。
-fn count_nodes_in_text(text: &str) -> usize {
-    let prepared =
-        prepare_subscription_payload(text.to_string()).unwrap_or_else(|_| text.to_string());
-    if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&prepared)
-        && let Some(list) = v.get("proxies").and_then(|p| p.as_sequence())
+/// 运行中配置重载统一入口：
+/// - iOS：走 App Group 原子热重载（保持 NEPacketTunnel 会话与 utun 不断开，避免撕毁重载触发 Code=12 或 Jetsam）；
+/// - 桌面 / Android：执行 restart_core 完整预检重启。
+async fn reload_running_core(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    #[cfg(target_os = "ios")]
     {
-        return list.len();
+        hot_reload_mobile_config(app, state).await
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        restart_core(app, state).await
+    }
+}
+
+/// 【APP47 任务3.1】统计订阅内容实际可用项数（节点数 + proxy-providers 数，用于多 UA 择优）。
+fn count_nodes_in_text(text: &str) -> usize {
+    let Ok(prepared) = prepare_subscription_payload(text.to_string()) else {
+        return 0;
+    };
+    let real = subscription_real_node_count(&prepared);
+    if real > 0 {
+        return real;
+    }
+    if subscription_has_proxy_providers(&prepared) {
+        return 1;
+    }
+    if prepared.trim_start().starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&prepared)
+        && let Some(arr) = v.get("outbounds").and_then(|o| o.as_array())
+    {
+        return arr
+            .iter()
+            .filter(|o| {
+                o.get("server")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !s.is_empty() && !s.starts_with("127.") && s != "localhost")
+            })
+            .count();
     }
     0
 }
 
-/// 订阅下载候选 User-Agent（按兼容性从强到弱轮询）：
-/// 【APP42 任务1.1】首位改为 Clash.Meta/mihomo 组合标识：机场面板普遍
-/// 依赖 UA 判定客户端并下发 Clash YAML + subscription-userinfo 配额头；
-/// 只写 clash-verge 会被部分面板识别为旧版 Verge 而返回精简节点。
-/// 1. Clash.Meta/mihomo/Prism/sing-box 组合标识 —— 首选；
-/// 2. v2rayN —— 仅放行 v2ray 客户端 UA 的面板（首拉 0 节点时重试）；
-/// 3. Shadowrocket —— 屏蔽 Clash UA 的面板；
-/// 4. 通用浏览器 —— 只放行浏览器 UA 的兜底。
-/// 【APP62 任务3】追加 Surge / Loon / Karing 三家专用 UA：部分机场按
-/// 客户端只下发自家格式（Surge INI / Loon INI / Karing JSON），统一由
-/// subscription::parse_subscription_content 六格式解析器消化。
-const SUBSCRIPTION_UAS: [&str; 7] = [
-    "Clash.Meta/v1.18.3 mihomo/1.18.3 Prism/0.3.69 sing-box/1.11.15",
+/// 订阅下载候选 User-Agent：
+/// - 首轮只并发 2 个核心 UA（纯净 Clash.Meta + v2rayN），避免单次更新向机场面板
+///   同时打 14 个并发连接触发 V2Board / Cloudflare 限流返回 HTML 拦截页；
+/// - 移除了首 UA 中的 `sing-box` 混写：V2Board PHP 面板遇到同时含 Clash 与 sing-box
+///   的 UA 时可能误命中未配置模板的 sing-box 分支返回空内容；
+/// - 首轮未拿到有效节点时再启动次轮冷门 UA（Clash / Shadowrocket / Surge / Loon / sing-box / Karing）。
+const SUBSCRIPTION_UAS: [&str; 8] = [
+    "Clash.Meta/v1.18.3 mihomo/1.18.3",
     "v2rayN/6.45",
+    "Clash/1.18.0",
+    "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
     "Surge/5.8.0",
     "Loon/800",
+    "sing-box/1.11.15",
     "Karing/1.0",
-    "Shadowrocket/2078 CFNetwork/1410.0.3 Darwin/22.6.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ];
 
 /// 【APP62 任务3】订阅链接 `?flag=xxx` 客户端格式提示 → 对应专用 UA。
@@ -2480,10 +2550,29 @@ fn prepare_subscription_payload(text: String) -> Result<String, String> {
     // 【APP62 任务3】多层自适应 Base64 剥壳（机场常见 1~3 层包裹）
     let text = crate::core::subscription::auto_decrypt_base64_payload(&text);
 
-    // 原生 Clash / Meta 订阅：proxy-groups、rules 等完整结构必须原样保留，
-    // 不能拆成节点后重建（否则分组、规则、策略全丢）
-    if text.contains("proxies:") {
+    // 原生 Clash / Meta 订阅：proxy-groups、proxy-providers、rules 等完整结构原样保留，
+    // 不能拆成节点后重建（否则分组、规则、策略全丢）。同时兼容只声明 proxy-providers 的订阅。
+    if text.contains("proxies:") || text.contains("proxy-providers:") {
         return Ok(text);
+    }
+
+    // 显式识别 HTML 页面（机场被墙、Cloudflare/WAF 防刷拦截、套餐失效登录页）
+    let trimmed = text.trim();
+    let lower_head = trimmed
+        .chars()
+        .take(512)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if lower_head.starts_with("<!doctype html")
+        || lower_head.starts_with("<html")
+        || lower_head.contains("<html")
+        || lower_head.contains("<head>")
+        || lower_head.contains("<body")
+    {
+        return Err(
+            "订阅地址返回了网页内容而非节点配置（可能触发了面板防刷验证、套餐已到期或订阅链接已失效）"
+                .into(),
+        );
     }
 
     // 【APP62 任务3】六格式统一解析：Clash/Meta YAML、Surge/Loon、
@@ -2547,9 +2636,29 @@ fn prepare_subscription_payload(text: String) -> Result<String, String> {
         return serde_yaml::to_string(&profile).map_err(|e| format!("订阅转换失败: {e}"));
     }
 
-    // 兼容旧行为：原样就是内核 JSON 时直接下发
-    if text.trim_start().starts_with('{') {
+    // JSON 响应区分：合法内核配置（含 outbounds）透传；面板 JSON 报错（如 V2Board
+    // `{"message":"token is error"}`）提取清晰提示而非当作合法内核 JSON。
+    if trimmed.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("outbounds").and_then(|v| v.as_array()).is_some() {
+                return Ok(text);
+            }
+            if let Some(msg) = val
+                .get("message")
+                .or_else(|| val.get("msg"))
+                .or_else(|| val.get("error"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Err(format!("订阅服务端返回提示：{}", truncate_for_msg(msg)));
+            }
+        }
         return Ok(text);
+    }
+
+    if trimmed.is_empty() {
+        return Err("订阅地址返回内容为空（请检查套餐状态或订阅链接是否有效）".into());
     }
 
     Err(format!(
@@ -2578,6 +2687,17 @@ fn subscription_real_node_count(text: &str) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn subscription_has_proxy_providers(text: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|v| v.get("proxy-providers").and_then(|m| m.as_mapping()).map(|m| !m.is_empty()))
+        .unwrap_or(false)
+}
+
+fn subscription_has_usable_content(text: &str) -> bool {
+    subscription_real_node_count(text) > 0 || subscription_has_proxy_providers(text)
 }
 
 /// 下载远程文本（订阅 / proxy-provider 共用）。
@@ -2636,86 +2756,107 @@ async fn fetch_remote_text(
             .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
     };
 
-    let mut attempts = FuturesUnordered::new();
-    // 【APP42 任务1.1】force_ua 非空时只发该 UA（首拉 0 节点的 v2rayN 重试）
+    // 分波直连拉取（避免单次刷新并发 14 个请求打爆 V2Board/Cloudflare 频控返回 HTML 拦截页）：
+    // - 指定 force_ua 时只跑该 UA（双栈竞速）；
+    // - 默认首波只跑核心双 UA（Clash.Meta + v2rayN），均出结果且存在真实节点即择优返回；
+    // - 首波未拿到有效节点时，再发次波补齐 Clash / Shadowrocket / Surge / Loon / sing-box / Karing。
+    let no_force = force_ua.is_none();
+    let waves: Vec<Vec<&str>> = match force_ua {
+        Some(ua) => vec![vec![ua]],
+        None => vec![
+            SUBSCRIPTION_UAS[..2].to_vec(),
+            SUBSCRIPTION_UAS[2..].to_vec(),
+        ],
+    };
     let uas: Vec<&str> = match force_ua {
         Some(ua) => vec![ua],
         None => SUBSCRIPTION_UAS.to_vec(),
     };
-    for ua in &uas {
-        for force_v4 in [false, true] {
-            let client = build_client(force_v4, ua)?;
-            let target = url.clone();
-            let ua: String = (*ua).to_string();
-            attempts.push(async move { (force_v4, ua, try_fetch_text(&client, &target).await) });
-        }
-    }
 
-    // 【APP47 任务3.1】双 UA 择优：机场按 UA 下发不同节点集（v2rayNG 给完整
-    // base64 URI 列表，Clash.Meta 有时给精简 YAML）。不再"先到先得"，而是让
-    // Clash.Meta 与 v2rayN 两族都产出结果后，按实际节点数取更多者；
-    // 同等节点数时保留先到者。
-    let no_force = force_ua.is_none();
     let mut best: Option<(
         String,
         Option<crate::core::store::SubscriptionQuota>,
         usize,
         String,
     )> = None;
-    let mut got_clash = false;
-    let mut got_v2ray = false;
-    while let Some((force_v4, ua, result)) = attempts.next().await {
-        match result {
-            Ok((text, quota)) => {
-                tracing::info!(
-                    "fetch succeeded (ua={}, force_v4={force_v4}) in {}ms",
-                    ua.split('/').next().unwrap_or(ua.as_str()),
-                    fetch_started.elapsed().as_millis()
-                );
-                let count = count_nodes_in_text(&text);
-                tracing::info!(
-                    "fetch ua={} nodes={count}",
-                    ua.split('/').next().unwrap_or(ua.as_str())
-                );
-                if ua == SUBSCRIPTION_UAS[0] {
-                    got_clash = true;
-                }
-                if ua == SUBSCRIPTION_RETRY_UA {
-                    got_v2ray = true;
-                }
-                match &best {
-                    Some((_, _, best_count, _)) if *best_count >= count => {}
-                    _ => best = Some((text, quota, count, ua)),
-                }
-                if !no_force {
-                    let (text, quota, _, _) = best.unwrap();
-                    return Ok((text, quota));
-                }
-                // 两个核心 UA 族都已产出 → 立即择优，不再等冷门 UA
-                if got_clash && got_v2ray {
-                    break;
-                }
-                // 非核心 UA 先成功时先记下，继续等核心 UA（最多到 attempts 耗尽）
-            }
-            Err(e) => {
-                last_err = e;
-                tracing::warn!(
-                    "fetch direct (ua={}, force_v4={force_v4}) failed at {}ms: {last_err}",
-                    ua.split('/').next().unwrap_or(ua.as_str()),
-                    fetch_started.elapsed().as_millis()
-                );
+
+    for (wave_idx, wave_uas) in waves.iter().enumerate() {
+        let mut attempts = FuturesUnordered::new();
+        for ua in wave_uas {
+            for force_v4 in [false, true] {
+                let client = build_client(force_v4, ua)?;
+                let target = url.clone();
+                let ua: String = (*ua).to_string();
+                attempts.push(async move { (force_v4, ua, try_fetch_text(&client, &target).await) });
             }
         }
+        let mut got_clash = false;
+        let mut got_v2ray = false;
+        while let Some((force_v4, ua, result)) = attempts.next().await {
+            match result {
+                Ok((text, quota)) => {
+                    tracing::info!(
+                        "fetch succeeded (wave={}, ua={}, force_v4={force_v4}) in {}ms",
+                        wave_idx + 1,
+                        ua.split('/').next().unwrap_or(ua.as_str()),
+                        fetch_started.elapsed().as_millis()
+                    );
+                    let count = count_nodes_in_text(&text);
+                    tracing::info!(
+                        "fetch ua={} nodes={count}",
+                        ua.split('/').next().unwrap_or(ua.as_str())
+                    );
+                    if ua == SUBSCRIPTION_UAS[0] {
+                        got_clash = true;
+                    }
+                    if ua == SUBSCRIPTION_RETRY_UA {
+                        got_v2ray = true;
+                    }
+                    match &best {
+                        Some((_, _, best_count, _)) if *best_count >= count && (*best_count > 0 || count == 0) => {}
+                        _ => best = Some((text, quota, count, ua)),
+                    }
+                    if !no_force && count > 0 {
+                        let (text, quota, _, _) = best.unwrap();
+                        return Ok((text, quota));
+                    }
+                    if wave_idx == 0 && got_clash && got_v2ray && best.as_ref().is_some_and(|b| b.2 > 0) {
+                        break;
+                    }
+                    if wave_idx > 0 && count > 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_err = e;
+                    tracing::warn!(
+                        "fetch direct (wave={}, ua={}, force_v4={force_v4}) failed at {}ms: {last_err}",
+                        wave_idx + 1,
+                        ua.split('/').next().unwrap_or(ua.as_str()),
+                        fetch_started.elapsed().as_millis()
+                    );
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|b| b.2 > 0) {
+            break;
+        }
     }
-    if let Some((text, quota, count, ua)) = best {
+
+    // 仅当直连确实拿到了可用节点（count > 0）时立刻返回；
+    // 若直连只拿到 0 节点的 HTML/空响应，先留作兜底，继续尝试本地代理与 DoH 通道。
+    if let Some((text, quota, count, ua)) = best.as_ref()
+        && *count > 0
+    {
         if no_force {
             tracing::info!(
                 "fetch pick ua={} nodes={count}",
                 ua.split('/').next().unwrap_or(ua.as_str())
             );
         }
-        return Ok((text, quota));
+        return Ok((text.clone(), quota.clone()));
     }
+    let mut zero_fallback = best.map(|(t, q, _, _)| (t, q));
 
     // ---- 内核运行中：经本地 mixed 入站转发（同样轮询多 UA）----
     if let Some(port) = local_proxy {
@@ -2739,8 +2880,13 @@ async fn fetch_remote_text(
             };
             match try_fetch_text(&client, &url).await {
                 Ok((text, quota)) => {
-                    tracing::info!("fetch remote text succeeded via local mixed proxy :{port}");
-                    return Ok((text, quota));
+                    if count_nodes_in_text(&text) > 0 {
+                        tracing::info!("fetch remote text succeeded via local mixed proxy :{port}");
+                        return Ok((text, quota));
+                    }
+                    if zero_fallback.is_none() {
+                        zero_fallback = Some((text, quota));
+                    }
                 }
                 Err(e) => {
                     last_err = e;
@@ -2782,10 +2928,15 @@ async fn fetch_remote_text(
                         };
                         match try_fetch_text(&client, &url).await {
                             Ok((text, quota)) => {
-                                tracing::info!(
-                                    "fetch remote text succeeded via DoH-pinned {host}->{ip}"
-                                );
-                                return Ok((text, quota));
+                                if count_nodes_in_text(&text) > 0 {
+                                    tracing::info!(
+                                        "fetch remote text succeeded via DoH-pinned {host}->{ip}"
+                                    );
+                                    return Ok((text, quota));
+                                }
+                                if zero_fallback.is_none() {
+                                    zero_fallback = Some((text, quota));
+                                }
                             }
                             Err(e) => {
                                 last_err = e;
@@ -2800,6 +2951,12 @@ async fn fetch_remote_text(
                 }
             }
         }
+    }
+
+    // 若本地代理与 DoH 均未拿到有效节点，回落已收到的 0 节点响应，由上层
+    // prepare_subscription_payload 给出精确诊断（如网页拦截 / JSON 提示 / 机场通知）
+    if let Some((text, quota)) = zero_fallback {
+        return Ok((text, quota));
     }
 
     if local_proxy.is_some() {
@@ -2866,9 +3023,9 @@ async fn try_fetch_text(
         }
     }
 
-    // 已请求 Accept-Encoding: identity，但部分面板无视请求头强制返回 gzip。
+    // 已请求 Accept-Encoding: identity，但部分面板无视请求头强制返回 gzip 或 zlib/deflate。
     // 此类响应交给 reqwest 解码器会报 error decoding response body；
-    // 这里按 gzip 魔数（0x1f 0x8b）手动流式解压。
+    // 这里按魔数手动流式解压（gzip: 0x1f 0x8b；zlib: 0x78 0x01/0x5e/0x9c/0xda）。
     if buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
         use std::io::Read as _;
         let mut decoded = Vec::new();
@@ -2888,6 +3045,24 @@ async fn try_fetch_text(
                     return Err(format!("gzip 解压失败: {e}"));
                 }
             }
+        }
+    } else if buf.len() >= 2
+        && buf[0] == 0x78
+        && matches!(buf[1], 0x01 | 0x5e | 0x9c | 0xda)
+    {
+        use std::io::Read as _;
+        let mut decoded = Vec::new();
+        if flate2::read::ZlibDecoder::new(&buf[..])
+            .read_to_end(&mut decoded)
+            .is_ok()
+            && !decoded.is_empty()
+        {
+            tracing::info!(
+                "订阅响应为 zlib/deflate 压缩，已手动解压 {} → {} 字节",
+                buf.len(),
+                decoded.len()
+            );
+            buf = decoded;
         }
     }
 
@@ -4104,7 +4279,7 @@ pub async fn save_custom_rules(
     crate::core::store::save_custom_rules(&state.data_dir, &filtered)
         .map_err(|e| format!("保存自定义规则失败: {e}"))?;
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        reload_running_core(&app, &state).await?;
         // 【APP55 任务5】规则变更属于 Rule 类别，不能混入内核日志
         crate::core::logger::info(
             crate::core::logger::MOD_RULE,
@@ -4151,7 +4326,7 @@ pub async fn toggle_subscription(
     // 【APP51 任务1】订阅启停第一时间清理失效节点并中止旧探测
     purge_disabled_or_deleted_subscription_nodes(&state);
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        reload_running_core(&app, &state).await?;
     }
     Ok(())
 }
@@ -4187,7 +4362,7 @@ pub async fn delete_subscription(
             });
         }
         if *state.status.read() == CoreStatus::Running {
-            restart_core(&app, &state).await?;
+            reload_running_core(&app, &state).await?;
         }
     }
     Ok(removed)
@@ -4551,9 +4726,9 @@ pub(crate) async fn terminate_pro_features_on_expiry(app: &AppHandle, state: &Ap
 
     // 4. 内核运行中：按关闭 Pro 功能后的配置重载，剥离回家隧道与覆写规则
     if *state.status.read() == CoreStatus::Running
-        && let Err(e) = restart_core(app, state).await
+        && let Err(e) = reload_running_core(app, state).await
     {
-        tracing::error!("restart after license expiry failed: {e}");
+        tracing::error!("reload after license expiry failed: {e}");
     }
 
     // 5. 专门的到期通知（前端按 reason 渲染「授权已到期」专属横幅）
@@ -4803,48 +4978,49 @@ fn is_forwarded_proxy_conn(conn: &serde_json::Value) -> bool {
 pub fn spawn_background_telemetry_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut logged_node: Option<String> = None;
+        let mut last_emitted_stopped = false;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             let state = app.state::<AppState>();
-            let today = crate::core::store::today_total_bytes(&state.data_dir)
-                .max(*state.today_bytes_cache.read());
-            let selected = state.settings.read().selected_node.clone();
             let running = *state.status.read() == CoreStatus::Running;
             let foreground = state
                 .app_in_foreground
                 .load(std::sync::atomic::Ordering::Relaxed);
+
+            // 【低能耗优化】退后台（锁屏/切 App）时彻底停止向挂起的 WebView 发射
+            // telemetry://tick，也不发起 /connections 探测；3s 轻量检查一次前台标志即可
+            if !foreground {
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                continue;
+            }
+
             if !running {
                 logged_node = None;
-                let _ = app.emit(
-                    "telemetry://tick",
-                    serde_json::json!({
-                        "down": 0,
-                        "up": 0,
-                        "today": today,
-                        "running": false,
-                        "selectedNode": selected,
-                    }),
-                );
+                if !last_emitted_stopped {
+                    last_emitted_stopped = true;
+                    let today = crate::core::store::today_total_bytes(&state.data_dir)
+                        .max(*state.today_bytes_cache.read());
+                    let selected = state.settings.read().selected_node.clone();
+                    let _ = app.emit(
+                        "telemetry://tick",
+                        serde_json::json!({
+                            "down": 0,
+                            "up": 0,
+                            "today": today,
+                            "running": false,
+                            "selectedNode": selected,
+                        }),
+                    );
+                }
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 continue;
             }
+            last_emitted_stopped = false;
 
-            // 【APP58 任务1.2】后台休眠：不发起任何网络请求，只广播缓存速率
-            if !foreground {
-                let (down, up) = state
-                    .last_traffic_sample
-                    .lock()
-                    .map(|s| (s.3, s.4))
-                    .unwrap_or((0, 0));
-                let _ = app.emit(
-                    "telemetry://tick",
-                    serde_json::json!({
-                        "down": down, "up": up, "today": today,
-                        "running": true, "selectedNode": selected,
-                    }),
-                );
-                continue;
-            }
-
+            let today = crate::core::store::today_total_bytes(&state.data_dir)
+                .max(*state.today_bytes_cache.read());
+            let selected = state.settings.read().selected_node.clone();
             let api = state.kernel_api();
             let Ok(conn_json) = api.get_connections_with_timeout(1200).await else {
                 // 探测失败：沿用上次速率（不做衰减、绝不归零闪断）
@@ -4860,6 +5036,8 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                         "running": true, "selectedNode": selected,
                     }),
                 );
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 continue;
             };
 
@@ -4963,6 +5141,8 @@ pub fn spawn_background_telemetry_worker(app: AppHandle) {
                     "selectedNode": selected,
                 }),
             );
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
     });
 }
@@ -4991,7 +5171,7 @@ pub async fn get_runtime_snapshot(state: State<'_, AppState>) -> Result<serde_js
     let due_speed =
         now_ms.saturating_sub(LAST_FETCH_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 1000;
     let due_analytics =
-        now_ms.saturating_sub(LAST_ANALYTICS_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 450;
+        now_ms.saturating_sub(LAST_ANALYTICS_MS.load(std::sync::atomic::Ordering::Relaxed)) >= 900;
     let due = (due_speed || due_analytics)
         && FETCHING
             .compare_exchange(
@@ -5726,8 +5906,8 @@ pub async fn save_go_lan_settings(
             // 在 spawn 内部通过 app.state() 获取 'static 生命周期的 AppState，
             // 避免命令参数 State<'_, AppState> 的非 'static 借用逃逸
             let state_static = app_clone.state::<AppState>();
-            if let Err(e) = restart_core(&app_clone, &state_static).await {
-                tracing::warn!("[go-lan] 保存后后台重启内核失败: {e}");
+            if let Err(e) = reload_running_core(&app_clone, &state_static).await {
+                tracing::warn!("[go-lan] 保存后后台重载内核失败: {e}");
             }
             // 【APP-11 任务1.3】开启后主动打一个回家探测包
             if lan_clone.enabled {
@@ -5839,8 +6019,17 @@ fn read_ios_bypass_sidecar(work_dir: &std::path::Path) -> Vec<(String, Vec<Strin
     }
     #[cfg(target_os = "ios")]
     {
-        let path = work_dir.join("golan_bypass.json");
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let text = crate::platform::ios::app_group_dir()
+            .and_then(|g| {
+                std::fs::read_to_string(
+                    std::path::Path::new(&g)
+                        .join("prism_work")
+                        .join("golan_bypass.json"),
+                )
+                .ok()
+            })
+            .or_else(|| std::fs::read_to_string(work_dir.join("golan_bypass.json")).ok());
+        let Some(text) = text else {
             return Vec::new();
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -5876,7 +6065,7 @@ pub async fn sync_go_lan_managed(
     let lan = crate::core::go_lan::sync_managed(&app).await?;
     // 拉取成功后若内核运行中，重建配置生效
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await?;
+        reload_running_core(&app, &state).await?;
     }
     serde_json::to_value(lan).map_err(|e| sanitize_err(&e.to_string()))
 }
@@ -5977,7 +6166,7 @@ async fn persist_probe_auto_cidr(
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             let state_static = app_clone.state::<AppState>();
-            if let Err(e) = restart_core(&app_clone, &state_static).await {
+            if let Err(e) = reload_running_core(&app_clone, &state_static).await {
                 tracing::warn!("[go-lan] 自动补网段后热更新内核失败: {e}");
             }
         });
@@ -6072,8 +6261,8 @@ pub async fn save_go_cus_settings(
     // 若开启引擎/MitM 或新增改写/脚本规则，立即按需拉起本地边车（无活跃规则时静默跳过）
     crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await.map_err(|e| {
-            log_cmd_error("Go Cus 配置生效重启内核失败", &e);
+        reload_running_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("Go Cus 配置生效重载内核失败", &e);
             e
         })?;
     }
@@ -6133,8 +6322,8 @@ pub async fn import_go_cus_module(
     );
     crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await.map_err(|e| {
-            log_cmd_error("导入 Go Cus 模块后重启内核失败", &e);
+        reload_running_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("导入 Go Cus 模块后重载内核失败", &e);
             e
         })?;
     }
@@ -6165,8 +6354,8 @@ pub async fn toggle_go_cus_module(
     *state.go_cus.write() = cus.clone();
     crate::core::go_cus::ensure_sidecar(app.clone());
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await.map_err(|e| {
-            log_cmd_error("切换 Go Cus 模块后重启内核失败", &e);
+        reload_running_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("切换 Go Cus 模块后重载内核失败", &e);
             e
         })?;
     }
@@ -6196,8 +6385,8 @@ pub async fn delete_go_cus_module(
     })?;
     *state.go_cus.write() = cus.clone();
     if *state.status.read() == CoreStatus::Running {
-        restart_core(&app, &state).await.map_err(|e| {
-            log_cmd_error("删除 Go Cus 模块后重启内核失败", &e);
+        reload_running_core(&app, &state).await.map_err(|e| {
+            log_cmd_error("删除 Go Cus 模块后重载内核失败", &e);
             e
         })?;
     }
@@ -6629,5 +6818,63 @@ mod app66_dns_tests {
             !code.contains(concat!("lookup", "_host")),
             "APP66 任务5.1：禁止在异步线程调用阻塞的系统解析器"
         );
+    }
+}
+
+#[cfg(test)]
+mod subscription_and_coupling_tests {
+    use super::{
+        count_nodes_in_text, prepare_subscription_payload, subscription_has_usable_content,
+    };
+
+    #[test]
+    fn accepts_proxy_providers_only_clash_yaml() {
+        let yaml = r#"
+proxy-providers:
+  main:
+    type: http
+    url: https://example.com/provider.yaml
+proxy-groups:
+  - name: Proxy
+    type: select
+    use:
+      - main
+rules:
+  - MATCH,Proxy
+"#;
+        let prepared = prepare_subscription_payload(yaml.to_string())
+            .expect("proxy-providers 订阅不应被判为无法识别");
+        assert!(subscription_has_usable_content(&prepared));
+        assert!(count_nodes_in_text(yaml) >= 1);
+    }
+
+    #[test]
+    fn classifies_html_and_json_api_error_pages_clearly() {
+        let html = "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Blocked</body></html>";
+        let err = prepare_subscription_payload(html.to_string()).unwrap_err();
+        assert!(err.contains("网页内容"), "HTML 拦截页应返回清晰提示：{err}");
+        assert_eq!(count_nodes_in_text(html), 0);
+
+        let api_err = r#"{"message":"token is error"}"#;
+        let err2 = prepare_subscription_payload(api_err.to_string()).unwrap_err();
+        assert!(
+            err2.contains("token is error"),
+            "面板 JSON 错误应透出具体提示：{err2}"
+        );
+        assert_eq!(count_nodes_in_text(api_err), 0);
+    }
+
+    #[test]
+    fn preserves_valid_singbox_json_and_counts_nodes() {
+        let sb = r#"{
+  "outbounds": [
+    {"type": "vless", "tag": "HK-1", "server": "1.2.3.4", "server_port": 443, "uuid": "11111111-1111-1111-1111-111111111111"},
+    {"type": "direct", "tag": "direct"}
+  ]
+}"#;
+        let prepared = prepare_subscription_payload(sb.to_string())
+            .expect("合法 sing-box JSON 应成功归一化");
+        assert!(subscription_has_usable_content(&prepared));
+        assert_eq!(count_nodes_in_text(sb), 1);
     }
 }

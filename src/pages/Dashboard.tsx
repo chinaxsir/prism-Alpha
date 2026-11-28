@@ -25,12 +25,10 @@ import {
   runGoAimProbe,
 
   getGoLanSettings,
-  getGoLanStatus,
   saveGoLanSettings,
   getGoCusSettings,
   saveGoCusSettings,
   isGoLanConfigured,
-  type GoLanStatus,
 } from "@/api/ipc";
 import {
   useCoreStore,
@@ -80,13 +78,13 @@ function useSmoothSpeed(target: number, active: boolean): number {
     const timer = window.setInterval(() => {
       const cur = currentRef.current;
       const tgt = targetRef.current;
+      if (cur === tgt) return;
       const diff = tgt - cur;
-      if (Math.abs(diff) < 64) {
-        currentRef.current = tgt;
-      } else {
-        currentRef.current = Math.round(cur + diff * 0.32);
+      const next = Math.abs(diff) < 64 ? tgt : Math.round(cur + diff * 0.32);
+      if (next !== cur) {
+        currentRef.current = next;
+        setDisplay(next);
       }
-      setDisplay(currentRef.current);
     }, 160);
     return () => window.clearInterval(timer);
   }, [active]);
@@ -121,12 +119,14 @@ function isVpnPermissionDeniedError(msg: string | null | undefined): boolean {
 
 export default function Dashboard() {
   const { t, resolved: lang } = useTranslation();
+  // 【APP49 任务6】App 前台可见性：后台时所有动画与定时器暂停清理，保持零功耗
+  const appVisible = useAppVisible();
   const status = useCoreStore((s) => s.status);
   const upSpeed = useCoreStore((s) => s.upSpeed);
   const downSpeed = useCoreStore((s) => s.downSpeed);
-  // 【APP66 任务3】渲染值走 160ms 缓动插值，数字连续滚动不顿挫
-  const smoothDown = useSmoothSpeed(downSpeed, status === "running");
-  const smoothUp = useSmoothSpeed(upSpeed, status === "running");
+  // 【APP66 任务3】渲染值走 160ms 缓动插值，数字连续滚动不顿挫；后台或未连接时停止
+  const smoothDown = useSmoothSpeed(downSpeed, status === "running" && appVisible);
+  const smoothUp = useSmoothSpeed(upSpeed, status === "running" && appVisible);
   // 【v0.4.19 任务2.1】双轨流量波形图：36 点滑动窗口 + latestSpeedRef
   // 采样。ref 保证 650ms 定时器永远读到最新网速（不再被 stale closure
   // 冻结在初值 0，从根本上修复波形空白）。后端每来一帧非零速率也会
@@ -152,18 +152,22 @@ export default function Dashboard() {
   }, [downSpeed, upSpeed, status]);
 
   useEffect(() => {
+    // 仅运行中且处于前台时驱动波形滚动，未连接或退后台时零定时器唤醒
+    if (status !== "running" || !appVisible) return;
     const timer = window.setInterval(() => {
       const { down, up, running } = latestSpeedRef.current;
       setDownSeries((prev) => [...prev.slice(1), running ? down : 0]);
       setUpSeries((prev) => [...prev.slice(1), running ? up : 0]);
     }, 650);
     return () => window.clearInterval(timer);
-  }, []);
-  // 停止时峰值归零（下次启动重新统计）
+  }, [status, appVisible]);
+  // 停止时峰值与波形归零（下次启动重新统计）
   useEffect(() => {
     if (status !== "running") {
       setPeakDown(0);
       setPeakUp(0);
+      setDownSeries(new Array(WAVE_POINTS).fill(0));
+      setUpSeries(new Array(WAVE_POINTS).fill(0));
     }
   }, [status]);
   const uptimeSecs = useCoreStore((s) => s.uptimeSecs);
@@ -212,9 +216,6 @@ export default function Dashboard() {
   const aimProgress = useCoreStore((s) => s.aimProgress);
   // 【v0.4.17】Go AIM 最近事件：探测中用它展示「正在检测: 节点」
   const aimEvent = useCoreStore((s) => s.aimEvent);
-  // 【v0.4.17】Go Lan 内网档案运行状态仍按需拉取更新（状态胶囊改用短状态，
-  // 不再直接渲染档案明细），因此只保留 setter，避免未读变量告警。
-  const [, setLanState] = useState<GoLanStatus | null>(null);
 
   const running = status === "running";
   // 【APP53 任务1.2】运行模式字样已从主控卡移除，outboundMode/mode 不再直接渲染；
@@ -306,20 +307,15 @@ export default function Dashboard() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
-  // 本地运行时长时钟（IPA-12）：禁止每秒 +1 计数器（锁屏/切后台时
-  // 系统 WebView 冻结定时器，亮屏后要等下个 tick 才恢复）。改为维护
-  // nowMs 本地时钟，以 250ms 轻量间隔刷新，时长 = (nowMs - startedAtMs)
-  // 差值实时计算；亮屏/回前台第一帧由下方唤醒监听 0ms 校准
+  // 本地运行时长时钟（IPA-12）：维护 nowMs 本地时钟，以 1000ms 轻量间隔刷新，
+  // 时长 = (nowMs - startedAtMs) 差值实时计算；亮屏/回前台第一帧由唤醒监听 0ms 校准。
+  // 相比 250ms 降低 75% 全页重渲染开销，秒级显示零差异。
   const [nowMs, setNowMs] = useState(() => Date.now());
-  // 【APP49 任务6】App 前台可见性：后台时所有定时器暂停清理
-  const appVisible = useAppVisible();
 
   useEffect(() => {
-    // 【APP-3 / APP49 任务6】后台（锁屏/切 App）停掉 250ms 时钟：清理 interval
-    // 不再每秒 4 次唤醒 JS 线程；回前台立即校准一次再恢复定时，时长无跳变
     if (!running || !appVisible) return;
     setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [running, appVisible]);
 
@@ -435,32 +431,6 @@ export default function Dashboard() {
       unAim.then((fn) => fn());
     };
   }, []);
-
-  // 【APP40 任务2】Go Lan 档案状态：任一档案启停变化时刷新 ⚡/🔒 徽章
-  // 【APP54 任务1】物理网络切换（连上家里/公司 Wi-Fi）后必须尽快显示直连，
-  // 因此启用期间每 3s 轻量刷新一次后端注入的 isDirect（未启用时零开销跳过）
-  useEffect(() => {
-    if (!lan?.enabled) {
-      setLanState(null);
-      return;
-    }
-    let cancelled = false;
-    const load = () => {
-      getGoLanStatus()
-        .then((s) => {
-          if (!cancelled) setLanState(s);
-        })
-        .catch(() => {
-          if (!cancelled) setLanState(null);
-        });
-    };
-    load();
-    const timer = window.setInterval(load, 3000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [lan?.enabled, lan?.profiles]);
 
   // 【APP51 任务1.3】全开关 0ms 乐观 UI：先同步改前端状态，再异步落盘；
   // 失败时回滚并 toast，点击后界面立即变色，绝不等待 IPC/内核重启

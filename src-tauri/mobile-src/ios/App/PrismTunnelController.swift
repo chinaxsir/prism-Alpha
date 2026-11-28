@@ -1349,7 +1349,7 @@ final class PrismTunnelController {
         if captureOutput {
             posix_spawn_file_actions_init(&fa)
             outPath = (NSTemporaryDirectory() as NSString)
-                .appendingPathComponent("prism_pluginkit_out.txt")
+                .appendingPathComponent("prism_helper_out_\(UUID().uuidString).txt")
             unlink(outPath!)
             posix_spawn_file_actions_addopen(
                 &fa, 1, outPath!, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
@@ -1370,7 +1370,26 @@ final class PrismTunnelController {
             return SpawnToolResult(spawn: spawnResult, exit: -1, termsig: 0, output: "")
         }
         var status: Int32 = 0
-        waitpid(pid, &status, 0)
+        // 有界等待（最长 3 秒）：严禁无超时阻塞 waitpid，防止 XPC 异常时永久卡死调用线程
+        let deadline = Date().addingTimeInterval(3.0)
+        var reaped = false
+        while Date() < deadline {
+            let r = waitpid(pid, &status, WNOHANG)
+            if r == pid {
+                reaped = true
+                break
+            }
+            if r < 0 && errno != EINTR {
+                reaped = true
+                break
+            }
+            usleep(20_000)
+        }
+        if !reaped {
+            NSLog("[PrismVPN] runSpawnTool 超时 (3s)，强制终止子进程 pid=\(pid)")
+            _ = kill(pid, SIGKILL)
+            _ = waitpid(pid, &status, 0)
+        }
         let exitCode = (status >> 8) & 0xFF // WEXITSTATUS
         // 信号死亡（SIGSEGV/SIGABRT…）时 WEXITSTATUS 恒为 0，会被误判为
         // 成功退出（build 138 实证 register:u0[] 的成因之一）——单独提取
@@ -1549,13 +1568,17 @@ final class PrismTunnelController {
         defaults.set(fingerprint, forKey: kUpgradeFingerprintKey)
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         defaults.set(build, forKey: "prism_last_build_version")
-        // 标记下次启动 VPN 时对既有配置做一次会话重绑，消除覆盖安装后 Code=12
-        defaults.set(true, forKey: kNeedsSessionRebindKey)
         NSLog("[PrismVPN] 升级指纹变化 \(last ?? "无") -> \(fingerprint)，执行启动自愈")
 
-        // 1. 增量注册新版 appex 路径并重启残留的旧版 PrismVPN / neagent / pkd 进程
-        //    （不触碰主 App LS 注册，绝不触发 uicache 注销主进程）
-        resetNetworkExtensionDaemons()
+        // 1. 仅异步清理残留的旧版 PrismVPN 扩展进程：
+        //    - 绝不在主线程 setup() 期间同步 posix_spawn + waitpid，也绝不在运行期
+        //      调用 LSApplicationWorkspace.registerPlugin: / uicache 或杀 pkd
+        //      （registerPlugin: 会破坏 TrollStore 官方 _LSBundlePlugins 导致永久 Code=14；
+        //      杀 pkd 会打断 WKWebView 初始化导致首次打开永久黑屏）。
+        //    - 延迟 350ms 放到低优先级后台队列执行，让首屏 UI 零阻塞完成首帧渲染。
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.35) {
+            _ = PrismTunnelController.killStaleExtensionProcess()
+        }
 
         // 2. 升级前隧道处于连接状态 → 标记待自动重启，由 Rust 在启动
         //    流程末尾重建隧道（用户无需手动点「连接」）
@@ -1566,43 +1589,44 @@ final class PrismTunnelController {
         return true
     }
 
-    /// 调用随包 PrismHelper killext（仅杀残留 PrismVPN 扩展进程）
-    static func killStaleExtensionProcess() {
-        let helperPath = Bundle.main.bundleURL
-            .appendingPathComponent("PrismHelper").path
-        guard FileManager.default.isExecutableFile(atPath: helperPath) else {
-            NSLog("[PrismVPN] killext 失败：PrismHelper 不存在")
-            return
-        }
-        let spawnTool = runSpawnTool(
-            path: helperPath, args: ["killext"],
-            asRoot: true, captureOutput: false)
-        NSLog("[PrismVPN] killext spawn=\(spawnTool.spawn) exit=\(spawnTool.exit) sig=\(spawnTool.termsig)")
-    }
+    private static let killExtLock = NSLock()
 
-    /// 调用随包 PrismHelper resetne：确保插件容器存在 + 增量 registerPlugin: +
-    /// 清理旧 PrismVPN / neagent / pkd 进程，使 launchd 重新绑定当前 Bundle UUID
-    static func resetNetworkExtensionDaemons() {
+    /// 调用随包 PrismHelper killext（仅杀残留 PrismVPN 扩展进程，绝不触碰 LS/pkd/neagent）
+    /// 返回本次 SIGKILL 的旧扩展进程数，并把精确输出写入 selfHelperResult 供诊断展示。
+    @discardableResult
+    static func killStaleExtensionProcess() -> Int {
+        killExtLock.lock()
+        defer { killExtLock.unlock() }
         let helperPath = Bundle.main.bundleURL
             .appendingPathComponent("PrismHelper").path
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o755], ofItemAtPath: helperPath)
         guard FileManager.default.isExecutableFile(atPath: helperPath) else {
-            selfHelperResult = "resetne:helper缺失"
-            NSLog("[PrismVPN] resetne 失败：PrismHelper 不存在或不可执行")
-            return
+            selfHelperResult = "killext:helper缺失"
+            NSLog("[PrismVPN] killext 失败：PrismHelper 不存在或不可执行")
+            return 0
         }
         let spawnTool = runSpawnTool(
-            path: helperPath,
-            args: ["resetne", Bundle.main.bundlePath],
-            asRoot: true,
-            captureOutput: true
-        )
+            path: helperPath, args: ["killext"],
+            asRoot: true, captureOutput: true)
         let out = spawnTool.output.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: " | ")
         let sigNote = spawnTool.termsig != 0 ? " sig=\(spawnTool.termsig)" : ""
-        selfHelperResult = "resetne:s\(spawnTool.spawn)/u\(spawnTool.exit)\(sigNote)[\(out.prefix(160))]"
+        selfHelperResult = "killext:s\(spawnTool.spawn)/u\(spawnTool.exit)\(sigNote)[\(out.prefix(160))]"
         NSLog("[PrismVPN] \(selfHelperResult)")
+        if let range = out.range(of: "killed=") {
+            let tail = out[range.upperBound...]
+            let digits = tail.prefix { $0.isNumber }
+            if let n = Int(digits) {
+                return n
+            }
+        }
+        return 0
+    }
+
+    /// 兼容入口：仅转调 killStaleExtensionProcess()，绝不再调用 registerPlugin: 或杀 pkd/neagent
+    static func resetNetworkExtensionDaemons() {
+        _ = killStaleExtensionProcess()
     }
 
     // MARK: - 随包 root helper（PrismHelper）强扭注册
@@ -1777,10 +1801,14 @@ final class PrismTunnelController {
         completion: @escaping (Error?) -> Void
     ) {
         // 【APP-2】启动前清场：非已连接状态下先 killext 清理残留/僵死的旧
-        // PrismVPN 扩展进程（可能仍绑定旧基站 Socket），达到"先开一下其他
-        // 代理软件"的同效清场，根治跨基站移动/弱 Wi-Fi 切换后全超时
+        // PrismVPN 扩展进程（可能仍绑定旧基站 Socket 或旧版本二进制）。
+        // 若确实杀掉了残留进程，留 150ms 让 nesessionmanagerd 完成回收，避免
+        // 紧随其后的 startVPNTunnel 与旧会话清理竞态。
         if activeManager?.connection.status != .connected {
-            PrismTunnelController.killStaleExtensionProcess()
+            let killed = PrismTunnelController.killStaleExtensionProcess()
+            if killed > 0 {
+                usleep(150_000)
+            }
         }
 
         // 【build 150】clearSharedErrorFile 已上移到 start() 入口只清一次；
@@ -1875,9 +1903,8 @@ final class PrismTunnelController {
                 let last = UserDefaults.standard.string(forKey: "prism_last_build_version")
                 if last != current {
                     UserDefaults.standard.set(current, forKey: "prism_last_build_version")
-                    UserDefaults.standard.set(true, forKey: PrismTunnelController.kNeedsSessionRebindKey)
-                    NSLog("[PrismVPN] 检测到覆盖安装 \(last ?? "无") -> \(current)：执行 resetne 清理旧扩展会话")
-                    PrismTunnelController.resetNetworkExtensionDaemons()
+                    NSLog("[PrismVPN] 检测到覆盖安装 \(last ?? "无") -> \(current)：killext 清理驻留旧版扩展进程")
+                    _ = PrismTunnelController.killStaleExtensionProcess()
                 }
                 // 不再在此处额外调用 matched.saveToPreferences：紧随其后的
                 // configureSaveAndStart 会做唯一一次权威 save + load，避免毫秒内
@@ -1894,11 +1921,13 @@ final class PrismTunnelController {
         }
     }
 
-    /// 失败出口：Code=12 且扩展无心跳时执行一次性深度自愈——
-    /// 1) PrismHelper resetne 刷新插件注册并重启 PrismVPN / neagent / pkd；
-    /// 2) 置位 kNeedsSessionRebindKey，让既有 VPN 配置经过 isEnabled=false->true
-    ///    会话重绑（不删配置、零授权弹窗），迫使 nesessionmanagerd 丢弃失效会话；
-    /// 3) 0.8s 后自动重试一次启动；其余错误直接交回上层。
+    /// 失败出口（build 169 方案）：
+    /// - Code=12 且扩展无心跳时，后台执行一次 PrismHelper killext 清理僵死
+    ///   PrismVPN 进程 → reload 刷新系统会话句柄 → 1.0s 后重试一次（绝不删除
+    ///   VPN 配置、绝不调用 registerPlugin:/uicache、绝不做 disable/enable 双写）；
+    /// - Code=14 仅记录诊断交回上层（运行期严禁调用 registerPlugin:/uicache，
+    ///   以免进一步破坏 TrollStore 官方 _LSBundlePlugins 注册；重装 IPA 或在
+    ///   TrollStore 中点「Refresh App Registrations」即可恢复）。
     private func recoverOrFinish(
         _ error: Error,
         configPath: String,
@@ -1906,25 +1935,25 @@ final class PrismTunnelController {
         completion: @escaping (Error?) -> Void
     ) {
         if PrismTunnelController.isVPNAppNotInstalled(error) {
-            NSLog("[PrismVPN] Code=14 插件未注册，尝试增量 registerPlugin 自愈")
-            PrismTunnelController.resetNetworkExtensionDaemons()
+            NSLog("[PrismVPN] Code=14 插件未注册（运行期严禁调用 registerPlugin:/uicache，请在 TrollStore 执行 Refresh App Registrations 或重装 IPA）")
         }
         if !PrismTunnelController.code12SelfHealed,
            PrismTunnelController.isCode12WithNoHeartbeat(error)
         {
             PrismTunnelController.code12SelfHealed = true
-            NSLog("[PrismVPN] Code=12 且 hb=无：执行 resetne + 会话重绑后自愈重试一次（保留 VPN 配置）")
-            PrismTunnelController.resetNetworkExtensionDaemons()
-            UserDefaults.standard.set(true, forKey: PrismTunnelController.kNeedsSessionRebindKey)
-            NETunnelProviderManager.loadAllFromPreferences { managers, _ in
-                PrismTunnelController.lastManagerCount = managers?.count ?? 0
-                NSLog("[PrismVPN] 自愈 reload 完成（\(managers?.count ?? 0) 个配置保留），0.8s 后重绑会话并重试")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    self.startAttempt(
-                        configPath: self.lastStartConfigPath.isEmpty ? configPath : self.lastStartConfigPath,
-                        attemptsRemaining: attemptsRemaining,
-                        completion: completion
-                    )
+            NSLog("[PrismVPN] Code=12 且 hb=无：保留 VPN 配置，后台 killext 清理旧扩展进程后自愈重试一次")
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = PrismTunnelController.killStaleExtensionProcess()
+                NETunnelProviderManager.loadAllFromPreferences { managers, _ in
+                    PrismTunnelController.lastManagerCount = managers?.count ?? 0
+                    NSLog("[PrismVPN] 自愈 reload 完成（\(managers?.count ?? 0) 个配置保留），1.0s 后重试启动")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.startAttempt(
+                            configPath: self.lastStartConfigPath.isEmpty ? configPath : self.lastStartConfigPath,
+                            attemptsRemaining: attemptsRemaining,
+                            completion: completion
+                        )
+                    }
                 }
             }
             return
@@ -1938,70 +1967,48 @@ final class PrismTunnelController {
         attemptsRemaining: Int,
         completion: @escaping (Error?) -> Void
     ) {
-        let isNewManager = (manager.protocolConfiguration == nil)
-        let needsRebind = !isNewManager
-            && UserDefaults.standard.bool(forKey: PrismTunnelController.kNeedsSessionRebindKey)
+        // 【build 169 方案·关键】单次权威 saveToPreferences + loadFromPreferences：
+        // 严禁在覆盖升级或自愈后做 stopVPNTunnel → isEnabled=false → save → load
+        // → isEnabled=true → save 连续双写（build 168 实证：双写会导致
+        // nesessionmanagerd 会话竞争、首启必报 Code=12 且 hb=无）。
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = extensionBundleIdentifier
+        proto.serverAddress = managerServerTag
+        proto.disconnectOnSleep = false
+        proto.providerConfiguration = ["config_path": configPath]
 
-        let applyAndLaunch: () -> Void = {
-            let proto = NETunnelProviderProtocol()
-            proto.providerBundleIdentifier = extensionBundleIdentifier
-            proto.serverAddress = managerServerTag
-            proto.disconnectOnSleep = false
-            proto.providerConfiguration = ["config_path": configPath]
+        manager.protocolConfiguration = proto
+        manager.isEnabled = true
 
-            manager.protocolConfiguration = proto
-            manager.isEnabled = true
+        manager.saveToPreferences { saveError in
+            if let saveError = saveError {
+                NSLog("[PrismVPN] saveToPreferences 失败: \(PrismTunnelController.describe(error: saveError))")
+                self.recoverOrFinish(
+                    saveError, configPath: configPath,
+                    attemptsRemaining: attemptsRemaining, completion: completion
+                )
+                return
+            }
+            NSLog("[PrismVPN] saveToPreferences 成功, extBundleId=\(extensionBundleIdentifier)")
 
-            manager.saveToPreferences { saveError in
-                if let saveError = saveError {
-                    NSLog("[PrismVPN] saveToPreferences 失败: \(PrismTunnelController.describe(error: saveError))")
+            manager.loadFromPreferences { loadError in
+                if let loadError = loadError {
+                    NSLog("[PrismVPN] loadFromPreferences 失败: \(PrismTunnelController.describe(error: loadError))")
                     self.recoverOrFinish(
-                        saveError, configPath: configPath,
+                        loadError, configPath: configPath,
                         attemptsRemaining: attemptsRemaining, completion: completion
                     )
                     return
                 }
-                NSLog("[PrismVPN] saveToPreferences 成功, extBundleId=\(extensionBundleIdentifier), rebind=\(needsRebind)")
-
-                manager.loadFromPreferences { loadError in
-                    if let loadError = loadError {
-                        NSLog("[PrismVPN] loadFromPreferences 失败: \(PrismTunnelController.describe(error: loadError))")
-                        self.recoverOrFinish(
-                            loadError, configPath: configPath,
-                            attemptsRemaining: attemptsRemaining, completion: completion
-                        )
-                        return
-                    }
-                    UserDefaults.standard.set(false, forKey: PrismTunnelController.kNeedsSessionRebindKey)
-                    self.activeManager = manager
-                    let settleDelay: TimeInterval = (isNewManager || needsRebind) ? 0.8 : 0.4
-                    DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
-                        self.launchTunnelSession(
-                            manager: manager,
-                            attemptsRemaining: attemptsRemaining,
-                            completion: completion
-                        )
-                    }
+                self.activeManager = manager
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.launchTunnelSession(
+                        manager: manager,
+                        attemptsRemaining: attemptsRemaining,
+                        completion: completion
+                    )
                 }
             }
-        }
-
-        // 覆盖升级 / Code=12 自愈场景：先停旧连接并将 isEnabled 置 false 落盘 reload，
-        // 迫使 nesessionmanagerd 销毁指向旧 Bundle UUID 的僵死 NESMVPNSession，
-        // 0.4s 后再重新启用并启动（不删除配置，不触发二次系统 VPN 授权弹窗）
-        if needsRebind {
-            NSLog("[PrismVPN] 执行既有 VPN 配置会话重绑（disable -> save -> load -> enable）")
-            manager.connection.stopVPNTunnel()
-            manager.isEnabled = false
-            manager.saveToPreferences { _ in
-                manager.loadFromPreferences { _ in
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        applyAndLaunch()
-                    }
-                }
-            }
-        } else {
-            applyAndLaunch()
         }
     }
 
@@ -2246,8 +2253,11 @@ final class PrismTunnelController {
             DispatchQueue.main.async { self.startVpnWatchdog() }
             return
         }
-        vpnWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
-            guard let self = self,
+        // 低功耗看门狗：30s 间隔 + 5s 容差（允许 iOS 合并定时器唤醒）；
+        // 退后台时不读磁盘（锁屏/后台期间由系统 NEVPNStatusDidChange 感知断开）。
+        let timer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            guard UIApplication.shared.applicationState == .active,
+                  let self = self,
                   let manager = self.activeManager,
                   manager.connection.status == .connected
             else { return }
@@ -2296,6 +2306,8 @@ final class PrismTunnelController {
                 return
             }
         }
+        timer.tolerance = 5.0
+        vpnWatchdogTimer = timer
     }
 
     private func stopVpnWatchdog() {

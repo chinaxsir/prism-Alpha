@@ -1765,6 +1765,10 @@ fn doh_resolve_node_hosts_ipv4_with_wait(
 ) -> std::collections::HashMap<String, String> {
     // 3600s 缓存命中直接返回（热路径 0ms）
     let mut out = get_cached_node_hosts_ipv4(hosts);
+    // 单元测试环境跳过外部网络解析，避免本机代理/FakeIP 劫持 UDP 53 导致测试结果漂移
+    if cfg!(test) {
+        return out;
+    }
     let mut todo: Vec<String> = Vec::new();
     for h in hosts {
         let key = h.trim().to_ascii_lowercase();

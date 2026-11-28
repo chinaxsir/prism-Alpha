@@ -641,6 +641,7 @@ function ensureAimHeartbeatStarted(): void {
   if (aimHeartbeatStarted) return;
   aimHeartbeatStarted = true;
   window.setInterval(() => {
+    if (document.visibilityState !== "visible") return;
     const state = useCoreStore.getState();
     const running = state.aimProgress.running || Boolean(state.goAimStatus?.probing);
     if (!running || aimHeartbeatBusy) return;

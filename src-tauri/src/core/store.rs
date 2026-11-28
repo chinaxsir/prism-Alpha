@@ -175,22 +175,67 @@ fn traffic_stats_path(data_dir: &Path) -> PathBuf {
     data_dir.join("traffic_stats.json")
 }
 
-/// 读取流量统计
-pub fn load_traffic_stats(data_dir: &Path) -> TrafficStats {
+struct TrafficStatsCache {
+    data_dir: PathBuf,
+    stats: TrafficStats,
+    last_flush_at: std::time::Instant,
+    last_flushed_bytes: u64,
+}
+
+static TRAFFIC_CACHE: std::sync::OnceLock<parking_lot::Mutex<Option<TrafficStatsCache>>> =
+    std::sync::OnceLock::new();
+
+fn traffic_cache() -> &'static parking_lot::Mutex<Option<TrafficStatsCache>> {
+    TRAFFIC_CACHE.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// 磁盘直读流量统计
+fn read_traffic_stats_disk(data_dir: &Path) -> TrafficStats {
     match std::fs::read(traffic_stats_path(data_dir)) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => TrafficStats::default(),
     }
 }
 
-/// 写入流量统计
-pub fn save_traffic_stats(data_dir: &Path, stats: &TrafficStats) -> anyhow::Result<()> {
+/// 原子写盘并同步更新内存缓存
+fn write_traffic_stats_disk(data_dir: &Path, stats: &TrafficStats) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir).ok();
     let path = traffic_stats_path(data_dir);
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(stats)?;
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// 读取流量统计（命中同 data_dir 内存缓存时零磁盘 I/O）
+pub fn load_traffic_stats(data_dir: &Path) -> TrafficStats {
+    let mut guard = traffic_cache().lock();
+    if let Some(entry) = guard.as_ref()
+        && entry.data_dir == data_dir
+    {
+        return entry.stats.clone();
+    }
+    let stats = read_traffic_stats_disk(data_dir);
+    *guard = Some(TrafficStatsCache {
+        data_dir: data_dir.to_path_buf(),
+        stats: stats.clone(),
+        last_flush_at: std::time::Instant::now(),
+        last_flushed_bytes: stats.current_session_bytes,
+    });
+    stats
+}
+
+/// 写入流量统计（同步落盘并刷新内存缓存）
+pub fn save_traffic_stats(data_dir: &Path, stats: &TrafficStats) -> anyhow::Result<()> {
+    write_traffic_stats_disk(data_dir, stats)?;
+    let mut guard = traffic_cache().lock();
+    *guard = Some(TrafficStatsCache {
+        data_dir: data_dir.to_path_buf(),
+        stats: stats.clone(),
+        last_flush_at: std::time::Instant::now(),
+        last_flushed_bytes: stats.current_session_bytes,
+    });
     Ok(())
 }
 
@@ -239,16 +284,60 @@ pub fn session_bytes(data_dir: &Path) -> u64 {
 }
 
 /// 写入当前会话绝对累计值（内核 /connections 流上报的 uploadTotal+downloadTotal）。
-/// 跨天则把 today_archived_bytes 清零、today_date 重新盖章（上一个会话归属昨日）
+/// 跨天则把 today_archived_bytes 清零、today_date 重新盖章（上一个会话归属昨日）。
+/// 【低能耗优化】内存即时更新（今日流量零延迟），磁盘落盘按「跨天 / 归零 /
+/// 增量 >= 256 KiB / 间隔 >= 15s」节流，将每秒 2 次闪存读写压缩 ~98%，
+/// 停止/归档会话仍由 archive_session 立即落盘，绝不丢数据。
 pub fn set_current_session(data_dir: &Path, bytes: u64) -> anyhow::Result<()> {
-    let mut stats = load_traffic_stats(data_dir);
+    const FLUSH_DELTA_BYTES: u64 = 256 * 1024;
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
     let today = current_day_stamp();
-    if stats.today_date != today {
-        stats.today_date = today;
-        stats.today_archived_bytes = 0;
+    let to_flush: Option<TrafficStats> = {
+        let mut guard = traffic_cache().lock();
+        let entry = match guard.as_mut() {
+            Some(e) if e.data_dir == data_dir => e,
+            _ => {
+                let stats = read_traffic_stats_disk(data_dir);
+                let flushed = stats.current_session_bytes;
+                *guard = Some(TrafficStatsCache {
+                    data_dir: data_dir.to_path_buf(),
+                    stats,
+                    last_flush_at: std::time::Instant::now()
+                        .checked_sub(FLUSH_INTERVAL)
+                        .unwrap_or_else(std::time::Instant::now),
+                    last_flushed_bytes: flushed,
+                });
+                guard.as_mut().expect("cache just initialized")
+            }
+        };
+        let mut force_flush = false;
+        if entry.stats.today_date != today {
+            entry.stats.today_date = today;
+            entry.stats.today_archived_bytes = 0;
+            force_flush = true;
+        }
+        if entry.stats.current_session_bytes == bytes && !force_flush {
+            return Ok(());
+        }
+        entry.stats.current_session_bytes = bytes;
+        let delta = bytes.abs_diff(entry.last_flushed_bytes);
+        if force_flush
+            || bytes == 0
+            || delta >= FLUSH_DELTA_BYTES
+            || entry.last_flush_at.elapsed() >= FLUSH_INTERVAL
+        {
+            entry.last_flush_at = std::time::Instant::now();
+            entry.last_flushed_bytes = bytes;
+            Some(entry.stats.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(stats) = to_flush {
+        write_traffic_stats_disk(data_dir, &stats)?;
     }
-    stats.current_session_bytes = bytes;
-    save_traffic_stats(data_dir, &stats)
+    Ok(())
 }
 
 /// 记录当前会话起始时间戳（进入 Running 时落盘，供强退重开后恢复计时）

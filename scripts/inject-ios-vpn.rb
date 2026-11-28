@@ -78,6 +78,14 @@ def inject
   # 构建 SHA（此前只改了扩展 target，主 App 仍显示 0.3.7 无法辨识构建）
   app_target.build_configurations.each do |config|
     config.build_settings['CURRENT_PROJECT_VERSION'] = current_project_version
+    if config.name == 'Release'
+      config.build_settings['SWIFT_OPTIMIZATION_LEVEL'] = '-O'
+      config.build_settings['SWIFT_COMPILATION_MODE'] = 'wholemodule'
+      config.build_settings['ENABLE_TESTABILITY'] = 'NO'
+      config.build_settings['DEBUG_INFORMATION_FORMAT'] = 'dwarf'
+      config.build_settings['COPY_PHASE_STRIP'] = 'YES'
+      config.build_settings['STRIP_STYLE'] = 'debugging'
+    end
   end
 
   # CI 构建在 mobile.yml 中用 GITHUB_RUN_NUMBER 覆盖 CFBundleVersion，
@@ -170,6 +178,14 @@ def inject
               app_target.build_configurations.first
     cfg_bundle_id = app_cfg.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] || 'com.prism.proxy'
     cfg.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = "#{cfg_bundle_id}.#{EXT_NAME}"
+    if cfg.name == 'Release'
+      cfg.build_settings['SWIFT_OPTIMIZATION_LEVEL'] = '-O'
+      cfg.build_settings['SWIFT_COMPILATION_MODE'] = 'wholemodule'
+      cfg.build_settings['ENABLE_TESTABILITY'] = 'NO'
+      cfg.build_settings['DEBUG_INFORMATION_FORMAT'] = 'dwarf'
+      cfg.build_settings['COPY_PHASE_STRIP'] = 'YES'
+      cfg.build_settings['STRIP_STYLE'] = 'debugging'
+    end
   end
 
   # ---- 3. 主 App：隧道控制器 + NetworkExtension 框架 ----
